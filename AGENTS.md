@@ -65,8 +65,24 @@ Inputs; ruling 0002, D18)
 
 ## Claim contract
 
-Lands with plan item 4. Nothing here until then (ruling 0001, P0
-deliverable 4).
+A Waypoint completes only through a validated Claim, never through
+Herdr's pane lifecycle (0001 D3; 0017 D53, D56). A Claim carries the
+execution triple injected into the pane at creation and printed by
+today's stub — `WIRK_ESTATE_ROOT`, `WIRK_WORK_ID`, `WIRK_RUN_ID`; these
+names are open in the workspace, not confirmed for wirk. A Claim also
+carries the artifacts the Waypoint's own output contract names, and the
+actor's own evidence files, not a transcript read from the pane (0017
+D57).
+
+wirkd validates a Claim by round-tripping the execution triple through
+it and the Journal, and by refusing a Claim missing a required artifact
+(0001 D9).
+
+A missing Claim leaves the Run open and honestly unresolved. A
+fabricated triple is recorded, not honored (0001 D9).
+
+No Herdr lifecycle event, no `agent wait`, and no exit status ever
+completes a Waypoint (0001 D3; 0017 D53, D56).
 
 ## Everything else
 
