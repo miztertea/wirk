@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = [
+    "wirk-core",
+    "wirk-herdr",
+    "wirk-atlas",
+    "wirk",
+]

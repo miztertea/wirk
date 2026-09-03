@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: rustup toolchain install (rust-toolchain.toml pins the version)
+        run: rustup toolchain install
+      - name: rustup component add clippy rustfmt (file-selected toolchain)
+        run: rustup component add clippy rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked

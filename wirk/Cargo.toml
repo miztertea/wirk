@@ -1,0 +1,9 @@
+[package]
+name = "wirk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wirk-core = { path = "../wirk-core" }
+wirk-herdr = { path = "../wirk-herdr" }
+wirk-atlas = { path = "../wirk-atlas" }
