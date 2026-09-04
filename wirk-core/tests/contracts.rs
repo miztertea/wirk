@@ -287,7 +287,6 @@ fn d9_2_lifecycle_events_never_advance_a_waypoint() {
 /// `validate_claim` return `Refused(MissingArtifact)`, folding to
 /// `RunState::Open`.
 #[test]
-#[should_panic(expected = "D9#3 D9#4 contract stub")]
 fn d9_3_claim_missing_required_artifact_is_refused() {
     let waypoint = wirk_core::WaypointDefinition {
         id: WaypointId("route-1/wp-1".to_string()),
@@ -305,7 +304,15 @@ fn d9_3_claim_missing_required_artifact_is_refused() {
         artifacts: vec![],
         kind: ClaimKind::Done,
     };
-    let _verdict = wirk_core::validate_claim(&waypoint, &run, &claim);
+    let verdict = wirk_core::validate_claim(&waypoint, &run, &claim);
+    assert!(
+        matches!(
+            &verdict,
+            ClaimVerdict::Refused(wirk_core::ClaimRefusal::MissingArtifact(name))
+                if name == "report.md"
+        ),
+        "expected Refused(MissingArtifact(\"report.md\")), got {verdict:?}"
+    );
 }
 
 /// D9#4 (0001 D9): "The injected triple round-trips through `wirk claim`
@@ -316,7 +323,6 @@ fn d9_3_claim_missing_required_artifact_is_refused() {
 /// `ClaimRefusal::TripleMismatch`, folding to `ClaimRecorded{verdict:
 /// Refused}`.
 #[test]
-#[should_panic(expected = "D9#3 D9#4 contract stub")]
 fn d9_4_fabricated_triple_is_recorded_not_honored() {
     let waypoint = wirk_core::WaypointDefinition {
         id: WaypointId("route-1/wp-1".to_string()),
@@ -333,7 +339,102 @@ fn d9_4_fabricated_triple_is_recorded_not_honored() {
         artifacts: vec![],
         kind: ClaimKind::Done,
     };
-    let _verdict = wirk_core::validate_claim(&waypoint, &run, &claim);
+    let verdict = wirk_core::validate_claim(&waypoint, &run, &claim);
+    assert!(
+        matches!(
+            verdict,
+            ClaimVerdict::Refused(wirk_core::ClaimRefusal::TripleMismatch)
+        ),
+        "expected Refused(TripleMismatch), got {verdict:?}"
+    );
+}
+
+/// The build brief's amendment 1 (this item, J1): a Claim on an
+/// already-`Claimed` Run is refused with `ClaimRefusal::AlreadyClaimed`,
+/// even when the Claim is otherwise valid (matching triple, no missing
+/// artifacts).
+#[test]
+fn claim_against_an_already_claimed_run_is_refused() {
+    let waypoint = wirk_core::WaypointDefinition {
+        id: WaypointId("route-1/wp-1".to_string()),
+        kind: wirk_core::WaypointKind::Actor,
+        declared_outputs: vec![],
+    };
+    let mut run = open_run("run-1");
+    run.state = RunState::Claimed(ClaimId("claim-earlier".to_string()));
+    let claim = Claim {
+        id: ClaimId("claim-2".to_string()),
+        run: RunId("run-1".to_string()),
+        triple: triple("run-1"),
+        artifacts: vec![],
+        kind: ClaimKind::Done,
+    };
+    let verdict = wirk_core::validate_claim(&waypoint, &run, &claim);
+    assert!(
+        matches!(
+            verdict,
+            ClaimVerdict::Refused(wirk_core::ClaimRefusal::AlreadyClaimed)
+        ),
+        "expected Refused(AlreadyClaimed), got {verdict:?}"
+    );
+}
+
+/// A Done claim with every required artifact present is `Validated`
+/// (0001 D9#3's positive case).
+#[test]
+fn done_claim_with_required_artifact_present_is_validated() {
+    let waypoint = wirk_core::WaypointDefinition {
+        id: WaypointId("route-1/wp-1".to_string()),
+        kind: wirk_core::WaypointKind::Actor,
+        declared_outputs: vec![ArtifactSpec {
+            name: "report.md".to_string(),
+            required: true,
+        }],
+    };
+    let run = open_run("run-1");
+    let claim = Claim {
+        id: ClaimId("claim-1".to_string()),
+        run: RunId("run-1".to_string()),
+        triple: triple("run-1"),
+        artifacts: vec![wirk_core::ArtifactRef {
+            name: "report.md".to_string(),
+            path: "report.md".to_string(),
+        }],
+        kind: ClaimKind::Done,
+    };
+    let verdict = wirk_core::validate_claim(&waypoint, &run, &claim);
+    assert!(
+        matches!(verdict, ClaimVerdict::Validated),
+        "expected Validated, got {verdict:?}"
+    );
+}
+
+/// A Question claim skips the artifact check entirely (0027 D87): even
+/// with a required, undeclared artifact missing, a Question is
+/// `Validated` once the triple and run-state checks pass.
+#[test]
+fn question_claim_with_missing_artifact_is_validated() {
+    let waypoint = wirk_core::WaypointDefinition {
+        id: WaypointId("route-1/wp-1".to_string()),
+        kind: wirk_core::WaypointKind::Actor,
+        declared_outputs: vec![ArtifactSpec {
+            name: "report.md".to_string(),
+            required: true,
+        }],
+    };
+    let run = open_run("run-1");
+    let claim = Claim {
+        id: ClaimId("claim-1".to_string()),
+        run: RunId("run-1".to_string()),
+        triple: triple("run-1"),
+        artifacts: vec![],
+        kind: ClaimKind::Question("what should this contain?".to_string()),
+    };
+    let verdict = wirk_core::validate_claim(&waypoint, &run, &claim);
+    assert!(
+        matches!(verdict, ClaimVerdict::Validated),
+        "expected Validated, got {verdict:?}"
+    );
 }
 
 /// D9#5 (0001 D9): "A moved pane rebinds from `session.snapshot`; a

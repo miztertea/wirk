@@ -10,9 +10,10 @@
 //! `Run`/`RunState`/`FailureCause`, `Claim`/`ExecutionTriple` (moved into
 //! W1)/`ClaimVerdict`/`ClaimRefusal`, `Event`/`EventKind`, `WorldHash::of`'s
 //! SHA-256 hashing, the `Run`-level reducer `Run::apply`, the `Executor`
-//! trait, and the D9 contract tests. `fold`/`validate_claim` remain
-//! `todo!()` stubs — item 2's journal store and item 3's claim validation
-//! own their bodies (build-brief.md §2). W3 (build-brief.md §3 W3, ruling
+//! trait, and the D9 contract tests. `fold` and `validate_claim` were
+//! stubs here — item 2's journal store and item 3's claim validation
+//! (this file, W1) landed their real bodies (build-brief.md §2). W3
+//! (build-brief.md §3 W3, ruling
 //! 0026): `ClaimRefusal::OutOfBoundary`, `Work.repositories` as
 //! `Vec<RepositoryBinding>`, `Claim.kind`/`ClaimKind`,
 //! `FailureCause.detail` — type-level answers to inherited defects 280,
@@ -521,6 +522,12 @@ pub enum ClaimRefusal {
     MissingArtifact(String),
     TripleMismatch,
     OutOfBoundary(String),
+    /// A Claim filed against a `Run` already `RunState::Claimed` (build
+    /// brief amendment 1, this item; d9_5's precedent: a valid Claim on
+    /// a `Failed` or `Vanished` Run is still honored — late evidence,
+    /// not stale — so only `Claimed` refuses here). J1, recorded in the
+    /// closing ruling.
+    AlreadyClaimed,
 }
 
 /// A Claim's completion verb (0001 D5: "the completion/question verb"),
@@ -969,8 +976,39 @@ pub enum JournalError {
 /// open. D9#4: a fabricated triple is recorded, not honored. Types and the
 /// refusal enum are final in this item; the validator body is item 3's
 /// "claim validation and wirkd" (0023 D81; build-brief.md §2, J5 over R7).
-pub fn validate_claim(_waypoint: &WaypointDefinition, _run: &Run, _claim: &Claim) -> ClaimVerdict {
-    todo!("D9#3 D9#4 contract stub: item 3, Claim validation")
+pub fn validate_claim(waypoint: &WaypointDefinition, run: &Run, claim: &Claim) -> ClaimVerdict {
+    // 1. Triple match (0001 D9#4): the Claim must name the Run it is
+    // filed against. `work_id` is not checked here — that needs the
+    // `Work`, which this signature does not carry; wirkd checks it
+    // (item 3's process, W3).
+    if claim.triple.run_id != run.id {
+        return ClaimVerdict::Refused(ClaimRefusal::TripleMismatch);
+    }
+
+    // 2. Run state (build brief amendment 1, this item's J1): a Claim
+    // against an already-`Claimed` Run is refused; `Open`, `Failed`,
+    // and `Vanished` all proceed (d9_5's precedent — a late claim is
+    // evidence the work completed, not stale).
+    if matches!(run.state, RunState::Claimed(_)) {
+        return ClaimVerdict::Refused(ClaimRefusal::AlreadyClaimed);
+    }
+
+    // 3. Artifacts by name (0001 D9#3), skipped for a Question claim
+    // (0027 D87): every declared, required output must appear in
+    // `claim.artifacts` by name; the first missing one refuses.
+    if matches!(claim.kind, ClaimKind::Done) {
+        for output in &waypoint.declared_outputs {
+            if !output.required {
+                continue;
+            }
+            let present = claim.artifacts.iter().any(|a| a.name == output.name);
+            if !present {
+                return ClaimVerdict::Refused(ClaimRefusal::MissingArtifact(output.name.clone()));
+            }
+        }
+    }
+
+    ClaimVerdict::Validated
 }
 
 // ---- Executor trait --------------------------------------------------------

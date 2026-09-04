@@ -320,3 +320,128 @@ fn replay_then_fold_equals_folding_the_original_events() {
     assert_eq!(folded_from_replay, folded_from_original);
     assert_eq!(folded_from_replay.state, wirk_core::WorkState::Completed);
 }
+
+/// Fold coverage gap named at 0033's close: a `ClaimRecorded` carrying
+/// `claim_kind: Question` and a `Refused` verdict is not a Work fact
+/// (fold.md §1, mirrored from `Run::apply`) — the Work must stay
+/// `Active`, never jump to `NeedsInput`, which only a *Validated*
+/// Question moves it to.
+#[test]
+fn fold_leaves_work_state_unchanged_on_a_refused_question_claim() {
+    let events = vec![
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: None,
+            at: Timestamp(0),
+            kind: EventKind::WorkSubmitted {
+                route: RouteId("route-1".to_string()),
+                repositories: vec![RepositoryBinding {
+                    name: "wirk".to_string(),
+                    access: Access::Write,
+                }],
+                intent: "do the thing".to_string(),
+                waypoints: vec![WaypointId("wp-1".to_string())],
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: None,
+            at: Timestamp(1),
+            kind: EventKind::WaypointReserved {
+                waypoint: WaypointId("wp-1".to_string()),
+                world_hash: WorldHash("deadbeef".to_string()),
+                world: deterministic_world(),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-1".to_string())),
+            at: Timestamp(2),
+            kind: EventKind::RunOpened {
+                run: RunId("run-1".to_string()),
+                waypoint: WaypointId("wp-1".to_string()),
+                attempt: 1,
+                world_hash: WorldHash("deadbeef".to_string()),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-1".to_string())),
+            at: Timestamp(3),
+            kind: EventKind::ClaimRecorded {
+                claim: ClaimId("claim-1".to_string()),
+                claim_kind: ClaimKind::Question("what next?".to_string()),
+                verdict: ClaimVerdict::Refused(wirk_core::ClaimRefusal::TripleMismatch),
+            },
+        },
+    ];
+
+    let work = wirk_core::fold(&events);
+    assert_eq!(
+        work.state,
+        wirk_core::WorkState::Active,
+        "a Refused Question claim must not move the Work to NeedsInput"
+    );
+}
+
+/// Fold coverage gap named at 0033's close: `Work.last_activity` (issue
+/// 286) advances to the timestamp of every folded event, not just the
+/// first or a `WorkSubmitted`.
+#[test]
+fn fold_advances_last_activity_across_events_with_increasing_timestamps() {
+    let events = vec![
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: None,
+            at: Timestamp(100),
+            kind: EventKind::WorkSubmitted {
+                route: RouteId("route-1".to_string()),
+                repositories: vec![RepositoryBinding {
+                    name: "wirk".to_string(),
+                    access: Access::Write,
+                }],
+                intent: "do the thing".to_string(),
+                waypoints: vec![WaypointId("wp-1".to_string())],
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: None,
+            at: Timestamp(200),
+            kind: EventKind::WaypointReserved {
+                waypoint: WaypointId("wp-1".to_string()),
+                world_hash: WorldHash("deadbeef".to_string()),
+                world: deterministic_world(),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-1".to_string())),
+            at: Timestamp(300),
+            kind: EventKind::RunOpened {
+                run: RunId("run-1".to_string()),
+                waypoint: WaypointId("wp-1".to_string()),
+                attempt: 1,
+                world_hash: WorldHash("deadbeef".to_string()),
+            },
+        },
+    ];
+
+    let work = wirk_core::fold(&events[..1]);
+    assert_eq!(work.last_activity, Timestamp(100));
+    let work = wirk_core::fold(&events[..2]);
+    assert_eq!(work.last_activity, Timestamp(200));
+    let work = wirk_core::fold(&events);
+    assert_eq!(
+        work.last_activity,
+        Timestamp(300),
+        "last_activity did not advance to the last folded event's timestamp"
+    );
+}

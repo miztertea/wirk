@@ -1,11 +1,15 @@
 //! wirk binary entrypoint.
 //!
-//! `wirk claim` is a stub for the P0 Herdr spike (ruling 0001 D3, D9#4;
-//! brief `p0-skeleton` W2 "What triple means"): its only purpose is to
-//! prove, running inside a Herdr pane, that the execution triple Herdr
-//! injects into the pane's env at creation is inherited by a process
-//! wirkd launches there. No validation, no journal, no Herdr call, no
-//! other subcommand — those arrive with the claim contract (plan item 4).
+//! `wirk claim` reads the injected triple from env (ruling 0001 D3, D5;
+//! unchanged since the P0 spike), then W3 (0023 D81) makes it real:
+//! locates the running wirkd via `WIRK_ESTATE_ROOT`'s pointer file
+//! (`orient/transport.md` §3), files the Claim over the socket, and
+//! prints the verdict wirkd journaled — no more triple-printing stub.
+//! `wirk wirkd start|stop|ping` and `wirk work submit` are new this
+//! wave: `start` runs the server loop (`wirkd::server::run`, blocking,
+//! foreground) that binds the socket, writes the pointer file, and
+//! serves; `stop`/`ping`/`submit` are thin clients dialing it
+//! (`orient/build-brief.md` §3 W3).
 //!
 //! `wirk journal demo <dir>` is item 2's tried step (ruling 0028 D93,
 //! `knowledge/work/p1-journal/orient/store.md` §6): glue over
@@ -26,10 +30,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// wirkd wire protocol (envelope, verb, payload types), the client
+// (`locate`, `call`) that reaches a running wirkd, and the server loop
+// itself (W2 `orient/transport.md` §2-4; W3 `orient/build-brief.md` §3).
+mod wirkd;
+
+use wirkd::{ClaimPayload, Reply, Request, SubmitPayload};
+
 use wirk_core::{
     Access, ClaimId, ClaimKind, ClaimVerdict, DeterministicWorld, Event, EventId, EventKind,
-    Journal, JournalError, OutputContract, RepositoryBinding, RouteId, RunId, WaypointId, WorkId,
-    WorkState, World, WorldHash,
+    ExecutionTriple, Journal, JournalError, OutputContract, RepositoryBinding, RouteId, RunId,
+    WaypointId, WorkId, WorkState, World, WorldHash,
 };
 
 /// The injected execution triple: ruling 0001 D3 ("the execution
@@ -44,31 +55,64 @@ const TRIPLE_VARS: [&str; 3] = ["WIRK_ESTATE_ROOT", "WIRK_WORK_ID", "WIRK_RUN_ID
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("claim") => claim(),
+        Some("claim") => claim(&args[2..]),
         Some("journal") => journal_command(&args[2..]),
+        Some("wirkd") => wirkd_command(&args[2..]),
+        Some("work") => work_command(&args[2..]),
         _ => {
-            eprintln!("usage: wirk claim");
+            eprintln!(
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping --estate <root> | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref>"
+            );
             ExitCode::FAILURE
         }
     }
 }
 
-/// Print each variable of the injected triple as `NAME=value`, one per
-/// line, in `TRIPLE_VARS` order, and exit 0. If any is absent, name
-/// every missing one on stderr (`wirk claim: missing NAME`) and exit
-/// nonzero — nothing is printed to stdout in that case.
-///
-/// Read exactly the way the predecessor's CLI reads its causation env
-/// (sergeant-rs v0.3.0, W1 hierarchical execution contract §6,
-/// `claimed_causation`/`origin`, R5): `std::env::var`, with an empty
-/// value treated as absent so an exported-but-blank variable still
-/// counts as missing, never as `""`.
-fn claim() -> ExitCode {
+/// Reads the injected triple from env, same as always (0001 D5); if any
+/// variable is absent or blank, names each missing one on stderr and
+/// exits 1 (usage) — nothing is printed to stdout, no wirkd contacted.
+/// Otherwise parses `--artifact <name>=<path>` (repeatable) and
+/// `--question <text>` (W3, build-brief.md §3 amendment 2; D87), locates
+/// wirkd via `WIRK_ESTATE_ROOT`'s pointer file, files the Claim, and
+/// prints the verdict wirkd journaled: `Validated` (exit 0) or
+/// `Refused: <code> <message>` (exit 3). A transport or locate failure
+/// (wirkd unreachable, pointer missing or malformed, a malformed reply)
+/// is exit 2, the error printed to stderr.
+fn claim(args: &[String]) -> ExitCode {
+    let mut artifacts: BTreeMap<String, String> = BTreeMap::new();
+    let mut question: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--artifact" => {
+                i += 1;
+                let Some(pair) = args.get(i) else {
+                    return claim_usage();
+                };
+                let Some((name, path)) = pair.split_once('=') else {
+                    return claim_usage();
+                };
+                artifacts.insert(name.to_string(), path.to_string());
+            }
+            "--question" => {
+                i += 1;
+                let Some(text) = args.get(i) else {
+                    return claim_usage();
+                };
+                question = Some(text.clone());
+            }
+            _ => return claim_usage(),
+        }
+        i += 1;
+    }
+
     let mut missing = Vec::new();
-    let mut lines = Vec::new();
+    let mut triple: BTreeMap<&str, String> = BTreeMap::new();
     for name in TRIPLE_VARS {
         match env::var(name).ok().filter(|v| !v.trim().is_empty()) {
-            Some(value) => lines.push(format!("{name}={value}")),
+            Some(value) => {
+                triple.insert(name, value);
+            }
             None => missing.push(name),
         }
     }
@@ -76,12 +120,195 @@ fn claim() -> ExitCode {
         for name in &missing {
             eprintln!("wirk claim: missing {name}");
         }
-        return ExitCode::FAILURE;
+        return ExitCode::from(1);
     }
-    for line in lines {
-        println!("{line}");
+    let estate_root = triple["WIRK_ESTATE_ROOT"].clone();
+
+    let pointer = match wirkd::client::locate(Path::new(&estate_root)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk claim: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let kind = match question {
+        Some(text) => ClaimKind::Question(text),
+        None => ClaimKind::Done,
+    };
+    let payload = ClaimPayload {
+        triple: ExecutionTriple {
+            estate_root,
+            work_id: WorkId(triple["WIRK_WORK_ID"].clone()),
+            run_id: RunId(triple["WIRK_RUN_ID"].clone()),
+        },
+        kind,
+        artifacts,
+    };
+
+    match wirkd::client::call(&pointer.socket, &Request::claim(payload)) {
+        Ok(Reply::Ok { result, .. }) => {
+            let _ = result;
+            println!("Validated");
+            ExitCode::SUCCESS
+        }
+        Ok(Reply::Err { error, .. }) => {
+            println!("Refused: {} {}", error.code, error.message);
+            ExitCode::from(3)
+        }
+        Err(err) => {
+            eprintln!("wirk claim: {err}");
+            ExitCode::from(2)
+        }
     }
-    ExitCode::SUCCESS
+}
+
+fn claim_usage() -> ExitCode {
+    eprintln!("usage: wirk claim [--artifact NAME=PATH]... [--question TEXT]");
+    ExitCode::from(1)
+}
+
+// ---- wirkd / work submit (W3, orient/build-brief.md §3) -------------
+
+/// Dispatches `wirk wirkd <rest>`: `start --estate <root>` runs the
+/// server loop in the foreground (blocking; the caller backgrounds it);
+/// `stop`/`ping --estate <root>` are thin clients.
+fn wirkd_command(rest: &[String]) -> ExitCode {
+    let Some(sub) = rest.first().map(String::as_str) else {
+        return wirkd_usage();
+    };
+    let Some(estate) = flag_value(&rest[1..], "--estate") else {
+        return wirkd_usage();
+    };
+    match sub {
+        "start" => match wirkd::server::run(PathBuf::from(estate)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("wirk wirkd start: {err}");
+                ExitCode::from(2)
+            }
+        },
+        "stop" => wirkd_client_call(&estate, &Request::stop(), |_| {
+            println!("stopped");
+        }),
+        "ping" => wirkd_client_call(&estate, &Request::ping(), |result| {
+            println!(
+                "protocol_version {} pid {}",
+                result["protocol_version"].as_u64().unwrap_or_default(),
+                result["pid"].as_u64().unwrap_or_default()
+            );
+        }),
+        _ => wirkd_usage(),
+    }
+}
+
+fn wirkd_usage() -> ExitCode {
+    eprintln!("usage: wirk wirkd start|stop|ping --estate <root>");
+    ExitCode::from(1)
+}
+
+/// Locates wirkd at `estate`, sends `request`, and on an `ok` reply
+/// hands its `result` to `on_ok` for the subcommand's own printing.
+/// Locate/transport failure is exit 2; a `{"ok":false,...}` reply (only
+/// `ping`/`stop`/`submit` use this helper, none of which wirkd ever
+/// refuses) is printed verbatim and treated as exit 2 too.
+fn wirkd_client_call(
+    estate: &str,
+    request: &Request,
+    on_ok: impl FnOnce(&serde_json::Value),
+) -> ExitCode {
+    let pointer = match wirkd::client::locate(Path::new(estate)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk wirkd: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    match wirkd::client::call(&pointer.socket, request) {
+        Ok(Reply::Ok { result, .. }) => {
+            on_ok(&result);
+            ExitCode::SUCCESS
+        }
+        Ok(Reply::Err { error, .. }) => {
+            eprintln!("wirk wirkd: {} {}", error.code, error.message);
+            ExitCode::from(2)
+        }
+        Err(err) => {
+            eprintln!("wirk wirkd: {err}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Dispatches `wirk work <rest>`: `submit --estate <root> --intent
+/// <text> --repo <name>:<read|write> (repeatable) --base <ref>`.
+fn work_command(rest: &[String]) -> ExitCode {
+    if rest.first().map(String::as_str) != Some("submit") {
+        return work_usage();
+    }
+    let rest = &rest[1..];
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return work_usage();
+    };
+    let Some(intent) = flag_value(rest, "--intent") else {
+        return work_usage();
+    };
+    let base_ref = flag_value(rest, "--base").unwrap_or_default();
+
+    let mut repositories = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == "--repo" {
+            i += 1;
+            let Some(spec) = rest.get(i) else {
+                return work_usage();
+            };
+            let Some((name, mode)) = spec.split_once(':') else {
+                return work_usage();
+            };
+            let access = match mode.to_ascii_lowercase().as_str() {
+                "read" => Access::Read,
+                "write" => Access::Write,
+                _ => return work_usage(),
+            };
+            repositories.push(RepositoryBinding {
+                name: name.to_string(),
+                access,
+            });
+        }
+        i += 1;
+    }
+
+    let payload = SubmitPayload {
+        intent,
+        repositories,
+        base_ref,
+    };
+    wirkd_client_call(&estate, &Request::submit(payload), |result| {
+        println!(
+            "work_id {} run_id {} waypoint {}",
+            result["work_id"].as_str().unwrap_or_default(),
+            result["run_id"].as_str().unwrap_or_default(),
+            result["waypoint"].as_str().unwrap_or_default()
+        );
+    })
+}
+
+fn work_usage() -> ExitCode {
+    eprintln!(
+        "usage: wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref>"
+    );
+    ExitCode::from(1)
+}
+
+/// Returns the value following `flag` in `args`, or `None` if the flag
+/// is absent or has no following value (R6: the one shared parsing move
+/// every subcommand's `--estate`/`--intent`/`--base` needs).
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 // ---- journal demo (item 2, ruling 0028 D93) --------------------------
