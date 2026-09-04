@@ -2,3 +2,13 @@
 name = "wirk-core"
 version = "0.1.0"
 edition = "2024"
+
+# R5: installed dependency, used the ordinary way. Deny-list boundary
+# (0022 D71), not zero-deps (0001 D7 narrowed).
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+# WorldHash's algorithm (W2 build brief §2): std::hash::Hasher's default
+# (SipHash) is documented unstable across Rust releases, unsuitable for a
+# persisted resume key. R5: installed dependency, used the ordinary way.
+sha2 = "0.10.9"

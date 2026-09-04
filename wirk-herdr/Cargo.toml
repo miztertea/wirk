@@ -3,5 +3,11 @@ name = "wirk-herdr"
 version = "0.1.0"
 edition = "2024"
 
+# R5: installed dependencies, used the ordinary way; versions pinned to
+# what W3's build brief names as already in the offline registry cache.
 [dependencies]
 wirk-core = { path = "../wirk-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+thiserror = "2.0.20"

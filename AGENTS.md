@@ -69,7 +69,7 @@ A Waypoint completes only through a validated Claim, never through
 Herdr's pane lifecycle (0001 D3; 0017 D53, D56). A Claim carries the
 execution triple injected into the pane at creation and printed by
 today's stub — `WIRK_ESTATE_ROOT`, `WIRK_WORK_ID`, `WIRK_RUN_ID`; these
-names are open in the workspace, not confirmed for wirk. A Claim also
+names stand, decided by the owner (ruling 0022 D73). A Claim also
 carries the artifacts the Waypoint's own output contract names, and the
 actor's own evidence files, not a transcript read from the pane (0017
 D57).
