@@ -85,9 +85,10 @@ fn main() -> ExitCode {
         Some("work") => work_command(&args[2..]),
         Some("run-deterministic") => run_deterministic_command(&args[2..]),
         Some("run") => executor::run_command(&args[2..]),
+        Some("plugin") => plugin_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping --estate <root> | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk run --estate <root> --work <id> --session <name> [--nudge-after <secs>] [--herdr-socket <path>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping --estate <root> | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk run --estate <root> --work <id> --session <name> [--nudge-after <secs>] [--herdr-socket <path>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root>"
             );
             ExitCode::FAILURE
         }
@@ -361,6 +362,49 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+// ---- plugin init (item 7 W1, herdr-plugin.toml's operator setup) -----
+
+/// Dispatches `wirk plugin <rest>`: `init --estate <root>` is the only
+/// subcommand. It writes `<root>` as one line into
+/// `$HERDR_PLUGIN_CONFIG_DIR/estate`, the file `plugin/startup.sh` and
+/// the manifest's `submit`/`wirkd-status` commands read (R6: one write,
+/// the operator-blocker fix named by this item's build brief §2 "the
+/// operator blocker dissolves by design"). Refuses to run outside a
+/// Herdr plugin invocation, where `HERDR_PLUGIN_CONFIG_DIR` is unset —
+/// there is nothing to configure otherwise.
+fn plugin_command(rest: &[String]) -> ExitCode {
+    if rest.first().map(String::as_str) != Some("init") {
+        return plugin_usage();
+    }
+    let rest = &rest[1..];
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return plugin_usage();
+    };
+    let Ok(config_dir) = env::var("HERDR_PLUGIN_CONFIG_DIR") else {
+        eprintln!(
+            "wirk plugin init: HERDR_PLUGIN_CONFIG_DIR is not set (run inside a Herdr plugin action)"
+        );
+        return ExitCode::from(2);
+    };
+    let config_dir = PathBuf::from(config_dir);
+    if let Err(err) = std::fs::create_dir_all(&config_dir) {
+        eprintln!("wirk plugin init: {err}");
+        return ExitCode::from(2);
+    }
+    let path = config_dir.join("estate");
+    if let Err(err) = std::fs::write(&path, format!("{estate}\n")) {
+        eprintln!("wirk plugin init: {err}");
+        return ExitCode::from(2);
+    }
+    println!("wrote estate root to {}", path.display());
+    ExitCode::SUCCESS
+}
+
+fn plugin_usage() -> ExitCode {
+    eprintln!("usage: wirk plugin init --estate <root>");
+    ExitCode::from(1)
 }
 
 // ---- run-deterministic (item 5 W3, orient/build-brief.md §3 W3) ------

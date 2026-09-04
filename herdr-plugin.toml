@@ -1,0 +1,90 @@
+# Wirk's real Herdr plugin manifest (P1 item 7; 0019 D62, 0022 D76/D79,
+# 0032 D98-D100; knowledge/work/p1-plugin-manifest/orient/manifest.md).
+#
+# `command` values are argv arrays, never shell-expanded by Herdr
+# (plugins.mdx "command values are argv arrays... no shell expansion
+# unless your command starts a shell itself"), so every entry below
+# starts `bash` itself. Runtime commands run with the plugin directory
+# as their working directory (plugins.mdx "Commands and environment"),
+# which is this manifest's own directory since it lives at the repo
+# root -- so `plugin/startup.sh` resolves there without climbing.
+
+id = "wirk"
+name = "Wirk"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Durable work engine: launch wirkd, submit and claim Work"
+platforms = ["linux"]
+
+[[startup]]
+command = ["bash", "plugin/startup.sh"]
+
+# The three actions are frozen to the verbs items 3 (ruling 0034) and 4
+# (ruling 0036) actually landed on `main`, not the sixteen-action
+# bundle (BRIEF.md Intent). Checked live against
+# `repos/wirk/wirk/src/main.rs` at build time: `wirk wirkd` exposes
+# `start|stop|ping` only -- there is no `wirk wirkd status` verb -- so
+# the read-only status action wraps `ping`, the verb wirkd actually
+# answers (item 3's tried step names it beside start/stop,
+# `orient/transport.md` §8).
+
+[[actions]]
+id = "submit"
+title = "Submit Work"
+contexts = ["workspace"]
+command = ["bash", "-c", '''
+WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
+ESTATE="$(cat "$HERDR_PLUGIN_CONFIG_DIR/estate" 2>/dev/null || true)"
+if [ -z "$ESTATE" ]; then
+    echo "wirk submit: no estate configured (run wirk plugin init --estate <root>)"
+    exit 0
+fi
+exec "$WIRK_BIN" work submit --estate "$ESTATE" --intent "Submitted from Herdr" --base HEAD
+''']
+
+[[actions]]
+id = "claim"
+title = "File a claim"
+contexts = ["pane"]
+command = ["bash", "-c", '''
+WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
+exec "$WIRK_BIN" claim
+''']
+
+[[actions]]
+id = "wirkd-status"
+title = "wirkd status"
+contexts = ["workspace"]
+command = ["bash", "-c", '''
+WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
+ESTATE="$(cat "$HERDR_PLUGIN_CONFIG_DIR/estate" 2>/dev/null || true)"
+if [ -z "$ESTATE" ]; then
+    echo "wirk wirkd-status: no estate configured"
+    exit 0
+fi
+exec "$WIRK_BIN" wirkd ping --estate "$ESTATE"
+''']
+
+# One status pane, `placement = "split"`, never `overlay` (0032 D99
+# verbatim). Its command is a bounded shell loop -- the pane's own
+# long-running program, not a hidden busy-wait (BRIEF.md outcome: "a
+# shell loop with sleep here is the pane's own program, allowed").
+
+[[panes]]
+id = "status"
+title = "Work status"
+placement = "split"
+command = ["bash", "-c", '''
+WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
+ESTATE="$(cat "$HERDR_PLUGIN_CONFIG_DIR/estate" 2>/dev/null || true)"
+i=0
+while [ "$i" -lt 100000 ]; do
+    if [ -z "$ESTATE" ]; then
+        echo "wirk status: no estate configured"
+    else
+        "$WIRK_BIN" wirkd ping --estate "$ESTATE" || echo "wirk status: wirkd unreachable"
+    fi
+    sleep 5
+    i=$((i + 1))
+done
+''']

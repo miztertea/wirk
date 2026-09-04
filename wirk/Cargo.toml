@@ -27,3 +27,8 @@ libc = "0.2.189"
 # already used by wirk-core/Cargo.toml's Journal round-trip fixtures,
 # ruling 0031 D97's latest-then-pin checked 2026-09-04).
 tempfile = "3.27.0"
+# wirk/tests/plugin_manifest.rs parses herdr-plugin.toml (item 7 W1).
+# Latest stable on crates.io today (0031 D97), checked 2026-09-04:
+# `curl -s https://crates.io/api/v1/crates/toml -A wirk` ->
+# max_stable_version 1.1.5+spec-1.1.0.
+toml = "1.1.5"
