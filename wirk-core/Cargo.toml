@@ -11,4 +11,14 @@ thiserror = "2.0.20"
 # WorldHash's algorithm (W2 build brief §2): std::hash::Hasher's default
 # (SipHash) is documented unstable across Rust releases, unsuitable for a
 # persisted resume key. R5: installed dependency, used the ordinary way.
-sha2 = "0.10.9"
+sha2 = "0.11.0"
+# W1 (p1-journal): the Journal store's on-disk envelope (orient/store.md
+# §1, R5, cache-confirmed). Latest-then-pin (0031 D97), checked against
+# crates.io 2026-09-04.
+serde_json = "1.0.151"
+# EventId minted by Journal::append (orient/store.md §2, R2+R5).
+ulid = "3.0.0"
+
+[dev-dependencies]
+# Journal round-trip test fixtures (orient/store.md §7). R5, cache-resolvable.
+tempfile = "3.27.0"

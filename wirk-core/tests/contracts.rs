@@ -7,9 +7,10 @@
 //! removes the attribute and writes the assertion, inheriting its red").
 
 use wirk_core::{
-    ActorWorld, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimVerdict,
+    Access, ActorWorld, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimVerdict,
     DeterministicWorld, Event, EventId, EventKind, ExecutionTriple, FailureCause, OutputContract,
-    Run, RunId, RunState, Timestamp, WaypointId, WorkId, World, WorldHash,
+    RepositoryBinding, RouteId, Run, RunId, RunState, Timestamp, WaypointId, WorkId, WorkState,
+    World, WorldHash,
 };
 
 fn triple(run_id: &str) -> ExecutionTriple {
@@ -56,22 +57,147 @@ fn actor_world(repository: &str, branch: &str, base_sha: &str, worktree: &str) -
     })
 }
 
+fn work_submitted(waypoints: Vec<&str>) -> EventKind {
+    EventKind::WorkSubmitted {
+        route: RouteId("route-1".to_string()),
+        repositories: vec![RepositoryBinding {
+            name: "wirk".to_string(),
+            access: Access::Write,
+        }],
+        intent: "do the thing".to_string(),
+        waypoints: waypoints
+            .into_iter()
+            .map(|wp| WaypointId(wp.to_string()))
+            .collect(),
+    }
+}
+
+fn waypoint_reserved(waypoint: &str) -> EventKind {
+    EventKind::WaypointReserved {
+        waypoint: WaypointId(waypoint.to_string()),
+        world_hash: WorldHash("deadbeef".to_string()),
+        world: actor_world("wirk", "p1/journal", "abc123", "/var/tmp/w1"),
+    }
+}
+
+fn run_opened(run: &str, waypoint: &str) -> EventKind {
+    EventKind::RunOpened {
+        run: RunId(run.to_string()),
+        waypoint: WaypointId(waypoint.to_string()),
+        attempt: 1,
+        world_hash: WorldHash("deadbeef".to_string()),
+    }
+}
+
+fn claim_recorded(claim: &str, kind: ClaimKind, verdict: ClaimVerdict) -> EventKind {
+    EventKind::ClaimRecorded {
+        claim: ClaimId(claim.to_string()),
+        claim_kind: kind,
+        verdict,
+    }
+}
+
 /// D9#1 (0001 D9): "Journal replay rebuilds Work state, no in-memory
-/// objects." Stub: `fold`'s real body is item 2's journal store
-/// (build-brief.md §2, §3 W2). The real assertion this lifts to: build a
-/// `Vec<Event>`, call `fold(&events) -> Work`, assert `Work.state` matches
-/// what the events imply and nothing else is consulted.
+/// objects." Real: `fold(&events) -> Work` is a pure reducer over
+/// `fold.md` §1's transition table (item 2, this build). Three cases per
+/// `fold.md` §5, plus `LifecycleObserved` inert at Work level.
 #[test]
-#[should_panic(expected = "D9#1 contract stub")]
 fn d9_1_journal_replay_rebuilds_work_state() {
-    let events = vec![event(
-        "ev-1",
+    // Case 1: completion on the last waypoint after Active on the
+    // first; current_waypoint tracks reservation, not claim; a
+    // LifecycleObserved event in between changes nothing (D9#2, inert
+    // here too).
+    let events = vec![
+        event("ev-1", None, work_submitted(vec!["wp-1", "wp-2"])),
+        event("ev-2", None, waypoint_reserved("wp-1")),
+        event("ev-3", Some("run-1"), run_opened("run-1", "wp-1")),
+        event(
+            "ev-4",
+            Some("run-1"),
+            EventKind::RunLaunched {
+                run: RunId("run-1".to_string()),
+            },
+        ),
+        event(
+            "ev-5",
+            Some("run-1"),
+            claim_recorded("claim-1", ClaimKind::Done, ClaimVerdict::Validated),
+        ),
+    ];
+    let work = wirk_core::fold(&events);
+    assert!(matches!(work.state, WorkState::Active), "{:?}", work.state);
+    assert_eq!(work.current_waypoint, Some(WaypointId("wp-1".to_string())));
+
+    let mut events = events;
+    events.push(event(
+        "ev-6",
         Some("run-1"),
         EventKind::LifecycleObserved {
-            status: "working".to_string(),
+            status: "idle".to_string(),
         },
-    )];
-    let _work = wirk_core::fold(&events);
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::Active),
+        "LifecycleObserved changed Work state: {:?}",
+        work.state
+    );
+
+    events.push(event("ev-7", None, waypoint_reserved("wp-2")));
+    events.push(event("ev-8", Some("run-2"), run_opened("run-2", "wp-2")));
+    events.push(event(
+        "ev-9",
+        Some("run-2"),
+        claim_recorded("claim-2", ClaimKind::Done, ClaimVerdict::Validated),
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::Completed),
+        "{:?}",
+        work.state
+    );
+
+    // Case 2: a validated Question claim moves the Work to NeedsInput
+    // (0027 D87).
+    let question_events = vec![
+        event("ev-1", None, work_submitted(vec!["wp-1"])),
+        event("ev-2", None, waypoint_reserved("wp-1")),
+        event("ev-3", Some("run-1"), run_opened("run-1", "wp-1")),
+        event(
+            "ev-4",
+            Some("run-1"),
+            claim_recorded(
+                "claim-q",
+                ClaimKind::Question("which base branch?".to_string()),
+                ClaimVerdict::Validated,
+            ),
+        ),
+    ];
+    let work = wirk_core::fold(&question_events);
+    assert!(
+        matches!(work.state, WorkState::NeedsInput),
+        "{:?}",
+        work.state
+    );
+
+    // Case 3: an event for an unknown (never-opened) Run is folded
+    // without panicking and without changing state.
+    let unknown_run_events = vec![
+        event("ev-1", None, work_submitted(vec!["wp-1"])),
+        event("ev-2", None, waypoint_reserved("wp-1")),
+        event(
+            "ev-3",
+            Some("run-unopened"),
+            claim_recorded("claim-x", ClaimKind::Done, ClaimVerdict::Validated),
+        ),
+    ];
+    let work = wirk_core::fold(&unknown_run_events);
+    assert!(
+        matches!(work.state, WorkState::Active),
+        "unknown-Run event changed Work state: {:?}",
+        work.state
+    );
+    assert_eq!(work.current_waypoint, Some(WaypointId("wp-1".to_string())));
 }
 
 /// D9#2 (0001 D9): "Lifecycle events never advance a Waypoint; only a
@@ -245,10 +371,13 @@ fn d9_5_vanished_run_ends_unresolved_not_complete() {
 /// worktree add` call pinning the SHA — is item 4's (0022 D77; build-brief
 /// §2: "the executor", not item 5), out of scope here (BRIEF: "Any carve
 /// of sergeant code (items 5, 9)"). This test proves the type carries the
-/// exact string (`WorktreeCreated{repo, base_sha}`), then calls `fold` so
-/// it panics as a stub naming the item that lifts it.
+/// exact string (`WorktreeCreated{repo, base_sha}`), then panics naming
+/// item 4 as the item that lifts it. W2 build brief §7: "stays
+/// should_panic" — it can no longer borrow `fold`'s own stub panic
+/// (`fold` is real as of this item), so the panic is explicit here
+/// instead (J1: local, reversible, test-only).
 #[test]
-#[should_panic(expected = "D9#1 contract stub")]
+#[should_panic(expected = "item 4 contract stub: worktree base_sha pin")]
 fn d9_6_worktree_base_sha_pinned() {
     let exact_sha = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
     let created = event(
@@ -264,11 +393,8 @@ fn d9_6_worktree_base_sha_pinned() {
         other => panic!("expected WorktreeCreated, got {other:?}"),
     }
     // The event carries the exact SHA (asserted above); the real pin — the
-    // `git worktree add` call itself — is item 4's. Call `fold` so this
-    // test panics as a stub, naming item 2's journal-store stub since no
-    // dedicated worktree-pin stub exists (build brief: no `pub fn
-    // worktree_base_sha_pinned() -> !` wanted).
-    let _work = wirk_core::fold(&[created]);
+    // `git worktree add` call itself — is item 4's.
+    panic!("item 4 contract stub: worktree base_sha pin");
 }
 
 /// Not a D9 number, but pins the resume key (world.md §2): the same

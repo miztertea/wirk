@@ -7,3 +7,9 @@ edition = "2024"
 wirk-core = { path = "../wirk-core" }
 wirk-herdr = { path = "../wirk-herdr" }
 wirk-atlas = { path = "../wirk-atlas" }
+
+[dev-dependencies]
+# wirk/tests/journal_demo.rs's tempdirs (R5, cache-resolvable; same pin
+# already used by wirk-core/Cargo.toml's Journal round-trip fixtures,
+# ruling 0031 D97's latest-then-pin checked 2026-09-04).
+tempfile = "3.27.0"

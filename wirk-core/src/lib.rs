@@ -21,7 +21,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 // ---- Identity ----------------------------------------------------------
 // Newtypes so a WorkId can't be handed where a RunId is expected
@@ -143,13 +146,22 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Durable unit of intent (0001 D5). D9#1: reconstructible from Events
 /// alone (orient/core.md line 30-38).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Work {
     pub id: WorkId,
     pub intent: String,
     pub route: RouteId,
     pub repositories: Vec<RepositoryBinding>,
     pub state: WorkState,
+    /// The Waypoint most recently reserved (issue 286; fold.md §4): set
+    /// by `WaypointReserved`, left unchanged by a `ClaimRecorded` that
+    /// advances state without a new reservation (fold.md §1).
+    pub current_waypoint: Option<WaypointId>,
+    /// Wall-clock time of the last event folded for this Work (issue
+    /// 286; fold.md §4), written on every folded event so "still
+    /// working" and "wedged" are distinguishable without transcript
+    /// reading.
+    pub last_activity: Timestamp,
 }
 
 /// A repository this Work may touch, with its declared access mode
@@ -160,7 +172,7 @@ pub struct Work {
 /// A Claim whose evidence shows a write to a repository declared
 /// `Access::Read` is refused (`ClaimRefusal::OutOfBoundary`), not
 /// accepted on trust.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryBinding {
     pub name: String,
     pub access: Access,
@@ -188,6 +200,18 @@ pub enum WorkState {
     Completed,
     Failed,
     Canceled,
+}
+
+impl WorkState {
+    /// `Completed`/`Failed`/`Canceled` are terminal (fold.md §1: each
+    /// new terminal event's row reads "any non-terminal -> ..."); used
+    /// by `fold` to stop advancing a Work that has already ended.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            WorkState::Completed | WorkState::Failed | WorkState::Canceled
+        )
+    }
 }
 
 // ---- Route / Waypoint ----------------------------------------------------
@@ -440,6 +464,17 @@ impl Run {
                 (ClaimVerdict::Refused(_), _) => {}
             },
             EventKind::WorktreeCreated { .. } => {}
+            // W2 (p1-journal): RunOpened/RunLaunched are Run-scoped
+            // bookkeeping the Work-level `fold` owns (fold.md §1);
+            // WorkSubmitted/WaypointReserved/WorkFailed/WorkCanceled
+            // carry no `run` and never reach this match (the guard
+            // above returns first) — arms kept only for exhaustiveness.
+            EventKind::RunOpened { .. }
+            | EventKind::RunLaunched { .. }
+            | EventKind::WorkSubmitted { .. }
+            | EventKind::WaypointReserved { .. }
+            | EventKind::WorkFailed { .. }
+            | EventKind::WorkCanceled { .. } => {}
         }
     }
 }
@@ -557,13 +592,377 @@ pub enum EventKind {
         repo: String,
         base_sha: String,
     },
+    /// Work doesn't exist until submitted; `waypoints` is the Route's
+    /// ordered plan at submission time — the only way `fold`'s
+    /// single-argument signature can tell "last waypoint" without a
+    /// `Route` parameter (fold.md §2, R6; BRIEF.md Intent).
+    WorkSubmitted {
+        route: RouteId,
+        repositories: Vec<RepositoryBinding>,
+        intent: String,
+        waypoints: Vec<WaypointId>,
+    },
+    /// Journals the compiled World at reservation (BRIEF.md Intent;
+    /// evidence/work/p1-executor-design/orient/world.md §5) so a
+    /// resumed/retried Run relaunches without recompiling (fold.md §2,
+    /// R6).
+    WaypointReserved {
+        waypoint: WaypointId,
+        world_hash: WorldHash,
+        world: World,
+    },
+    /// Creates the Run's own record; distinct from `WaypointReserved`
+    /// because one reservation (one World, one hash) can back several
+    /// attempts under `RetryPolicy` (fold.md §2, R6).
+    RunOpened {
+        run: RunId,
+        waypoint: WaypointId,
+        attempt: u32,
+        world_hash: WorldHash,
+    },
+    /// "Run's actor launched" (BRIEF.md Intent); an activity signal
+    /// issue 286 needs, distinct from `RunOpened` so a stalled launch is
+    /// visible before any lifecycle event arrives (fold.md §2, R6).
+    RunLaunched {
+        run: RunId,
+    },
+    /// Terminal Work failure is never inferred from `RunFailed`
+    /// (incident file); an explicit event keeps `fold` retry-policy-
+    /// agnostic — the component that exhausts `RetryPolicy` (items 4, 5)
+    /// fires this (fold.md §2, §8; 0027 D92). J1: no ruling pins
+    /// Work-level failure firing yet.
+    WorkFailed {
+        cause: FailureCause,
+    },
+    /// Owner/operator cancellation; no existing event carries this verb
+    /// (fold.md §2, R6).
+    WorkCanceled {
+        reason: Option<String>,
+    },
 }
 
-/// D9#1: replay rebuilds Work state, no in-memory objects. Pure reducer
-/// proving it; a real append/read store is item 2 (orient/core.md line
-/// 125-127; build-brief.md §2: ships as a stub in this item either way).
-pub fn fold(_events: &[Event]) -> Work {
-    todo!("D9#1 contract stub: item 2, Journal")
+/// D9#1: replay rebuilds Work state, no in-memory objects. The
+/// Work-level reducer over `fold.md` §1's transition table: strictly
+/// slice order, single-writer/append-only so slice order *is* journal
+/// order by construction (fold.md §3) — `fold` consults nothing but
+/// `events` (BRIEF.md's decisive check).
+///
+/// A `Work` exists only from its `WorkSubmitted` event onward; nothing
+/// before it is folded (no oracle for a Work that hasn't been
+/// submitted). `WaypointReserved`'s `world`/`world_hash` are not kept
+/// on `Work` today — folded for their state/`current_waypoint` effect
+/// only (fold.md §1's `WaypointReserved` row); a resumed Run's use of
+/// the journaled World is item 4's, not this reducer's.
+///
+/// Unknown Run: any event naming a `run` this Work has no `RunOpened`
+/// for is ignored entirely — never panics, never changes state — same
+/// policy as `Run::apply` (`lib.rs` above, line ~404-407; fold.md §3,
+/// §7, R6).
+pub fn fold(events: &[Event]) -> Work {
+    let mut work: Option<Work> = None;
+    let mut route_waypoints: Vec<WaypointId> = Vec::new();
+    let mut run_waypoints: BTreeMap<RunId, WaypointId> = BTreeMap::new();
+
+    for event in events {
+        let is_work_submitted = matches!(event.kind, EventKind::WorkSubmitted { .. });
+        let is_run_opened = matches!(event.kind, EventKind::RunOpened { .. });
+        if !is_work_submitted
+            && let Some(run) = &event.run
+            && !is_run_opened
+            && !run_waypoints.contains_key(run)
+        {
+            // Unknown Run: the whole event is ignored (fold.md §3).
+            continue;
+        }
+
+        let Some(w) = work.as_mut() else {
+            if let EventKind::WorkSubmitted {
+                route,
+                repositories,
+                intent,
+                waypoints,
+            } = &event.kind
+            {
+                route_waypoints = waypoints.clone();
+                work = Some(Work {
+                    id: event.work.clone(),
+                    intent: intent.clone(),
+                    route: route.clone(),
+                    repositories: repositories.clone(),
+                    state: WorkState::Pending,
+                    current_waypoint: None,
+                    last_activity: event.at,
+                });
+            }
+            // No `Work` exists yet and this isn't `WorkSubmitted`: there
+            // is nothing to fold onto (fold.md's table has no row for
+            // "before submission"; R1).
+            continue;
+        };
+
+        w.last_activity = event.at;
+
+        match &event.kind {
+            EventKind::WorkSubmitted { .. } => {
+                // Precondition "no prior event for this work" (fold.md
+                // §1): a second WorkSubmitted for an already-existing
+                // Work does not reset it.
+            }
+            EventKind::WaypointReserved { waypoint, .. } => {
+                if !w.state.is_terminal() {
+                    w.current_waypoint = Some(waypoint.clone());
+                    if matches!(w.state, WorkState::Pending | WorkState::Waiting) {
+                        w.state = WorkState::Active;
+                    }
+                }
+            }
+            EventKind::RunOpened { run, waypoint, .. } => {
+                run_waypoints.insert(run.clone(), waypoint.clone());
+            }
+            EventKind::RunLaunched { .. } => {}
+            // D9#2: inert at Run level (0001 D9 #2; 0017 D56); equally
+            // inert here — a lifecycle event alone never advances or
+            // otherwise changes WorkState (fold.md §6, rejecting
+            // sergeant's KIND_WORK_COMPLETED jump table).
+            EventKind::LifecycleObserved { .. } => {}
+            EventKind::ClaimFiled { .. } => {}
+            EventKind::ClaimRecorded {
+                claim_kind,
+                verdict,
+                ..
+            } => {
+                let claimed_waypoint = event.run.as_ref().and_then(|run| run_waypoints.get(run));
+                match (verdict, claim_kind) {
+                    (ClaimVerdict::Validated, ClaimKind::Done) => {
+                        let is_last_waypoint =
+                            claimed_waypoint.is_some_and(|wp| route_waypoints.last() == Some(wp));
+                        if is_last_waypoint {
+                            w.state = WorkState::Completed;
+                        } else if !w.state.is_terminal() {
+                            // current_waypoint unchanged until the next
+                            // WaypointReserved (fold.md §1).
+                            w.state = WorkState::Active;
+                        }
+                    }
+                    (ClaimVerdict::Validated, ClaimKind::Question(_)) => {
+                        if !w.state.is_terminal() {
+                            w.state = WorkState::NeedsInput;
+                        }
+                    }
+                    // A refusal is not a Work fact, mirrors Run::apply
+                    // line ~443 (fold.md §1).
+                    (ClaimVerdict::Refused(_), _) => {}
+                }
+            }
+            // "A failed Run is not a failed Work" (incident file;
+            // fold.md §1) — activity only.
+            EventKind::RunFailed { .. } => {}
+            EventKind::RunVanished => {}
+            EventKind::WorktreeCreated { .. } => {}
+            EventKind::WorkFailed { .. } => {
+                w.state = WorkState::Failed;
+            }
+            EventKind::WorkCanceled { .. } => {
+                w.state = WorkState::Canceled;
+            }
+        }
+    }
+
+    work.expect("fold called with no WorkSubmitted event in the slice: no Work to build")
+}
+
+// ---- Journal ------------------------------------------------------------
+//
+// Item 2's store (orient/store.md). Append-only NDJSON, one
+// `{"seq": N, "event": {...}}` envelope per line, `serde_json` (§1, R5).
+// `Journal`/`JournalError` live beside `Event`/`fold`: pure file/format
+// logic, no Herdr or process concept, same crate and deny-list boundary
+// (0022 D71; store.md §2, §6).
+
+/// On-disk envelope: the sequence number is a store-only field, never on
+/// `Event` itself — `fold` consults nothing but the events it is handed
+/// (store.md §2, "sequence is not added to `Event`").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Envelope {
+    seq: u64,
+    event: Event,
+}
+
+/// Owns the one write path for a Work's journal (Intent, BRIEF.md:17-18:
+/// "Every append goes through one write path that keeps any derived
+/// state contiguous with the journal"). No other way to add a line to
+/// the file this owns (store.md §2).
+pub struct Journal {
+    file: File,
+    next_seq: u64,
+}
+
+impl Journal {
+    /// Opens the journal inside `dir`, creating `dir` and
+    /// `dir/journal.ndjson` if either is absent (Outcome: "the directory
+    /// created on open"). Scans any existing lines once to recover
+    /// `next_seq` for the next `append` — fails closed on the same
+    /// malformed-line/seq-gap rule `replay`/`iter` apply (§5): a
+    /// corrupted journal never opens silently as if it were empty.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Journal, JournalError> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("journal.ndjson");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        let mut journal = Journal { file, next_seq: 1 };
+        for envelope in journal.envelopes()? {
+            let (seq, _event) = envelope?;
+            journal.next_seq = seq + 1;
+        }
+        Ok(journal)
+    }
+
+    /// Appends one `Event`: builds the `{"seq", "event"}` envelope,
+    /// mints a ULID into `event.id` when the caller left it empty
+    /// (store.md §2, §3 — `EventId` is minted here, the convention
+    /// `WorkId`/`RunId`/`ClaimId` already document), serializes it to a
+    /// single line, one `write_all`, then `fsync`s before returning —
+    /// every acknowledged append is durable (R1: no batching for P1).
+    pub fn append(&mut self, event: &Event) -> Result<(), JournalError> {
+        let mut event = event.clone();
+        if event.id.0.is_empty() {
+            event.id = EventId(ulid::Ulid::generate().to_string());
+        }
+        let seq = self.next_seq;
+        let envelope = Envelope { seq, event };
+        let mut line = serde_json::to_vec(&envelope).map_err(|source| JournalError::Serialize {
+            index: seq as usize,
+            source,
+        })?;
+        line.push(b'\n');
+        self.file.write_all(&line)?;
+        self.file.sync_all()?;
+        self.next_seq = seq + 1;
+        Ok(())
+    }
+
+    /// Rebuilds `Vec<Event>` from seq 1; `fold(&journal.replay()?)` is
+    /// the only derived-Work path P1 has (store.md §4: no cache).
+    pub fn replay(&self) -> Result<Vec<Event>, JournalError> {
+        self.iter()?.collect()
+    }
+
+    /// Streaming form; fails closed the same way as `replay` — a bad
+    /// line stops the iterator with `Err`, never silently skipped (§5).
+    pub fn iter(&self) -> Result<JournalIter, JournalError> {
+        Ok(JournalIter {
+            inner: self.envelopes()?,
+        })
+    }
+
+    /// Reads the file from its start through a fresh seek on a cloned
+    /// handle (`append`'s handle keeps writing at EOF regardless of the
+    /// read cursor, per `O_APPEND` semantics) — one on-disk file, one
+    /// write path, read from wherever this call needs.
+    fn envelopes(&self) -> Result<EnvelopeIter, JournalError> {
+        let mut reader = self.file.try_clone()?;
+        reader.seek(SeekFrom::Start(0))?;
+        Ok(EnvelopeIter {
+            lines: BufReader::new(reader).lines(),
+            next_seq: 1,
+            line_no: 0,
+            done: false,
+        })
+    }
+}
+
+/// `Iterator<Item = Result<Event, JournalError>>` over a buffered reader
+/// from the file's start (store.md §2). Wraps `EnvelopeIter`, dropping
+/// the store-only `seq`.
+pub struct JournalIter {
+    inner: EnvelopeIter,
+}
+
+impl Iterator for JournalIter {
+    type Item = Result<Event, JournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|item| item.map(|(_seq, event)| event))
+    }
+}
+
+/// Private: parses one envelope per line, checking `seq` against the
+/// expected next value. Stops and yields one final `Err` on the first
+/// line that fails to parse or whose `seq` is not `expected` — never
+/// silently skipped (§5); nothing is yielded after that `Err`.
+struct EnvelopeIter {
+    lines: std::io::Lines<BufReader<File>>,
+    next_seq: u64,
+    line_no: usize,
+    done: bool,
+}
+
+impl Iterator for EnvelopeIter {
+    type Item = Result<(u64, Event), JournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let line = match self.lines.next()? {
+            Ok(line) => line,
+            Err(source) => {
+                self.done = true;
+                return Some(Err(JournalError::Io(source)));
+            }
+        };
+        self.line_no += 1;
+        let envelope: Envelope = match serde_json::from_str(&line) {
+            Ok(envelope) => envelope,
+            Err(source) => {
+                self.done = true;
+                return Some(Err(JournalError::Malformed {
+                    line: self.line_no,
+                    source,
+                }));
+            }
+        };
+        if envelope.seq != self.next_seq {
+            self.done = true;
+            return Some(Err(JournalError::SeqDiscontinuity {
+                line: self.line_no,
+                expected: self.next_seq,
+                found: envelope.seq,
+            }));
+        }
+        self.next_seq += 1;
+        Some(Ok((envelope.seq, envelope.event)))
+    }
+}
+
+/// store.md §2. `Malformed`/`SeqDiscontinuity` are reported, never
+/// silently skipped (§5) — the decisive check's own words.
+#[derive(Debug, Error)]
+pub enum JournalError {
+    #[error("journal io error")]
+    Io(#[from] std::io::Error),
+    #[error("event {index} failed to serialize")]
+    Serialize {
+        index: usize,
+        source: serde_json::Error,
+    },
+    #[error("malformed line {line}: {source}")]
+    Malformed {
+        line: usize,
+        source: serde_json::Error,
+    },
+    #[error("seq discontinuity at line {line}: expected {expected}, found {found}")]
+    SeqDiscontinuity {
+        line: usize,
+        expected: u64,
+        found: u64,
+    },
 }
 
 /// D9#3: a Claim missing a required artifact is refused, the Run stays
