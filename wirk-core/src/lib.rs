@@ -84,9 +84,11 @@ impl WorldHash {
     /// Covered, `World::Actor`: `repository`, `branch`, `base_sha`,
     /// `intent`, each `output_contract` artifact spec's `name` and
     /// `required` flag, each `boundary` glob. Covered, `World::Deterministic`:
-    /// each `command` word, each `expected_artifacts` spec's `name` and
-    /// `required` flag. Excluded (world.md §2): `worktree_path`,
-    /// `estate_root`, `cwd`, `env`, `triple`, every id.
+    /// each `command` word, `base_sha` (item 5, issue 285: the code
+    /// state the command runs against is content, same principle as
+    /// `Actor`'s own `base_sha`), each `expected_artifacts` spec's
+    /// `name` and `required` flag. Excluded (world.md §2):
+    /// `worktree_path`, `estate_root`, `cwd`, `env`, `triple`, every id.
     ///
     /// Hex-encoded lowercase.
     pub fn of(world: &World) -> WorldHash {
@@ -119,6 +121,8 @@ impl WorldHash {
                     hasher.update(word.as_bytes());
                     hasher.update([0x1f]);
                 }
+                hasher.update(det.base_sha.as_bytes());
+                hasher.update([0x1f]);
                 for spec in &det.expected_artifacts.0 {
                     hasher.update(spec.name.as_bytes());
                     hasher.update([0x1f]);
@@ -350,6 +354,14 @@ pub struct DeterministicWorld {
     /// Route: the Waypoint's own command definition (0001 D4:
     /// "wirk-owned executors").
     pub command: Vec<String>,
+    /// git: exact commit the child/docker executor's cwd is checked out
+    /// at, explicit and validated, never read back from the checkout
+    /// itself (issue 285; item 5 orient/child.md §7 item 1). A
+    /// `ChildExecutor`/`DockerExecutor` refuses to launch a World whose
+    /// `base_sha` is empty. Covered by `WorldHash::of`'s `Deterministic`
+    /// arm below (J3 on 0029 D95's principle: the code state a
+    /// deterministic command runs against is content, not location).
+    pub base_sha: String,
     /// git: same `worktree_path` as `ActorWorld` (0018 D60).
     pub cwd: PathBuf,
     /// env: execution triple (claim-contract.md) plus any Route-declared

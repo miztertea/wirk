@@ -5,13 +5,22 @@
 //! request and per reply, the Journal's own line-delimited convention
 //! reused (R2).
 //!
-//! Five verbs (transport.md §2): `ping`, `submit`, `claim`, `status`,
-//! `stop`. `ping` and `stop` carry no payload fields; `submit`,
-//! `claim`, `status` each have a typed payload struct so a caller does
-//! not hand-build JSON, but `Request.payload` itself stays a
-//! `serde_json::Value` — the one shape both a typed payload (via
-//! `Request::submit`/`claim`/`status`) and a scripted fake server's
-//! literal JSON (the W2 test) can produce identically.
+//! Six verbs (transport.md §2, `fail` new this wave): `ping`, `submit`,
+//! `claim`, `status`, `stop`, `fail`. `ping` and `stop` carry no payload
+//! fields; `submit`, `claim`, `status`, `fail` each have a typed
+//! payload struct so a caller does not hand-build JSON, but
+//! `Request.payload` itself stays a `serde_json::Value` — the one shape
+//! both a typed payload (via `Request::submit`/`claim`/`status`/`fail`)
+//! and a scripted fake server's literal JSON (the W2 test) can produce
+//! identically.
+//!
+//! `fail` (W3, `orient/build-brief.md` §3 W3; `orient/child.md` §7 item
+//! 2): the only way `wirk run-deterministic` — a separate `wirk`
+//! invocation from the wirkd it talks to, never a library call into it
+//! — can turn a local executor `launch` error or a
+//! `RunObservation::Failed` into a journaled `RunFailed`; the Journal
+//! itself lives behind wirkd's own socket, not a handle that process
+//! holds.
 
 // `wirk/tests/wirkd_client.rs` compiles this module into its own crate
 // root via `#[path]` (not through `main.rs`) to unit-test the wire
@@ -35,9 +44,9 @@ pub mod server;
 
 // ---- Request ---------------------------------------------------------
 
-/// The five verbs a request names (transport.md §2). Serialized as its
-/// lowercase name (`"ping"`, `"submit"`, ...), matching the envelope's
-/// `{"verb": "<name>", ...}` shape verbatim.
+/// The six verbs a request names (transport.md §2; `Fail` new this
+/// wave). Serialized as its lowercase name (`"ping"`, `"submit"`, ...),
+/// matching the envelope's `{"verb": "<name>", ...}` shape verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Verb {
@@ -46,6 +55,7 @@ pub enum Verb {
     Claim,
     Status,
     Stop,
+    Fail,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -100,6 +110,16 @@ impl Request {
             payload: serde_json::to_value(payload).expect("StatusPayload always serializes"),
         }
     }
+
+    /// `fail`'s request: `run-deterministic`'s own way of journaling a
+    /// local executor failure (module doc) — never invented by wirkd
+    /// itself.
+    pub fn fail(payload: FailPayload) -> Self {
+        Request {
+            verb: Verb::Fail,
+            payload: serde_json::to_value(payload).expect("FailPayload always serializes"),
+        }
+    }
 }
 
 /// `submit`'s payload (transport.md §2): the intent text, the
@@ -107,11 +127,24 @@ impl Request {
 /// is cut from. `Route` authoring is not built yet (build-brief.md §3
 /// W3, R6) — `submit` names only what W3's hardcoded "smoke" Route
 /// needs to open a Run against.
+///
+/// `kind`/`command` are additive this wave (item 5, `wirk work submit
+/// --kind deterministic --command <argv...>`, kept minimal so item 4's
+/// own sibling branch touching `submit` stays a small merge, per the
+/// task): `#[serde(default)]` so an old caller sending neither field
+/// still deserializes, `kind` absent or `"actor"` keeps today's
+/// hardcoded `ActorWorld` path unchanged, `"deterministic"` (with
+/// `command` non-empty) reserves a `World::Deterministic` instead —
+/// `wirkd`'s own smoke Route stays hardcoded either way (R6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitPayload {
     pub intent: String,
     pub repositories: Vec<RepositoryBinding>,
     pub base_ref: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
 }
 
 /// `claim`'s payload (transport.md §2): the injected
@@ -132,6 +165,21 @@ pub struct ClaimPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusPayload {
     pub work_id: WorkId,
+}
+
+/// `fail`'s payload (W3, `run-deterministic`'s own verb, module doc):
+/// the triple names which Work's journal and which Run; `status`/
+/// `detail` become `FailureCause.status`/`.detail` verbatim (wirkd
+/// stamps `at`, same as every other server-minted event timestamp) —
+/// wirkd refuses (`TripleMismatch`) a `run_id` naming no `RunOpened` in
+/// this Work's journal, the same D9#4 check `claim` makes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailPayload {
+    pub triple: ExecutionTriple,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 // ---- Reply -------------------------------------------------------------

@@ -277,3 +277,61 @@ fn wirkd_process_lifecycle() {
     assert!(!estate.join(".wirk").join("wirkd.json").exists());
     assert!(!estate.join(".wirk").join("wirkd.sock").exists());
 }
+
+/// The 0034 follow-up (ruling 0034, "Follow-ups carried": "The on-disk
+/// artifact check has no test that names an artifact whose file is
+/// absent"): distinct from `wirkd_process_lifecycle`'s own
+/// missing-artifact case (`work2`/`run2` above), which claims with
+/// *no* `--artifact` at all and is refused by `validate_claim`'s own
+/// declared-outputs check before the on-disk check in `handle_claim`
+/// ever runs (`orient/validate.md` §3). Here the claim *names*
+/// `report.md` — satisfying `validate_claim` — but the file is never
+/// written to the reserved World's worktree path, so only the on-disk
+/// existence check (build-brief amendment 3, `worktree_path_for_run`)
+/// can catch it: `Refused(MissingArtifact("report.md"))`, exit 3, the
+/// Run stays open (`active`).
+#[test]
+fn claim_names_an_artifact_whose_file_is_absent_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().to_path_buf();
+
+    let mut wirkd_child = KillOnDrop(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_pointer(&estate);
+
+    let (work, run, _waypoint) = submit(&estate, "demo:write");
+    // Deliberately no `fs::write(estate.join("report.md"), ...)` here —
+    // the claim names the file but it is absent from the worktree path.
+    assert!(!estate.join("report.md").exists());
+
+    let (code, stdout) = claim(&estate, &work, &run, &["--artifact", "report.md=report.md"]);
+    assert_eq!(code, Some(3), "on-disk-missing claim stdout: {stdout}");
+    assert!(
+        stdout.contains("MissingArtifact") && stdout.contains("report.md"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(status(&pointer.socket, &work), "active");
+
+    let stop = Command::new(wirk_bin())
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let exit_status = wirkd_child.0.wait().expect("reap wirkd child");
+    assert!(
+        exit_status.success(),
+        "wirkd did not exit clean: {exit_status:?}"
+    );
+}

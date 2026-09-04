@@ -172,6 +172,7 @@ fn launch_refuses_a_deterministic_world() {
     let run = open_run("run-1");
     let world = wirk_core::World::Deterministic(wirk_core::DeterministicWorld {
         command: vec!["cargo".to_string(), "test".to_string()],
+        base_sha: "abc123".to_string(),
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: wirk_core::OutputContract(vec![]),

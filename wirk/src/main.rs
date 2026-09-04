@@ -11,6 +11,19 @@
 //! serves; `stop`/`ping`/`submit` are thin clients dialing it
 //! (`orient/build-brief.md` §3 W3).
 //!
+//! `wirk run-deterministic --estate <root> --work <id> --executor
+//! child|docker` is item 5's own W3 (`orient/build-brief.md` §3 W3):
+//! reads the reserved `World` for `work_id`'s current Waypoint back
+//! from wirkd's own `status` verb (never recompiles it), launches it
+//! through the chosen `ChildExecutor`/`DockerExecutor`, then polls a
+//! bounded loop until wirkd's `status` reports the Run `claimed` (exit
+//! 0) or `failed` (exit 5) — named `run-deterministic`, not `run`, so
+//! it does not clash with item 4's own `wirk run` on a sibling branch
+//! (build-brief outcome). `wirk work submit --kind deterministic
+//! --command <argv...>` is the additive flag that reserves a
+//! `World::Deterministic` for it to read back, kept minimal on purpose
+//! to reduce that same merge.
+//!
 //! `wirk journal demo <dir>` is item 2's tried step (ruling 0028 D93,
 //! `knowledge/work/p1-journal/orient/store.md` §6): glue over
 //! `wirk_core::Journal`/`fold`, no new type (build-brief.md §5). On a
@@ -35,12 +48,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // itself (W2 `orient/transport.md` §2-4; W3 `orient/build-brief.md` §3).
 mod wirkd;
 
-use wirkd::{ClaimPayload, Reply, Request, SubmitPayload};
+// Deterministic (child/docker) executors, wirk-owned per 0001 D4, in
+// the `wirk` bin per 0022 D78 (no fifth crate). W1 (this wave, item 5
+// build-brief.md §3): `ChildExecutor`. `DockerExecutor` is W2.
+mod executors;
+
+use wirkd::{ClaimPayload, FailPayload, Reply, Request, SubmitPayload};
 
 use wirk_core::{
     Access, ClaimId, ClaimKind, ClaimVerdict, DeterministicWorld, Event, EventId, EventKind,
-    ExecutionTriple, Journal, JournalError, OutputContract, RepositoryBinding, RouteId, RunId,
-    WaypointId, WorkId, WorkState, World, WorldHash,
+    ExecutionTriple, Executor, FailureCause, Journal, JournalError, OutputContract,
+    RepositoryBinding, RouteId, Run, RunId, RunObservation, WaypointId, WorkId, WorkState, World,
+    WorldHash,
 };
 
 /// The injected execution triple: ruling 0001 D3 ("the execution
@@ -59,9 +78,10 @@ fn main() -> ExitCode {
         Some("journal") => journal_command(&args[2..]),
         Some("wirkd") => wirkd_command(&args[2..]),
         Some("work") => work_command(&args[2..]),
+        Some("run-deterministic") => run_deterministic_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping --estate <root> | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref>"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping --estate <root> | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind deterministic --command <argv...>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker"
             );
             ExitCode::FAILURE
         }
@@ -254,27 +274,44 @@ fn work_command(rest: &[String]) -> ExitCode {
         return work_usage();
     };
     let base_ref = flag_value(rest, "--base").unwrap_or_default();
+    let kind = flag_value(rest, "--kind");
 
     let mut repositories = Vec::new();
+    let mut command: Option<Vec<String>> = None;
     let mut i = 0;
     while i < rest.len() {
-        if rest[i] == "--repo" {
-            i += 1;
-            let Some(spec) = rest.get(i) else {
-                return work_usage();
-            };
-            let Some((name, mode)) = spec.split_once(':') else {
-                return work_usage();
-            };
-            let access = match mode.to_ascii_lowercase().as_str() {
-                "read" => Access::Read,
-                "write" => Access::Write,
-                _ => return work_usage(),
-            };
-            repositories.push(RepositoryBinding {
-                name: name.to_string(),
-                access,
-            });
+        match rest[i].as_str() {
+            "--repo" => {
+                i += 1;
+                let Some(spec) = rest.get(i) else {
+                    return work_usage();
+                };
+                let Some((name, mode)) = spec.split_once(':') else {
+                    return work_usage();
+                };
+                let access = match mode.to_ascii_lowercase().as_str() {
+                    "read" => Access::Read,
+                    "write" => Access::Write,
+                    _ => return work_usage(),
+                };
+                repositories.push(RepositoryBinding {
+                    name: name.to_string(),
+                    access,
+                });
+            }
+            // `--command` consumes every remaining argument as the
+            // command argv verbatim (`--kind deterministic --command
+            // sh -c 'echo x > report.md'`): a deterministic command may
+            // itself carry flag-shaped words, so `--command` must be
+            // the last flag on the line, never interleaved with
+            // `--repo`/`--kind`/etc. (additive, kept minimal per the
+            // task to reduce a merge with item 4's own `submit`
+            // changes).
+            "--command" => {
+                command = Some(rest[i + 1..].to_vec());
+                break;
+            }
+            _ => {}
         }
         i += 1;
     }
@@ -283,6 +320,8 @@ fn work_command(rest: &[String]) -> ExitCode {
         intent,
         repositories,
         base_ref,
+        kind,
+        command,
     };
     wirkd_client_call(&estate, &Request::submit(payload), |result| {
         println!(
@@ -296,7 +335,7 @@ fn work_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref>"
+        "usage: wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind deterministic --command <argv...>]"
     );
     ExitCode::from(1)
 }
@@ -309,6 +348,276 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+// ---- run-deterministic (item 5 W3, orient/build-brief.md §3 W3) ------
+
+/// Total time `run-deterministic`'s own poll loop waits for a launched
+/// Run to reach a terminal state before giving up and exiting 5 with a
+/// `"timeout"` cause — "polls with a bounded loop" (BRIEF outcome),
+/// never an unbounded wait.
+const RUN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Step between polls of both the executor and wirkd's own `status`
+/// verb — `CONTINUE_POLL_INTERVAL`'s own bounded-poll shape (issue
+/// 359), not a tuned sleep standing in for "the Run is done".
+const RUN_POLL_STEP: Duration = Duration::from_millis(50);
+
+/// Dispatches `wirk run-deterministic --estate <root> --work <id>
+/// --executor child|docker` (module doc). Reads the reserved `World`
+/// for `work_id`'s current Waypoint from wirkd's own `status` verb,
+/// refusing anything but a `World::Deterministic` (item 4's own actor
+/// executors, `wirk run`, are out of this command's scope), launches it
+/// through the chosen executor, then drives a bounded poll loop
+/// (`drive_run`) to a terminal outcome — printing one line per
+/// transition (`Running` at launch, then `Claimed`/`RunFailed` at the
+/// end) and exiting 0 (Claimed) or 5 (Failed, local or wirkd-side).
+fn run_deterministic_command(args: &[String]) -> ExitCode {
+    let Some(estate) = flag_value(args, "--estate") else {
+        return run_deterministic_usage();
+    };
+    let Some(work_id_str) = flag_value(args, "--work") else {
+        return run_deterministic_usage();
+    };
+    let Some(executor_kind) = flag_value(args, "--executor") else {
+        return run_deterministic_usage();
+    };
+    if executor_kind != "child" && executor_kind != "docker" {
+        return run_deterministic_usage();
+    }
+
+    let estate_root = PathBuf::from(&estate);
+    let work_id = WorkId(work_id_str);
+
+    let status = match wirkd_status(&estate, &work_id) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("wirk run-deterministic: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let (run, world) = match reserved_deterministic(&status) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("wirk run-deterministic: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+
+    println!("Running {}", run.id.0);
+
+    let outcome = if executor_kind == "child" {
+        let executor = executors::child::ChildExecutor::new(estate_root, work_id.clone());
+        drive_run(&executor, &run, &world, &estate, &work_id)
+    } else {
+        let executor = executors::docker::DockerExecutor::new(estate_root, work_id.clone());
+        drive_run(&executor, &run, &world, &estate, &work_id)
+    };
+
+    match outcome {
+        Ok(()) => {
+            println!("Claimed {}", run.id.0);
+            ExitCode::SUCCESS
+        }
+        Err(cause) => {
+            // Only this process's own `drive_run` ever sees a local
+            // executor failure directly; a wirkd-side one (the Claim
+            // itself refused) is already journaled by wirkd's own
+            // `claim` handler, so re-filing it here would double-record
+            // — `wirkd_fail`'s own `TripleMismatch`-shaped refusal for
+            // an already-Failed Run is the harmless outcome of that
+            // case, discarded (`let _ =`).
+            let cause = ensure_detail(cause);
+            let _ = wirkd_fail(&estate, &work_id, &run.id, &cause);
+            println!(
+                "RunFailed {} status={} detail={}",
+                run.id.0,
+                cause.status.as_deref().unwrap_or(""),
+                cause.detail.as_deref().unwrap_or(""),
+            );
+            ExitCode::from(5)
+        }
+    }
+}
+
+fn run_deterministic_usage() -> ExitCode {
+    eprintln!("usage: wirk run-deterministic --estate <root> --work <id> --executor child|docker");
+    ExitCode::from(1)
+}
+
+/// Parses wirkd `status`'s reply (`handle_status`'s own additions) into
+/// the `Run`/`World` pair `launch` needs. Refuses anything but a
+/// `World::Deterministic` — this command drives only the deterministic
+/// executors.
+fn reserved_deterministic(status: &serde_json::Value) -> Result<(Run, World), String> {
+    let Some(run_id) = status["run_id"].as_str() else {
+        return Err("no open Run reserved for this Work".to_string());
+    };
+    let Some(waypoint) = status["current_waypoint"].as_str() else {
+        return Err("wirkd status carries no current_waypoint".to_string());
+    };
+    let attempt = status["attempt"].as_u64().unwrap_or(1) as u32;
+    let world_hash = status["world_hash"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let world_value = status
+        .get("world")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| "wirkd status carries no World for this Work".to_string())?;
+    let world: World = serde_json::from_value(world_value.clone())
+        .map_err(|err| format!("malformed World from wirkd status: {err}"))?;
+    if !matches!(world, World::Deterministic(_)) {
+        return Err("the reserved World is not Deterministic".to_string());
+    }
+    let run = Run {
+        id: RunId(run_id.to_string()),
+        waypoint: WaypointId(waypoint.to_string()),
+        attempt,
+        world_hash: WorldHash(world_hash),
+        state: wirk_core::RunState::Open,
+    };
+    Ok((run, world))
+}
+
+/// Launches `world` through `executor`, then polls a bounded loop:
+/// each tick calls the executor's own `poll` (which files the Claim
+/// itself on a clean exit — `orient/child.md` §4 — never reported back
+/// through `RunObservation`, which carries no `Completed` variant,
+/// 0027), then re-checks wirkd's `status`, since only wirkd's own
+/// journal knows whether a filed Claim was Validated or Refused (a
+/// `MissingArtifact` refusal, for instance, surfaces to the executor's
+/// `poll` as `Err(ClaimFiling)`, handled the same way below as any
+/// other local failure — no double-journaling: wirkd already recorded
+/// that refusal itself). `Ok(())` once `status` reports the Run
+/// `claimed`; `Err(FailureCause)` on any terminal failure, local
+/// (`launch`/`poll` themselves) or wirkd-reported, for the caller to
+/// journal via the `fail` verb when it was local — a wirkd-reported
+/// failure is already journaled and this function's own `Err` for it
+/// carries the same cause only so the caller can print it.
+fn drive_run<E: Executor>(
+    executor: &E,
+    run: &Run,
+    world: &World,
+    estate: &str,
+    work_id: &WorkId,
+) -> Result<(), FailureCause> {
+    if let Err(err) = executor.launch(run, world) {
+        return Err(local_cause(&err));
+    }
+
+    let deadline = Instant::now() + RUN_POLL_TIMEOUT;
+    loop {
+        match executor.poll(run) {
+            Ok(RunObservation::Running) => {}
+            Ok(RunObservation::Failed(cause)) => return Err(cause),
+            Ok(RunObservation::Vanished) => {
+                return Err(FailureCause {
+                    status: Some("vanished".to_string()),
+                    request_id: None,
+                    at: wirk_core_timestamp_now(),
+                    detail: None,
+                });
+            }
+            Err(err) => return Err(local_cause(&err)),
+        }
+
+        if let Ok(status) = wirkd_status(estate, work_id) {
+            match status["run_state"].as_str() {
+                Some("claimed") => return Ok(()),
+                Some("failed") => {
+                    return Err(FailureCause {
+                        status: status["failure_status"].as_str().map(str::to_string),
+                        request_id: None,
+                        at: wirk_core_timestamp_now(),
+                        detail: status["failure_detail"].as_str().map(str::to_string),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(FailureCause {
+                status: Some("timeout".to_string()),
+                request_id: None,
+                at: wirk_core_timestamp_now(),
+                detail: Some(format!("no terminal state within {RUN_POLL_TIMEOUT:?}")),
+            });
+        }
+        std::thread::sleep(RUN_POLL_STEP);
+    }
+}
+
+/// Guarantees `cause.detail` is never empty by the time this command
+/// prints or journals it (issue 279's own guarantee, extended: a
+/// journaled failure must always carry *some* diagnostic, even when the
+/// failing command captured none itself — a bare `sh -c false` writes
+/// nothing to stderr, so `ChildExecutor::poll`'s own tail is
+/// legitimately empty; that emptiness must not silently become an
+/// empty `detail` here, one more layer up).
+fn ensure_detail(mut cause: FailureCause) -> FailureCause {
+    if cause.detail.as_deref().unwrap_or("").is_empty() {
+        cause.detail = Some(format!(
+            "run-deterministic: no diagnostic output captured (status {})",
+            cause.status.as_deref().unwrap_or("unknown")
+        ));
+    }
+    cause
+}
+
+fn local_cause<E: std::error::Error>(err: &E) -> FailureCause {
+    FailureCause {
+        status: None,
+        request_id: None,
+        at: wirk_core_timestamp_now(),
+        detail: Some(err.to_string()),
+    }
+}
+
+/// Calls wirkd's `status` verb for `work_id`, returning the parsed
+/// `result` object on an `ok` reply.
+fn wirkd_status(estate: &str, work_id: &WorkId) -> Result<serde_json::Value, String> {
+    let pointer = wirkd::client::locate(Path::new(estate)).map_err(|err| err.to_string())?;
+    match wirkd::client::call(
+        &pointer.socket,
+        &Request::status(wirkd::StatusPayload {
+            work_id: work_id.clone(),
+        }),
+    ) {
+        Ok(Reply::Ok { result, .. }) => Ok(result),
+        Ok(Reply::Err { error, .. }) => Err(format!("{}: {}", error.code, error.message)),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Files `cause` as a journaled `RunFailed` for `run_id` via wirkd's
+/// `fail` verb — the only way this process, a separate `wirk`
+/// invocation from the wirkd it talks to, can record a local executor
+/// failure: the Journal itself lives behind wirkd's socket, not a
+/// handle this process holds (`orient/child.md` §7 item 2).
+fn wirkd_fail(
+    estate: &str,
+    work_id: &WorkId,
+    run_id: &RunId,
+    cause: &FailureCause,
+) -> Result<(), String> {
+    let pointer = wirkd::client::locate(Path::new(estate)).map_err(|err| err.to_string())?;
+    let payload = FailPayload {
+        triple: ExecutionTriple {
+            estate_root: estate.to_string(),
+            work_id: work_id.clone(),
+            run_id: run_id.clone(),
+        },
+        status: cause.status.clone(),
+        detail: cause.detail.clone(),
+    };
+    match wirkd::client::call(&pointer.socket, &Request::fail(payload)) {
+        Ok(Reply::Ok { .. }) => Ok(()),
+        Ok(Reply::Err { error, .. }) => Err(format!("{}: {}", error.code, error.message)),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 // ---- journal demo (item 2, ruling 0028 D93) --------------------------
@@ -419,6 +728,11 @@ fn demo_events() -> Vec<Event> {
 
     let world = World::Deterministic(DeterministicWorld {
         command: vec!["true".to_string()],
+        // Ripple-only value from item 5's additive `base_sha` field
+        // (issue 285; wirk-core/src/lib.rs): the demo has no real repo
+        // to pin, so it names itself rather than leaving the field
+        // empty (a `ChildExecutor` refuses an empty `base_sha`).
+        base_sha: "journal-demo".to_string(),
         cwd: PathBuf::from("."),
         env: BTreeMap::new(),
         expected_artifacts: OutputContract(Vec::new()),

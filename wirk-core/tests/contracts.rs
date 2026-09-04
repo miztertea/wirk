@@ -517,12 +517,14 @@ fn world_hash_covers_content_not_location_or_identity() {
 
     let det1 = World::Deterministic(DeterministicWorld {
         command: vec!["cargo".to_string(), "test".to_string()],
+        base_sha: "abc123".to_string(),
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
     });
     let det2 = World::Deterministic(DeterministicWorld {
         command: vec!["test".to_string(), "cargo".to_string()],
+        base_sha: "abc123".to_string(),
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
@@ -537,15 +539,51 @@ fn world_hash_covers_content_not_location_or_identity() {
     // separator; with the separator they hash different.
     let det3 = World::Deterministic(DeterministicWorld {
         command: vec!["ab".to_string(), "c".to_string()],
+        base_sha: "abc123".to_string(),
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
     });
     let det4 = World::Deterministic(DeterministicWorld {
         command: vec!["a".to_string(), "bc".to_string()],
+        base_sha: "abc123".to_string(),
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
     });
     assert_ne!(WorldHash::of(&det3), WorldHash::of(&det4));
+}
+
+/// Item 5 (issue 285; child.md §7 item 1): `DeterministicWorld.base_sha`
+/// is covered by the hash, same principle as `ActorWorld.base_sha`
+/// above — a changed base ref is a changed World even when the command
+/// and artifacts are byte-identical.
+#[test]
+fn world_hash_covers_deterministic_base_sha() {
+    let det_a = World::Deterministic(DeterministicWorld {
+        command: vec!["cargo".to_string(), "test".to_string()],
+        base_sha: "abc123".to_string(),
+        cwd: "/var/tmp/w1".into(),
+        env: Default::default(),
+        expected_artifacts: OutputContract(vec![]),
+    });
+    let det_b = World::Deterministic(DeterministicWorld {
+        command: vec!["cargo".to_string(), "test".to_string()],
+        base_sha: "def456".to_string(),
+        cwd: "/var/tmp/w1".into(),
+        env: Default::default(),
+        expected_artifacts: OutputContract(vec![]),
+    });
+    assert_ne!(WorldHash::of(&det_a), WorldHash::of(&det_b));
+
+    // worktree_path/cwd stays excluded for a Deterministic world too
+    // (world.md §2): same base_sha, different cwd, same hash.
+    let det_c = World::Deterministic(DeterministicWorld {
+        command: vec!["cargo".to_string(), "test".to_string()],
+        base_sha: "abc123".to_string(),
+        cwd: "/var/tmp/w2".into(),
+        env: Default::default(),
+        expected_artifacts: OutputContract(vec![]),
+    });
+    assert_eq!(WorldHash::of(&det_a), WorldHash::of(&det_c));
 }

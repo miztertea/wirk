@@ -13,6 +13,14 @@ wirk-atlas = { path = "../wirk-atlas" }
 # checked 2026-09-04 there) — R2, not a new adoption.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# ChildExecutor's death-signal mechanism (0022 D78; orient/child.md §3,
+# §6): `libc::prctl(PR_SET_PDEATHSIG, SIGKILL)`, R5 — the reference's
+# own mechanism, not a `nix` reimplementation. Latest stable on
+# crates.io today (0031 D97), checked 2026-09-04:
+# `curl -s https://crates.io/api/v1/crates/libc -A wirk` ->
+# max_stable_version 0.2.189 (1.0.0-alpha.4 is a prerelease, excluded);
+# matches the cached series (0.2.173/.183/.186/.189).
+libc = "0.2.189"
 
 [dev-dependencies]
 # wirk/tests/journal_demo.rs's tempdirs (R5, cache-resolvable; same pin

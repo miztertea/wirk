@@ -218,6 +218,7 @@ fn open_creates_the_directory_if_absent() {
 fn deterministic_world() -> World {
     World::Deterministic(DeterministicWorld {
         command: vec!["cargo".to_string(), "test".to_string()],
+        base_sha: "abc123".to_string(),
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),

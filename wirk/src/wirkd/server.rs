@@ -22,8 +22,23 @@
 //! §3): the triple's `work_id` against the folded `Work.id`, and, when
 //! the reserved `World` carries a `worktree_path`, that each claimed
 //! artifact's path exists on disk beneath it (build-brief amendment 3).
+//!
+//! W3 (`orient/build-brief.md` §3 W3): `submit`'s `SubmitPayload.kind ==
+//! Some("deterministic")` reserves a `World::Deterministic` instead of
+//! the always-`Actor` World every earlier wave built, from `--command`
+//! (`wirk work submit --kind deterministic --command <argv...>`);
+//! `status` grows `run_id`/`attempt`/`world_hash`/`run_state`/`world`
+//! fields alongside the ones W3 (item 3) already returned, so `wirk
+//! run-deterministic` can read the reserved World back without
+//! recompiling it (`orient/child.md` §7 item 2: "wirkd's own
+//! Route-runner owns the loop"; the Route-runner itself, `run-
+//! deterministic`, is a separate `wirk` invocation in the `wirk` bin,
+//! not code living inside this server). `fail` is the new verb that
+//! process uses to journal a `RunFailed` for a local executor failure
+//! it has no other way to write to the journal (`FailPayload`'s own
+//! doc).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -37,13 +52,14 @@ use serde_json::{Value, json};
 
 use wirk_core::{
     ActorWorld, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimRefusal,
-    ClaimVerdict, Event, EventKind, ExecutionTriple, Journal, JournalError, OutputContract,
-    RouteId, Run, RunId, RunState, Timestamp, WaypointDefinition, WaypointId, WaypointKind, WorkId,
-    WorkState, World, WorldHash, fold, validate_claim,
+    ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple, FailureCause, Journal,
+    JournalError, OutputContract, RouteId, Run, RunId, RunState, Timestamp, WaypointDefinition,
+    WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash, fold, validate_claim,
 };
 
 use super::{
-    ClaimPayload, ErrorDetail, Reply, Request, StatusPayload, SubmitPayload, Verb, WirkdPointer,
+    ClaimPayload, ErrorDetail, FailPayload, Reply, Request, StatusPayload, SubmitPayload, Verb,
+    WirkdPointer,
 };
 
 /// Envelope reply plus what the server does after writing it: `stop`
@@ -253,8 +269,90 @@ fn handle_connection(stream: UnixStream, state: &Arc<WirkdState>, socket_path: &
     let _ = stream.shutdown(std::net::Shutdown::Both);
 
     if matches!(outcome, Outcome::Stop(_)) {
+        remove_owned_containers(&state.estate_root);
         remove_pointer_and_socket(&state.estate_root, socket_path);
         std::process::exit(0);
+    }
+}
+
+/// `docker rm -f`s every `io.wirk.managed` container whose run id
+/// appears in one of this estate's Work journals (W3, build-brief
+/// outcome: "wirkd stop removes any io.wirk.managed containers whose
+/// run ids appear in its journals"). Exact-owned, the same discipline
+/// `DockerExecutor::remove_owned` uses (`orient/docker.md` §1, §4):
+/// never a blind `docker rm` by a derived name alone — `managed_
+/// container_names` below is checked first, so only a container the
+/// daemon itself reports as `io.wirk.managed=true` is ever touched.
+/// Best-effort throughout: no `docker` binary, no daemon, or an empty
+/// estate (no `works/` directory yet) all mean nothing to remove, not
+/// an error — a clean `stop` must not fail because docker is absent
+/// from a box that never ran a `DockerExecutor` Run at all. This is a
+/// separate scan from any live `DockerExecutor`'s own in-memory `runs`
+/// map (`docker.rs`, out of this wave's allow-list): those only track
+/// Runs launched by *that* process's own instance, never the ones a
+/// separate, already-exited `wirk run-deterministic` invocation
+/// launched — journal-derived is the only owner-agnostic source wirkd
+/// itself has (`orient/docker.md` §4: "the name is journaled, not only
+/// held in memory").
+fn remove_owned_containers(estate_root: &Path) {
+    let works_dir = estate_root.join("works");
+    let Ok(entries) = std::fs::read_dir(&works_dir) else {
+        return;
+    };
+    let mut run_ids: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(journal) = Journal::open(&dir) else {
+            continue;
+        };
+        let Ok(events) = journal.replay() else {
+            continue;
+        };
+        for event in &events {
+            if let EventKind::RunOpened { run, .. } = &event.kind {
+                run_ids.push(run.0.clone());
+            }
+        }
+    }
+    if run_ids.is_empty() {
+        return;
+    }
+    let managed = managed_container_names();
+    for run_id in run_ids {
+        let name = format!("wirk-{run_id}");
+        if managed.contains(&name) {
+            let _ = std::process::Command::new("docker")
+                .arg("rm")
+                .arg("-f")
+                .arg(&name)
+                .output();
+        }
+    }
+}
+
+/// `docker ps -a --filter label=io.wirk.managed=true --format
+/// '{{.Names}}'`, one name per line — an empty set (no `docker`
+/// binary, no daemon reachable, or genuinely none managed) is not an
+/// error here, just nothing to remove.
+fn managed_container_names() -> std::collections::HashSet<String> {
+    let output = std::process::Command::new("docker")
+        .arg("ps")
+        .arg("-a")
+        .arg("--filter")
+        .arg("label=io.wirk.managed=true")
+        .arg("--format")
+        .arg("{{.Names}}")
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect(),
+        _ => Default::default(),
     }
 }
 
@@ -271,6 +369,10 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {
         },
         Verb::Status => match serde_json::from_value::<StatusPayload>(request.payload.clone()) {
             Ok(payload) => Outcome::Reply(handle_status(state, payload)),
+            Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+        },
+        Verb::Fail => match serde_json::from_value::<FailPayload>(request.payload.clone()) {
+            Ok(payload) => Outcome::Reply(handle_fail(state, payload)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
@@ -304,16 +406,40 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         name: "report.md".to_string(),
         required: true,
     }]);
-    let world = World::Actor(ActorWorld {
-        repository,
-        worktree_path: state.estate_root.clone(),
-        branch: format!("wirk/{}", work_id.0),
-        base_sha: payload.base_ref.clone(),
-        triple,
-        intent: payload.intent.clone(),
-        output_contract,
-        boundary: Boundary(Vec::new()),
-    });
+
+    // W3 (build-brief.md §3 W3): `--kind deterministic --command
+    // <argv...>` reserves a `World::Deterministic` instead of the
+    // always-`Actor` World every earlier wave built; `kind` absent or
+    // any other value keeps today's behavior unchanged (additive, R6 —
+    // module doc).
+    let deterministic = payload.kind.as_deref() == Some("deterministic");
+    if deterministic && payload.command.as_ref().is_none_or(|c| c.is_empty()) {
+        return err_reply(
+            "BadRequest",
+            "work submit --kind deterministic requires a non-empty --command",
+        );
+    }
+
+    let world = if deterministic {
+        World::Deterministic(DeterministicWorld {
+            command: payload.command.clone().unwrap_or_default(),
+            base_sha: payload.base_ref.clone(),
+            cwd: state.estate_root.clone(),
+            env: BTreeMap::new(),
+            expected_artifacts: output_contract,
+        })
+    } else {
+        World::Actor(ActorWorld {
+            repository,
+            worktree_path: state.estate_root.clone(),
+            branch: format!("wirk/{}", work_id.0),
+            base_sha: payload.base_ref.clone(),
+            triple,
+            intent: payload.intent.clone(),
+            output_contract,
+            boundary: Boundary(Vec::new()),
+        })
+    };
     let world_hash = WorldHash::of(&world);
 
     let journal = match journal_for(state, &work_id) {
@@ -499,6 +625,18 @@ fn record_and_reply(
     }
 }
 
+/// W3 (build-brief.md §3 W3): alongside item 3's original three fields
+/// (`state`, `current_waypoint`, `events`), now also carries
+/// `run_id`/`attempt`/`world_hash`/`run_state` and, when the Work's
+/// current Waypoint has one, the reserved `world` itself — the shape
+/// `wirk run-deterministic` reads (module doc: "reads the reserved
+/// World from wirkd status"). All five are additive and only present
+/// once a Run has actually been opened for the current Waypoint (a
+/// freshly submitted Work's own first `status` call, before `submit`'s
+/// own `RunOpened` — never observable here since `submit` journals all
+/// three of `WorkSubmitted`/`WaypointReserved`/`RunOpened` atomically
+/// under one lock hold, module doc — always finds one), so an old
+/// caller reading only the first three fields is unaffected.
 fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
     let journal = match journal_for(state, &payload.work_id) {
         Ok(journal) => journal,
@@ -513,11 +651,77 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         return err_reply("NotFound", "no such work");
     }
     let work = fold(&events);
-    ok_reply(json!({
+    let mut result = json!({
         "state": work_state_name(work.state),
-        "current_waypoint": work.current_waypoint.map(|w| w.0),
+        "current_waypoint": work.current_waypoint.as_ref().map(|w| w.0.clone()),
         "events": events.len(),
-    }))
+    });
+
+    if let Some(waypoint) = &work.current_waypoint
+        && let Some((run_id, attempt, world_hash)) = latest_run_for_waypoint(&events, waypoint)
+    {
+        result["run_id"] = json!(run_id.0);
+        result["attempt"] = json!(attempt);
+        result["world_hash"] = json!(world_hash.0);
+        if let Some(run) = find_run(&events, &run_id) {
+            let (run_state, failure_status, failure_detail) = match &run.state {
+                RunState::Open => ("open", None, None),
+                RunState::Claimed(_) => ("claimed", None, None),
+                RunState::Vanished => ("vanished", None, None),
+                RunState::Failed(cause) => ("failed", cause.status.clone(), cause.detail.clone()),
+            };
+            result["run_state"] = json!(run_state);
+            if let Some(status) = failure_status {
+                result["failure_status"] = json!(status);
+            }
+            if let Some(detail) = failure_detail {
+                result["failure_detail"] = json!(detail);
+            }
+        }
+        if let Some(world) = world_for_waypoint(&events, waypoint) {
+            result["world"] = serde_json::to_value(&world).expect("World always serializes");
+        }
+    }
+
+    ok_reply(result)
+}
+
+/// `run-deterministic`'s own verb (module doc, `FailPayload`): journals
+/// a `RunFailed { cause }` for the triple's `run_id`, refusing
+/// (`TripleMismatch`) the same way `claim` does (D9#4) when no
+/// `RunOpened` in this Work's journal names it — this call never
+/// invents a Run, only records a fact about one that already exists.
+fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
+    let work_id = payload.triple.work_id.clone();
+    let run_id = payload.triple.run_id.clone();
+
+    let journal = match journal_for(state, &work_id) {
+        Ok(journal) => journal,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let events = match journal.replay() {
+        Ok(events) => events,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    if find_run(&events, &run_id).is_none() {
+        return err_reply(
+            "TripleMismatch",
+            "the run id does not match any Run opened for this Work",
+        );
+    }
+
+    let cause = FailureCause {
+        status: payload.status,
+        request_id: None,
+        at: now_ts(),
+        detail: payload.detail,
+    };
+    let event = new_event(&work_id, Some(run_id), EventKind::RunFailed { cause });
+    if let Err(err) = journal.append(&event) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    ok_reply(json!({}))
 }
 
 /// Fetches (opening on first touch) the `Arc<Mutex<Journal>>` for
@@ -594,6 +798,40 @@ fn worktree_path_for_run(events: &[Event], run_id: &RunId) -> Option<PathBuf> {
             World::Actor(actor) => Some(actor.worktree_path.clone()),
             World::Deterministic(deterministic) => Some(deterministic.cwd.clone()),
         },
+        _ => None,
+    })
+}
+
+/// The most recently opened Run for `waypoint_id` — the last
+/// `RunOpened` naming it, walked in reverse so a retried Waypoint's
+/// latest attempt wins (W3, `handle_status`: "reads the reserved World
+/// from wirkd status" needs a `run_id`/`attempt`/`world_hash` to hand
+/// back, the same three fields `RunOpened` itself carries).
+fn latest_run_for_waypoint(
+    events: &[Event],
+    waypoint_id: &WaypointId,
+) -> Option<(RunId, u32, WorldHash)> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::RunOpened {
+            run,
+            waypoint,
+            attempt,
+            world_hash,
+        } if waypoint == waypoint_id => Some((run.clone(), *attempt, world_hash.clone())),
+        _ => None,
+    })
+}
+
+/// The `World` reserved for `waypoint_id` — the last `WaypointReserved`
+/// naming it (mirrors `worktree_path_for_run`'s own lookup, generalized
+/// to the whole `World` rather than only its `worktree_path`/`cwd`, for
+/// `handle_status` to hand back verbatim so `wirk run-deterministic`
+/// never has to recompile it).
+fn world_for_waypoint(events: &[Event], waypoint_id: &WaypointId) -> Option<World> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::WaypointReserved {
+            waypoint, world, ..
+        } if waypoint == waypoint_id => Some(world.clone()),
         _ => None,
     })
 }
