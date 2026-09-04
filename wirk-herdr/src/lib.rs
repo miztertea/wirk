@@ -12,13 +12,12 @@
 //! matching pair); the info structs `PaneInfo`/`WorkspaceInfo`/
 //! `WorktreeInfo`/`TabInfo` and `AgentStatus`, fields verbatim from
 //! `herdr api schema --json` (protocol 20); `HerdrError`; the
-//! `HerdrClient` trait; `event_identity`/`Reconciler` (D51's dedup and
-//! rebind); `HerdrExecutor`, implementing `wirk_core::Executor`;
+//! `HerdrClient` trait; `HerdrExecutor`, implementing
+//! `wirk_core::Executor`;
 //! `PromptGate` (item 4's per-pane serialisation, D56, named here only).
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -27,7 +26,7 @@ pub mod git;
 pub mod run_loop;
 pub mod socket;
 
-pub use run_loop::{Clock, ManualClock, RunLoop, SystemClock, WirkdApi};
+pub use run_loop::{RunLoop, WirkdApi};
 pub use socket::SocketClient;
 
 // ---- Bearing / PaneBinding -------------------------------------------------
@@ -536,130 +535,87 @@ pub trait HerdrClient: Send + Sync {
     fn subscribe(
         &self,
         subs: Vec<EventSubscription>,
-    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>>>, HerdrError>;
+    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>, HerdrError>;
 }
 
-// ---- Event identity for dedup (D51) --------------------------------------
-
-/// Identity for deduplicating replayed `HerdrEvent`s (0017 D51). For
-/// `PaneCreated`/`PaneUpdated`, `"<type>:<pane_id>:<revision>"` — the
-/// schema nests a full `PaneInfo` carrying `revision` on exactly these
-/// two variants. For every other variant, `"<type>:"` plus the
-/// lowercase-hex SHA-256 of `serde_json::to_string(e)`: no other
-/// variant carries a sequence, id, or revision field
-/// (`herdr api schema --json`, protocol 20 — `event_id`/`timestamp`
-/// occur nowhere in the schema; every `seq` hit is an outgoing request
-/// param, not an identity Herdr stamps on emitted events).
-///
-/// Collision assumption (R7 — no lower rung covers an ad hoc envelope
-/// shape; J1, herdr.md §2): Herdr never emits two content-identical
-/// events for distinct facts. This is a real gap the schema itself does
-/// not close, and is re-checked at each Herdr protocol bump (currently
-/// 20).
-pub fn event_identity(e: &HerdrEvent) -> String {
-    match e {
-        HerdrEvent::PaneCreated { pane } => {
-            format!("pane_created:{}:{}", pane.pane_id, pane.revision)
-        }
-        HerdrEvent::PaneUpdated { pane } => {
-            format!("pane_updated:{}:{}", pane.pane_id, pane.revision)
-        }
-        other => {
-            let type_name = event_type_name(other);
-            let json = serde_json::to_string(other).expect("HerdrEvent always serializes");
-            let mut hasher = Sha256::new();
-            hasher.update(json.as_bytes());
-            let digest = hasher.finalize();
-            format!("{type_name}:{}", hex_lower(&digest))
-        }
+/// So a test can hold an `Arc<FakeHerdrClient>` (mutating its recorded
+/// responses concurrently with a `RunLoop` driving on another thread)
+/// and still satisfy `RunLoop`'s `C: HerdrClient` bound directly — the
+/// same move `run_loop.rs` already makes for `Arc<T: WirkdApi>`.
+impl<T: HerdrClient + ?Sized> HerdrClient for std::sync::Arc<T> {
+    fn create_workspace(&self, req: CreateWorkspace) -> Result<WorkspaceInfo, HerdrError> {
+        (**self).create_workspace(req)
     }
-}
-
-/// The schema's underscored `type` tag for a `HerdrEvent` variant,
-/// matching `#[serde(tag = "type", rename_all = "snake_case")]` above.
-fn event_type_name(e: &HerdrEvent) -> &'static str {
-    match e {
-        HerdrEvent::WorkspaceCreated { .. } => "workspace_created",
-        HerdrEvent::WorkspaceClosed { .. } => "workspace_closed",
-        HerdrEvent::WorkspaceMetadataUpdated { .. } => "workspace_metadata_updated",
-        HerdrEvent::WorkspaceFocused { .. } => "workspace_focused",
-        HerdrEvent::WorktreeOpened { .. } => "worktree_opened",
-        HerdrEvent::WorktreeRemoved { .. } => "worktree_removed",
-        HerdrEvent::TabCreated { .. } => "tab_created",
-        HerdrEvent::TabFocused { .. } => "tab_focused",
-        HerdrEvent::PaneCreated { .. } => "pane_created",
-        HerdrEvent::PaneUpdated { .. } => "pane_updated",
-        HerdrEvent::PaneClosed { .. } => "pane_closed",
-        HerdrEvent::PaneFocused { .. } => "pane_focused",
-        HerdrEvent::PaneMoved { .. } => "pane_moved",
-        HerdrEvent::PaneExited { .. } => "pane_exited",
-        HerdrEvent::PaneAgentDetected { .. } => "pane_agent_detected",
-        HerdrEvent::PaneAgentStatusChanged { .. } => "pane_agent_status_changed",
+    fn split_pane(&self, req: SplitPane) -> Result<PaneInfo, HerdrError> {
+        (**self).split_pane(req)
     }
-}
-
-/// Lowercase hex encoding of a byte slice (stdlib `format!`, R3 — no
-/// hex crate needed for this one call site; same approach as
-/// `wirk-core`'s `WorldHash::of`).
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(out, "{byte:02x}").expect("writing to a String never fails");
+    fn open_worktree(&self, req: OpenWorktree) -> Result<WorktreeInfo, HerdrError> {
+        (**self).open_worktree(req)
     }
-    out
-}
-
-// ---- Reconciler -----------------------------------------------------------
-
-/// Dedup-by-identity (`admit`) and terminal_id-keyed rebind (`rebind`)
-/// above the `HerdrClient` trait (0017 D51). Holds no client and opens
-/// no socket.
-#[derive(Debug, Default)]
-pub struct Reconciler {
-    seen: BTreeSet<String>,
-    bindings: BTreeMap<String, PaneBinding>,
-}
-
-impl Reconciler {
-    pub fn new() -> Self {
-        Self::default()
+    fn remove_worktree(&self, req: RemoveWorktree) -> Result<(), HerdrError> {
+        (**self).remove_worktree(req)
     }
-
-    /// Admits an event by its `event_identity`. Returns `false` on a
-    /// replay (an identity already seen) rather than re-processing it.
-    pub fn admit(&mut self, e: &HerdrEvent) -> bool {
-        self.seen.insert(event_identity(e))
+    fn send_input(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
+        (**self).send_input(pane_id, text)
     }
-
-    /// Rebinds every known `PaneBinding`'s `Bearing` from a fresh
-    /// `Snapshot`, keyed by `terminal_id` (0017 D51; D9 #5). Returns
-    /// the `terminal_id`s present before the call but absent from
-    /// `snapshot` — vanished, not resolved by inference.
-    pub fn rebind(&mut self, snapshot: &Snapshot) -> Vec<String> {
-        let mut by_terminal: BTreeMap<&str, &Bearing> = BTreeMap::new();
-        for bearing in &snapshot.workspaces {
-            by_terminal.insert(bearing.terminal_id.as_str(), bearing);
-        }
-        let mut vanished = Vec::new();
-        for (terminal_id, binding) in self.bindings.iter_mut() {
-            match by_terminal.get(terminal_id.as_str()) {
-                Some(fresh) => binding.bearing = (*fresh).clone(),
-                None => vanished.push(terminal_id.clone()),
-            }
-        }
-        vanished
+    fn start_agent(&self, req: StartAgent) -> Result<(), HerdrError> {
+        (**self).start_agent(req)
     }
-
-    /// Adds or replaces a binding, keyed by its `terminal_id` (test and
-    /// executor setup helper — the initial bind, distinct from
-    /// `rebind`'s update-in-place).
-    pub fn bind(&mut self, binding: PaneBinding) {
-        self.bindings.insert(binding.terminal_id.clone(), binding);
+    fn prompt_agent(&self, req: PromptAgent) -> Result<(), HerdrError> {
+        (**self).prompt_agent(req)
     }
-
-    pub fn binding(&self, terminal_id: &str) -> Option<&PaneBinding> {
-        self.bindings.get(terminal_id)
+    fn wait_agent(
+        &self,
+        target: &str,
+        until: AgentStatus,
+        timeout_ms: u64,
+    ) -> Result<AgentStatus, HerdrError> {
+        (**self).wait_agent(target, until, timeout_ms)
+    }
+    fn get_pane(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
+        (**self).get_pane(pane_id)
+    }
+    fn get_agent(&self, target: &str) -> Result<PaneInfo, HerdrError> {
+        (**self).get_agent(target)
+    }
+    fn list_agents(&self) -> Result<Vec<PaneInfo>, HerdrError> {
+        (**self).list_agents()
+    }
+    fn send_keys(&self, req: SendKeys) -> Result<(), HerdrError> {
+        (**self).send_keys(req)
+    }
+    fn release_agent(&self, req: ReleaseAgent) -> Result<(), HerdrError> {
+        (**self).release_agent(req)
+    }
+    fn close_pane(&self, pane_id: &str) -> Result<(), HerdrError> {
+        (**self).close_pane(pane_id)
+    }
+    fn close_workspace(&self, req: CloseWorkspace) -> Result<(), HerdrError> {
+        (**self).close_workspace(req)
+    }
+    fn snapshot(&self) -> Result<Snapshot, HerdrError> {
+        (**self).snapshot()
+    }
+    fn report_agent_session(&self, req: ReportAgentSession) -> Result<(), HerdrError> {
+        (**self).report_agent_session(req)
+    }
+    fn report_agent(&self, req: ReportAgent) -> Result<(), HerdrError> {
+        (**self).report_agent(req)
+    }
+    fn report_metadata(&self, req: ReportMetadata) -> Result<(), HerdrError> {
+        (**self).report_metadata(req)
+    }
+    fn notify(&self, req: Notify) -> Result<(), HerdrError> {
+        (**self).notify(req)
+    }
+    fn focus_pane(&self, req: FocusPane) -> Result<(), HerdrError> {
+        (**self).focus_pane(req)
+    }
+    fn subscribe(
+        &self,
+        subs: Vec<EventSubscription>,
+    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>, HerdrError> {
+        (**self).subscribe(subs)
     }
 }
 
@@ -727,7 +683,7 @@ pub struct HerdrExecutor<C: HerdrClient> {
 /// subscription out is what makes one subscription enough.
 pub struct LaunchedRun {
     pub pane: PaneInfo,
-    pub events: Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>>>,
+    pub events: Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>,
 }
 
 impl std::fmt::Debug for LaunchedRun {
@@ -883,11 +839,28 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         run: &wirk_core::Run,
         pane_id: &str,
     ) -> Result<(), HerdrExecutorError> {
+        // W1 (0041 D129): `run.kind`, not a hardcoded `"claude"` — the
+        // opencode row starts with its own configured default model
+        // (`hecate/qwen3.8-27b-udiq3s-mtp`, orient/actor.md §5, passed
+        // explicitly the first live run rather than relying on
+        // opencode's own bare-args default).
+        let (kind_str, args) = match run.kind {
+            wirk_core::ActorKind::Claude => {
+                ("claude", vec!["--model".to_string(), "sonnet".to_string()])
+            }
+            wirk_core::ActorKind::Opencode => (
+                "opencode",
+                vec![
+                    "--model".to_string(),
+                    "hecate/qwen3.8-27b-udiq3s-mtp".to_string(),
+                ],
+            ),
+        };
         self.client.start_agent(StartAgent {
             pane_id: pane_id.to_string(),
-            kind: "claude".to_string(),
+            kind: kind_str.to_string(),
             name: run.id.0.clone(),
-            args: vec!["--model".to_string(), "sonnet".to_string()],
+            args,
             timeout_ms: None,
         })?;
         Ok(())

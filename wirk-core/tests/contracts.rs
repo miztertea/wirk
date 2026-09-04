@@ -29,6 +29,7 @@ fn open_run(run_id: &str) -> Run {
         attempt: 1,
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
+        kind: Default::default(),
     }
 }
 
@@ -70,6 +71,7 @@ fn work_submitted(waypoints: Vec<&str>) -> EventKind {
             .into_iter()
             .map(|wp| WaypointId(wp.to_string()))
             .collect(),
+        wp2_command: None,
     }
 }
 
@@ -117,6 +119,7 @@ fn d9_1_journal_replay_rebuilds_work_state() {
             Some("run-1"),
             EventKind::RunLaunched {
                 run: RunId("run-1".to_string()),
+                actor_kind: Default::default(),
             },
         ),
         event(
@@ -592,4 +595,67 @@ fn world_hash_covers_deterministic_base_sha() {
         expected_artifacts: OutputContract(vec![]),
     });
     assert_eq!(WorldHash::of(&det_a), WorldHash::of(&det_c));
+}
+
+/// W1 (0041 D129): a `RunLaunched` written before the `kind` field
+/// existed on it still folds — `#[serde(default)]` means the missing
+/// field deserializes to `ActorKind::Claude` (the pre-existing,
+/// only-ever-Claude behavior) rather than refusing the journal line.
+#[test]
+fn run_launched_without_kind_field_still_folds() {
+    let pre_existing_json = r#"{"kind":"RunLaunched","run":"run-1"}"#;
+    let parsed: EventKind = serde_json::from_str(pre_existing_json)
+        .expect("a RunLaunched event written before this change still deserializes");
+    let mut run = open_run("run-1");
+    assert_eq!(run.kind, wirk_core::ActorKind::Claude);
+    let event = event("e-1", Some("run-1"), parsed);
+    run.apply(&event);
+    assert_eq!(
+        run.kind,
+        wirk_core::ActorKind::Claude,
+        "a pre-existing RunLaunched with no kind field folds to the Claude default"
+    );
+}
+
+/// W3 (0034 D107 scaffolding, `orient/route.md` §2/§8): a `WorkSubmitted`
+/// written before `wp2_command` existed still deserializes and folds —
+/// `#[serde(default)]` means the missing field reads as `None`, same
+/// shape `run_launched_without_kind_field_still_folds` pins for
+/// `RunLaunched.actor_kind` above.
+#[test]
+fn work_submitted_without_wp2_command_field_still_folds() {
+    let pre_existing_json = r#"{"kind":"WorkSubmitted","route":"proving","repositories":[],"intent":"do the thing","waypoints":["proving/wp-1","proving/wp-2"]}"#;
+    let parsed: EventKind = serde_json::from_str(pre_existing_json)
+        .expect("a WorkSubmitted event written before this change still deserializes");
+    let EventKind::WorkSubmitted { wp2_command, .. } = &parsed else {
+        panic!("expected WorkSubmitted, got {parsed:?}");
+    };
+    assert_eq!(*wp2_command, None, "missing field defaults to None");
+
+    let events = vec![event("e-1", None, parsed)];
+    let work = wirk_core::fold(&events);
+    assert_eq!(
+        work.id,
+        WorkId("work-1".to_string()),
+        "fold still builds the Work from a WorkSubmitted missing wp2_command"
+    );
+}
+
+/// W1 (0041 D129): a `RunLaunched` that does carry `kind` moves the
+/// Run's kind on fold — the seam that lets `wirk run --actor-kind
+/// opencode` be observed on replay, not just at launch time.
+#[test]
+fn run_launched_with_opencode_kind_updates_run() {
+    let mut run = open_run("run-1");
+    assert_eq!(run.kind, wirk_core::ActorKind::Claude);
+    let event = event(
+        "e-1",
+        Some("run-1"),
+        EventKind::RunLaunched {
+            run: RunId("run-1".to_string()),
+            actor_kind: wirk_core::ActorKind::Opencode,
+        },
+    );
+    run.apply(&event);
+    assert_eq!(run.kind, wirk_core::ActorKind::Opencode);
 }

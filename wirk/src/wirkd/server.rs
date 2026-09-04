@@ -52,11 +52,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use wirk_core::{
-    ActorWorld, ArtifactRef, ArtifactSpec, BackoffPolicy, Boundary, Claim, ClaimId, ClaimKind,
-    ClaimRefusal, ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple,
-    FailureCause, Journal, JournalError, OutputContract, RetryPolicy, Route, RouteId, Run, RunId,
-    RunState, Timestamp, WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World,
-    WorldHash, fold, validate_claim,
+    ActorWorld, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimRefusal,
+    ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple, FailureCause, Journal,
+    JournalError, OutputContract, Route, RouteId, Run, RunId, RunState, Timestamp,
+    WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash, fold,
+    validate_claim,
 };
 
 use super::{
@@ -118,10 +118,6 @@ fn proving_route() -> Route {
                 }],
             },
         ],
-        retry_policy: RetryPolicy {
-            max_attempts: 1,
-            backoff: BackoffPolicy::None,
-        },
     }
 }
 
@@ -147,10 +143,6 @@ fn route_definition(id: &RouteId) -> Route {
     Route {
         id: RouteId("smoke".to_string()),
         waypoints: vec![smoke_waypoint(WaypointId("smoke/wp-1".to_string()))],
-        retry_policy: RetryPolicy {
-            max_attempts: 1,
-            backoff: BackoffPolicy::None,
-        },
     }
 }
 
@@ -168,6 +160,20 @@ fn route_waypoints(events: &[Event]) -> Vec<WaypointId> {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// The submitted `--command` argv this Work's `WorkSubmitted` carried
+/// (`orient/route.md` §2/§5, R2 shape of `route_waypoints` above):
+/// `None` when the submit carried no `--command` (or no `WorkSubmitted`
+/// is present at all) — `handle_claim`'s auto-advance falls back to
+/// `PROVING_WP2_COMMAND` itself in that case, kept out of this function
+/// so it stays a pure read of the journal, same shape as
+/// `route_waypoints`.
+fn wp2_command_for(events: &[Event]) -> Option<Vec<String>> {
+    events.iter().find_map(|event| match &event.kind {
+        EventKind::WorkSubmitted { wp2_command, .. } => wp2_command.clone(),
+        _ => None,
+    })
 }
 
 /// Everything wirkd can fail at during startup — bind, pointer write, or
@@ -224,6 +230,43 @@ impl From<JournalError> for WirkdError {
 struct WirkdState {
     estate_root: PathBuf,
     journals: Mutex<HashMap<WorkId, Arc<Mutex<Journal>>>>,
+    /// One `Sender<Event>` per live `watch` connection on a Work (item B,
+    /// ruling 0044): registered under the Work's own `Mutex<Journal>`
+    /// (`handle_watch_connection`, so a watcher dialing in never misses
+    /// an event appended between its replay and its registration), fed
+    /// by `append_event` under that same lock (so notification is
+    /// ordered with the append it announces, never racing a second
+    /// concurrent writer). A dead receiver (the client hung up, or its
+    /// thread's write to the socket failed) is pruned lazily, the next
+    /// time `append_event` tries to send to it and gets `Err` — no
+    /// separate deregistration path, no timer.
+    watchers: Mutex<HashMap<WorkId, Vec<std::sync::mpsc::Sender<Event>>>>,
+}
+
+/// Appends `event` to `journal`, then hands a clone to every live
+/// `watch` connection on `work_id`, pruning any whose receiver is gone
+/// (module doc on `WirkdState::watchers`). Notification happens while
+/// `journal`'s own lock (the caller's `MutexGuard`) is still held, so a
+/// watch connection that registers between two calls to this function
+/// either sees the earlier event in its own replay or is registered in
+/// time to receive this one — never neither (item B: "a client
+/// connected before an append receives it; a client connecting after
+/// receives the earlier lines first").
+fn append_event(
+    state: &Arc<WirkdState>,
+    journal: &mut Journal,
+    work_id: &WorkId,
+    event: &Event,
+) -> Result<(), JournalError> {
+    journal.append(event)?;
+    let mut watchers = state
+        .watchers
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(senders) = watchers.get_mut(work_id) {
+        senders.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+    Ok(())
 }
 
 /// Binds `estate_root/.wirk/wirkd.sock`, writes the pointer file, then
@@ -248,6 +291,7 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
     let state = Arc::new(WirkdState {
         estate_root,
         journals: Mutex::new(HashMap::new()),
+        watchers: Mutex::new(HashMap::new()),
     });
 
     for stream in listener.incoming() {
@@ -335,10 +379,27 @@ fn handle_connection(stream: UnixStream, state: &Arc<WirkdState>, socket_path: &
         return;
     }
 
-    let outcome = match serde_json::from_str::<Request>(line.trim_end()) {
-        Ok(request) => dispatch(&request, state),
-        Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+    let request = match serde_json::from_str::<Request>(line.trim_end()) {
+        Ok(request) => request,
+        Err(err) => {
+            write_one_reply(&stream, &err_reply("BadRequest", &err.to_string()));
+            return;
+        }
     };
+
+    // `watch` (item B) is a long-lived, many-lines-out connection, not
+    // the one-request-one-reply shape every other verb uses — it never
+    // returns an `Outcome`, and ends only when the client hangs up or
+    // this process exits (ruling 0044: no read timeout, no poll).
+    if request.verb == Verb::Watch {
+        match serde_json::from_value::<super::WatchPayload>(request.payload) {
+            Ok(payload) => handle_watch_connection(stream, state, payload),
+            Err(err) => write_one_reply(&stream, &err_reply("BadRequest", &err.to_string())),
+        }
+        return;
+    }
+
+    let outcome = dispatch(&request, state);
 
     let reply = match &outcome {
         Outcome::Reply(reply) | Outcome::Stop(reply) => reply,
@@ -462,7 +523,108 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
+        // `handle_connection` intercepts `watch` before ever calling
+        // `dispatch` (its own long-lived, many-lines-out shape does not
+        // fit `Outcome`) — this arm exists only so the match stays
+        // exhaustive against a `Verb` this function is never actually
+        // handed for.
+        Verb::Watch => Outcome::Reply(err_reply(
+            "Internal",
+            "watch is not dispatched through this path",
+        )),
     }
+}
+
+/// One-shot fast path for a reply that has to go out before (or instead
+/// of) the normal `handle_connection` write-then-shutdown sequence — a
+/// malformed `watch` payload, in practice, so far.
+fn write_one_reply(stream: &UnixStream, reply: &Reply) {
+    let mut bytes = serde_json::to_vec(reply).expect("Reply always serializes");
+    bytes.push(b'\n');
+    let mut writer = stream;
+    let _ = writer.write_all(&bytes);
+    let _ = writer.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// `watch` (item B): replays the Work's journal, registers this
+/// connection as a watcher of it (both under the Work's own journal
+/// lock, `WirkdState::watchers`' own doc comment — no append can land
+/// between the replay and the registration), writes one NDJSON `Event`
+/// line per already-present event, then blocks on the channel
+/// (`Receiver::recv`, no timeout — ruling 0044) writing one more line
+/// per event appended after that, until the client hangs up (a write
+/// fails) or this process exits (the socket closes with it, an `EOF`
+/// for the client — same "closed stream is the peer's death" reading
+/// D134 gives Herdr's own subscription).
+fn handle_watch_connection(
+    stream: UnixStream,
+    state: &Arc<WirkdState>,
+    payload: super::WatchPayload,
+) {
+    let work_id = payload.work_id;
+    let journal = match journal_for(state, &work_id) {
+        Ok(journal) => journal,
+        Err(err) => {
+            write_one_reply(&stream, &err_reply("JournalError", &err.to_string()));
+            return;
+        }
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<Event>();
+    let existing = {
+        let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+        let existing = match journal.replay() {
+            Ok(events) => events,
+            Err(err) => {
+                write_one_reply(&stream, &err_reply("JournalError", &err.to_string()));
+                return;
+            }
+        };
+        // Registered while `journal`'s lock is still held (module doc):
+        // `append_event` takes the same lock before it ever sends, so an
+        // append cannot land between this `replay()` and this
+        // registration.
+        state
+            .watchers
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(work_id.clone())
+            .or_default()
+            .push(tx);
+        existing
+    };
+
+    let mut writer = &stream;
+    for event in &existing {
+        if write_event_line(&mut writer, event).is_err() {
+            return;
+        }
+    }
+    // `rx` is dropped on every return path below, which is what makes
+    // `append_event`'s next `tx.send` on this Work fail and prune this
+    // dead entry (`WirkdState::watchers`' own doc comment) — no separate
+    // deregistration call.
+    while let Ok(event) = rx.recv() {
+        if write_event_line(&mut writer, &event).is_err() {
+            return;
+        }
+    }
+    // `Err` from `recv` means every `Sender` for this Work is gone —
+    // only possible if this process is shutting down (nothing else ever
+    // drops the map's own copy) — the connection ends the same as a
+    // client hangup: the socket simply closes when this function
+    // returns.
+}
+
+/// One NDJSON line per `Event`, raw — not wrapped in the request/reply
+/// `Reply` envelope (this is not a reply to anything; it is a push),
+/// matching `handle_watch_connection`'s own doc.
+fn write_event_line(writer: &mut &UnixStream, event: &Event) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec(event).expect("Event always serializes");
+    bytes.push(b'\n');
+    writer.write_all(&bytes)?;
+    writer.flush()
 }
 
 fn handle_ping() -> Reply {
@@ -585,6 +747,13 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             repositories: payload.repositories,
             intent: payload.intent,
             waypoints: all_waypoints,
+            // W3 (route.md §2/§8, build-brief.md §7.1): carried
+            // unconditionally, not only for `--kind actor` — harmless for
+            // a `--kind deterministic`/smoke submit (nothing reads it
+            // back unless this Work's Route later auto-advances to a
+            // Deterministic Waypoint), and avoids a second `payload.kind`
+            // branch here (R6).
+            wp2_command: payload.command,
         },
     );
     let reserved = new_event(
@@ -607,7 +776,7 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         },
     );
     for event in [submitted, reserved, opened] {
-        if let Err(err) = journal.append(&event) {
+        if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
             return err_reply("JournalError", &err.to_string());
         }
     }
@@ -666,7 +835,7 @@ fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
     };
     let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
     let event = new_event(&payload.work_id, payload.run, payload.kind);
-    if let Err(err) = journal.append(&event) {
+    if let Err(err) = append_event(state, &mut journal, &payload.work_id, &event) {
         return err_reply("JournalError", &err.to_string());
     }
     ok_reply(json!({}))
@@ -712,6 +881,7 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     // nothing about the Work changes.
     let Some(run) = find_run(&events, &run_id) else {
         return record_and_reply(
+            state,
             &mut journal,
             &work_id,
             &run_id,
@@ -732,6 +902,7 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     // the triple's work_id against the Work").
     if work.id != work_id {
         return record_and_reply(
+            state,
             &mut journal,
             &work_id,
             &run_id,
@@ -764,6 +935,7 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
 
     let claim_kind = payload.kind.clone();
     let reply = record_and_reply(
+        state,
         &mut journal,
         &work_id,
         &run_id,
@@ -796,15 +968,26 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 })
                 .unwrap_or_default();
             let next_world = match next_def.kind {
-                // R6: proving's own wp-2 is the only Deterministic
-                // Waypoint any hardcoded Route advances to today; its
-                // command is hardcoded alongside the Route itself
-                // (`PROVING_WP2_COMMAND`'s own doc comment).
+                // W3 (route.md §2/§8, build-brief.md §7.1): the
+                // Work's own submitted `wp2_command` (an actor-kind
+                // submit's `--command`) wins when present; proving's
+                // own wp-2 is the only Deterministic Waypoint any
+                // hardcoded Route advances to today, so absent that,
+                // `PROVING_WP2_COMMAND` (hardcoded alongside the Route
+                // itself) is the fallback.
                 WaypointKind::Deterministic => Some(World::Deterministic(DeterministicWorld {
-                    command: PROVING_WP2_COMMAND.iter().map(|s| s.to_string()).collect(),
+                    command: wp2_command_for(&events).unwrap_or_else(|| {
+                        PROVING_WP2_COMMAND.iter().map(|s| s.to_string()).collect()
+                    }),
                     base_sha,
                     cwd,
-                    env: BTreeMap::new(),
+                    // Every cargo the child executor runs uses the one
+                    // named-kept warm cache (0030; 0039 D126), not a
+                    // cold build in the worktree (build-brief.md §7.5).
+                    env: BTreeMap::from([(
+                        "CARGO_TARGET_DIR".to_string(),
+                        "/var/tmp/wirk-target".to_string(),
+                    )]),
                     expected_artifacts: OutputContract(next_def.declared_outputs.clone()),
                 })),
                 // No hardcoded Route advances Actor-to-Actor today
@@ -835,7 +1018,7 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                     },
                 );
                 for event in [reserved, opened] {
-                    if let Err(err) = journal.append(&event) {
+                    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
                         return err_reply("JournalError", &err.to_string());
                     }
                 }
@@ -851,6 +1034,7 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
 /// whichever way the verdict fell), then builds the wire reply from the
 /// same verdict.
 fn record_and_reply(
+    state: &Arc<WirkdState>,
     journal: &mut Journal,
     work_id: &WorkId,
     run_id: &RunId,
@@ -865,7 +1049,7 @@ fn record_and_reply(
             claim: claim_id.clone(),
         },
     );
-    if let Err(err) = journal.append(&filed) {
+    if let Err(err) = append_event(state, journal, work_id, &filed) {
         return err_reply("JournalError", &err.to_string());
     }
     let recorded = new_event(
@@ -877,7 +1061,7 @@ fn record_and_reply(
             verdict: verdict.clone(),
         },
     );
-    if let Err(err) = journal.append(&recorded) {
+    if let Err(err) = append_event(state, journal, work_id, &recorded) {
         return err_reply("JournalError", &err.to_string());
     }
 
@@ -994,7 +1178,7 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
         detail: payload.detail,
     };
     let event = new_event(&work_id, Some(run_id), EventKind::RunFailed { cause });
-    if let Err(err) = journal.append(&event) {
+    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
         return err_reply("JournalError", &err.to_string());
     }
     ok_reply(json!({}))
@@ -1076,6 +1260,12 @@ fn find_run(events: &[Event], run_id: &RunId) -> Option<Run> {
                 attempt: *attempt,
                 world_hash: world_hash.clone(),
                 state: RunState::Open,
+                // W1 (0041 D129): `RunOpened` is journaled at submit,
+                // before `--actor-kind` is chosen (that happens at
+                // `wirk run` time) — seeded `Claude` here, then folded
+                // to the real kind by `RunLaunched` via `Run::apply`
+                // below, same event stream this loop already replays.
+                kind: wirk_core::ActorKind::default(),
             });
         }
         if let Some(run) = run.as_mut() {
@@ -1209,6 +1399,15 @@ mod tests {
     use super::*;
 
     fn work_submitted_event(waypoints: Vec<&str>) -> Event {
+        work_submitted_event_with_command(waypoints, None)
+    }
+
+    /// W3: same as `work_submitted_event`, with the submitted
+    /// `wp2_command` also settable, for `wp2_command_for`'s own test.
+    fn work_submitted_event_with_command(
+        waypoints: Vec<&str>,
+        wp2_command: Option<Vec<&str>>,
+    ) -> Event {
         Event {
             id: wirk_core::EventId(String::new()),
             work: WorkId("work-1".to_string()),
@@ -1222,8 +1421,34 @@ mod tests {
                     .into_iter()
                     .map(|id| WaypointId(id.to_string()))
                     .collect(),
+                wp2_command: wp2_command.map(|cmd| cmd.into_iter().map(String::from).collect()),
             },
         }
+    }
+
+    /// `wp2_command_for` (`orient/route.md` §5): the submitted command
+    /// wins when present, `None` when absent — `handle_claim`'s
+    /// auto-advance falls the latter back to `PROVING_WP2_COMMAND`
+    /// itself, not this function's job.
+    #[test]
+    fn wp2_command_for_reads_workssubmitted_or_falls_back_to_none() {
+        let submitted = vec![work_submitted_event_with_command(
+            vec!["proving/wp-1", "proving/wp-2"],
+            Some(vec!["sh", "-c", "cargo test"]),
+        )];
+        assert_eq!(
+            wp2_command_for(&submitted),
+            Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "cargo test".to_string()
+            ])
+        );
+
+        let absent = vec![work_submitted_event(vec!["proving/wp-1", "proving/wp-2"])];
+        assert_eq!(wp2_command_for(&absent), None);
+
+        assert_eq!(wp2_command_for(&[]), None);
     }
 
     /// `route_waypoints` reads the ordered ids straight off the Work's

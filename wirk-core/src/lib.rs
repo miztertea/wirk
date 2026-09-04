@@ -221,29 +221,15 @@ impl WorkState {
 
 // ---- Route / Waypoint ----------------------------------------------------
 
-/// Sergeant's workflow. `retry_policy` is new (incident file item 4: "a
-/// retry policy is a Route concern... not a hidden default in the
-/// executor" — no sergeant field carries this; orient/core.md line
-/// 48-52).
+/// Sergeant's workflow. `retry_policy` (incident file item 4's "a retry
+/// policy is a Route concern") is gone (ruling 0044 D134: no count or
+/// time governs how wirk treats an agent or a Run; `RetryPolicy`/
+/// `BackoffPolicy` were unread by anything — R1). P2.3 decides retry
+/// from the failure observed, not a policy value carried here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Route {
     pub id: RouteId,
     pub waypoints: Vec<WaypointDefinition>,
-    pub retry_policy: RetryPolicy,
-}
-
-/// Per orient/core.md line 54.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,
-    pub backoff: BackoffPolicy,
-}
-
-/// Per orient/core.md line 56.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BackoffPolicy {
-    None,
-    FixedSeconds(u32),
 }
 
 /// Sergeant's stage, from `StageDefinition`/`StageBinding`
@@ -384,6 +370,29 @@ pub enum World {
 
 // ---- Run ------------------------------------------------------------------
 
+/// Which program drives this Run's actor pane (0041 D129). Not content
+/// the actor must produce, only which executor runs the intent — the
+/// same distinction `ActorWorld.triple`/`env` already draw between
+/// content and execution mechanism (`WorldHash::of` excludes both), so
+/// `kind` lives on `Run`, never `World`, and is never hashed (orient/
+/// actor.md §2). `Default` is `Claude`: every journal on disk before
+/// this field existed only ever ran Claude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ActorKind {
+    #[default]
+    Claude,
+    Opencode,
+}
+
+impl std::fmt::Display for ActorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ActorKind::Claude => "claude",
+            ActorKind::Opencode => "opencode",
+        })
+    }
+}
+
 /// Sergeant's execution attempt. `attempt: u32` adopted
 /// (domain/execution.rs:36-52); `backend`/`native_id`/`stop_requested`
 /// dropped (Herdr-shaped, 0022 D71) — `ExecutionHandle`
@@ -396,6 +405,14 @@ pub struct Run {
     pub attempt: u32,
     pub world_hash: WorldHash,
     pub state: RunState,
+    /// W1 (0041 D129): additive, `#[serde(default)]` so a `Run`
+    /// reconstructed from a journal line written before this field
+    /// existed still folds, defaulting to `Claude` (the only kind that
+    /// ever ran before). Seeded at `RunOpened` (before `--actor-kind`
+    /// is known — submit precedes `wirk run`) and moved to the actual
+    /// launched kind when `RunLaunched` folds (`Run::apply`).
+    #[serde(default)]
+    pub kind: ActorKind,
 }
 
 /// Reshaped hard from sergeant's `StageStatus` (domain/workflow.rs:561-578,
@@ -477,13 +494,19 @@ impl Run {
                 (ClaimVerdict::Refused(_), _) => {}
             },
             EventKind::WorktreeCreated { .. } => {}
-            // W2 (p1-journal): RunOpened/RunLaunched are Run-scoped
-            // bookkeeping the Work-level `fold` owns (fold.md §1);
+            // W1 (0041 D129): the one place a Run's `kind` moves after
+            // being seeded (at `RunOpened`, before `--actor-kind` is
+            // known) to the kind `wirk run` actually launched —
+            // `run_launched_with_opencode_kind_updates_run` pins it.
+            EventKind::RunLaunched { actor_kind, .. } => {
+                self.kind = *actor_kind;
+            }
+            // W2 (p1-journal): RunOpened is Run-scoped bookkeeping the
+            // Work-level `fold` owns (fold.md §1);
             // WorkSubmitted/WaypointReserved/WorkFailed/WorkCanceled
             // carry no `run` and never reach this match (the guard
             // above returns first) — arms kept only for exhaustiveness.
             EventKind::RunOpened { .. }
-            | EventKind::RunLaunched { .. }
             | EventKind::WorkSubmitted { .. }
             | EventKind::WaypointReserved { .. }
             | EventKind::WorkFailed { .. }
@@ -620,6 +643,20 @@ pub enum EventKind {
         repositories: Vec<RepositoryBinding>,
         intent: String,
         waypoints: Vec<WaypointId>,
+        /// W3 (0034 D107 scaffolding, `orient/route.md` §2/§8;
+        /// build-brief.md §7.1): the submitted `--command` argv (the
+        /// same `SubmitPayload.command` an actor-kind submit already
+        /// carries but `handle_submit` otherwise ignores), carried onto
+        /// the journal so `handle_claim`'s auto-advance can build the
+        /// Route's Deterministic Waypoint from it instead of the
+        /// hardcoded `PROVING_WP2_COMMAND`. Additive, `#[serde(default)]`
+        /// so a `WorkSubmitted` written before this field existed still
+        /// folds (`work_submitted_without_wp2_command_field_still_folds`
+        /// pins it) — same shape as `RunLaunched.actor_kind` (W1, 0041
+        /// D129). Absent (or a non-`--command` submit) falls back to
+        /// `PROVING_WP2_COMMAND` in `server.rs`.
+        #[serde(default)]
+        wp2_command: Option<Vec<String>>,
     },
     /// Journals the compiled World at reservation (BRIEF.md Intent;
     /// evidence/work/p1-executor-design/orient/world.md §5) so a
@@ -632,7 +669,8 @@ pub enum EventKind {
     },
     /// Creates the Run's own record; distinct from `WaypointReserved`
     /// because one reservation (one World, one hash) can back several
-    /// attempts under `RetryPolicy` (fold.md §2, R6).
+    /// attempts (fold.md §2, R6; ruling 0044: no policy governs how
+    /// many).
     RunOpened {
         run: RunId,
         waypoint: WaypointId,
@@ -642,12 +680,23 @@ pub enum EventKind {
     /// "Run's actor launched" (BRIEF.md Intent); an activity signal
     /// issue 286 needs, distinct from `RunOpened` so a stalled launch is
     /// visible before any lifecycle event arrives (fold.md §2, R6).
+    ///
+    /// `actor_kind` (W1, 0041 D129): additive, `#[serde(default)]` so a
+    /// `RunLaunched` written before this field existed still folds —
+    /// `run_launched_without_kind_field_still_folds` pins it. Carries
+    /// `--actor-kind` (chosen at `wirk run` time, after `RunOpened` has
+    /// already been journaled at submit) onto the Run via `Run::apply`.
+    /// Named `actor_kind`, not `kind`: `EventKind`'s own internal tag
+    /// field is already named `kind` (`#[serde(tag = "kind")]` above),
+    /// same reason `ClaimRecorded.claim_kind` isn't `kind` either.
     RunLaunched {
         run: RunId,
+        #[serde(default)]
+        actor_kind: ActorKind,
     },
     /// Terminal Work failure is never inferred from `RunFailed`
     /// (incident file); an explicit event keeps `fold` retry-policy-
-    /// agnostic — the component that exhausts `RetryPolicy` (items 4, 5)
+    /// agnostic — the component that decides a Run's fate (items 4, 5)
     /// fires this (fold.md §2, §8; 0027 D92). J1: no ruling pins
     /// Work-level failure firing yet.
     WorkFailed {
@@ -700,6 +749,7 @@ pub fn fold(events: &[Event]) -> Work {
                 repositories,
                 intent,
                 waypoints,
+                wp2_command: _,
             } = &event.kind
             {
                 route_waypoints = waypoints.clone();

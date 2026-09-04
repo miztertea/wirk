@@ -1,11 +1,11 @@
 //! Live method sweep against a real Herdr session (fix 2, 0028 tried
 //! step's lesson: "the live run is finding one call per run" —
-//! `knowledge/work/p1-herdr-executor/ASSESSMENT.md`). `#[ignore]`d by
-//! default; runs only when explicitly requested with `--ignored` *and*
-//! `WIRK_HERDR_LIVE_SOCKET=<path>` naming a live Herdr socket. Never
-//! run by this build (fix build discipline: never run the live sweep
-//! against any session) — the verifier runs it, in a throwaway
-//! session, the same discipline the tried step itself uses.
+//! `knowledge/work/p1-herdr-executor/ASSESSMENT.md`). No longer
+//! `#[ignore]`d (0040 D127: "the live sweep becomes the ordinary
+//! suite, gated only on Herdr being installed") — it starts and tears
+//! down its own throwaway named session via `LiveHerdrSession`, never
+//! the owner's `default`, and is skipped with a printed reason (never a
+//! hard failure) when `herdr` is not on PATH (`tests.md` §3).
 //!
 //! Walks `HerdrExecutor::launch`'s own order first — `ping`,
 //! `session.snapshot`, `workspace.create`, `pane.split`, `subscribe`,
@@ -37,12 +37,14 @@
 //! (one subscribe, idle pane); `pane_c`, split between the second and
 //! third, is closed with the others at teardown.
 
+#[path = "support/live_herdr.rs"]
+mod live_herdr;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::tempdir;
@@ -50,8 +52,8 @@ use tempfile::tempdir;
 use wirk_herdr::{
     AgentStatus, Bearing, CloseWorkspace, CreateWorkspace, EventSubscription, FocusPane,
     HerdrClient, HerdrError, Notify, OpenWorktree, PaneInfo, PromptAgent, ReleaseAgent,
-    RemoveWorktree, ReportAgent, ReportAgentSession, ReportMetadata, SendKeys, SocketClient,
-    SplitDirection, SplitPane, StartAgent,
+    RemoveWorktree, ReportAgent, ReportAgentSession, ReportMetadata, SendKeys, SplitDirection,
+    SplitPane, StartAgent,
 };
 
 /// The read timeout applied to every request connection this test's
@@ -59,19 +61,17 @@ use wirk_herdr::{
 /// bound on how long the `events.subscribe` step waits for a pushed
 /// event before giving up — generous for a live session, short enough
 /// that a genuinely wedged server fails this test instead of hanging
-/// the run (issue 359: bounded, not a sleep).
-const LIVE_READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// the run (issue 359: bounded, not a sleep). Re-exported from the
+/// fixture so this file's own `raw_call` keeps using the same bound.
+use std::time::Duration;
 
-fn live_socket_path() -> PathBuf {
-    match std::env::var("WIRK_HERDR_LIVE_SOCKET") {
-        Ok(p) if !p.is_empty() => PathBuf::from(p),
-        _ => panic!(
-            "live_sweep needs WIRK_HERDR_LIVE_SOCKET=<path to a live Herdr session's socket> \
-             and must be run with `cargo test -- --ignored` explicitly; never run against the \
-             owner's default session"
-        ),
-    }
-}
+/// This test file's own termination bound for its one raw, hand-framed
+/// socket call (`raw_call` — no `HerdrClient` method wraps `tab.create`,
+/// module doc): a live-run test may carry a bound whose exhaustion is
+/// reported as "never observed" (the owner's ruling of 2026-09-02 §3;
+/// ruling 0044's own exception), never a verdict about the product,
+/// which itself sets no read timeout anywhere any more (fix 2).
+const RAW_CALL_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -114,7 +114,7 @@ fn raw_call(socket_path: &Path, method: &str, params: Value) -> Value {
     let mut stream = UnixStream::connect(socket_path)
         .unwrap_or_else(|e| panic!("raw_call({method}): connecting: {e}"));
     stream
-        .set_read_timeout(Some(LIVE_READ_TIMEOUT))
+        .set_read_timeout(Some(RAW_CALL_READ_TIMEOUT))
         .expect("set_read_timeout");
     let request = json!({"id": format!("live-sweep-{method}"), "method": method, "params": params});
     let mut line = serde_json::to_string(&request).expect("request serializes");
@@ -148,11 +148,14 @@ fn assert_raw_ok_or_business_error(method: &str, reply: &Value) {
 }
 
 #[test]
-#[ignore]
 fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
-    let socket_path = live_socket_path();
-    let client = SocketClient::connect_with_read_timeout(socket_path.clone(), LIVE_READ_TIMEOUT)
-        .expect("connect to the live Herdr socket named by WIRK_HERDR_LIVE_SOCKET");
+    let Some(session) = live_herdr::LiveHerdrSession::start(
+        "live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest",
+    ) else {
+        return;
+    };
+    let socket_path = session.socket_path().to_path_buf();
+    let client = session.client();
 
     // ---- HerdrExecutor::launch's own order --------------------------
 
@@ -218,9 +221,8 @@ fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
 
     // events.subscribe: subscribe to pane_a, cause an update (a
     // harmless echo via pane.send_text), then read at least one event
-    // before dropping the subscription. Bounded by `LIVE_READ_TIMEOUT`
-    // via the reader thread's own read timeout on the subscription
-    // connection — no sleep (issue 359).
+    // before dropping the subscription — a genuine blocking read, no
+    // timeout anywhere in the product (fix 2, ruling 0044).
     let mut events = client
         .subscribe(vec![EventSubscription::PaneUpdated {
             pane_id: pane_a.pane_id.clone(),
@@ -229,9 +231,12 @@ fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
     client
         .send_input(&pane_a.pane_id, "echo wirk-live-sweep\n")
         .expect("pane.send_text (the harmless echo)");
+    // Blocks with no timeout (fix 2, ruling 0044: the product itself
+    // sets none on a subscription connection any more) until Herdr
+    // pushes the event the `send_input` above should trigger.
     let first_event = events
         .next()
-        .expect("events.subscribe: no event arrived within the read timeout");
+        .expect("events.subscribe: the subscription ended before any event arrived");
     first_event.expect("events.subscribe: pushed line was not a well-formed HerdrEvent");
     drop(events);
 

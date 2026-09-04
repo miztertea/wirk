@@ -274,6 +274,46 @@ impl Executor for ChildExecutor {
             Err(err) => return Err(ChildExecutorError::Wait(err)),
         };
 
+        self.finish_exit(run, state, status)
+    }
+}
+
+impl ChildExecutor {
+    /// Blocks on the child's own exit (`std::process::Child::wait`, R3 —
+    /// the child's death is the state this blocks on, ruling 0044: no
+    /// poll loop, no timeout) and returns the terminal
+    /// `RunObservation` directly — the one wirkd status read after this
+    /// call is the caller's job (`main.rs::drive_run`), not this
+    /// method's.
+    pub fn wait(&self, run: &Run) -> Result<RunObservation, ChildExecutorError> {
+        // Held across the blocking `wait(2)` below (module's own
+        // pre-existing discipline: `poll` already holds this lock for
+        // its own, non-blocking `try_wait`) — `wirk run-deterministic`
+        // drives exactly one Run per process, so no other caller shares
+        // this executor while this blocks (`orient/child.md` §2's
+        // "many concurrent Runs" is a future caller's concern, not this
+        // one's, R1).
+        let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let state = runs
+            .get_mut(&run.id)
+            .ok_or_else(|| ChildExecutorError::UnknownRun(run.id.clone()))?;
+        if state.claim_filed {
+            return Ok(RunObservation::Running);
+        }
+        let status = state.child.wait().map_err(ChildExecutorError::Wait)?;
+        self.finish_exit(run, state, status)
+    }
+
+    /// Shared post-exit handling for both `poll` (non-blocking,
+    /// `try_wait`) and `wait` (blocking, `Child::wait`): kill the
+    /// process group, join the stderr reader, and file the Claim on a
+    /// clean exit (`orient/child.md` §3/§4).
+    fn finish_exit(
+        &self,
+        run: &Run,
+        state: &mut ChildState,
+        status: std::process::ExitStatus,
+    ) -> Result<RunObservation, ChildExecutorError> {
         kill_process_group(state.pgid);
 
         // Join the stderr reader thread before reading its tail, on

@@ -105,10 +105,10 @@ fn pause_after_then_kill_leaves_a_partial_journal() {
     child.kill().expect("SIGKILL the paused process");
     child.wait().expect("reap the killed process");
 
-    // No `continue` signal file is written: the process never reaches
-    // "appends the rest" — that is the point of the kill.
-    assert!(!dir_path.join("continue").exists());
-
+    // The process was killed while blocked reading the `continue` FIFO
+    // (`wait_for_continue`'s own open(2), which blocks until a writer
+    // connects) — it never got the signal to append the rest, which the
+    // replay below confirms directly (`events 3`, not `events 6`).
     let replay = Command::new(wirk_bin())
         .args(["journal", "demo"])
         .arg(dir_path)

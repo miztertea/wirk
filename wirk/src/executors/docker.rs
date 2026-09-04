@@ -113,6 +113,11 @@ struct DockerState {
     /// supervisor's attached `docker start -a` (module doc), bounded to
     /// `LOG_TAIL_BYTES`.
     log_tail: Arc<Mutex<Vec<u8>>>,
+    /// The supervisor thread's own handle, so `wait` can block on the
+    /// container's exit by joining it directly (ruling 0044: no poll
+    /// loop) rather than polling `exit_code`. `Some` until `wait` (or
+    /// `poll`'s terminal tick) takes and joins it once.
+    supervisor: Option<JoinHandle<()>>,
 }
 
 /// Everything a `DockerExecutor` call can fail with — one enum per
@@ -294,7 +299,7 @@ impl Executor for DockerExecutor {
         // lifetime). Detached: the supervisor's own exit, not this
         // `JoinHandle`, is what `poll` observes (via `exit_code`); the
         // OS thread runs to completion regardless.
-        let _ = spawn_supervisor(
+        let supervisor = spawn_supervisor(
             self.docker_bin.clone(),
             container_name.clone(),
             exit_code.clone(),
@@ -308,6 +313,7 @@ impl Executor for DockerExecutor {
             claim_filed: false,
             exit_code,
             log_tail,
+            supervisor: Some(supervisor),
         };
         self.runs
             .lock()
@@ -348,6 +354,60 @@ impl Executor for DockerExecutor {
             return Ok(RunObservation::Running);
         };
 
+        self.finish_exit(run, state, exit_code)
+    }
+}
+
+impl DockerExecutor {
+    /// Blocks on the container's own exit by joining the supervisor
+    /// thread `launch` spawned (`docker start -a`, module doc: already
+    /// blocks internally on the container's real exit — no polling
+    /// added here, ruling 0044) and returns the terminal
+    /// `RunObservation` directly; the one wirkd status read after this
+    /// call is `main.rs::drive_run`'s job, not this method's.
+    pub fn wait(&self, run: &Run) -> Result<RunObservation, DockerExecutorError> {
+        let supervisor = {
+            let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+            let state = runs
+                .get_mut(&run.id)
+                .ok_or_else(|| DockerExecutorError::UnknownRun(run.id.clone()))?;
+            if state.claim_filed {
+                return Ok(RunObservation::Running);
+            }
+            state.supervisor.take()
+        };
+        // Joined without holding `runs`'s lock: the supervisor thread
+        // itself never touches this executor's state, only the
+        // `exit_code`/`log_tail` Arcs it was handed at spawn time, so no
+        // other Run's `poll`/`wait` is blocked by this join.
+        if let Some(handle) = supervisor {
+            let _ = handle.join();
+        }
+        let mut runs = self.runs.lock().unwrap_or_else(|p| p.into_inner());
+        let state = runs
+            .get_mut(&run.id)
+            .ok_or_else(|| DockerExecutorError::UnknownRun(run.id.clone()))?;
+        if state.claim_filed {
+            return Ok(RunObservation::Running);
+        }
+        let exit_code = state
+            .exit_code
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect("supervisor joined: exit_code is set");
+        self.finish_exit(run, state, exit_code)
+    }
+
+    /// Shared post-exit handling for both `poll` (still-observed via the
+    /// `exit_code` Arc, module doc's heartbeat path) and `wait`
+    /// (blocking join): file the Claim on a clean exit or report the
+    /// exit code and captured log tail as `Failed`.
+    fn finish_exit(
+        &self,
+        run: &Run,
+        state: &mut DockerState,
+        exit_code: i32,
+    ) -> Result<RunObservation, DockerExecutorError> {
         if exit_code == 0 {
             let artifacts: Vec<ArtifactRef> = state
                 .expected_artifacts

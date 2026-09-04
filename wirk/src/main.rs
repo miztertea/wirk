@@ -15,14 +15,15 @@
 //! child|docker` is item 5's own W3 (`orient/build-brief.md` §3 W3):
 //! reads the reserved `World` for `work_id`'s current Waypoint back
 //! from wirkd's own `status` verb (never recompiles it), launches it
-//! through the chosen `ChildExecutor`/`DockerExecutor`, then polls a
-//! bounded loop until wirkd's `status` reports the Run `claimed` (exit
-//! 0) or `failed` (exit 5) — named `run-deterministic`, not `run`, so
-//! it does not clash with item 4's own `wirk run` on a sibling branch
-//! (build-brief outcome). `wirk work submit --kind deterministic
-//! --command <argv...>` is the additive flag that reserves a
-//! `World::Deterministic` for it to read back, kept minimal on purpose
-//! to reduce that same merge.
+//! through the chosen `ChildExecutor`/`DockerExecutor`, blocks once on
+//! the child's own exit (`ChildExecutor::wait`/`DockerExecutor::wait`,
+//! ruling 0044: no poll loop, no timeout), then reads wirkd's `status`
+//! exactly once to learn `claimed` (exit 0) or `failed` (exit 5) —
+//! named `run-deterministic`, not `run`, so it does not clash with item
+//! 4's own `wirk run` on a sibling branch (build-brief outcome). `wirk
+//! work submit --kind deterministic --command <argv...>` is the
+//! additive flag that reserves a `World::Deterministic` for it to read
+//! back, kept minimal on purpose to reduce that same merge.
 //!
 //! `wirk journal demo <dir>` is item 2's tried step (ruling 0028 D93,
 //! `knowledge/work/p1-journal/orient/store.md` §6): glue over
@@ -31,17 +32,16 @@
 //! (`orient/fold.md` §1) that carries a fresh Work from `Pending` to
 //! `Completed`; on a directory already holding one it replays and
 //! prints the folded `Work`. `--pause-after N` appends N events then
-//! blocks on a bounded poll for `<dir>/continue` (W3 build-brief
-//! amendment 2: "the kill is deterministic, no tuned sleep" — issue
-//! 359's shape, fixed here rather than a timed sleep in the killing
-//! script) so a verifier can `SIGKILL` the process mid-sequence with an
-//! exact, reproducible line count.
+//! blocks (ruling 0044: no poll, no timeout) opening `<dir>/continue`
+//! as a FIFO for reading — a verifier's own write to it is the signal —
+//! so a verifier can `SIGKILL` the process mid-sequence with an exact,
+//! reproducible line count.
 
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // wirkd wire protocol (envelope, verb, payload types), the client
 // (`locate`, `call`) that reaches a running wirkd, and the server loop
@@ -88,7 +88,7 @@ fn main() -> ExitCode {
         Some("plugin") => plugin_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status --estate <root> [--work <id>] | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--route <name>] [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--nudge-after <secs>] [--herdr-socket <path>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root>"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--route <name>] [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind claude|opencode] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root>"
             );
             ExitCode::FAILURE
         }
@@ -232,13 +232,114 @@ fn wirkd_command(rest: &[String]) -> ExitCode {
         // `--work` is absent, or just the one when it's given — the
         // manifest's own `wirkd-status` action names this verb.
         "status" => wirkd_status_command(&estate, flag_value(&rest[1..], "--work")),
+        // Item B/G, ruling 0044: prints one line per journal append,
+        // starting with what is already there, blocking (no timeout) for
+        // more — the herdr-plugin status pane's own program (G). `--work
+        // <id>` streams that one Work; absent, streams **every current
+        // Work's** appends (not the estate's own status changes — no
+        // single wirkd verb reports "the estate changed" as a stream,
+        // only a Work's journal; `wirkd::server::handle_watch_connection`
+        // is scoped per-Work, so covering "every Work" here means one
+        // watch connection per Work id found under `<estate>/works/` at
+        // start, merged onto one stdout — a Work submitted after this
+        // command starts is not picked up, the one real limitation this
+        // shape carries, named rather than silently accepted).
+        "watch" => wirkd_watch_command(&estate, flag_value(&rest[1..], "--work")),
         _ => wirkd_usage(),
     }
 }
 
 fn wirkd_usage() -> ExitCode {
-    eprintln!("usage: wirk wirkd start|stop|ping|status --estate <root> [--work <id>]");
+    eprintln!("usage: wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>]");
     ExitCode::from(1)
+}
+
+/// `wirk wirkd watch --estate <root> [--work <id>]`: opens one `watch`
+/// connection per named (or discovered) Work id and prints one line per
+/// `Event` it carries — `work_id kind {...event json...}` — as they
+/// arrive, blocking between lines (no poll, no timeout, ruling 0044).
+/// Never returns on its own: it ends only when every watched
+/// connection's iterator ends (wirkd stopped, or every named Work's
+/// connection was refused up front) or the process is killed, matching
+/// the plugin pane's own "the pane program ends; that is the state"
+/// contract (item G). `--estate` naming a wirkd that is not running
+/// prints why and exits 2 immediately, rather than blocking on a
+/// connection that will never come.
+fn wirkd_watch_command(estate: &str, work_filter: Option<String>) -> ExitCode {
+    let pointer = match wirkd::client::locate(Path::new(estate)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk wirkd watch: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let work_ids: Vec<String> = match work_filter {
+        Some(id) => vec![id],
+        None => match list_work_ids(Path::new(estate)) {
+            Ok(ids) => ids,
+            Err(err) => {
+                eprintln!("wirk wirkd watch: {err}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    if work_ids.is_empty() {
+        eprintln!("wirk wirkd watch: no Work under {estate}/works to watch");
+        return ExitCode::from(2);
+    }
+
+    // One reader thread per watched Work, one shared channel every
+    // thread's lines funnel into — the same "many readers, one channel
+    // the caller blocks on" shape item A's `RunLoop` uses for Herdr plus
+    // wirkd, applied here to N Work watches instead of two fixed
+    // streams.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let mut handles = Vec::new();
+    for work_id in work_ids {
+        let socket = pointer.socket.clone();
+        let tx = tx.clone();
+        handles.push(std::thread::spawn(move || {
+            let events = match wirkd::client::watch(
+                &socket,
+                wirkd::WatchPayload {
+                    work_id: WorkId(work_id.clone()),
+                },
+            ) {
+                Ok(events) => events,
+                Err(err) => {
+                    let _ = tx.send(format!("{work_id} watch_error {err}"));
+                    return;
+                }
+            };
+            for event in events {
+                match event {
+                    Ok(event) => {
+                        let line = serde_json::to_string(&event)
+                            .unwrap_or_else(|_| "<unserializable event>".to_string());
+                        if tx.send(format!("{work_id} {line}")).is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(format!("{work_id} watch_error {err}"));
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+    drop(tx); // this thread's own copy: `rx` ends once every reader thread's clone is dropped
+
+    // Blocks on the channel — no timeout, ruling 0044: ends only when
+    // every reader thread above has returned (every watched connection
+    // closed).
+    for line in rx {
+        println!("{line}");
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    ExitCode::SUCCESS
 }
 
 /// `wirk wirkd status --estate <root> [--work <id>]` and its `wirk work
@@ -423,9 +524,31 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
             // the last flag on the line, never interleaved with
             // `--repo`/`--kind`/etc. (additive, kept minimal per the
             // task to reduce a merge with item 4's own `submit`
-            // changes).
+            // changes). An optional `--` fence right after
+            // `--command` marks the argv explicitly; without a fence,
+            // any of `work submit`'s own flags among the remaining
+            // arguments makes the argv and the submit flags
+            // untellable apart, so the usage line and exit 1 go out
+            // before the payload is built or wirkd is called.
             "--command" => {
-                command = Some(rest[i + 1..].to_vec());
+                let remaining = &rest[i + 1..];
+                let fenced = remaining.first().is_some_and(|arg| arg == "--");
+                if !fenced
+                    && [
+                        "--estate",
+                        "--intent",
+                        "--repo",
+                        "--base",
+                        "--route",
+                        "--kind",
+                        "--repo-path",
+                    ]
+                    .iter()
+                    .any(|flag| remaining.iter().any(|arg| arg == *flag))
+                {
+                    return work_usage();
+                }
+                command = Some(if fenced { &remaining[1..] } else { remaining }.to_vec());
                 break;
             }
             _ => {}
@@ -518,17 +641,6 @@ fn plugin_usage() -> ExitCode {
 
 // ---- run-deterministic (item 5 W3, orient/build-brief.md §3 W3) ------
 
-/// Total time `run-deterministic`'s own poll loop waits for a launched
-/// Run to reach a terminal state before giving up and exiting 5 with a
-/// `"timeout"` cause — "polls with a bounded loop" (BRIEF outcome),
-/// never an unbounded wait.
-const RUN_POLL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Step between polls of both the executor and wirkd's own `status`
-/// verb — `CONTINUE_POLL_INTERVAL`'s own bounded-poll shape (issue
-/// 359), not a tuned sleep standing in for "the Run is done".
-const RUN_POLL_STEP: Duration = Duration::from_millis(50);
-
 /// Dispatches `wirk run-deterministic --estate <root> --work <id>
 /// --executor child|docker` (module doc). Reads the reserved `World`
 /// for `work_id`'s current Waypoint from wirkd's own `status` verb,
@@ -575,10 +687,10 @@ fn run_deterministic_command(args: &[String]) -> ExitCode {
 
     let outcome = if executor_kind == "child" {
         let executor = executors::child::ChildExecutor::new(estate_root, work_id.clone());
-        drive_run(&executor, &run, &world, &estate, &work_id)
+        drive_run_child(&executor, &run, &world, &estate, &work_id)
     } else {
         let executor = executors::docker::DockerExecutor::new(estate_root, work_id.clone());
-        drive_run(&executor, &run, &world, &estate, &work_id)
+        drive_run_docker(&executor, &run, &world, &estate, &work_id)
     };
 
     match outcome {
@@ -643,27 +755,31 @@ fn reserved_deterministic(status: &serde_json::Value) -> Result<(Run, World), St
         attempt,
         world_hash: WorldHash(world_hash),
         state: wirk_core::RunState::Open,
+        // Deterministic runs carry no actor kind (0041 D129 is
+        // actor-only); default is inert here.
+        kind: wirk_core::ActorKind::default(),
     };
     Ok((run, world))
 }
 
-/// Launches `world` through `executor`, then polls a bounded loop:
-/// each tick calls the executor's own `poll` (which files the Claim
-/// itself on a clean exit — `orient/child.md` §4 — never reported back
-/// through `RunObservation`, which carries no `Completed` variant,
-/// 0027), then re-checks wirkd's `status`, since only wirkd's own
-/// journal knows whether a filed Claim was Validated or Refused (a
-/// `MissingArtifact` refusal, for instance, surfaces to the executor's
-/// `poll` as `Err(ClaimFiling)`, handled the same way below as any
-/// other local failure — no double-journaling: wirkd already recorded
-/// that refusal itself). `Ok(())` once `status` reports the Run
-/// `claimed`; `Err(FailureCause)` on any terminal failure, local
-/// (`launch`/`poll` themselves) or wirkd-reported, for the caller to
+/// Launches `world` through `executor`, then blocks once on the
+/// child's own exit (`ChildExecutor::wait`/`DockerExecutor::wait`,
+/// ruling 0044: no poll loop, no timeout — `std::process::Child::wait`
+/// or, for docker, the supervisor thread's own `docker start -a` join,
+/// both already blocking calls) and reads wirkd's `status` exactly
+/// once afterward, since only wirkd's own journal knows whether a
+/// filed Claim was Validated or Refused (a `MissingArtifact` refusal,
+/// for instance, surfaces to the executor's `wait` as
+/// `Err(ClaimFiling)`, handled the same way below as any other local
+/// failure — no double-journaling: wirkd already recorded that
+/// refusal itself). `Ok(())` once `status` reports the Run `claimed`;
+/// `Err(FailureCause)` on any other terminal outcome, local
+/// (`launch`/`wait` themselves) or wirkd-reported, for the caller to
 /// journal via the `fail` verb when it was local — a wirkd-reported
 /// failure is already journaled and this function's own `Err` for it
 /// carries the same cause only so the caller can print it.
-fn drive_run<E: Executor>(
-    executor: &E,
+fn drive_run_child(
+    executor: &executors::child::ChildExecutor,
     run: &Run,
     world: &World,
     estate: &str,
@@ -672,47 +788,78 @@ fn drive_run<E: Executor>(
     if let Err(err) = executor.launch(run, world) {
         return Err(local_cause(&err));
     }
-
-    let deadline = Instant::now() + RUN_POLL_TIMEOUT;
-    loop {
-        match executor.poll(run) {
-            Ok(RunObservation::Running) => {}
-            Ok(RunObservation::Failed(cause)) => return Err(cause),
-            Ok(RunObservation::Vanished) => {
-                return Err(FailureCause {
-                    status: Some("vanished".to_string()),
-                    request_id: None,
-                    at: wirk_core_timestamp_now(),
-                    detail: None,
-                });
-            }
-            Err(err) => return Err(local_cause(&err)),
-        }
-
-        if let Ok(status) = wirkd_status(estate, work_id) {
-            match status["run_state"].as_str() {
-                Some("claimed") => return Ok(()),
-                Some("failed") => {
-                    return Err(FailureCause {
-                        status: status["failure_status"].as_str().map(str::to_string),
-                        request_id: None,
-                        at: wirk_core_timestamp_now(),
-                        detail: status["failure_detail"].as_str().map(str::to_string),
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        if Instant::now() >= deadline {
+    match executor.wait(run) {
+        Ok(RunObservation::Failed(cause)) => return Err(cause),
+        Ok(RunObservation::Vanished) => {
             return Err(FailureCause {
-                status: Some("timeout".to_string()),
+                status: Some("vanished".to_string()),
                 request_id: None,
                 at: wirk_core_timestamp_now(),
-                detail: Some(format!("no terminal state within {RUN_POLL_TIMEOUT:?}")),
+                detail: None,
             });
         }
-        std::thread::sleep(RUN_POLL_STEP);
+        Ok(RunObservation::Running) => {}
+        Err(err) => return Err(local_cause(&err)),
+    }
+    read_terminal_status(estate, work_id)
+}
+
+/// As `drive_run_child`, against `DockerExecutor`.
+fn drive_run_docker(
+    executor: &executors::docker::DockerExecutor,
+    run: &Run,
+    world: &World,
+    estate: &str,
+    work_id: &WorkId,
+) -> Result<(), FailureCause> {
+    if let Err(err) = executor.launch(run, world) {
+        return Err(local_cause(&err));
+    }
+    match executor.wait(run) {
+        Ok(RunObservation::Failed(cause)) => return Err(cause),
+        Ok(RunObservation::Vanished) => {
+            return Err(FailureCause {
+                status: Some("vanished".to_string()),
+                request_id: None,
+                at: wirk_core_timestamp_now(),
+                detail: None,
+            });
+        }
+        Ok(RunObservation::Running) => {}
+        Err(err) => return Err(local_cause(&err)),
+    }
+    read_terminal_status(estate, work_id)
+}
+
+/// The one wirkd `status` read after the executor's blocking `wait`
+/// returns (module doc): a clean exit only means the Claim was filed,
+/// not that wirkd accepted it — that verdict lives in wirkd's own
+/// journal alone.
+fn read_terminal_status(estate: &str, work_id: &WorkId) -> Result<(), FailureCause> {
+    match wirkd_status(estate, work_id) {
+        Ok(status) => match status["run_state"].as_str() {
+            Some("claimed") => Ok(()),
+            Some("failed") => Err(FailureCause {
+                status: status["failure_status"].as_str().map(str::to_string),
+                request_id: None,
+                at: wirk_core_timestamp_now(),
+                detail: status["failure_detail"].as_str().map(str::to_string),
+            }),
+            other => Err(FailureCause {
+                status: Some("unexpected_run_state".to_string()),
+                request_id: None,
+                at: wirk_core_timestamp_now(),
+                detail: Some(format!(
+                    "executor wait returned Running but wirkd status was {other:?}"
+                )),
+            }),
+        },
+        Err(err) => Err(FailureCause {
+            status: Some("wirkd_status_failed".to_string()),
+            request_id: None,
+            at: wirk_core_timestamp_now(),
+            detail: Some(err),
+        }),
     }
 }
 
@@ -788,13 +935,6 @@ fn wirkd_fail(
 
 // ---- journal demo (item 2, ruling 0028 D93) --------------------------
 
-/// A verifier polls at this interval for the `<dir>/continue` signal
-/// file, never for longer than `CONTINUE_POLL_TIMEOUT` — a bounded poll
-/// on a signal file, not a tuned sleep guessing how long a kill takes
-/// (build-brief.md §8 amendment 2, issue 359).
-const CONTINUE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CONTINUE_POLL_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Dispatches `wirk journal <rest>`. Only `demo <dir> [--pause-after
 /// N]` is defined; anything else is a usage error, same shape as
 /// `claim`'s (one line to stderr, `ExitCode::FAILURE`).
@@ -868,15 +1008,26 @@ fn append_demo_sequence(journal: &mut Journal, dir: &str, pause_after: Option<us
     ExitCode::SUCCESS
 }
 
-/// Polls for `<dir>/continue` every `CONTINUE_POLL_INTERVAL`, for at
-/// most `CONTINUE_POLL_TIMEOUT` — a bound so a signal that never
-/// arrives cannot hang the process forever, not a substitute for the
-/// signal itself (build-brief.md §8 amendment 2).
+/// Blocks on the verifier's continue signal (ruling 0044: no poll, no
+/// timeout) via a named pipe: `<dir>/continue` is created as a FIFO
+/// (`mkfifo`, R4 — no libc dependency earned for one call, `std::
+/// process::Command` shells out to the same coreutils binary a
+/// deterministic Waypoint's own command would) if it does not already
+/// exist, then opened for reading, which itself blocks until some
+/// other process opens the same path for writing (POSIX FIFO open
+/// semantics — a reader's `open` blocks until a writer is present) —
+/// the writer is the verifier's `SIGKILL`-timing probe, tried and
+/// proven live in `w3/fix2/BUILD.md`'s tried step, not simulated here.
+/// A single byte read (or EOF) is the signal; its content is never
+/// interpreted.
 fn wait_for_continue(dir: &str) {
     let signal = Path::new(dir).join("continue");
-    let deadline = Instant::now() + CONTINUE_POLL_TIMEOUT;
-    while !signal.exists() && Instant::now() < deadline {
-        std::thread::sleep(CONTINUE_POLL_INTERVAL);
+    if !signal.exists() {
+        let _ = std::process::Command::new("mkfifo").arg(&signal).status();
+    }
+    if let Ok(mut fifo) = std::fs::File::open(&signal) {
+        let mut buf = [0u8; 1];
+        let _ = std::io::Read::read(&mut fifo, &mut buf);
     }
 }
 
@@ -917,6 +1068,7 @@ fn demo_events() -> Vec<Event> {
                 }],
                 intent: "demo the journal lifecycle".to_string(),
                 waypoints: vec![waypoint.clone()],
+                wp2_command: None,
             },
         ),
         new_event(
@@ -941,7 +1093,10 @@ fn demo_events() -> Vec<Event> {
         new_event(
             &work,
             Some(run.clone()),
-            EventKind::RunLaunched { run: run.clone() },
+            EventKind::RunLaunched {
+                run: run.clone(),
+                actor_kind: wirk_core::ActorKind::default(),
+            },
         ),
         new_event(
             &work,

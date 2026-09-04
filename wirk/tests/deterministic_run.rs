@@ -226,3 +226,95 @@ fn run_deterministic_child_completes_and_fails() {
     assert!(!estate.join(".wirk").join("wirkd.json").exists());
     assert!(!estate.join(".wirk").join("wirkd.sock").exists());
 }
+
+/// Fix 2 (ruling 0044, item E): `run-deterministic` blocks on the
+/// child's own exit with no deadline anywhere — proven directly against
+/// a child that exits only after a real delay of its own (`sh -c
+/// 'sleep 2; exit 0'`, the thing under test, not a wait this test adds
+/// on top of it), well past the old `RUN_POLL_TIMEOUT`/`RUN_POLL_STEP`
+/// this item's own fix struck. Completes `Claimed`, never `"timeout"`
+/// (a cause this build no longer has any code path that can produce).
+#[test]
+fn run_deterministic_child_blocks_past_a_real_delay_with_no_deadline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().to_path_buf();
+
+    let mut wirkd_child = KillOnDrop(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_wirkd(&estate);
+
+    let (work, run) = submit_deterministic(
+        &estate,
+        &["sh", "-c", "sleep 2; echo x > report.md; exit 0"],
+    );
+    let started = Instant::now();
+    let (code, stdout) = run_deterministic(&estate, &work, "child");
+    assert_eq!(code, Some(0), "run-deterministic stdout: {stdout}");
+    assert!(
+        stdout.contains(&format!("Claimed {run}")),
+        "stdout: {stdout}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "run-deterministic returned before the child's own 2s delay elapsed: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(status_state(&pointer.socket, &work), "completed");
+
+    let stop = Command::new(wirk_bin())
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let _ = wirkd_child.0.wait();
+}
+
+/// A `--command` argv not fenced with `--` that still carries one of
+/// `work submit`'s own flags (`--base`/`--repo`/`--intent` here) is
+/// ambiguous — the command's argv and the submit flags can no longer be
+/// told apart — so `work submit` must refuse with the usage line (exit
+/// 1, empty stdout) before building the payload or ever calling
+/// wirkd. No daemon is started or expected for this shape.
+#[test]
+fn submit_command_rejects_unfenced_flag_after_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(wirk_bin())
+        .args(["work", "submit", "--estate"])
+        .arg(dir.path())
+        .args(["--route", "smoke", "--kind", "deterministic", "--command"])
+        .args(["sh", "-c", "echo x > report.md"])
+        .args([
+            "--base",
+            "deadbeef",
+            "--repo",
+            "demo:write",
+            "--intent",
+            "t",
+        ])
+        .output()
+        .expect("work submit runs");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

@@ -27,8 +27,10 @@ and exits 0 without spawning a `wirkd`.
   using the execution triple already injected into the pane's
   environment), `wirkd-status` (`wirk wirkd ping` — wirkd has no
   separate `status` verb, only `start`/`stop`/`ping`).
-- `[[panes]]` `status`, `placement = "split"`: polls `wirk wirkd ping`
-  every 5 seconds, bounded.
+- `[[panes]]` `status`, `placement = "split"`: `wirk wirkd watch
+  --estate <root>` (item B, ruling 0044) — streams every current
+  Work's journal appends, blocking, no loop and no sleep; the pane
+  ends when wirkd does (or was never running).
 
 Binary resolution (startup hook and every action/pane command):
 `WIRK_BIN_PATH` if set, else

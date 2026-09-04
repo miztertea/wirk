@@ -5,11 +5,11 @@
 //! function; `base_sha` refusal happens before any `docker` invocation)
 //! and always run. `d5_9`/`d5_10` are `#[ignore]`d unless
 //! `WIRK_DOCKER_LIVE=1`, against `alpine:3.24` already on the box (no
-//! pull path exists anywhere in `docker.rs`) — same shape as
-//! `child_executor.rs`'s claim-filing tests: a scripted fake wirkd on a
-//! `UnixListener`, not a real `wirkd::server::run` (that file's own
-//! header explains why: the real wirkd's only Route today is an
-//! unrelated hardcoded Actor Waypoint).
+//! pull path exists anywhere in `docker.rs`). `d5_9`'s wirkd half is
+//! live (0040 D127): a real `wirk wirkd`, a real `wirk work submit
+//! --kind deterministic` — `child_executor.rs`'s own move, duplicated
+//! (R6, a third test binary); `d5_10` needs no wirkd at all (a nonzero
+//! exit never reaches the claim path), unchanged.
 //!
 //! `wirk` has no `lib.rs` (bin-only): `wirkd` and `executors` are
 //! compiled into this test binary's own crate root via `#[path]`, the
@@ -22,12 +22,9 @@ mod wirkd;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::Command;
-use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use executors::docker::{DockerExecutor, DockerExecutorError, create_argv};
@@ -35,7 +32,7 @@ use wirk_core::{
     DeterministicWorld, ExecutionTriple, Executor, OutputContract, Run, RunId, RunObservation,
     RunState, WaypointId, WorkId, World, WorldHash,
 };
-use wirkd::{Request, WirkdPointer};
+use wirkd::WirkdPointer;
 
 // ---- shared fixtures (R2: same shape as `child_executor.rs`'s) --------
 
@@ -46,6 +43,7 @@ fn open_run(run_id: &str) -> Run {
         attempt: 1,
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
+        kind: Default::default(),
     }
 }
 
@@ -63,44 +61,69 @@ fn deterministic_world(
     })
 }
 
-fn write_pointer(estate: &Path, socket: &Path) {
-    fs::create_dir_all(estate.join(".wirk")).expect("mkdir .wirk");
-    let pointer = WirkdPointer {
-        schema: "wirkd-pointer/1".to_string(),
-        socket: socket.to_path_buf(),
-        pid: std::process::id(),
-        protocol_version: 1,
-    };
-    fs::write(
-        estate.join(".wirk").join("wirkd.json"),
-        serde_json::to_vec(&pointer).expect("serialize pointer"),
-    )
-    .expect("write pointer");
+/// As `child_executor.rs`'s own `wait_for_pointer_live`/
+/// `submit_deterministic` (R6 duplicate — a third test binary).
+fn wait_for_pointer_live(estate: &Path) -> WirkdPointer {
+    let path = estate.join(".wirk").join("wirkd.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(pointer) = serde_json::from_slice::<WirkdPointer>(&bytes)
+        {
+            return pointer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wirkd pointer file never appeared (readable) at {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
-fn spawn_fake_wirkd(
-    socket_path: &Path,
-    scripted_reply: &'static str,
-) -> (JoinHandle<()>, mpsc::Receiver<Request>) {
-    let listener = UnixListener::bind(socket_path).expect("bind fake wirkd socket");
-    let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        let Ok((stream, _)) = listener.accept() else {
-            return;
-        };
-        let mut reader = BufReader::new(&stream);
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            return;
+fn submit_deterministic(
+    estate: &Path,
+    base: &str,
+    intent: &str,
+    command: &[&str],
+) -> (String, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wirk"));
+    cmd.args(["work", "submit", "--estate"])
+        .arg(estate)
+        .args([
+            "--intent",
+            intent,
+            "--kind",
+            "deterministic",
+            "--base",
+            base,
+        ])
+        .args(["--repo", "demo:write", "--command"])
+        .args(command);
+    let output = cmd.output().expect("work submit runs");
+    assert!(
+        output.status.success(),
+        "work submit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    let (mut work_id, mut run_id, mut waypoint) = (String::new(), String::new(), String::new());
+    for pair in words.chunks(2) {
+        if let [key, value] = pair {
+            match *key {
+                "work_id" => work_id = (*value).to_string(),
+                "run_id" => run_id = (*value).to_string(),
+                "waypoint" => waypoint = (*value).to_string(),
+                _ => {}
+            }
         }
-        if let Ok(request) = serde_json::from_str::<Request>(line.trim_end_matches(['\n', '\r'])) {
-            let _ = tx.send(request);
-        }
-        let mut writer = &stream;
-        let _ = writer.write_all(scripted_reply.as_bytes());
-        let _ = writer.write_all(b"\n");
-    });
-    (handle, rx)
+    }
+    assert!(
+        !work_id.is_empty() && !run_id.is_empty() && !waypoint.is_empty(),
+        "unexpected work submit stdout: {stdout:?}"
+    );
+    (work_id, run_id, waypoint)
 }
 
 /// Polls `condition` every 100 ms (coarser than `child_executor.rs`'s
@@ -140,6 +163,22 @@ impl Drop for RemoveContainerOnDrop {
             .arg("-f")
             .arg(&self.0)
             .output();
+    }
+}
+
+/// Kills the wrapped `wirk wirkd` child on drop, including during a
+/// panicking unwind (ruling 0030: "no wirkd... survives the run that
+/// started it" — found live by this item's own wrong-assertion probe on
+/// `d5_9`, which panicked ahead of the test's own explicit `wirkd
+/// stop`/`kill` and left a `wirk wirkd` process running against a
+/// `/tmp` estate until this guard was added). `child_executor.rs`'s own
+/// `KillWirkdOnDrop` shape (R6 duplicate — a third test binary).
+struct KillWirkdOnDrop(std::process::Child);
+
+impl Drop for KillWirkdOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 
@@ -256,14 +295,40 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         eprintln!("skipped: set WIRK_DOCKER_LIVE=1 to run");
         return;
     }
-    let estate = tempfile::tempdir().expect("estate tempdir");
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
     let cwd = tempfile::tempdir().expect("cwd tempdir");
-    let socket = estate.path().join("wirkd.sock");
-    let (_server, rx) = spawn_fake_wirkd(&socket, r#"{"ok":true,"result":{}}"#);
-    write_pointer(estate.path(), &socket);
 
-    let executor = DockerExecutor::new(estate.path().to_path_buf(), WorkId("work-1".to_string()));
-    let run = open_run("run-1");
+    // The wirkd half is real (0040 D127): a real `wirk wirkd`, a real
+    // `wirk work submit --kind deterministic`, whose Waypoint always
+    // requires `report.md` by name (`wirkd/server.rs`'s hardcoded
+    // output_contract) — matching what this command actually writes.
+    let mut wirkd_guard = KillWirkdOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_wirk"))
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer_live(&estate);
+    let (work_id, run_id, waypoint) = submit_deterministic(
+        &estate,
+        "abc123",
+        "d5_9 tried live",
+        &["sh", "-c", "echo hi > report.md"],
+    );
+
+    let executor = DockerExecutor::new(estate.clone(), WorkId(work_id.clone()));
+    let run = Run {
+        id: RunId(run_id),
+        waypoint: WaypointId(waypoint),
+        attempt: 1,
+        world_hash: WorldHash("deadbeef".to_string()),
+        state: RunState::Open,
+        kind: Default::default(),
+    };
     let artifacts = OutputContract(vec![wirk_core::ArtifactSpec {
         name: "report.md".to_string(),
         required: true,
@@ -279,14 +344,29 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         .expect("container name recorded after launch");
     let _guard = RemoveContainerOnDrop(container_name.clone());
 
+    // `poll` stays `Ok(Running)` on both a filed and a refused Claim
+    // (`orient/child.md` §5's rule, shared by `DockerExecutor`); the
+    // real wirkd's journal is the decisive, real-service signal.
+    let journal_path = estate.join("works").join(&work_id);
     let deadline = Instant::now() + POLL_DEADLINE;
-    let request = loop {
+    let claimed = loop {
         match executor.poll(&run) {
             Ok(RunObservation::Running) => {}
             other => panic!("expected Running throughout (no Completed variant), got {other:?}"),
         }
-        if let Ok(request) = rx.try_recv() {
-            break request;
+        if let Ok(journal) = wirk_core::Journal::open(&journal_path)
+            && let Ok(events) = journal.replay()
+            && events.iter().any(|e| {
+                matches!(
+                    &e.kind,
+                    wirk_core::EventKind::ClaimRecorded {
+                        verdict: wirk_core::ClaimVerdict::Validated,
+                        ..
+                    }
+                )
+            })
+        {
+            break true;
         }
         assert!(
             Instant::now() < deadline,
@@ -294,14 +374,10 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         );
         thread::sleep(Duration::from_millis(100));
     };
-
-    assert_eq!(request.verb, wirkd::Verb::Claim);
-    let payload: wirkd::ClaimPayload =
-        serde_json::from_value(request.payload).expect("claim payload deserializes");
-    assert!(matches!(payload.kind, wirk_core::ClaimKind::Done));
-    assert_eq!(payload.triple.run_id, run.id);
-    assert_eq!(payload.artifacts.len(), 1);
-    assert!(payload.artifacts.contains_key("report.md"));
+    assert!(
+        claimed,
+        "the real wirkd's journal never recorded ClaimRecorded{{Validated}}"
+    );
     assert!(
         cwd.path().join("report.md").exists(),
         "the container's write through the /work bind mount must land on the host cwd"
@@ -317,6 +393,19 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
             .any(|name| name == container_name)),
         "container {container_name} was not removed by --rm"
     );
+
+    let stop = std::process::Command::new(env!("CARGO_BIN_EXE_wirk"))
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let _ = wirkd_guard.0.kill();
+    let _ = wirkd_guard.0.wait();
 }
 
 #[test]

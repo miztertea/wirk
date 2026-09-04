@@ -24,15 +24,14 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use serde::Deserialize;
 
 use wirk_core::{EventKind, Run, RunId, RunState, WorkId, WorkState, World, WorldHash};
 use wirk_herdr::SocketClient;
-use wirk_herdr::run_loop::{Outcome, RunLoop, RunStatusEntry, SystemClock, WirkdApi, WorkStatus};
+use wirk_herdr::run_loop::{Outcome, RunLoop, RunStatusEntry, WirkdApi, WorkStatus};
 
-use crate::wirkd::{self, RecordPayload, Reply, Request, StatusPayload};
+use crate::wirkd::{self, RecordPayload, Reply, Request, StatusPayload, WatchPayload};
 
 /// `~/.config/herdr/sessions/<session>/herdr.sock` — the named-session
 /// socket convention (`knowledge/evidence/work/p1-plugin-spike/orient/
@@ -216,14 +215,39 @@ impl WirkdApi for WirkdRunLoopApi {
     fn record(&self, work_id: &WorkId, run_id: &RunId, kind: EventKind) -> Result<(), Self::Error> {
         wirkd_record(&self.socket, work_id, Some(run_id.clone()), kind)
     }
+
+    /// Item B: `wirkd::client::watch` over the same socket, mapped into
+    /// `WirkdApi::watch`'s `Result<_, ExecutorError>` shape (`ClientError`
+    /// already converts via `From`).
+    fn watch(
+        &self,
+        work_id: &WorkId,
+    ) -> Result<wirk_herdr::run_loop::WatchEvents<Self::Error>, Self::Error> {
+        let events = wirkd::client::watch(
+            &self.socket,
+            WatchPayload {
+                work_id: work_id.clone(),
+            },
+        )?;
+        Ok(Box::new(
+            events.map(|item| item.map_err(ExecutorError::from)),
+        ))
+    }
 }
 
-/// `wirk run --estate <root> --work <id> --session <name> [--nudge-after
-/// <secs>] [--herdr-socket <path>]` (build-brief.md "Outcome"). Exits 0
+/// `wirk run --estate <root> --work <id> --session <name>
+/// [--herdr-socket <path>]` (build-brief.md "Outcome"). Exits 0
 /// (Claimed), 4 (NeedsInput), or 5 (Vanished, a subscription stream that
 /// ended with nothing terminal, or any setup/drive error) — a status
 /// line is printed for each transition this function itself observes.
 pub fn run_command(rest: &[String]) -> ExitCode {
+    let actor_kind = match parse_actor_kind(rest) {
+        Ok(kind) => kind,
+        Err(()) => {
+            eprintln!("wirk run: --actor-kind must be claude or opencode");
+            return run_usage();
+        }
+    };
     let Some(estate) = flag_value(rest, "--estate") else {
         return run_usage();
     };
@@ -233,9 +257,6 @@ pub fn run_command(rest: &[String]) -> ExitCode {
     let Some(session) = flag_value(rest, "--session") else {
         return run_usage();
     };
-    let nudge_after = flag_value(rest, "--nudge-after")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(120);
     let herdr_socket = match flag_value(rest, "--herdr-socket") {
         Some(path) => PathBuf::from(path),
         None => match session_socket_path(&session) {
@@ -258,13 +279,21 @@ pub fn run_command(rest: &[String]) -> ExitCode {
         }
     };
 
-    let (run, world) = match fetch_open_run(&pointer.socket, &work_id) {
+    let (mut run, world) = match fetch_open_run(&pointer.socket, &work_id) {
         Ok(pair) => pair,
         Err(err) => {
             eprintln!("wirk run: {err}");
             return ExitCode::from(2);
         }
     };
+    // `--actor-kind` is this invocation's own choice, not something
+    // wirkd's `status` reply carries (`RunOpened` is journaled at
+    // submit, before any `wirk run` flag is known — orient/actor.md
+    // §2); `run.kind` is unhashed (`WorldHash::of` never covers it), so
+    // overriding it here is exactly the same kind of local mechanism
+    // update `run.rs`'s own `worktree_path` re-emission is. `RunLoop`'s
+    // `launch` journals the real kind used via `RunLaunched` below.
+    run.kind = actor_kind;
     let actor = match world {
         World::Actor(actor) => actor,
         World::Deterministic(_) => {
@@ -340,12 +369,7 @@ pub fn run_command(rest: &[String]) -> ExitCode {
     let wirkd_api = WirkdRunLoopApi {
         socket: pointer.socket.clone(),
     };
-    let mut run_loop = RunLoop::new(
-        client,
-        wirkd_api,
-        SystemClock,
-        Duration::from_secs(nudge_after),
-    );
+    let mut run_loop = RunLoop::new(client, wirkd_api);
 
     match run_loop.drive(&work_id, &run, &updated_world) {
         Ok(Outcome::Claimed) => {
@@ -354,6 +378,9 @@ pub fn run_command(rest: &[String]) -> ExitCode {
         }
         Ok(Outcome::NeedsInput) => {
             println!("NeedsInput");
+            if let Some(observation) = run_loop.stuck_observation() {
+                println!("{observation}");
+            }
             ExitCode::from(4)
         }
         Ok(Outcome::Vanished) => {
@@ -378,7 +405,7 @@ pub fn run_command(rest: &[String]) -> ExitCode {
 
 fn run_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk run --estate <root> --work <id> --session <name> [--nudge-after <secs>] [--herdr-socket <path>]"
+        "usage: wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind claude|opencode]"
     );
     ExitCode::from(1)
 }
@@ -393,4 +420,46 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// `--actor-kind claude|opencode` (0041 D129), default `claude` when
+/// the flag is absent; any other value is refused (`Err(())`) so
+/// `run_command` can turn it into the usage exit without inventing a
+/// silent fallback (AGENTS.md's "a defect with a standard answer is not
+/// J0" — here the standard answer is refuse, not guess).
+fn parse_actor_kind(rest: &[String]) -> Result<wirk_core::ActorKind, ()> {
+    match flag_value(rest, "--actor-kind").as_deref() {
+        None => Ok(wirk_core::ActorKind::Claude),
+        Some("claude") => Ok(wirk_core::ActorKind::Claude),
+        Some("opencode") => Ok(wirk_core::ActorKind::Opencode),
+        Some(_) => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actor_kind_defaults_to_claude_when_absent() {
+        assert_eq!(parse_actor_kind(&[]), Ok(wirk_core::ActorKind::Claude));
+    }
+
+    #[test]
+    fn actor_kind_opencode_selects_opencode() {
+        let rest = vec!["--actor-kind".to_string(), "opencode".to_string()];
+        assert_eq!(parse_actor_kind(&rest), Ok(wirk_core::ActorKind::Opencode));
+    }
+
+    #[test]
+    fn actor_kind_claude_selects_claude() {
+        let rest = vec!["--actor-kind".to_string(), "claude".to_string()];
+        assert_eq!(parse_actor_kind(&rest), Ok(wirk_core::ActorKind::Claude));
+    }
+
+    #[test]
+    fn actor_kind_bogus_is_refused() {
+        let rest = vec!["--actor-kind".to_string(), "bogus".to_string()];
+        assert_eq!(parse_actor_kind(&rest), Err(()));
+    }
 }

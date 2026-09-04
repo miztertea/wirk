@@ -9,17 +9,10 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use super::{Reply, Request, WirkdPointer};
+use wirk_core::Event;
 
-/// `client::call`'s read timeout: the peer is a Unix-domain socket on
-/// the same host, not a network hop, so this only guards against a
-/// wedged or malicious peer that connects and never writes a reply
-/// line — a real wirkd answers in microseconds. Long enough that no
-/// real reply is ever cut off, short enough a test using this default
-/// fails promptly rather than hanging.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+use super::{Reply, Request, WatchPayload, WirkdPointer};
 
 /// Everything that can go wrong locating or calling wirkd. Kept as one
 /// flat enum, no `thiserror` (not on `wirk`'s allow-list this wave,
@@ -109,7 +102,6 @@ pub fn locate(estate_root: &Path) -> Result<WirkdPointer, ClientError> {
 /// whether that is an error for its purposes, matching `Reply::is_ok`.
 pub fn call(socket: &Path, request: &Request) -> Result<Reply, ClientError> {
     let mut stream = UnixStream::connect(socket)?;
-    stream.set_read_timeout(Some(READ_TIMEOUT))?;
 
     let mut line = serde_json::to_vec(request).map_err(|err| {
         ClientError::Io(io::Error::other(format!(
@@ -126,4 +118,75 @@ pub fn call(socket: &Path, request: &Request) -> Result<Reply, ClientError> {
 
     serde_json::from_str(reply_line)
         .map_err(|err| ClientError::MalformedReply(format!("{err}: {reply_line:?}")))
+}
+
+/// Item B: dials `socket`, sends `{"verb":"watch",...}`, and hands back
+/// a **blocking** iterator over the Work's journal — every event
+/// already appended, then one more per line as `server::
+/// handle_watch_connection` pushes it, with no read timeout (ruling
+/// 0044: this connection blocks on wirkd's own state, exactly the way
+/// `wirk-herdr`'s Herdr subscription blocks on Herdr's). Never
+/// half-closes the write side (unlike `call`, above): a still-open
+/// write half is harmless (`handle_watch_connection` never reads again
+/// after the request line), and shutting it here would be pure noise.
+/// The iterator ends (`None`) the moment the connection's read returns
+/// `Ok(0)` — wirkd stopped, or refused the request outright and closed
+/// after its one `Reply` line (surfaced as the iterator's first and
+/// only `Some(Err(..))`, same as a malformed line).
+pub fn watch(
+    socket: &Path,
+    payload: WatchPayload,
+) -> Result<impl Iterator<Item = Result<Event, ClientError>> + use<>, ClientError> {
+    let stream = UnixStream::connect(socket)?;
+    let request = Request::watch(payload);
+    let mut line = serde_json::to_vec(&request).map_err(|err| {
+        ClientError::Io(io::Error::other(format!(
+            "wirkd watch request failed to serialize: {err}"
+        )))
+    })?;
+    line.push(b'\n');
+    (&stream).write_all(&line)?;
+
+    Ok(WatchLines {
+        reader: BufReader::new(stream),
+    })
+}
+
+/// The blocking line iterator `watch` returns: each `next()` is one
+/// `read_line` call, which blocks (no timeout set on this socket, per
+/// `watch`'s own doc) until wirkd pushes a line or the connection ends.
+struct WatchLines {
+    reader: BufReader<UnixStream>,
+}
+
+impl Iterator for WatchLines {
+    type Item = Result<Event, ClientError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut line = String::new();
+        match self.reader.read_line(&mut line) {
+            Ok(0) => None, // EOF: wirkd is gone, or ended this connection
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\n', '\r']);
+                // A bare `Reply::Err` line (a malformed watch request,
+                // `handle_watch_connection`'s own early-return fast
+                // path) parses as neither `Event` nor anything this
+                // iterator invents a variant for — surfaced as
+                // `MalformedReply` so the caller sees wirkd's own
+                // `code`/`message` rather than a generic decode error.
+                match serde_json::from_str::<Event>(trimmed) {
+                    Ok(event) => Some(Ok(event)),
+                    Err(_) => match serde_json::from_str::<Reply>(trimmed) {
+                        Ok(Reply::Err { error, .. }) => Some(Err(ClientError::MalformedReply(
+                            format!("{}: {}", error.code, error.message),
+                        ))),
+                        _ => Some(Err(ClientError::MalformedReply(format!(
+                            "not a watch Event line: {trimmed:?}"
+                        )))),
+                    },
+                }
+            }
+            Err(err) => Some(Err(ClientError::Io(err))),
+        }
+    }
 }

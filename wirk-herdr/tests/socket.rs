@@ -318,30 +318,39 @@ fn a_malformed_pushed_line_is_transport_not_a_panic() {
     );
 }
 
-// ---- read timeout ---------------------------------------------------------
+// ---- no read timeout (ruling 0044, fix 2) ---------------------------------
+//
+// `SocketClient` sets no read timeout anywhere any more (D134: "wirk
+// blocks on state... not a read timeout"): a request read blocks until
+// the reply arrives or the connection closes, for however long that
+// takes. This test proves the "blocks, does not time out early" half
+// directly — a fake server that replies only after a real, deliberate
+// delay of its own (the thing under test, not a wait in the test,
+// mirroring item G's `sleep 2; exit 0` shape) still gets its reply, well
+// past what the old 200ms/30s timeouts would ever have tolerated.
 
 #[test]
-fn a_read_timeout_is_honoured_when_the_server_never_replies() {
+fn a_request_blocks_until_the_server_actually_replies_no_matter_how_long() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let socket_path = spawn_fake_server(&dir, |reader, _writer| {
-        // Accept and read the request, then never reply — held open
-        // until the test process exits; the client's own read timeout
-        // is what bounds the test, not this handler.
-        let _ = read_request(reader);
-        std::thread::sleep(Duration::from_secs(60));
+    let reply_delay = Duration::from_millis(500);
+    let socket_path = spawn_fake_server(&dir, move |reader, writer| {
+        let request = read_request(reader);
+        std::thread::sleep(reply_delay);
+        let id = request["id"].as_str().unwrap_or_default();
+        write_reply(
+            writer,
+            id,
+            serde_json::json!({"type": "pane_info", "pane": sample_pane_json("pane1")}),
+        );
     });
 
-    let client = SocketClient::connect_with_read_timeout(socket_path, Duration::from_millis(200))
-        .expect("connect");
+    let client = SocketClient::connect(socket_path).expect("connect");
     let started = Instant::now();
-    let err = client.get_pane("pane1").expect_err("times out");
+    let pane = client.get_pane("pane1").expect("blocks, then succeeds");
+    assert_eq!(pane.pane_id, "pane1");
     assert!(
-        matches!(err, HerdrError::Transport(_)),
-        "expected Transport on timeout, got {err:?}"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "read timeout should bound the call well under the server's 60s sleep, took {:?}",
+        started.elapsed() >= reply_delay,
+        "the call returned before the server's own delay elapsed: {:?} < {reply_delay:?}",
         started.elapsed()
     );
 }

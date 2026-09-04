@@ -64,9 +64,15 @@ exec "$WIRK_BIN" wirkd status --estate "$ESTATE"
 ''']
 
 # One status pane, `placement = "split"`, never `overlay` (0032 D99
-# verbatim). Its command is a bounded shell loop -- the pane's own
-# long-running program, not a hidden busy-wait (BRIEF.md outcome: "a
-# shell loop with sleep here is the pane's own program, allowed").
+# verbatim). Fix 2 (ruling 0044): no loop, no sleep -- the pane's own
+# program is `wirk wirkd watch`, item B's blocking journal stream
+# (every current Work's appends -- `wirk wirkd watch` supports that, or
+# one Work's alone with `--work <id>`, never "the estate's own status
+# changes" as a stream, no wirkd verb reports that). It runs until
+# wirkd is gone (the stream's own EOF) or the pane closes; when wirkd
+# is not running, `wirk wirkd watch` prints why and exits, and Herdr's
+# own "pane program ended" is what the pane shows -- the state, not a
+# hidden retry loop pretending otherwise.
 
 [[panes]]
 id = "status"
@@ -75,14 +81,9 @@ placement = "split"
 command = ["bash", "-c", '''
 WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
 ESTATE="$(cat "$HERDR_PLUGIN_CONFIG_DIR/estate" 2>/dev/null || true)"
-i=0
-while [ "$i" -lt 100000 ]; do
-    if [ -z "$ESTATE" ]; then
-        echo "wirk status: no estate configured"
-    else
-        "$WIRK_BIN" wirkd ping --estate "$ESTATE" || echo "wirk status: wirkd unreachable"
-    fi
-    sleep 5
-    i=$((i + 1))
-done
+if [ -z "$ESTATE" ]; then
+    echo "wirk status: no estate configured"
+    exit 0
+fi
+exec "$WIRK_BIN" wirkd watch --estate "$ESTATE"
 ''']

@@ -31,6 +31,21 @@ pub struct FakeHerdrClient {
     pub get_pane_responses: Mutex<BTreeMap<String, Result<PaneInfo, HerdrError>>>,
     pub snapshots: Mutex<VecDeque<Snapshot>>,
     pub subscribe_events: Mutex<Vec<HerdrEvent>>,
+    /// Fix 2 (0040, ruling 0044): a real channel a test can feed and
+    /// close, standing in for Herdr's own blocking subscription — used
+    /// instead of `subscribe_events`'s fixed `Vec` when set
+    /// (`with_subscribe_channel`), since `RunLoop::drive`'s tests need
+    /// to control exactly when the subscription "ends" relative to the
+    /// wirkd watch fake, not dump every event at once.
+    pub subscribe_channel: Mutex<Option<std::sync::mpsc::Receiver<Result<HerdrEvent, HerdrError>>>>,
+    /// W1 (0041 D129): records every `agent.start` call so a test can
+    /// assert `kind`/`args` per actor kind, the way `split_pane_calls`
+    /// already does for `split_pane`.
+    pub start_agent_calls: Mutex<Vec<StartAgent>>,
+    /// Fix 2 (item C, D133): records every `agent.prompt` call so a
+    /// `RunLoop` test can assert how many prompts were sent and what
+    /// they said.
+    pub prompt_agent_calls: Mutex<Vec<PromptAgent>>,
 }
 
 impl FakeHerdrClient {
@@ -58,6 +73,19 @@ impl FakeHerdrClient {
 
     pub fn with_subscribe_events(self, events: Vec<HerdrEvent>) -> Self {
         *self.subscribe_events.lock().unwrap() = events;
+        self
+    }
+
+    /// Real-channel form (fix 2, 0040): the test keeps the paired
+    /// `Sender`, pushing `Ok(event)` to simulate a pushed Herdr event
+    /// and dropping it (or sending `Err`) to simulate the subscription
+    /// ending — `RunLoop`'s own reader thread reads this exactly like a
+    /// live `SocketClient::subscribe` iterator.
+    pub fn with_subscribe_channel(
+        self,
+        rx: std::sync::mpsc::Receiver<Result<HerdrEvent, HerdrError>>,
+    ) -> Self {
+        *self.subscribe_channel.lock().unwrap() = Some(rx);
         self
     }
 }
@@ -94,11 +122,13 @@ impl HerdrClient for FakeHerdrClient {
         Ok(())
     }
 
-    fn start_agent(&self, _req: StartAgent) -> Result<(), HerdrError> {
+    fn start_agent(&self, req: StartAgent) -> Result<(), HerdrError> {
+        self.start_agent_calls.lock().unwrap().push(req);
         Ok(())
     }
 
-    fn prompt_agent(&self, _req: PromptAgent) -> Result<(), HerdrError> {
+    fn prompt_agent(&self, req: PromptAgent) -> Result<(), HerdrError> {
+        self.prompt_agent_calls.lock().unwrap().push(req);
         Ok(())
     }
 
@@ -175,7 +205,10 @@ impl HerdrClient for FakeHerdrClient {
     fn subscribe(
         &self,
         _subs: Vec<EventSubscription>,
-    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>>>, HerdrError> {
+    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>, HerdrError> {
+        if let Some(rx) = self.subscribe_channel.lock().unwrap().take() {
+            return Ok(Box::new(rx.into_iter()));
+        }
         let events: Vec<Result<HerdrEvent, HerdrError>> = self
             .subscribe_events
             .lock()

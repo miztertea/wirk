@@ -91,7 +91,6 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -103,15 +102,6 @@ use crate::{
     RemoveWorktree, ReportAgent, ReportAgentSession, ReportMetadata, SendKeys, Snapshot, SplitPane,
     StartAgent, WorkspaceInfo, WorktreeInfo,
 };
-
-/// Read timeout applied to the held request connection when a caller
-/// does not name one (`connect`); `timeout_ms` on `StartAgent`/
-/// `wait_agent` is a separate, higher-level bound (0017 D56's doc
-/// comment on `HerdrClient::wait_agent`) — this one is transport-level
-/// only, guarding against a wedged socket. 30s, generous for a live
-/// session; tests use `connect_with_read_timeout` with a short bound
-/// (issue 359: bounded, not a sleep).
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Every wire `method` name `SocketClient` sends, `ping` and
 /// `events.subscribe` included alongside the `HerdrClient` trait
@@ -167,7 +157,6 @@ struct RequestConn {
 pub struct SocketClient {
     socket_path: PathBuf,
     next_id: AtomicU64,
-    read_timeout: Duration,
 }
 
 impl SocketClient {
@@ -175,24 +164,15 @@ impl SocketClient {
     /// prior eager-connect behavior callers such as `wirk run` rely on
     /// for an immediate error), then drops that probe connection — it
     /// is never reused; every `call()` dials its own, per request.
-    /// `DEFAULT_READ_TIMEOUT` is applied to each of those.
+    /// Ruling 0044 (fix 2): no read timeout is set on any connection
+    /// this client dials — a request read blocks until the reply
+    /// arrives or the connection closes; `EOF`/a read error *is* the
+    /// transport failure, not a timeout standing in for one.
     pub fn connect(socket_path: PathBuf) -> Result<Self, HerdrError> {
-        Self::connect_with_read_timeout(socket_path, DEFAULT_READ_TIMEOUT)
-    }
-
-    /// As `connect`, with an explicit read timeout applied to every
-    /// per-request connection this client dials — the hook tests use to
-    /// keep the "read timeout is honoured" probe fast and bounded
-    /// (issue 359: no sleep, a short deterministic bound instead).
-    pub fn connect_with_read_timeout(
-        socket_path: PathBuf,
-        read_timeout: Duration,
-    ) -> Result<Self, HerdrError> {
-        drop(dial(&socket_path, read_timeout)?);
+        drop(dial(&socket_path)?);
         Ok(Self {
             socket_path,
             next_id: AtomicU64::new(1),
-            read_timeout,
         })
     }
 
@@ -237,7 +217,7 @@ impl SocketClient {
             .map_err(|e| transport(format!("encoding {method} request: {e}")))?;
         line.push('\n');
 
-        let mut conn = dial(&self.socket_path, self.read_timeout)?;
+        let mut conn = dial(&self.socket_path)?;
         conn.writer
             .write_all(line.as_bytes())
             .map_err(|e| transport(format!("writing {method}: {e}")))?;
@@ -301,8 +281,8 @@ impl SocketClient {
     fn subscribe_impl(
         &self,
         subs: Vec<EventSubscription>,
-    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>>>, HerdrError> {
-        let conn = dial(&self.socket_path, self.read_timeout)?;
+    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>, HerdrError> {
+        let conn = dial(&self.socket_path)?;
         let RequestConn {
             mut writer,
             mut reader,
@@ -398,6 +378,13 @@ impl SocketClient {
             }
         }
 
+        // Ruling 0044 (fix 2): no read timeout on this connection — the
+        // reader thread blocks on `read_line` until Herdr pushes a line
+        // or the connection closes. `Ok(0)` (`EOF`) ends the iterator
+        // with no further message: `RunLoop`'s own forwarding thread
+        // (`run_loop.rs::spawn_herdr_reader`) reads that as the stream
+        // ending and treats it as "Herdr is gone" — a closed stream
+        // *is* the observation, never a case a timeout has to invent.
         let (tx, rx) = mpsc::channel::<Result<HerdrEvent, HerdrError>>();
         std::thread::spawn(move || {
             let mut raw = String::new();
@@ -425,16 +412,15 @@ impl SocketClient {
 /// Dials `socket_path`, splitting one `UnixStream` into an independent
 /// write handle and a `BufReader`-wrapped read handle via `try_clone`
 /// (R3: both share the underlying fd; std's documented pattern for a
-/// half-duplex pair with no extra locking between read and write).
-fn dial(socket_path: &Path, read_timeout: Duration) -> Result<RequestConn, HerdrError> {
+/// half-duplex pair with no extra locking between read and write). No
+/// read timeout is set (ruling 0044): every read on either half blocks
+/// until data arrives or the peer closes the connection.
+fn dial(socket_path: &Path) -> Result<RequestConn, HerdrError> {
     let writer = UnixStream::connect(socket_path)
         .map_err(|e| transport(format!("connecting to {}: {e}", socket_path.display())))?;
     let reader_stream = writer
         .try_clone()
         .map_err(|e| transport(format!("cloning socket handle: {e}")))?;
-    reader_stream
-        .set_read_timeout(Some(read_timeout))
-        .map_err(|e| transport(format!("setting read timeout: {e}")))?;
     Ok(RequestConn {
         writer,
         reader: BufReader::new(reader_stream),
@@ -936,7 +922,7 @@ impl HerdrClient for SocketClient {
     fn subscribe(
         &self,
         subs: Vec<EventSubscription>,
-    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>>>, HerdrError> {
+    ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>, HerdrError> {
         self.subscribe_impl(subs)
     }
 }

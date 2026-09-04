@@ -249,6 +249,7 @@ fn replay_then_fold_equals_folding_the_original_events() {
                 }],
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
+                wp2_command: None,
             },
         },
         Event {
@@ -281,6 +282,7 @@ fn replay_then_fold_equals_folding_the_original_events() {
             at: Timestamp(3),
             kind: EventKind::RunLaunched {
                 run: RunId("run-1".to_string()),
+                actor_kind: Default::default(),
             },
         },
         Event {
@@ -352,6 +354,7 @@ fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
                 WaypointId("proving/wp-1".to_string()),
                 WaypointId("proving/wp-2".to_string()),
             ],
+            wp2_command: None,
         },
     };
     let wp1_events = [
@@ -511,6 +514,7 @@ fn fold_leaves_work_state_unchanged_on_a_refused_question_claim() {
                 }],
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
+                wp2_command: None,
             },
         },
         Event {
@@ -576,6 +580,7 @@ fn fold_advances_last_activity_across_events_with_increasing_timestamps() {
                 }],
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
+                wp2_command: None,
             },
         },
         Event {

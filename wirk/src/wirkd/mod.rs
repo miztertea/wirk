@@ -69,6 +69,12 @@ pub enum Verb {
     Record,
     Stop,
     Fail,
+    /// Item B, ruling 0044: a long-lived connection, not the usual
+    /// one-request-one-reply shape — `server::handle_connection`
+    /// special-cases it before the normal `dispatch`/single-`Reply`
+    /// path, and `client::watch` reads a blocking line iterator instead
+    /// of one `Reply`.
+    Watch,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -142,6 +148,15 @@ impl Request {
         Request {
             verb: Verb::Fail,
             payload: serde_json::to_value(payload).expect("FailPayload always serializes"),
+        }
+    }
+
+    /// `watch`'s request (item B): the Work whose journal appends the
+    /// caller wants streamed, starting with what is already there.
+    pub fn watch(payload: WatchPayload) -> Self {
+        Request {
+            verb: Verb::Watch,
+            payload: serde_json::to_value(payload).expect("WatchPayload always serializes"),
         }
     }
 }
@@ -233,6 +248,12 @@ pub struct FailPayload {
     pub status: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
+}
+
+/// `watch`'s payload (item B): the Work whose journal to stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchPayload {
+    pub work_id: WorkId,
 }
 
 // ---- Reply -------------------------------------------------------------

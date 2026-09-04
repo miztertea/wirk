@@ -67,6 +67,21 @@ pub fn worktree_remove(repo: &Path, path: &Path) -> Result<(), GitError> {
     Ok(())
 }
 
+/// The worktree's own no-progress signal (ruling 0044/D133's "no
+/// progress" check, item C): `git status --porcelain` (uncommitted
+/// changes) plus `git rev-parse HEAD` (a new commit), run with `cwd` as
+/// the worktree — exactly the two `git` calls named in the brief,
+/// nothing timed. Unreadable (not a git worktree, git missing) folds to
+/// an empty string rather than erroring: the caller compares two
+/// fingerprints for equality, and a worktree that cannot be read is
+/// "no progress observable" either way, not a hard failure of the
+/// stuck-actor check.
+pub fn fingerprint(cwd: &Path) -> String {
+    let status = run_git(cwd, &["status", "--porcelain"]).unwrap_or_default();
+    let head = run_git(cwd, &["rev-parse", "HEAD"]).unwrap_or_default();
+    format!("{}\n{}", status.trim(), head.trim())
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     let output = Command::new("git").current_dir(cwd).args(args).output()?;
     if !output.status.success() {
