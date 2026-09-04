@@ -21,12 +21,10 @@ command = ["bash", "plugin/startup.sh"]
 
 # The three actions are frozen to the verbs items 3 (ruling 0034) and 4
 # (ruling 0036) actually landed on `main`, not the sixteen-action
-# bundle (BRIEF.md Intent). Checked live against
-# `repos/wirk/wirk/src/main.rs` at build time: `wirk wirkd` exposes
-# `start|stop|ping` only -- there is no `wirk wirkd status` verb -- so
-# the read-only status action wraps `ping`, the verb wirkd actually
-# answers (item 3's tried step names it beside start/stop,
-# `orient/transport.md` §8).
+# bundle (BRIEF.md Intent). Item 8 W1 (0035 D118's own carried
+# follow-up) lands `wirk wirkd status --estate <root>`; the read-only
+# status action below now wraps that verb instead of `ping`, so it
+# prints every Work's state, not just wirkd's own liveness.
 
 [[actions]]
 id = "submit"
@@ -62,7 +60,7 @@ if [ -z "$ESTATE" ]; then
     echo "wirk wirkd-status: no estate configured"
     exit 0
 fi
-exec "$WIRK_BIN" wirkd ping --estate "$ESTATE"
+exec "$WIRK_BIN" wirkd status --estate "$ESTATE"
 ''']
 
 # One status pane, `placement = "split"`, never `overlay` (0032 D99

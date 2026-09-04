@@ -52,10 +52,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use wirk_core::{
-    ActorWorld, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimRefusal,
-    ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple, FailureCause, Journal,
-    JournalError, OutputContract, RouteId, Run, RunId, RunState, Timestamp, WaypointDefinition,
-    WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash, fold, validate_claim,
+    ActorWorld, ArtifactRef, ArtifactSpec, BackoffPolicy, Boundary, Claim, ClaimId, ClaimKind,
+    ClaimRefusal, ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple,
+    FailureCause, Journal, JournalError, OutputContract, RetryPolicy, Route, RouteId, Run, RunId,
+    RunState, Timestamp, WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World,
+    WorldHash, fold, validate_claim,
 };
 
 use super::{
@@ -87,6 +88,86 @@ fn smoke_waypoint(id: WaypointId) -> WaypointDefinition {
             required: true,
         }],
     }
+}
+
+/// The hardcoded "proving" Route (item 8, `orient/route.md` §1, R6):
+/// two Waypoints, wp-1 Actor (writes `report.md`), wp-2 Deterministic
+/// (counts its lines into `summary.md`) — a second smoke-shaped Route,
+/// named as scaffolding beside `smoke_waypoint`, same footing (0034
+/// D107 "holds until a Route file format exists"). Selected by
+/// `SubmitPayload.route == Some("proving")`; `handle_claim`'s
+/// auto-advance reserves wp-2 once wp-1's Claim is Validated.
+fn proving_route() -> Route {
+    Route {
+        id: RouteId("proving".to_string()),
+        waypoints: vec![
+            WaypointDefinition {
+                id: WaypointId("proving/wp-1".to_string()),
+                kind: WaypointKind::Actor,
+                declared_outputs: vec![ArtifactSpec {
+                    name: "report.md".to_string(),
+                    required: true,
+                }],
+            },
+            WaypointDefinition {
+                id: WaypointId("proving/wp-2".to_string()),
+                kind: WaypointKind::Deterministic,
+                declared_outputs: vec![ArtifactSpec {
+                    name: "summary.md".to_string(),
+                    required: true,
+                }],
+            },
+        ],
+        retry_policy: RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::None,
+        },
+    }
+}
+
+/// wp-2's fixed command (R6, `orient/route.md` §1): hardcoded alongside
+/// the Route itself, since `WaypointDefinition` carries no command
+/// field — that lives on `DeterministicWorld`, built once at
+/// reservation, not on the Route (no core-type change this item).
+/// Redirect form so `summary.md` holds only the line count, not
+/// `report.md`'s own name.
+const PROVING_WP2_COMMAND: [&str; 3] = ["sh", "-c", "wc -l < report.md > summary.md"];
+
+/// Looks up the hardcoded Route named by `id` (R6, `orient/route.md`
+/// §2): `"proving"` selects the two-Waypoint proving Route above,
+/// anything else (including `"smoke"`, the default) the original
+/// one-Waypoint smoke Route. `handle_claim`'s validation and
+/// auto-advance both key off this instead of calling `smoke_waypoint`
+/// directly, so a Work submitted on a non-smoke Route is validated
+/// against its own Waypoints, not the smoke one.
+fn route_definition(id: &RouteId) -> Route {
+    if id.0 == "proving" {
+        return proving_route();
+    }
+    Route {
+        id: RouteId("smoke".to_string()),
+        waypoints: vec![smoke_waypoint(WaypointId("smoke/wp-1".to_string()))],
+        retry_policy: RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::None,
+        },
+    }
+}
+
+/// The ordered Waypoint ids `WorkSubmitted` named for this Work — the
+/// same field `wirk_core::fold`'s own reducer reads into its private
+/// `route_waypoints` local (`wirk-core/src/lib.rs`), inlined here
+/// because `server.rs` only has raw `events`, not `fold`'s locals
+/// (`orient/route.md` §2, R6). Empty when no `WorkSubmitted` is present
+/// (a fabricated/stale journal — never this server's own writes).
+fn route_waypoints(events: &[Event]) -> Vec<WaypointId> {
+    events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::WorkSubmitted { waypoints, .. } => Some(waypoints.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Everything wirkd can fail at during startup — bind, pointer write, or
@@ -394,8 +475,21 @@ fn handle_ping() -> Reply {
 fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
     let work_id = WorkId(mint_id("work"));
     let run_id = RunId(mint_id("run"));
-    let waypoint_id = WaypointId(format!("smoke/{}", "wp-1"));
-    let route_id = RouteId("smoke".to_string());
+    // `--route proving` selects the two-Waypoint proving Route (item 8,
+    // `orient/route.md` §2); absent or any other value keeps today's
+    // one-Waypoint "smoke" Route (R6, additive — every existing caller
+    // that never sets `route` is unaffected). Only wp-1 is reserved and
+    // opened here either way; wp-2 (proving only) is reserved by
+    // `handle_claim`'s auto-advance once wp-1's Claim is Validated.
+    let proving = payload.route.as_deref() == Some("proving");
+    let route = if proving {
+        proving_route()
+    } else {
+        route_definition(&RouteId("smoke".to_string()))
+    };
+    let route_id = route.id.clone();
+    let waypoint_id = route.waypoints[0].id.clone();
+    let all_waypoints: Vec<WaypointId> = route.waypoints.iter().map(|w| w.id.clone()).collect();
 
     let triple = ExecutionTriple {
         estate_root: state.estate_root.display().to_string(),
@@ -490,7 +584,7 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             route: route_id,
             repositories: payload.repositories,
             intent: payload.intent,
-            waypoints: vec![waypoint_id.clone()],
+            waypoints: all_waypoints,
         },
     );
     let reserved = new_event(
@@ -647,7 +741,13 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         );
     }
 
-    let waypoint = smoke_waypoint(run.waypoint.clone());
+    let route = route_definition(&work.route);
+    let waypoint = route
+        .waypoints
+        .iter()
+        .find(|def| def.id == run.waypoint)
+        .cloned()
+        .unwrap_or_else(|| smoke_waypoint(run.waypoint.clone()));
     let mut verdict = validate_claim(&waypoint, &run, &claim);
 
     if matches!(verdict, ClaimVerdict::Validated)
@@ -662,14 +762,88 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         }
     }
 
-    record_and_reply(
+    let claim_kind = payload.kind.clone();
+    let reply = record_and_reply(
         &mut journal,
         &work_id,
         &run_id,
         claim_id,
         payload.kind,
-        verdict,
-    )
+        verdict.clone(),
+    );
+
+    // Auto-advance (item 8, `orient/route.md` §2, J1 decided in
+    // `build-brief.md` §2 "Disagreement resolved"): a Validated Done
+    // claim against a non-last Waypoint reserves the Route's next one,
+    // inside the same journal lock the claim itself just appended
+    // under — atomic with the claim, no second round trip, no race
+    // with a concurrent `status` read. A Validated Question, a Refused
+    // claim, or a claim on the last Waypoint advances nothing.
+    if matches!(verdict, ClaimVerdict::Validated) && matches!(claim_kind, ClaimKind::Done) {
+        let waypoints = route_waypoints(&events);
+        let is_last = waypoints.last() == Some(&run.waypoint);
+        if !is_last
+            && let Some(pos) = waypoints.iter().position(|w| w == &run.waypoint)
+            && let Some(next_id) = waypoints.get(pos + 1)
+            && let Some(next_def) = route.waypoints.iter().find(|def| &def.id == next_id)
+        {
+            let cwd = worktree_path_for_run(&events, &run_id)
+                .unwrap_or_else(|| state.estate_root.clone());
+            let base_sha = world_for_waypoint(&events, &run.waypoint)
+                .map(|world| match world {
+                    World::Actor(actor) => actor.base_sha,
+                    World::Deterministic(deterministic) => deterministic.base_sha,
+                })
+                .unwrap_or_default();
+            let next_world = match next_def.kind {
+                // R6: proving's own wp-2 is the only Deterministic
+                // Waypoint any hardcoded Route advances to today; its
+                // command is hardcoded alongside the Route itself
+                // (`PROVING_WP2_COMMAND`'s own doc comment).
+                WaypointKind::Deterministic => Some(World::Deterministic(DeterministicWorld {
+                    command: PROVING_WP2_COMMAND.iter().map(|s| s.to_string()).collect(),
+                    base_sha,
+                    cwd,
+                    env: BTreeMap::new(),
+                    expected_artifacts: OutputContract(next_def.declared_outputs.clone()),
+                })),
+                // No hardcoded Route advances Actor-to-Actor today
+                // (R1: nothing needs it) — left unadvanced rather than
+                // guessing an intent/repo_path for a second pane.
+                WaypointKind::Actor => None,
+            };
+            if let Some(next_world) = next_world {
+                let world_hash = WorldHash::of(&next_world);
+                let next_run_id = RunId(mint_id("run"));
+                let reserved = new_event(
+                    &work_id,
+                    None,
+                    EventKind::WaypointReserved {
+                        waypoint: next_id.clone(),
+                        world_hash: world_hash.clone(),
+                        world: next_world,
+                    },
+                );
+                let opened = new_event(
+                    &work_id,
+                    Some(next_run_id.clone()),
+                    EventKind::RunOpened {
+                        run: next_run_id,
+                        waypoint: next_id.clone(),
+                        attempt: 1,
+                        world_hash,
+                    },
+                );
+                for event in [reserved, opened] {
+                    if let Err(err) = journal.append(&event) {
+                        return err_reply("JournalError", &err.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    reply
 }
 
 /// Appends `ClaimFiled` then `ClaimRecorded { verdict }` (validate.md
@@ -1028,4 +1202,78 @@ fn refusal_reply(refusal: &ClaimRefusal) -> Reply {
         }
     };
     err_reply(code, &message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn work_submitted_event(waypoints: Vec<&str>) -> Event {
+        Event {
+            id: wirk_core::EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: None,
+            at: Timestamp(0),
+            kind: EventKind::WorkSubmitted {
+                route: RouteId("route-1".to_string()),
+                repositories: Vec::new(),
+                intent: "do the thing".to_string(),
+                waypoints: waypoints
+                    .into_iter()
+                    .map(|id| WaypointId(id.to_string()))
+                    .collect(),
+            },
+        }
+    }
+
+    /// `route_waypoints` reads the ordered ids straight off the Work's
+    /// own `WorkSubmitted` event (`orient/route.md` §4): two for a
+    /// proving-shaped submission, one for a smoke-shaped one, and empty
+    /// when no `WorkSubmitted` is present at all.
+    #[test]
+    fn route_waypoints_reads_workssubmitted_in_order() {
+        let two = vec![work_submitted_event(vec!["proving/wp-1", "proving/wp-2"])];
+        assert_eq!(
+            route_waypoints(&two),
+            vec![
+                WaypointId("proving/wp-1".to_string()),
+                WaypointId("proving/wp-2".to_string()),
+            ]
+        );
+
+        let one = vec![work_submitted_event(vec!["smoke/wp-1"])];
+        assert_eq!(
+            route_waypoints(&one),
+            vec![WaypointId("smoke/wp-1".to_string())]
+        );
+
+        assert_eq!(route_waypoints(&[]), Vec::<WaypointId>::new());
+    }
+
+    /// `route_definition("proving")` names two Waypoints, wp-1 Actor
+    /// then wp-2 Deterministic, in that order (`orient/route.md` §1) —
+    /// any other id (including `"smoke"`) stays the original single
+    /// Actor Waypoint.
+    #[test]
+    fn route_definition_selects_proving_or_falls_back_to_smoke() {
+        let proving = route_definition(&RouteId("proving".to_string()));
+        assert_eq!(proving.waypoints.len(), 2);
+        assert_eq!(
+            proving.waypoints[0].id,
+            WaypointId("proving/wp-1".to_string())
+        );
+        assert_eq!(proving.waypoints[0].kind, WaypointKind::Actor);
+        assert_eq!(
+            proving.waypoints[1].id,
+            WaypointId("proving/wp-2".to_string())
+        );
+        assert_eq!(proving.waypoints[1].kind, WaypointKind::Deterministic);
+
+        let smoke = route_definition(&RouteId("smoke".to_string()));
+        assert_eq!(smoke.waypoints.len(), 1);
+        assert_eq!(smoke.waypoints[0].kind, WaypointKind::Actor);
+
+        let other = route_definition(&RouteId("anything-else".to_string()));
+        assert_eq!(other.waypoints.len(), 1);
+    }
 }

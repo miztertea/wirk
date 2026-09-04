@@ -322,6 +322,174 @@ fn replay_then_fold_equals_folding_the_original_events() {
     assert_eq!(folded_from_replay.state, wirk_core::WorkState::Completed);
 }
 
+/// The two-Waypoint half of item 8's "fold completes a Work on the
+/// last waypoint of `WorkSubmitted`'s ordered list" claim
+/// (`orient/route.md` §4), through a real `Journal` store rather than
+/// `fold` called on hand-built events directly (`wirk-core/tests/
+/// contracts.rs`'s `d9_1_journal_replay_rebuilds_work_state` already
+/// covers that half) — appended by one `Journal` value, that value
+/// dropped, reopened, and folded from the replay: `Active` right after
+/// wp-1's Validated Done (wp-2 not yet reserved), `Completed` only once
+/// wp-2's own Validated Done lands, matching the same shape this file's
+/// `replay_then_fold_equals_folding_the_original_events` already pins
+/// for one Waypoint.
+#[test]
+fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
+    let dir = tempdir().expect("tempdir");
+    let submitted = Event {
+        id: EventId(String::new()),
+        work: WorkId("work-1".to_string()),
+        run: None,
+        at: Timestamp(0),
+        kind: EventKind::WorkSubmitted {
+            route: RouteId("proving".to_string()),
+            repositories: vec![RepositoryBinding {
+                name: "wirk".to_string(),
+                access: Access::Write,
+            }],
+            intent: "write report.md with one line".to_string(),
+            waypoints: vec![
+                WaypointId("proving/wp-1".to_string()),
+                WaypointId("proving/wp-2".to_string()),
+            ],
+        },
+    };
+    let wp1_events = [
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: None,
+            at: Timestamp(1),
+            kind: EventKind::WaypointReserved {
+                waypoint: WaypointId("proving/wp-1".to_string()),
+                world_hash: WorldHash("deadbeef1".to_string()),
+                world: deterministic_world(),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-1".to_string())),
+            at: Timestamp(2),
+            kind: EventKind::RunOpened {
+                run: RunId("run-1".to_string()),
+                waypoint: WaypointId("proving/wp-1".to_string()),
+                attempt: 1,
+                world_hash: WorldHash("deadbeef1".to_string()),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-1".to_string())),
+            at: Timestamp(3),
+            kind: EventKind::ClaimFiled {
+                claim: ClaimId("claim-1".to_string()),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-1".to_string())),
+            at: Timestamp(4),
+            kind: EventKind::ClaimRecorded {
+                claim: ClaimId("claim-1".to_string()),
+                claim_kind: ClaimKind::Done,
+                verdict: ClaimVerdict::Validated,
+            },
+        },
+    ];
+    let wp2_events = [
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: None,
+            at: Timestamp(5),
+            kind: EventKind::WaypointReserved {
+                waypoint: WaypointId("proving/wp-2".to_string()),
+                world_hash: WorldHash("deadbeef2".to_string()),
+                world: deterministic_world(),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-2".to_string())),
+            at: Timestamp(6),
+            kind: EventKind::RunOpened {
+                run: RunId("run-2".to_string()),
+                waypoint: WaypointId("proving/wp-2".to_string()),
+                attempt: 1,
+                world_hash: WorldHash("deadbeef2".to_string()),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-2".to_string())),
+            at: Timestamp(7),
+            kind: EventKind::ClaimFiled {
+                claim: ClaimId("claim-2".to_string()),
+            },
+        },
+        Event {
+            id: EventId(String::new()),
+            work: WorkId("work-1".to_string()),
+            run: Some(RunId("run-2".to_string())),
+            at: Timestamp(8),
+            kind: EventKind::ClaimRecorded {
+                claim: ClaimId("claim-2".to_string()),
+                claim_kind: ClaimKind::Done,
+                verdict: ClaimVerdict::Validated,
+            },
+        },
+    ];
+
+    {
+        let mut journal = Journal::open(dir.path()).expect("open");
+        journal.append(&submitted).expect("append WorkSubmitted");
+        for event in &wp1_events {
+            journal.append(event).expect("append wp-1 event");
+        }
+        // journal dropped here, closing the file handle.
+    }
+
+    // Reopen and fold after wp-1's Validated Done alone: Active, not
+    // Completed — wp-2 has not been reserved yet (fold.md §1's own
+    // "current_waypoint unchanged until the next WaypointReserved").
+    let journal = Journal::open(dir.path()).expect("reopen after wp-1");
+    let replayed = journal.replay().expect("replay after wp-1");
+    let work = wirk_core::fold(&replayed);
+    assert_eq!(
+        work.state,
+        wirk_core::WorkState::Active,
+        "wp-1's Validated Done alone must not complete the Work: {:?}",
+        work.state
+    );
+    assert_eq!(
+        work.current_waypoint,
+        Some(WaypointId("proving/wp-1".to_string()))
+    );
+    drop(journal);
+
+    {
+        let mut journal = Journal::open(dir.path()).expect("reopen to append wp-2");
+        for event in &wp2_events {
+            journal.append(event).expect("append wp-2 event");
+        }
+    }
+
+    let journal = Journal::open(dir.path()).expect("reopen after wp-2");
+    let replayed = journal.replay().expect("replay after wp-2");
+    let work = wirk_core::fold(&replayed);
+    assert_eq!(
+        work.state,
+        wirk_core::WorkState::Completed,
+        "wp-2's Validated Done (the last Waypoint) must complete the Work: {:?}",
+        work.state
+    );
+}
+
 /// Fold coverage gap named at 0033's close: a `ClaimRecorded` carrying
 /// `claim_kind: Question` and a `Refused` verdict is not a Work fact
 /// (fold.md §1, mirrored from `Run::apply`) — the Work must stay

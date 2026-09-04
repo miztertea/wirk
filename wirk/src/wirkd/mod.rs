@@ -177,6 +177,12 @@ pub struct SubmitPayload {
     pub command: Option<Vec<String>>,
     #[serde(default)]
     pub repo_path: Option<String>,
+    /// Item 8 (`orient/route.md` §2, R6): `Some("proving")` selects the
+    /// hardcoded two-Waypoint proving Route; absent or any other value
+    /// keeps the original one-Waypoint "smoke" Route — additive,
+    /// `#[serde(default)]` so every existing caller parses unchanged.
+    #[serde(default)]
+    pub route: Option<String>,
 }
 
 /// `claim`'s payload (transport.md §2): the injected

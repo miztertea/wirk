@@ -58,7 +58,7 @@ mod executors;
 // Herdr session and wirkd via `wirk_herdr::run_loop::RunLoop`.
 mod executor;
 
-use wirkd::{ClaimPayload, FailPayload, Reply, Request, SubmitPayload};
+use wirkd::{ClaimPayload, FailPayload, Reply, Request, StatusPayload, SubmitPayload};
 
 use wirk_core::{
     Access, ClaimId, ClaimKind, ClaimVerdict, DeterministicWorld, Event, EventId, EventKind,
@@ -88,7 +88,7 @@ fn main() -> ExitCode {
         Some("plugin") => plugin_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping --estate <root> | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk run --estate <root> --work <id> --session <name> [--nudge-after <secs>] [--herdr-socket <path>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root>"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status --estate <root> [--work <id>] | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--route <name>] [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--nudge-after <secs>] [--herdr-socket <path>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root>"
             );
             ExitCode::FAILURE
         }
@@ -225,13 +225,105 @@ fn wirkd_command(rest: &[String]) -> ExitCode {
                 result["pid"].as_u64().unwrap_or_default()
             );
         }),
+        // The 0035 follow-up (ruling 0034 D118: "`wirk wirkd status` as
+        // a CLI verb does not exist... carried to item 8 W1"): a thin
+        // client over the existing `status` wire verb (R6, same shape
+        // as `ping`/`stop`), naming every Work under the estate when
+        // `--work` is absent, or just the one when it's given — the
+        // manifest's own `wirkd-status` action names this verb.
+        "status" => wirkd_status_command(&estate, flag_value(&rest[1..], "--work")),
         _ => wirkd_usage(),
     }
 }
 
 fn wirkd_usage() -> ExitCode {
-    eprintln!("usage: wirk wirkd start|stop|ping --estate <root>");
+    eprintln!("usage: wirk wirkd start|stop|ping|status --estate <root> [--work <id>]");
     ExitCode::from(1)
+}
+
+/// `wirk wirkd status --estate <root> [--work <id>]` and its `wirk work
+/// status` alias: prints wirkd's `status` verb reply for `work_id`
+/// alone, or (no `--work`) for every Work directory under
+/// `<estate>/works/` (`server.rs`'s own `journal_for` layout, 0033
+/// D101), one line each, oldest-directory-name-order first (`sort`, R6
+/// — no journal timestamp read needed for a listing). A locate/
+/// transport failure is exit 2, same as `wirkd_client_call`; a `status`
+/// refusal for one Work id (`NotFound`, a fabricated id passed via
+/// `--work`) is printed on stderr and folded into the same exit 2
+/// rather than aborting the rest of the listing.
+fn wirkd_status_command(estate: &str, work_filter: Option<String>) -> ExitCode {
+    let pointer = match wirkd::client::locate(Path::new(estate)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk wirkd status: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let work_ids: Vec<String> = match work_filter {
+        Some(id) => vec![id],
+        None => match list_work_ids(Path::new(estate)) {
+            Ok(ids) => ids,
+            Err(err) => {
+                eprintln!("wirk wirkd status: {err}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    let mut exit = ExitCode::SUCCESS;
+    for work_id in work_ids {
+        let reply = wirkd::client::call(
+            &pointer.socket,
+            &Request::status(StatusPayload {
+                work_id: WorkId(work_id.clone()),
+            }),
+        );
+        match reply {
+            Ok(Reply::Ok { result, .. }) => {
+                println!(
+                    "work_id {} state {} current_waypoint {}",
+                    work_id,
+                    result["state"].as_str().unwrap_or("?"),
+                    result["current_waypoint"].as_str().unwrap_or("-")
+                );
+            }
+            Ok(Reply::Err { error, .. }) => {
+                eprintln!(
+                    "wirk wirkd status: {work_id} {} {}",
+                    error.code, error.message
+                );
+                exit = ExitCode::from(2);
+            }
+            Err(err) => {
+                eprintln!("wirk wirkd status: {work_id} {err}");
+                exit = ExitCode::from(2);
+            }
+        }
+    }
+    exit
+}
+
+/// Every Work id under `<estate>/works/` (directory names, `server.rs`'s
+/// own `journal_for` layout) — `wirkd_status_command`'s own listing
+/// source when `--work` is absent. An absent `works/` directory (no
+/// Work ever submitted) is an empty list, not an error.
+fn list_work_ids(estate: &Path) -> Result<Vec<String>, String> {
+    let dir = estate.join("works");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(&dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    let mut ids: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("{}: {err}", dir.display()))?;
+        if entry.path().is_dir()
+            && let Ok(name) = entry.file_name().into_string()
+        {
+            ids.push(name);
+        }
+    }
+    ids.sort();
+    Ok(ids)
 }
 
 /// Locates wirkd at `estate`, sends `request`, and on an `ok` reply
@@ -274,10 +366,25 @@ fn wirkd_client_call(
 /// behaves exactly as before — the original hardcoded "smoke" World,
 /// unresolved `base_ref`).
 fn work_command(rest: &[String]) -> ExitCode {
-    if rest.first().map(String::as_str) != Some("submit") {
-        return work_usage();
+    match rest.first().map(String::as_str) {
+        Some("submit") => work_submit_command(&rest[1..]),
+        // Item 8 (0035 follow-up, `orient/build-brief.md` §3 W1): an
+        // alias for `wirk wirkd status --estate <root> --work <id>`,
+        // named on the manifest's own `wirkd-status` action.
+        Some("status") => {
+            let Some(estate) = flag_value(&rest[1..], "--estate") else {
+                return work_usage();
+            };
+            let Some(work_id) = flag_value(&rest[1..], "--work") else {
+                return work_usage();
+            };
+            wirkd_status_command(&estate, Some(work_id))
+        }
+        _ => work_usage(),
     }
-    let rest = &rest[1..];
+}
+
+fn work_submit_command(rest: &[String]) -> ExitCode {
     let Some(estate) = flag_value(rest, "--estate") else {
         return work_usage();
     };
@@ -328,6 +435,7 @@ fn work_command(rest: &[String]) -> ExitCode {
 
     let kind = flag_value(rest, "--kind");
     let repo_path = flag_value(rest, "--repo-path");
+    let route = flag_value(rest, "--route");
 
     let payload = SubmitPayload {
         intent,
@@ -336,6 +444,7 @@ fn work_command(rest: &[String]) -> ExitCode {
         kind,
         command,
         repo_path,
+        route,
     };
     wirkd_client_call(&estate, &Request::submit(payload), |result| {
         println!(
@@ -349,7 +458,7 @@ fn work_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind actor|deterministic --repo-path <path> | --command <argv...>]"
+        "usage: wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--route <name>] [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk work status --estate <root> --work <id>"
     );
     ExitCode::from(1)
 }
