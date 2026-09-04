@@ -1,0 +1,12 @@
+{
+  "id": "smoke",
+  "waypoints": [
+    {
+      "id": "smoke/wp-1",
+      "kind": "Actor",
+      "intent": "write report.md",
+      "declared_outputs": [{"name": "report.md", "required": true}],
+      "boundary": ["**"]
+    }
+  ]
+}

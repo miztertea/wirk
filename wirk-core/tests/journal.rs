@@ -249,7 +249,7 @@ fn replay_then_fold_equals_folding_the_original_events() {
                 }],
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
-                wp2_command: None,
+                waypoint_defs: Vec::new(),
             },
         },
         Event {
@@ -354,7 +354,7 @@ fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
                 WaypointId("proving/wp-1".to_string()),
                 WaypointId("proving/wp-2".to_string()),
             ],
-            wp2_command: None,
+            waypoint_defs: Vec::new(),
         },
     };
     let wp1_events = [
@@ -514,7 +514,7 @@ fn fold_leaves_work_state_unchanged_on_a_refused_question_claim() {
                 }],
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
-                wp2_command: None,
+                waypoint_defs: Vec::new(),
             },
         },
         Event {
@@ -580,7 +580,7 @@ fn fold_advances_last_activity_across_events_with_increasing_timestamps() {
                 }],
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
-                wp2_command: None,
+                waypoint_defs: Vec::new(),
             },
         },
         Event {
@@ -618,4 +618,65 @@ fn fold_advances_last_activity_across_events_with_increasing_timestamps() {
         Timestamp(300),
         "last_activity did not advance to the last folded event's timestamp"
     );
+}
+
+/// p2-route-files W1 (build-brief.md §3 W1's own test list): a
+/// `WorkSubmitted` line written before `waypoint_defs` existed (this
+/// campaign's own evidence only — 0034 D107's scaffolding predates it,
+/// none in production) still replays and folds, defaulting to an empty
+/// `Vec` (`#[serde(default)]`), the same additive-field convention
+/// `wp2_command` and `RunLaunched.actor_kind` already pin. Hand-crafted
+/// by serializing a real `WorkSubmitted` event then deleting the
+/// `waypoint_defs` key from its JSON before writing the ndjson line —
+/// never by constructing the struct literal without the field, which
+/// Rust's own field-exhaustiveness would refuse to compile.
+#[test]
+fn old_worksubmitted_without_waypoint_defs_field_still_folds() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("journal.ndjson");
+
+    let event = Event {
+        id: EventId("ev-1".to_string()),
+        work: WorkId("work-1".to_string()),
+        run: None,
+        at: Timestamp(0),
+        kind: EventKind::WorkSubmitted {
+            route: RouteId("route-1".to_string()),
+            repositories: vec![],
+            intent: "do the thing".to_string(),
+            waypoints: vec![WaypointId("wp-1".to_string())],
+            waypoint_defs: Vec::new(),
+        },
+    };
+    let mut value = serde_json::to_value(&event).expect("event serializes");
+    value
+        .get_mut("kind")
+        .expect("event has a kind object")
+        .as_object_mut()
+        .expect("kind is an object")
+        .remove("waypoint_defs");
+    assert!(
+        !value["kind"]
+            .as_object()
+            .unwrap()
+            .contains_key("waypoint_defs"),
+        "the fixture must genuinely omit waypoint_defs, not merely null it"
+    );
+
+    let line = serde_json::json!({"seq": 1, "event": value}).to_string();
+    fs::write(&path, format!("{line}\n")).expect("write hand-crafted journal line");
+
+    let journal = Journal::open(dir.path()).expect("journal opens despite the missing field");
+    let events = journal.replay().expect("replay folds the old-shaped line");
+    assert_eq!(events.len(), 1);
+    let EventKind::WorkSubmitted { waypoint_defs, .. } = &events[0].kind else {
+        panic!("expected WorkSubmitted, got {:?}", events[0].kind);
+    };
+    assert!(
+        waypoint_defs.is_empty(),
+        "an old line with no waypoint_defs key must default to an empty Vec, got {waypoint_defs:?}"
+    );
+
+    let work = wirk_core::fold(&events);
+    assert_eq!(work.id, WorkId("work-1".to_string()));
 }

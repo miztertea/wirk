@@ -161,26 +161,26 @@ impl Request {
     }
 }
 
-/// `submit`'s payload (transport.md §2): the intent text, the
-/// repository bindings the Work declares, and the base ref its worktree
-/// is cut from. `Route` authoring is not built yet (build-brief.md §3
-/// W3, R6) — `submit` names only what W3's hardcoded "smoke" Route
-/// needs to open a Run against.
+/// `submit`'s payload (transport.md §2): the repository bindings the
+/// Work declares and the base ref its worktree is cut from. `intent`
+/// is carried for wire-shape compatibility only (p2-route-files W2,
+/// J1) — `--intent` is removed from `wirk work submit`, so every real
+/// caller now sends an empty string; a Waypoint's own intent is
+/// authored in its Route file (`WaypointDefinition.intent`).
 ///
 /// `kind`/`command`/`repo_path` are additive across both items (item 4's
 /// `--kind actor --repo-path <path>` and item 5's `--kind deterministic
 /// --command <argv...>`, `orient/build-brief.md` "Outcome" for each):
 /// `#[serde(default)]` on all three keeps every existing caller that
-/// never sets them (the W2/W3 item-3 tests) parsing exactly as before,
-/// taking the original "smoke" `World::Actor` path unchanged when `kind`
-/// is absent. `kind: Some("actor")` with a `repo_path` resolves
-/// `base_ref` to a commit SHA with git at submit time (issue 285: an
-/// unresolved ref left the worktree's pin meaningless) and reserves an
-/// `ActorWorld` with an empty `worktree_path` — `wirk run` fills it in
-/// once the worktree exists (`RecordPayload`, below). `kind: Some(
-/// "deterministic")` with `command` non-empty reserves a
-/// `World::Deterministic` instead — `wirkd`'s own smoke Route stays
-/// hardcoded either way (R6).
+/// never sets them parsing exactly as before. `kind: Some("actor")`
+/// with a `repo_path` resolves `base_ref` to a commit SHA with git at
+/// submit time (issue 285: an unresolved ref left the worktree's pin
+/// meaningless) and reserves an `ActorWorld` with an empty
+/// `worktree_path` — `wirk run` fills it in once the worktree exists
+/// (`RecordPayload`, below). `kind: Some("deterministic")` with
+/// `command` non-empty reserves a `World::Deterministic` instead, the
+/// one submit shape that carries no Route at all (build-brief.md
+/// §7.3) — every other submit resolves `route` (below) to a file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitPayload {
     pub intent: String,
@@ -192,10 +192,10 @@ pub struct SubmitPayload {
     pub command: Option<Vec<String>>,
     #[serde(default)]
     pub repo_path: Option<String>,
-    /// Item 8 (`orient/route.md` §2, R6): `Some("proving")` selects the
-    /// hardcoded two-Waypoint proving Route; absent or any other value
-    /// keeps the original one-Waypoint "smoke" Route — additive,
-    /// `#[serde(default)]` so every existing caller parses unchanged.
+    /// p2-route-files W2 (build-brief.md §7.3): a bare name or a path
+    /// naming the Route file to load (`server.rs::resolve_route_path`,
+    /// `wirk_core::load_route`) — required for every submit except the
+    /// ad hoc `--kind deterministic --command` shape above.
     #[serde(default)]
     pub route: Option<String>,
 }

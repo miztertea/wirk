@@ -88,7 +88,7 @@ fn main() -> ExitCode {
         Some("plugin") => plugin_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--route <name>] [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind claude|opencode] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root>"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind claude|opencode] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root>"
             );
             ExitCode::FAILURE
         }
@@ -460,12 +460,13 @@ fn wirkd_client_call(
     }
 }
 
-/// Dispatches `wirk work <rest>`: `submit --estate <root> --intent
-/// <text> --repo <name>:<read|write> (repeatable) --base <ref>
-/// [--kind actor|deterministic --repo-path <path>]`. `--kind`/
-/// `--repo-path` are item 4's W3 addition (additive: omitted, `submit`
-/// behaves exactly as before — the original hardcoded "smoke" World,
-/// unresolved `base_ref`).
+/// Dispatches `wirk work <rest>`: `submit --estate <root> --repo
+/// <name>:<read|write> (repeatable) --base <ref> --route <name>
+/// [--kind actor --repo-path <path>]`, or the Route-less ad hoc
+/// `--kind deterministic --command <argv...>` (build-brief.md §7.3).
+/// `--intent` is removed (p2-route-files W2, J1): an Actor Waypoint's
+/// intent is authored per-Waypoint in the Route file now, not passed
+/// on the submit line.
 fn work_command(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("submit") => work_submit_command(&rest[1..]),
@@ -487,9 +488,6 @@ fn work_command(rest: &[String]) -> ExitCode {
 
 fn work_submit_command(rest: &[String]) -> ExitCode {
     let Some(estate) = flag_value(rest, "--estate") else {
-        return work_usage();
-    };
-    let Some(intent) = flag_value(rest, "--intent") else {
         return work_usage();
     };
     let base_ref = flag_value(rest, "--base").unwrap_or_default();
@@ -517,6 +515,15 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
                     access,
                 });
             }
+            // p2-route-files W2 (build-brief.md §7.3, J1): `--intent`
+            // is removed — an Actor Waypoint's intent is authored in
+            // the Route file now, per-Waypoint. A submit that still
+            // passes it is a usage exit, not a silently-ignored flag,
+            // so an old caller notices the removal rather than
+            // submitting with no intent text anywhere.
+            "--intent" => {
+                return work_usage();
+            }
             // `--command` consumes every remaining argument as the
             // command argv verbatim (`--kind deterministic --command
             // sh -c 'echo x > report.md'`): a deterministic command may
@@ -536,7 +543,6 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
                 if !fenced
                     && [
                         "--estate",
-                        "--intent",
                         "--repo",
                         "--base",
                         "--route",
@@ -560,8 +566,16 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
     let repo_path = flag_value(rest, "--repo-path");
     let route = flag_value(rest, "--route");
 
+    // p2-route-files W2 (build-brief.md §7.3): `--route` is required
+    // for every submit except the ad hoc `--kind deterministic
+    // --command` single-Waypoint Work, which carries no Route at all.
+    let ad_hoc_deterministic = kind.as_deref() == Some("deterministic") && command.is_some();
+    if route.is_none() && !ad_hoc_deterministic {
+        return work_usage();
+    }
+
     let payload = SubmitPayload {
-        intent,
+        intent: String::new(),
         repositories,
         base_ref,
         kind,
@@ -581,7 +595,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--route <name>] [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk work status --estate <root> --work <id>"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id>"
     );
     ExitCode::from(1)
 }
@@ -801,7 +815,7 @@ fn drive_run_child(
         Ok(RunObservation::Running) => {}
         Err(err) => return Err(local_cause(&err)),
     }
-    read_terminal_status(estate, work_id)
+    read_terminal_status(estate, work_id, &run.id)
 }
 
 /// As `drive_run_child`, against `DockerExecutor`.
@@ -828,37 +842,61 @@ fn drive_run_docker(
         Ok(RunObservation::Running) => {}
         Err(err) => return Err(local_cause(&err)),
     }
-    read_terminal_status(estate, work_id)
+    read_terminal_status(estate, work_id, &run.id)
 }
 
 /// The one wirkd `status` read after the executor's blocking `wait`
 /// returns (module doc): a clean exit only means the Claim was filed,
 /// not that wirkd accepted it — that verdict lives in wirkd's own
 /// journal alone.
-fn read_terminal_status(estate: &str, work_id: &WorkId) -> Result<(), FailureCause> {
-    match wirkd_status(estate, work_id) {
-        Ok(status) => match status["run_state"].as_str() {
-            Some("claimed") => Ok(()),
-            Some("failed") => Err(FailureCause {
-                status: status["failure_status"].as_str().map(str::to_string),
+///
+/// p2-route-files W2: reads *this Run's own* entry out of `status`'s
+/// `"runs"` array by id, never the Work's own top-level
+/// `current_waypoint`/`run_state` fields — those name whatever Run is
+/// now current, which a Route file can auto-advance to a *different*
+/// freshly-reserved Run in the same journal lock the Claim above just
+/// appended under (a Deterministic Waypoint immediately followed by
+/// another one, unlike every Route this command's callers used to
+/// see). Looking the just-claimed Run up by its own id is what stays
+/// correct regardless of what wirkd advanced to next.
+fn read_terminal_status(
+    estate: &str,
+    work_id: &WorkId,
+    run_id: &RunId,
+) -> Result<(), FailureCause> {
+    let status = match wirkd_status(estate, work_id) {
+        Ok(status) => status,
+        Err(err) => {
+            return Err(FailureCause {
+                status: Some("wirkd_status_failed".to_string()),
                 request_id: None,
                 at: wirk_core_timestamp_now(),
-                detail: status["failure_detail"].as_str().map(str::to_string),
-            }),
-            other => Err(FailureCause {
-                status: Some("unexpected_run_state".to_string()),
-                request_id: None,
-                at: wirk_core_timestamp_now(),
-                detail: Some(format!(
-                    "executor wait returned Running but wirkd status was {other:?}"
-                )),
-            }),
-        },
-        Err(err) => Err(FailureCause {
-            status: Some("wirkd_status_failed".to_string()),
+                detail: Some(err),
+            });
+        }
+    };
+    let run_state = status["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|entry| entry["run"]["id"].as_str() == Some(run_id.0.as_str()))
+        .map(|entry| entry["run"]["state"].clone());
+    match run_state {
+        Some(ref state) if state.get("Claimed").is_some() => Ok(()),
+        Some(ref state) if state.get("Failed").is_some() => Err(FailureCause {
+            status: state["Failed"]["status"].as_str().map(str::to_string),
             request_id: None,
             at: wirk_core_timestamp_now(),
-            detail: Some(err),
+            detail: state["Failed"]["detail"].as_str().map(str::to_string),
+        }),
+        other => Err(FailureCause {
+            status: Some("unexpected_run_state".to_string()),
+            request_id: None,
+            at: wirk_core_timestamp_now(),
+            detail: Some(format!(
+                "run {} not claimed after executor wait returned Running: {other:?}",
+                run_id.0
+            )),
         }),
     }
 }
@@ -1068,7 +1106,7 @@ fn demo_events() -> Vec<Event> {
                 }],
                 intent: "demo the journal lifecycle".to_string(),
                 waypoints: vec![waypoint.clone()],
-                wp2_command: None,
+                waypoint_defs: Vec::new(),
             },
         ),
         new_event(

@@ -11,6 +11,8 @@
 //! Readiness is a bounded poll on the pointer file appearing (issue
 //! 359), never a sleep standing in for "wirkd is up".
 
+#[path = "support/route_fixture.rs"]
+mod route_fixture;
 #[path = "../src/wirkd/mod.rs"]
 mod wirkd;
 
@@ -48,14 +50,18 @@ fn wait_for_pointer(estate: &Path) -> WirkdPointer {
     }
 }
 
-/// Runs `wirk work submit --estate <estate> --intent smoke --repo
-/// <repo> --base main` and parses its `work_id <id> run_id <id>
+/// Runs `wirk work submit --estate <estate> --route smoke --repo
+/// <repo> --base main` (the estate's own copy of the canonical
+/// `smoke.json` fixture, p2-route-files W2 — `--route` is required now
+/// and no `--intent` exists any more, an Actor Waypoint's intent being
+/// authored in the file) and parses its `work_id <id> run_id <id>
 /// waypoint <id>` stdout line.
 fn submit(estate: &Path, repo: &str) -> (String, String, String) {
+    route_fixture::install_route_fixture(estate, "smoke");
     let output = Command::new(wirk_bin())
         .args(["work", "submit", "--estate"])
         .arg(estate)
-        .args(["--intent", "smoke", "--repo", repo, "--base", "main"])
+        .args(["--route", "smoke", "--repo", repo, "--base", "main"])
         .output()
         .expect("work submit runs");
     assert!(

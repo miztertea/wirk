@@ -1,0 +1,12 @@
+{
+  "id": "unknown-field",
+  "waypoints": [
+    {
+      "id": "unknown-field/wp-1",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "true"],
+      "declared_outputs": [],
+      "retries": 3
+    }
+  ]
+}

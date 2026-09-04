@@ -1,0 +1,24 @@
+{
+  "id": "three-wp",
+  "waypoints": [
+    {
+      "id": "three-wp/wp-1",
+      "kind": "Actor",
+      "intent": "write report.md with one line",
+      "declared_outputs": [{"name": "report.md", "required": true}],
+      "boundary": ["**"]
+    },
+    {
+      "id": "three-wp/wp-2",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "wc -l < report.md > summary.md"],
+      "declared_outputs": [{"name": "summary.md", "required": true}]
+    },
+    {
+      "id": "three-wp/wp-3",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "wc -l < summary.md > final.md"],
+      "declared_outputs": [{"name": "final.md", "required": true}]
+    }
+  ]
+}

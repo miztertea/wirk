@@ -71,7 +71,7 @@ fn work_submitted(waypoints: Vec<&str>) -> EventKind {
             .into_iter()
             .map(|wp| WaypointId(wp.to_string()))
             .collect(),
-        wp2_command: None,
+        waypoint_defs: Vec::new(),
     }
 }
 
@@ -299,6 +299,9 @@ fn d9_3_claim_missing_required_artifact_is_refused() {
             name: "report.md".to_string(),
             required: true,
         }],
+        intent: None,
+        command: None,
+        boundary: Boundary(Vec::new()),
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -332,6 +335,9 @@ fn d9_4_fabricated_triple_is_recorded_not_honored() {
         id: WaypointId("route-1/wp-1".to_string()),
         kind: wirk_core::WaypointKind::Actor,
         declared_outputs: vec![],
+        intent: None,
+        command: None,
+        boundary: Boundary(Vec::new()),
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -363,6 +369,9 @@ fn claim_against_an_already_claimed_run_is_refused() {
         id: WaypointId("route-1/wp-1".to_string()),
         kind: wirk_core::WaypointKind::Actor,
         declared_outputs: vec![],
+        intent: None,
+        command: None,
+        boundary: Boundary(Vec::new()),
     };
     let mut run = open_run("run-1");
     run.state = RunState::Claimed(ClaimId("claim-earlier".to_string()));
@@ -394,6 +403,9 @@ fn done_claim_with_required_artifact_present_is_validated() {
             name: "report.md".to_string(),
             required: true,
         }],
+        intent: None,
+        command: None,
+        boundary: Boundary(Vec::new()),
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -425,6 +437,9 @@ fn question_claim_with_missing_artifact_is_validated() {
             name: "report.md".to_string(),
             required: true,
         }],
+        intent: None,
+        command: None,
+        boundary: Boundary(Vec::new()),
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -614,30 +629,6 @@ fn run_launched_without_kind_field_still_folds() {
         run.kind,
         wirk_core::ActorKind::Claude,
         "a pre-existing RunLaunched with no kind field folds to the Claude default"
-    );
-}
-
-/// W3 (0034 D107 scaffolding, `orient/route.md` §2/§8): a `WorkSubmitted`
-/// written before `wp2_command` existed still deserializes and folds —
-/// `#[serde(default)]` means the missing field reads as `None`, same
-/// shape `run_launched_without_kind_field_still_folds` pins for
-/// `RunLaunched.actor_kind` above.
-#[test]
-fn work_submitted_without_wp2_command_field_still_folds() {
-    let pre_existing_json = r#"{"kind":"WorkSubmitted","route":"proving","repositories":[],"intent":"do the thing","waypoints":["proving/wp-1","proving/wp-2"]}"#;
-    let parsed: EventKind = serde_json::from_str(pre_existing_json)
-        .expect("a WorkSubmitted event written before this change still deserializes");
-    let EventKind::WorkSubmitted { wp2_command, .. } = &parsed else {
-        panic!("expected WorkSubmitted, got {parsed:?}");
-    };
-    assert_eq!(*wp2_command, None, "missing field defaults to None");
-
-    let events = vec![event("e-1", None, parsed)];
-    let work = wirk_core::fold(&events);
-    assert_eq!(
-        work.id,
-        WorkId("work-1".to_string()),
-        "fold still builds the Work from a WorkSubmitted missing wp2_command"
     );
 }
 

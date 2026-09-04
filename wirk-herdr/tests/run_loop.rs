@@ -116,7 +116,7 @@ fn work_submitted() -> EventKind {
         repositories: Vec::new(),
         intent: "write report.md".to_string(),
         waypoints: vec![WaypointId("route-1/wp-1".to_string())],
-        wp2_command: None,
+        waypoint_defs: Vec::new(),
     }
 }
 

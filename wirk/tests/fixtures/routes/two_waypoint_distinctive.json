@@ -1,0 +1,18 @@
+{
+  "id": "two-wp-distinctive",
+  "waypoints": [
+    {
+      "id": "two-wp-distinctive/wp-1",
+      "kind": "Actor",
+      "intent": "write report.md with one line",
+      "declared_outputs": [{"name": "report.md", "required": true}],
+      "boundary": ["**"]
+    },
+    {
+      "id": "two-wp-distinctive/wp-2",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "echo distinctive-not-proving > summary.md"],
+      "declared_outputs": [{"name": "summary.md", "required": true}]
+    }
+  ]
+}

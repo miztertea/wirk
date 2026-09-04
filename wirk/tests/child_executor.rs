@@ -77,31 +77,19 @@ fn wait_for_pointer_live(estate: &Path) -> wirkd::WirkdPointer {
     }
 }
 
-/// `wirk work submit --estate <estate> --intent <intent> --kind
-/// deterministic --command <argv...> --base <base> --repo demo:write`,
-/// parsing its `work_id <id> run_id <id> waypoint <id>` stdout line
-/// (`run_verb.rs`'s own `submit_actor` shape, R6 duplicate — a
-/// different World kind). The real wirkd's Waypoint (the "smoke"
-/// Route's own hardcoded definition) always requires `report.md` by
-/// name regardless of `--kind` or `--command` — the caller's own
+/// `wirk work submit --estate <estate> --kind deterministic --command
+/// <argv...> --base <base> --repo demo:write` (no `--intent`, removed
+/// p2-route-files W2), parsing its `work_id <id> run_id <id> waypoint
+/// <id>` stdout line (`run_verb.rs`'s own `submit_actor` shape, R6
+/// duplicate — a different World kind). The real wirkd's Waypoint (the
+/// Route-less ad hoc path's own synthesized definition) always requires
+/// `report.md` by name regardless of `--command` — the caller's own
 /// command decides whether the later Claim honors that.
-fn submit_deterministic(
-    estate: &Path,
-    base: &str,
-    intent: &str,
-    command: &[&str],
-) -> (String, String, String) {
+fn submit_deterministic(estate: &Path, base: &str, command: &[&str]) -> (String, String, String) {
     let mut cmd = Command::new(wirk_bin());
     cmd.args(["work", "submit", "--estate"])
         .arg(estate)
-        .args([
-            "--intent",
-            intent,
-            "--kind",
-            "deterministic",
-            "--base",
-            base,
-        ])
+        .args(["--kind", "deterministic", "--base", base])
         .args(["--repo", "demo:write", "--command"])
         .args(command);
     let output = cmd.output().expect("work submit runs");
@@ -214,12 +202,8 @@ fn d5_1_true_completes_by_claim() {
     // (`wirkd/server.rs`'s hardcoded output_contract); this command
     // writes it into the World's own `cwd`, matching `expected_
     // artifacts` below so the real Claim validates.
-    let (work_id, run_id, waypoint) = submit_deterministic(
-        &estate,
-        "abc123",
-        "d5_1 tried live",
-        &["sh", "-c", "echo hi > report.md"],
-    );
+    let (work_id, run_id, waypoint) =
+        submit_deterministic(&estate, "abc123", &["sh", "-c", "echo hi > report.md"]);
 
     let cwd = tempfile::tempdir().expect("cwd tempdir");
     let executor = ChildExecutor::new(estate.clone(), WorkId(work_id.clone()));
@@ -449,8 +433,7 @@ fn d5_6b_a_claim_wirkd_refuses_surfaces_as_claim_filing_error() {
     // The real Waypoint always requires `report.md` by name; `true`
     // never writes it, so the real Claim is genuinely refused
     // `MissingArtifact` — no scripted refusal needed (0040 D127).
-    let (work_id, run_id, waypoint) =
-        submit_deterministic(&estate, "abc123", "d5_6b tried live", &["true"]);
+    let (work_id, run_id, waypoint) = submit_deterministic(&estate, "abc123", &["true"]);
 
     let executor = ChildExecutor::new(estate.clone(), WorkId(work_id));
     let run = Run {

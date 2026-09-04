@@ -226,7 +226,12 @@ impl WorkState {
 /// time governs how wirk treats an agent or a Run; `RetryPolicy`/
 /// `BackoffPolicy` were unread by anything — R1). P2.3 decides retry
 /// from the failure observed, not a policy value carried here.
+/// `deny_unknown_fields` (p2-route-files, format.md §1, R6): a Route
+/// file authored by hand cannot carry a field this type doesn't know —
+/// D134's "no count or duration field" is enforced by the loader
+/// refusing it (`RouteError::Malformed`), not by silently dropping it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Route {
     pub id: RouteId,
     pub waypoints: Vec<WaypointDefinition>,
@@ -237,11 +242,27 @@ pub struct Route {
 /// (backend-selection) dropped, Herdr-adjacent (0022 D71).
 /// `declared_outputs` kept: D9#3 checks a Claim against it
 /// (orient/core.md line 57-62).
+///
+/// p2-route-files (format.md §1, build-brief.md §2 Disagreement 1,
+/// R6): `intent`/`command` added as an `Option` pair, not an
+/// enum-with-payload — the type itself does not bar an Actor Waypoint
+/// from carrying a `command` (or vice versa); `load_route`'s refusals
+/// (`ActorWithCommand`/`DeterministicMissingCommand`) catch it instead.
+/// `boundary` defaults to an empty `Boundary` (`#[serde(default)]`,
+/// R6) — refusal 9: an empty boundary is authoring, not enforcement
+/// (P2.4's). `deny_unknown_fields` per `Route`'s own doc above.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WaypointDefinition {
     pub id: WaypointId,
     pub kind: WaypointKind,
     pub declared_outputs: Vec<ArtifactSpec>,
+    #[serde(default)]
+    pub intent: Option<String>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub boundary: Boundary,
 }
 
 /// From sergeant's `StageKind` (Actor). `Container` (backend concept)
@@ -271,8 +292,110 @@ pub struct OutputContract(pub Vec<ArtifactSpec>);
 /// The declared mutation surface and authority envelope for a Waypoint
 /// (vocabulary.md "Boundary": "declared mutation surface... per-Route";
 /// 0001 D5), as path globs the Waypoint may mutate. Minimal, R6.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` (p2-route-files, format.md §1, R6): an empty boundary
+/// (`Boundary(Vec::new())`) so `WaypointDefinition.boundary`'s
+/// `#[serde(default)]` has a value to default to, and a Route file
+/// omitting `"boundary"` parses as authoring nothing yet, not a
+/// refusal (refusal 9, out of scope: enforcement is P2.4's).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Boundary(pub Vec<String>);
+
+// ---- Route file loader ------------------------------------------------
+
+/// Every way `load_route` refuses a Route file (p2-route-files,
+/// format.md §3, build-brief.md §2/§7). A refusal never touches the
+/// journal (`wirkd`'s own `handle_submit` reads the file before
+/// minting any id) — this type only carries the reason.
+#[derive(Debug, Error)]
+pub enum RouteError {
+    #[error("route file not found: {path}")]
+    NotFound { path: PathBuf },
+    /// Unparseable JSON, an unknown field (`deny_unknown_fields`, D134
+    /// row 10), a `kind` string that is neither `Actor` nor
+    /// `Deterministic` (folds into this row, format.md refusal 5 — a
+    /// closed two-variant enum, serde already refuses an unknown tag),
+    /// or an Actor Waypoint with no `intent` (build-brief.md §2
+    /// Disagreement 3's resolution: "row 2, same as Actor-with-command"
+    /// — a post-parse structural check reported the same way).
+    #[error("route file malformed at {path}: {reason}")]
+    Malformed { path: PathBuf, reason: String },
+    #[error("route has no waypoints")]
+    NoWaypoints,
+    #[error("duplicate waypoint id: {}", id.0)]
+    DuplicateWaypoint { id: WaypointId },
+    #[error("actor waypoint {} carries a command", id.0)]
+    ActorWithCommand { id: WaypointId },
+    #[error("deterministic waypoint {} has no command", id.0)]
+    DeterministicMissingCommand { id: WaypointId },
+    #[error("waypoint {} declares an output with an empty name", waypoint.0)]
+    EmptyArtifactName { waypoint: WaypointId },
+}
+
+/// Reads and validates a Route file (format.md §3, R2 co-located with
+/// `Route`): a file path in, a `Route` or a named `RouteError` out.
+/// Read once, at submit (build-brief.md §7.1) — `wirkd` never calls
+/// this again for the same Work; auto-advance reads the journaled
+/// `WaypointDefinition`s instead (`WorkSubmitted.waypoint_defs`).
+pub fn load_route(path: &Path) -> Result<Route, RouteError> {
+    let text = std::fs::read_to_string(path).map_err(|_| RouteError::NotFound {
+        path: path.to_path_buf(),
+    })?;
+    let route: Route = serde_json::from_str(&text).map_err(|source| RouteError::Malformed {
+        path: path.to_path_buf(),
+        reason: source.to_string(),
+    })?;
+
+    if route.waypoints.is_empty() {
+        return Err(RouteError::NoWaypoints);
+    }
+
+    let mut seen: std::collections::HashSet<&WaypointId> = std::collections::HashSet::new();
+    for waypoint in &route.waypoints {
+        if !seen.insert(&waypoint.id) {
+            return Err(RouteError::DuplicateWaypoint {
+                id: waypoint.id.clone(),
+            });
+        }
+        match waypoint.kind {
+            WaypointKind::Actor => {
+                if waypoint.command.is_some() {
+                    return Err(RouteError::ActorWithCommand {
+                        id: waypoint.id.clone(),
+                    });
+                }
+                if waypoint.intent.is_none() {
+                    return Err(RouteError::Malformed {
+                        path: path.to_path_buf(),
+                        reason: format!(
+                            "waypoint {} is an actor Waypoint with no intent",
+                            waypoint.id.0
+                        ),
+                    });
+                }
+            }
+            WaypointKind::Deterministic => {
+                if waypoint.command.is_none() {
+                    return Err(RouteError::DeterministicMissingCommand {
+                        id: waypoint.id.clone(),
+                    });
+                }
+            }
+        }
+        for output in &waypoint.declared_outputs {
+            if output.name.is_empty() {
+                return Err(RouteError::EmptyArtifactName {
+                    waypoint: waypoint.id.clone(),
+                });
+            }
+        }
+        // Refusal 9 (format.md §3): an empty `boundary` parses and
+        // loads clean — authoring is this item's, enforcement is
+        // P2.4's.
+    }
+
+    Ok(route)
+}
 
 // ---- ExecutionTriple ------------------------------------------------------
 
@@ -643,20 +766,28 @@ pub enum EventKind {
         repositories: Vec<RepositoryBinding>,
         intent: String,
         waypoints: Vec<WaypointId>,
-        /// W3 (0034 D107 scaffolding, `orient/route.md` §2/§8;
-        /// build-brief.md §7.1): the submitted `--command` argv (the
-        /// same `SubmitPayload.command` an actor-kind submit already
-        /// carries but `handle_submit` otherwise ignores), carried onto
-        /// the journal so `handle_claim`'s auto-advance can build the
-        /// Route's Deterministic Waypoint from it instead of the
-        /// hardcoded `PROVING_WP2_COMMAND`. Additive, `#[serde(default)]`
+        /// p2-route-files W2 (build-brief.md §2 Disagreement 2, J4): the
+        /// submitted `--command` argv W3's scaffolding once carried here
+        /// for auto-advance's own fallback is removed, dropped with no
+        /// compatibility field — no production journal predates this
+        /// wave to protect, and the Route file's own Deterministic
+        /// Waypoint now carries its command on `waypoint_defs` below
+        /// unconditionally.
+        /// p2-route-files (build-brief.md §7.1, format.md §4, J3 on
+        /// 0029 D95): the full Route content as authored in the loaded
+        /// file — every `WaypointDefinition`, in Route order — read
+        /// once here at submit and never re-read from the file again.
+        /// Auto-advance (`handle_claim`) and every later reader take a
+        /// Waypoint's intent/command/outputs from here, never from
+        /// `Route::load`, so a file edited after submit cannot change
+        /// what a Work already reserved. Additive, `#[serde(default)]`
         /// so a `WorkSubmitted` written before this field existed still
-        /// folds (`work_submitted_without_wp2_command_field_still_folds`
-        /// pins it) — same shape as `RunLaunched.actor_kind` (W1, 0041
-        /// D129). Absent (or a non-`--command` submit) falls back to
-        /// `PROVING_WP2_COMMAND` in `server.rs`.
+        /// folds (`old_worksubmitted_without_waypoint_defs_still_folds`
+        /// pins it); empty for a submit that named no Route file (a
+        /// bare-name submit still taking the hardcoded Route this
+        /// wave).
         #[serde(default)]
-        wp2_command: Option<Vec<String>>,
+        waypoint_defs: Vec<WaypointDefinition>,
     },
     /// Journals the compiled World at reservation (BRIEF.md Intent;
     /// evidence/work/p1-executor-design/orient/world.md §5) so a
@@ -749,7 +880,7 @@ pub fn fold(events: &[Event]) -> Work {
                 repositories,
                 intent,
                 waypoints,
-                wp2_command: _,
+                waypoint_defs: _,
             } = &event.kind
             {
                 route_waypoints = waypoints.clone();

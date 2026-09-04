@@ -1,0 +1,18 @@
+{
+  "id": "proving",
+  "waypoints": [
+    {
+      "id": "proving/wp-1",
+      "kind": "Actor",
+      "intent": "write report.md",
+      "declared_outputs": [{"name": "report.md", "required": true}],
+      "boundary": ["**"]
+    },
+    {
+      "id": "proving/wp-2",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "wc -l < report.md > summary.md"],
+      "declared_outputs": [{"name": "summary.md", "required": true}]
+    }
+  ]
+}

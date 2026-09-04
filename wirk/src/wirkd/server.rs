@@ -11,10 +11,16 @@
 //! never serialized behind one lock (transport.md §5, sergeant issues
 //! 334/358 answered by construction).
 //!
-//! `submit` constructs one hardcoded "smoke" `Route` in code (R6, no
-//! Route-authoring format built yet): `RouteId("smoke")`, one
-//! `WaypointDefinition { kind: Actor, declared_outputs: [{name:
-//! "report.md", required: true}] }`. `claim` locates the Work's journal
+//! `submit` requires `--route <name or path>` and loads it via
+//! `wirk_core::load_route` (p2-route-files W2, build-brief.md §7.3),
+//! except the Route-less ad hoc `--kind deterministic --command
+//! <argv...>` single-Waypoint Work, which synthesizes its own
+//! `WaypointDefinition` instead. Either way the full Route content is
+//! journaled onto `WorkSubmitted.waypoint_defs` (§7.1): every later
+//! reader — the World reserved here, `handle_claim`'s validation and
+//! auto-advance — takes a Waypoint's kind/intent/command/outputs from
+//! there, never by loading the file a second time or by a hardcoded
+//! lookup. `claim` locates the Work's journal
 //! by the triple's `work_id`, folds it to find the named `Run` (a
 //! `RunId` with no matching `RunOpened` is `Refused(TripleMismatch)`,
 //! recorded not honored — D9#4), then runs `validate_claim`, then two
@@ -56,7 +62,7 @@ use wirk_core::{
     ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple, FailureCause, Journal,
     JournalError, OutputContract, Route, RouteId, Run, RunId, RunState, Timestamp,
     WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash, fold,
-    validate_claim,
+    load_route, validate_claim,
 };
 
 use super::{
@@ -76,76 +82,6 @@ enum Outcome {
 /// pointer file (transport.md §2-3).
 const PROTOCOL_VERSION: u32 = 1;
 
-/// The hardcoded "smoke" Route's single Waypoint (R6, build-brief.md §3
-/// W3): every `submit` reserves this one Waypoint, every `claim`
-/// validates against it. A Route-authoring format is not this item's.
-fn smoke_waypoint(id: WaypointId) -> WaypointDefinition {
-    WaypointDefinition {
-        id,
-        kind: WaypointKind::Actor,
-        declared_outputs: vec![ArtifactSpec {
-            name: "report.md".to_string(),
-            required: true,
-        }],
-    }
-}
-
-/// The hardcoded "proving" Route (item 8, `orient/route.md` §1, R6):
-/// two Waypoints, wp-1 Actor (writes `report.md`), wp-2 Deterministic
-/// (counts its lines into `summary.md`) — a second smoke-shaped Route,
-/// named as scaffolding beside `smoke_waypoint`, same footing (0034
-/// D107 "holds until a Route file format exists"). Selected by
-/// `SubmitPayload.route == Some("proving")`; `handle_claim`'s
-/// auto-advance reserves wp-2 once wp-1's Claim is Validated.
-fn proving_route() -> Route {
-    Route {
-        id: RouteId("proving".to_string()),
-        waypoints: vec![
-            WaypointDefinition {
-                id: WaypointId("proving/wp-1".to_string()),
-                kind: WaypointKind::Actor,
-                declared_outputs: vec![ArtifactSpec {
-                    name: "report.md".to_string(),
-                    required: true,
-                }],
-            },
-            WaypointDefinition {
-                id: WaypointId("proving/wp-2".to_string()),
-                kind: WaypointKind::Deterministic,
-                declared_outputs: vec![ArtifactSpec {
-                    name: "summary.md".to_string(),
-                    required: true,
-                }],
-            },
-        ],
-    }
-}
-
-/// wp-2's fixed command (R6, `orient/route.md` §1): hardcoded alongside
-/// the Route itself, since `WaypointDefinition` carries no command
-/// field — that lives on `DeterministicWorld`, built once at
-/// reservation, not on the Route (no core-type change this item).
-/// Redirect form so `summary.md` holds only the line count, not
-/// `report.md`'s own name.
-const PROVING_WP2_COMMAND: [&str; 3] = ["sh", "-c", "wc -l < report.md > summary.md"];
-
-/// Looks up the hardcoded Route named by `id` (R6, `orient/route.md`
-/// §2): `"proving"` selects the two-Waypoint proving Route above,
-/// anything else (including `"smoke"`, the default) the original
-/// one-Waypoint smoke Route. `handle_claim`'s validation and
-/// auto-advance both key off this instead of calling `smoke_waypoint`
-/// directly, so a Work submitted on a non-smoke Route is validated
-/// against its own Waypoints, not the smoke one.
-fn route_definition(id: &RouteId) -> Route {
-    if id.0 == "proving" {
-        return proving_route();
-    }
-    Route {
-        id: RouteId("smoke".to_string()),
-        waypoints: vec![smoke_waypoint(WaypointId("smoke/wp-1".to_string()))],
-    }
-}
-
 /// The ordered Waypoint ids `WorkSubmitted` named for this Work — the
 /// same field `wirk_core::fold`'s own reducer reads into its private
 /// `route_waypoints` local (`wirk-core/src/lib.rs`), inlined here
@@ -162,18 +98,25 @@ fn route_waypoints(events: &[Event]) -> Vec<WaypointId> {
         .unwrap_or_default()
 }
 
-/// The submitted `--command` argv this Work's `WorkSubmitted` carried
-/// (`orient/route.md` §2/§5, R2 shape of `route_waypoints` above):
-/// `None` when the submit carried no `--command` (or no `WorkSubmitted`
-/// is present at all) — `handle_claim`'s auto-advance falls back to
-/// `PROVING_WP2_COMMAND` itself in that case, kept out of this function
-/// so it stays a pure read of the journal, same shape as
-/// `route_waypoints`.
-fn wp2_command_for(events: &[Event]) -> Option<Vec<String>> {
-    events.iter().find_map(|event| match &event.kind {
-        EventKind::WorkSubmitted { wp2_command, .. } => wp2_command.clone(),
-        _ => None,
-    })
+/// p2-route-files W2 (build-brief.md §7.1, format.md §4): every Work's
+/// own `WaypointDefinition`s, as `WorkSubmitted.waypoint_defs` journaled
+/// them at submit — a loaded Route file's own Waypoints, or the ad hoc
+/// deterministic path's single synthesized one (`handle_submit`, below;
+/// no submit leaves this empty any more). `handle_claim`'s validation
+/// and auto-advance both read a Waypoint's kind/intent/command/outputs
+/// from here, never by re-reading the Route file, so an edit to the
+/// file after submit cannot change what a Work already reserved (§7.1's
+/// own test). Empty only for a journal line written before this field
+/// existed (`old_worksubmitted_without_waypoint_defs_field_still_folds`,
+/// this campaign's own evidence, none in production).
+fn waypoint_defs_for(events: &[Event]) -> Vec<WaypointDefinition> {
+    events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::WorkSubmitted { waypoint_defs, .. } => Some(waypoint_defs.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Everything wirkd can fail at during startup — bind, pointer write, or
@@ -634,43 +577,35 @@ fn handle_ping() -> Reply {
     }))
 }
 
+/// p2-route-files (format.md §2): a `--route` value is path-like when
+/// it contains `/` or ends `.json`; `resolve_route_path` (below) is the
+/// only caller.
+fn is_route_path(spec: &str) -> bool {
+    spec.contains('/') || spec.ends_with(".json")
+}
+
+/// p2-route-files W2 (format.md §2, build-brief.md §7.3): a path-like
+/// `--route` value (`is_route_path`) resolves cwd-relative or absolute,
+/// same as any other path `std::fs` opens; a bare name resolves against
+/// the estate's own `routes/` directory — `--route proving`/`smoke` now
+/// name `<estate_root>/routes/proving.json`/`smoke.json`, never a
+/// hardcoded Route in this binary.
+fn resolve_route_path(estate_root: &Path, spec: &str) -> PathBuf {
+    if is_route_path(spec) {
+        PathBuf::from(spec)
+    } else {
+        estate_root.join("routes").join(format!("{spec}.json"))
+    }
+}
+
 fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
     let work_id = WorkId(mint_id("work"));
     let run_id = RunId(mint_id("run"));
-    // `--route proving` selects the two-Waypoint proving Route (item 8,
-    // `orient/route.md` §2); absent or any other value keeps today's
-    // one-Waypoint "smoke" Route (R6, additive — every existing caller
-    // that never sets `route` is unaffected). Only wp-1 is reserved and
-    // opened here either way; wp-2 (proving only) is reserved by
-    // `handle_claim`'s auto-advance once wp-1's Claim is Validated.
-    let proving = payload.route.as_deref() == Some("proving");
-    let route = if proving {
-        proving_route()
-    } else {
-        route_definition(&RouteId("smoke".to_string()))
-    };
-    let route_id = route.id.clone();
-    let waypoint_id = route.waypoints[0].id.clone();
-    let all_waypoints: Vec<WaypointId> = route.waypoints.iter().map(|w| w.id.clone()).collect();
 
-    let triple = ExecutionTriple {
-        estate_root: state.estate_root.display().to_string(),
-        work_id: work_id.clone(),
-        run_id: run_id.clone(),
-    };
-    let output_contract = OutputContract(vec![ArtifactSpec {
-        name: "report.md".to_string(),
-        required: true,
-    }]);
-    let branch = format!("wirk/{}", work_id.0);
-
-    // W3 (build-brief.md §3 W3, both items): `--kind deterministic
-    // --command <argv...>` (item 5) reserves a `World::Deterministic`;
-    // `--kind actor --repo-path <path>` (item 4) reserves an `ActorWorld`
-    // with `base_ref` resolved to a commit SHA and an empty
-    // `worktree_path` filled in later by `wirk run`; `kind` absent or
-    // any other value keeps today's original "smoke" World unchanged —
-    // `worktree_path: state.estate_root`, the raw unresolved `base_ref`.
+    // W3 (build-brief.md §3 W3): `--kind deterministic --command
+    // <argv...>` is the one submit shape that carries no Route at all
+    // (build-brief.md §7.3) — every other submit, `--kind actor
+    // --repo-path <path>` or bare, must name `--route`.
     let deterministic = payload.kind.as_deref() == Some("deterministic");
     if deterministic && payload.command.as_ref().is_none_or(|c| c.is_empty()) {
         return err_reply(
@@ -679,57 +614,121 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         );
     }
 
-    let world = if deterministic {
-        World::Deterministic(DeterministicWorld {
-            command: payload.command.clone().unwrap_or_default(),
+    // p2-route-files W2 (build-brief.md §7.1, §7.3): `route` is `None`
+    // only for the ad hoc deterministic path above, whose own single
+    // Waypoint is synthesized below instead of loaded from a file —
+    // either way `waypoint_defs` ends up with the full, ordered
+    // Waypoint definitions this Work reserves, read once here and never
+    // reloaded (auto-advance and validation both read it back off the
+    // journal, `waypoint_defs_for`).
+    let (route, waypoint_defs): (Option<Route>, Vec<WaypointDefinition>) = if deterministic {
+        (
+            None,
+            vec![WaypointDefinition {
+                id: WaypointId("ad-hoc/wp-1".to_string()),
+                kind: WaypointKind::Deterministic,
+                declared_outputs: vec![ArtifactSpec {
+                    name: "report.md".to_string(),
+                    required: true,
+                }],
+                intent: None,
+                command: payload.command.clone(),
+                boundary: Boundary(Vec::new()),
+            }],
+        )
+    } else {
+        let Some(spec) = payload.route.as_deref() else {
+            return err_reply(
+                "BadRequest",
+                "--route is required unless --kind deterministic --command is used",
+            );
+        };
+        match load_route(&resolve_route_path(&state.estate_root, spec)) {
+            Ok(route) => {
+                let defs = route.waypoints.clone();
+                (Some(route), defs)
+            }
+            Err(err) => return err_reply("RouteError", &err.to_string()),
+        }
+    };
+    let route_id = route
+        .as_ref()
+        .map(|r| r.id.clone())
+        .unwrap_or_else(|| RouteId("ad-hoc".to_string()));
+    let first_def = waypoint_defs[0].clone();
+    let waypoint_id = first_def.id.clone();
+    let all_waypoints: Vec<WaypointId> = waypoint_defs.iter().map(|w| w.id.clone()).collect();
+
+    let triple = ExecutionTriple {
+        estate_root: state.estate_root.display().to_string(),
+        work_id: work_id.clone(),
+        run_id: run_id.clone(),
+    };
+    let output_contract = OutputContract(first_def.declared_outputs.clone());
+    let branch = format!("wirk/{}", work_id.0);
+
+    // The reserved World's own kind follows the *Route's* first
+    // Waypoint (`first_def.kind`), not `payload.kind` directly — a
+    // Route file's own authored order decides what gets reserved first
+    // (build-brief.md §7.3's own "advances in the file's order", the
+    // same rule auto-advance already applies to every later Waypoint,
+    // `next_def.kind` below).
+    let world = match first_def.kind {
+        WaypointKind::Deterministic => World::Deterministic(DeterministicWorld {
+            command: first_def.command.clone().unwrap_or_default(),
             base_sha: payload.base_ref.clone(),
             cwd: state.estate_root.clone(),
             env: BTreeMap::new(),
             expected_artifacts: output_contract,
-        })
-    } else if payload.kind.as_deref() == Some("actor") {
-        let Some(repo_path) = payload.repo_path.clone() else {
-            return err_reply("BadRequest", "--repo-path is required for --kind actor");
-        };
-        // Issue 285: resolve `base_ref` to a commit SHA with git at
-        // submit time, so the World reserved here — not the worktree
-        // `wirk run` creates later — is what pins the base. An empty or
-        // unresolvable ref refuses submit rather than reserving a World
-        // whose base can never be honoured.
-        let base_sha = match resolve_git_sha(&repo_path, &payload.base_ref) {
-            Ok(sha) => sha,
-            Err(detail) => return err_reply("GitError", &detail),
-        };
-        World::Actor(ActorWorld {
-            repository: repo_path.clone(),
-            // Empty until `wirk run` creates the worktree and records
-            // the update (`handle_record`, `RecordPayload`'s doc
-            // comment): the World is reserved before any worktree
-            // exists.
-            worktree_path: PathBuf::new(),
-            branch,
-            base_sha,
-            triple,
-            intent: payload.intent.clone(),
-            output_contract,
-            boundary: Boundary(vec![repo_path]),
-        })
-    } else {
-        let repository = payload
-            .repositories
-            .first()
-            .map(|binding| binding.name.clone())
-            .unwrap_or_else(|| "smoke".to_string());
-        World::Actor(ActorWorld {
-            repository,
-            worktree_path: state.estate_root.clone(),
-            branch,
-            base_sha: payload.base_ref.clone(),
-            triple,
-            intent: payload.intent.clone(),
-            output_contract,
-            boundary: Boundary(Vec::new()),
-        })
+        }),
+        WaypointKind::Actor if payload.kind.as_deref() == Some("actor") => {
+            let Some(repo_path) = payload.repo_path.clone() else {
+                return err_reply("BadRequest", "--repo-path is required for --kind actor");
+            };
+            // Issue 285: resolve `base_ref` to a commit SHA with git at
+            // submit time, so the World reserved here — not the
+            // worktree `wirk run` creates later — is what pins the
+            // base. An empty or unresolvable ref refuses submit rather
+            // than reserving a World whose base can never be honoured.
+            let base_sha = match resolve_git_sha(&repo_path, &payload.base_ref) {
+                Ok(sha) => sha,
+                Err(detail) => return err_reply("GitError", &detail),
+            };
+            World::Actor(ActorWorld {
+                repository: repo_path.clone(),
+                // Empty until `wirk run` creates the worktree and
+                // records the update (`handle_record`, `RecordPayload`'s
+                // doc comment): the World is reserved before any
+                // worktree exists.
+                worktree_path: PathBuf::new(),
+                branch,
+                base_sha,
+                triple,
+                // p2-route-files W2 (`--intent` removed, J1): the
+                // Waypoint's own authored intent, never the submit
+                // line's.
+                intent: first_def.intent.clone().unwrap_or_default(),
+                output_contract,
+                boundary: Boundary(vec![repo_path]),
+            })
+        }
+        WaypointKind::Actor => {
+            let repository = payload
+                .repositories
+                .first()
+                .map(|binding| binding.name.clone())
+                .unwrap_or_else(|| route_id.0.clone());
+            World::Actor(ActorWorld {
+                repository,
+                worktree_path: state.estate_root.clone(),
+                branch,
+                base_sha: payload.base_ref.clone(),
+                triple,
+                intent: first_def.intent.clone().unwrap_or_default(),
+                output_contract,
+                boundary: Boundary(Vec::new()),
+            })
+        }
     };
     let world_hash = WorldHash::of(&world);
 
@@ -747,13 +746,13 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             repositories: payload.repositories,
             intent: payload.intent,
             waypoints: all_waypoints,
-            // W3 (route.md §2/§8, build-brief.md §7.1): carried
-            // unconditionally, not only for `--kind actor` — harmless for
-            // a `--kind deterministic`/smoke submit (nothing reads it
-            // back unless this Work's Route later auto-advances to a
-            // Deterministic Waypoint), and avoids a second `payload.kind`
-            // branch here (R6).
-            wp2_command: payload.command,
+            // p2-route-files W2 (build-brief.md §7.1): the full,
+            // ordered Waypoint definitions this Work reserves — a
+            // loaded Route file's own Waypoints, or the ad hoc
+            // deterministic path's single synthesized one — journaled
+            // whole so `handle_claim`'s validation and auto-advance
+            // never re-read the file (or reconstruct a fallback) again.
+            waypoint_defs,
         },
     );
     let reserved = new_event(
@@ -912,13 +911,32 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         );
     }
 
-    let route = route_definition(&work.route);
-    let waypoint = route
-        .waypoints
+    // p2-route-files W2 (build-brief.md §7.1): every submit journals
+    // the full Waypoint definitions it reserves onto
+    // `WorkSubmitted.waypoint_defs` (`handle_submit`, above) — this is
+    // the only place a Waypoint's kind/intent/command/outputs come
+    // from, never a hardcoded lookup and never a second read of the
+    // Route file. A Run whose Waypoint has no matching definition is a
+    // data-integrity problem no valid submit can produce (every submit
+    // path populates `waypoint_defs` unconditionally), so it is refused
+    // the same way a mismatched triple is (D9#4's own reasoning) rather
+    // than guessing at a fallback shape.
+    let journaled_defs = waypoint_defs_for(&events);
+    let Some(waypoint) = journaled_defs
         .iter()
         .find(|def| def.id == run.waypoint)
         .cloned()
-        .unwrap_or_else(|| smoke_waypoint(run.waypoint.clone()));
+    else {
+        return record_and_reply(
+            state,
+            &mut journal,
+            &work_id,
+            &run_id,
+            claim_id,
+            payload.kind,
+            ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
+        );
+    };
     let mut verdict = validate_claim(&waypoint, &run, &claim);
 
     if matches!(verdict, ClaimVerdict::Validated)
@@ -957,7 +975,7 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         if !is_last
             && let Some(pos) = waypoints.iter().position(|w| w == &run.waypoint)
             && let Some(next_id) = waypoints.get(pos + 1)
-            && let Some(next_def) = route.waypoints.iter().find(|def| &def.id == next_id)
+            && let Some(next_def) = journaled_defs.iter().find(|def| &def.id == next_id)
         {
             let cwd = worktree_path_for_run(&events, &run_id)
                 .unwrap_or_else(|| state.estate_root.clone());
@@ -968,17 +986,15 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 })
                 .unwrap_or_default();
             let next_world = match next_def.kind {
-                // W3 (route.md §2/§8, build-brief.md §7.1): the
-                // Work's own submitted `wp2_command` (an actor-kind
-                // submit's `--command`) wins when present; proving's
-                // own wp-2 is the only Deterministic Waypoint any
-                // hardcoded Route advances to today, so absent that,
-                // `PROVING_WP2_COMMAND` (hardcoded alongside the Route
-                // itself) is the fallback.
+                // p2-route-files W2 (build-brief.md §7.1): the next
+                // Waypoint's own journaled definition carries its
+                // command directly — `load_route` already refused a
+                // Deterministic Waypoint with no command at submit
+                // (`RouteError::DeterministicMissingCommand`), so this
+                // is always `Some` for a Route a Work could ever have
+                // been submitted against.
                 WaypointKind::Deterministic => Some(World::Deterministic(DeterministicWorld {
-                    command: wp2_command_for(&events).unwrap_or_else(|| {
-                        PROVING_WP2_COMMAND.iter().map(|s| s.to_string()).collect()
-                    }),
+                    command: next_def.command.clone().unwrap_or_default(),
                     base_sha,
                     cwd,
                     // Every cargo the child executor runs uses the one
@@ -990,9 +1006,10 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                     )]),
                     expected_artifacts: OutputContract(next_def.declared_outputs.clone()),
                 })),
-                // No hardcoded Route advances Actor-to-Actor today
-                // (R1: nothing needs it) — left unadvanced rather than
-                // guessing an intent/repo_path for a second pane.
+                // No Route this item's dogfood needs advances
+                // Actor-to-Actor (R1: nothing needs it) — left
+                // unadvanced rather than guessing an intent/repo_path
+                // for a second pane.
                 WaypointKind::Actor => None,
             };
             if let Some(next_world) = next_world {
@@ -1399,15 +1416,6 @@ mod tests {
     use super::*;
 
     fn work_submitted_event(waypoints: Vec<&str>) -> Event {
-        work_submitted_event_with_command(waypoints, None)
-    }
-
-    /// W3: same as `work_submitted_event`, with the submitted
-    /// `wp2_command` also settable, for `wp2_command_for`'s own test.
-    fn work_submitted_event_with_command(
-        waypoints: Vec<&str>,
-        wp2_command: Option<Vec<&str>>,
-    ) -> Event {
         Event {
             id: wirk_core::EventId(String::new()),
             work: WorkId("work-1".to_string()),
@@ -1421,34 +1429,9 @@ mod tests {
                     .into_iter()
                     .map(|id| WaypointId(id.to_string()))
                     .collect(),
-                wp2_command: wp2_command.map(|cmd| cmd.into_iter().map(String::from).collect()),
+                waypoint_defs: Vec::new(),
             },
         }
-    }
-
-    /// `wp2_command_for` (`orient/route.md` §5): the submitted command
-    /// wins when present, `None` when absent — `handle_claim`'s
-    /// auto-advance falls the latter back to `PROVING_WP2_COMMAND`
-    /// itself, not this function's job.
-    #[test]
-    fn wp2_command_for_reads_workssubmitted_or_falls_back_to_none() {
-        let submitted = vec![work_submitted_event_with_command(
-            vec!["proving/wp-1", "proving/wp-2"],
-            Some(vec!["sh", "-c", "cargo test"]),
-        )];
-        assert_eq!(
-            wp2_command_for(&submitted),
-            Some(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "cargo test".to_string()
-            ])
-        );
-
-        let absent = vec![work_submitted_event(vec!["proving/wp-1", "proving/wp-2"])];
-        assert_eq!(wp2_command_for(&absent), None);
-
-        assert_eq!(wp2_command_for(&[]), None);
     }
 
     /// `route_waypoints` reads the ordered ids straight off the Work's
@@ -1475,30 +1458,23 @@ mod tests {
         assert_eq!(route_waypoints(&[]), Vec::<WaypointId>::new());
     }
 
-    /// `route_definition("proving")` names two Waypoints, wp-1 Actor
-    /// then wp-2 Deterministic, in that order (`orient/route.md` §1) —
-    /// any other id (including `"smoke"`) stays the original single
-    /// Actor Waypoint.
+    /// p2-route-files W2 (format.md §2): a bare name resolves against
+    /// the estate's own `routes/` directory; a path-like value (a `/`
+    /// or a `.json` suffix) resolves as the literal path, unchanged.
     #[test]
-    fn route_definition_selects_proving_or_falls_back_to_smoke() {
-        let proving = route_definition(&RouteId("proving".to_string()));
-        assert_eq!(proving.waypoints.len(), 2);
+    fn resolve_route_path_bare_name_vs_path() {
+        let estate = Path::new("/tmp/some-estate");
         assert_eq!(
-            proving.waypoints[0].id,
-            WaypointId("proving/wp-1".to_string())
+            resolve_route_path(estate, "proving"),
+            estate.join("routes").join("proving.json")
         );
-        assert_eq!(proving.waypoints[0].kind, WaypointKind::Actor);
         assert_eq!(
-            proving.waypoints[1].id,
-            WaypointId("proving/wp-2".to_string())
+            resolve_route_path(estate, "./my-route.json"),
+            PathBuf::from("./my-route.json")
         );
-        assert_eq!(proving.waypoints[1].kind, WaypointKind::Deterministic);
-
-        let smoke = route_definition(&RouteId("smoke".to_string()));
-        assert_eq!(smoke.waypoints.len(), 1);
-        assert_eq!(smoke.waypoints[0].kind, WaypointKind::Actor);
-
-        let other = route_definition(&RouteId("anything-else".to_string()));
-        assert_eq!(other.waypoints.len(), 1);
+        assert_eq!(
+            resolve_route_path(estate, "/abs/route.json"),
+            PathBuf::from("/abs/route.json")
+        );
     }
 }

@@ -58,16 +58,16 @@ impl Drop for KillOnDrop {
 }
 
 /// Runs `wirk work submit --kind deterministic --command <command>`
-/// (the `--repo`/`--base` values are fixed smoke-Route filler, same as
-/// `wirkd_process.rs::submit` — no Route authoring exists yet, R6) and
-/// parses its `work_id <id> run_id <id> waypoint <id>` stdout line.
+/// (the `--repo`/`--base` values are fixed filler, same as
+/// `wirkd_process.rs::submit` — this is the Route-less ad hoc shape,
+/// build-brief.md §7.3, R6) and parses its `work_id <id> run_id <id>
+/// waypoint <id>` stdout line. No `--intent`: removed from `wirk work
+/// submit` (p2-route-files W2, J1).
 fn submit_deterministic(estate: &Path, command: &[&str]) -> (String, String) {
     let output = Command::new(wirk_bin())
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args([
-            "--intent",
-            "smoke",
             "--repo",
             "demo:write",
             "--base",
@@ -282,11 +282,11 @@ fn run_deterministic_child_blocks_past_a_real_delay_with_no_deadline() {
 }
 
 /// A `--command` argv not fenced with `--` that still carries one of
-/// `work submit`'s own flags (`--base`/`--repo`/`--intent` here) is
-/// ambiguous — the command's argv and the submit flags can no longer be
-/// told apart — so `work submit` must refuse with the usage line (exit
-/// 1, empty stdout) before building the payload or ever calling
-/// wirkd. No daemon is started or expected for this shape.
+/// `work submit`'s own flags (`--base`/`--repo` here) is ambiguous —
+/// the command's argv and the submit flags can no longer be told apart
+/// — so `work submit` must refuse with the usage line (exit 1, empty
+/// stdout) before building the payload or ever calling wirkd. No
+/// daemon is started or expected for this shape.
 #[test]
 fn submit_command_rejects_unfenced_flag_after_command() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -295,14 +295,7 @@ fn submit_command_rejects_unfenced_flag_after_command() {
         .arg(dir.path())
         .args(["--route", "smoke", "--kind", "deterministic", "--command"])
         .args(["sh", "-c", "echo x > report.md"])
-        .args([
-            "--base",
-            "deadbeef",
-            "--repo",
-            "demo:write",
-            "--intent",
-            "t",
-        ])
+        .args(["--base", "deadbeef", "--repo", "demo:write"])
         .output()
         .expect("work submit runs");
     assert_eq!(

@@ -1,0 +1,17 @@
+{
+  "id": "proving-reversed",
+  "waypoints": [
+    {
+      "id": "proving-reversed/wp-2",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "echo the-report > report.md"],
+      "declared_outputs": [{"name": "report.md", "required": true}]
+    },
+    {
+      "id": "proving-reversed/wp-1",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "wc -l < report.md > summary.md"],
+      "declared_outputs": [{"name": "summary.md", "required": true}]
+    }
+  ]
+}

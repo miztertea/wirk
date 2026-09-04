@@ -81,23 +81,14 @@ fn wait_for_pointer_live(estate: &Path) -> WirkdPointer {
     }
 }
 
-fn submit_deterministic(
-    estate: &Path,
-    base: &str,
-    intent: &str,
-    command: &[&str],
-) -> (String, String, String) {
+/// No `--intent`: removed from `wirk work submit` (p2-route-files W2,
+/// J1) — this is the Route-less ad hoc `--kind deterministic --command`
+/// shape (build-brief.md §7.3).
+fn submit_deterministic(estate: &Path, base: &str, command: &[&str]) -> (String, String, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_wirk"));
     cmd.args(["work", "submit", "--estate"])
         .arg(estate)
-        .args([
-            "--intent",
-            intent,
-            "--kind",
-            "deterministic",
-            "--base",
-            base,
-        ])
+        .args(["--kind", "deterministic", "--base", base])
         .args(["--repo", "demo:write", "--command"])
         .args(command);
     let output = cmd.output().expect("work submit runs");
@@ -313,12 +304,8 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
             .expect("spawn wirkd"),
     );
     wait_for_pointer_live(&estate);
-    let (work_id, run_id, waypoint) = submit_deterministic(
-        &estate,
-        "abc123",
-        "d5_9 tried live",
-        &["sh", "-c", "echo hi > report.md"],
-    );
+    let (work_id, run_id, waypoint) =
+        submit_deterministic(&estate, "abc123", &["sh", "-c", "echo hi > report.md"]);
 
     let executor = DockerExecutor::new(estate.clone(), WorkId(work_id.clone()));
     let run = Run {

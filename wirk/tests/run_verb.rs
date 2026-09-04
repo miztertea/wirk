@@ -36,6 +36,8 @@
 
 #[path = "../../wirk-herdr/tests/support/live_herdr.rs"]
 mod live_herdr;
+#[path = "support/route_fixture.rs"]
+mod route_fixture;
 #[path = "../src/wirkd/mod.rs"]
 mod wirkd;
 
@@ -113,16 +115,24 @@ fn git_rev_parse(dir: &Path, rev: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// `wirk work submit --estate <estate> --intent <text> --kind actor
-/// --repo-path <repo> --base HEAD`, parsing its `work_id <id> run_id
-/// <id> waypoint <id>` stdout line (same parse `wirkd_process.rs`'s
-/// `submit` uses, R6 duplicate — the two tests submit different World
-/// kinds).
+/// Writes a single-Waypoint Actor Route (`smoke_waypoint`'s old shape,
+/// now authored per call so each test's own distinctive intent lands
+/// in the file, p2-route-files W2) as `<estate>/routes/smoke.json`,
+/// then `wirk work submit --estate <estate> --route smoke --kind actor
+/// --repo-path <repo> --base HEAD` (no `--intent`, removed), parsing
+/// its `work_id <id> run_id <id> waypoint <id>` stdout line (same parse
+/// `wirkd_process.rs`'s `submit` uses, R6 duplicate — the two tests
+/// submit different World kinds).
 fn submit_actor(estate: &Path, repo: &Path, intent: &str) -> (String, String, String) {
+    let route_json = format!(
+        r#"{{"id":"smoke","waypoints":[{{"id":"smoke/wp-1","kind":"Actor","intent":{intent:?},"declared_outputs":[{{"name":"report.md","required":true}}],"boundary":["**"]}}]}}"#
+    );
+    route_fixture::write_route(estate, "smoke", &route_json);
+
     let output = Command::new(wirk_bin())
         .args(["work", "submit", "--estate"])
         .arg(estate)
-        .args(["--intent", intent, "--kind", "actor", "--repo-path"])
+        .args(["--route", "smoke", "--kind", "actor", "--repo-path"])
         .arg(repo)
         .args(["--base", "HEAD"])
         .output()

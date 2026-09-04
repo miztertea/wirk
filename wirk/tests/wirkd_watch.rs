@@ -5,6 +5,8 @@
 //! client::watch` directly — the client side is a plain library call
 //! over the real socket, never a fake server (0040 D127).
 
+#[path = "support/route_fixture.rs"]
+mod route_fixture;
 #[path = "../src/wirkd/mod.rs"]
 mod wirkd;
 
@@ -51,8 +53,11 @@ impl Drop for KillOnDrop {
 
 /// Submits a Work directly over the socket (`submit`'s own verb, R6 —
 /// no CLI round trip needed for what this file tests) and returns its
-/// `WorkId`.
-fn submit(socket: &Path, intent: &str) -> WorkId {
+/// `WorkId`. `--route` is required now (p2-route-files W2), so the
+/// estate's own copy of the canonical `smoke.json` fixture is installed
+/// first — this file's own tests are about `watch`, not Route content.
+fn submit(estate: &Path, socket: &Path, intent: &str) -> WorkId {
+    route_fixture::install_route_fixture(estate, "smoke");
     let reply = wirkd::client::call(
         socket,
         &Request::submit(SubmitPayload {
@@ -65,7 +70,7 @@ fn submit(socket: &Path, intent: &str) -> WorkId {
             kind: None,
             command: None,
             repo_path: None,
-            route: None,
+            route: Some("smoke".to_string()),
         }),
     )
     .expect("submit call reaches wirkd");
@@ -150,7 +155,7 @@ fn a_watcher_sees_events_before_and_after_it_dials() {
             .expect("spawn wirkd"),
     );
     let pointer = wait_for_pointer(&estate);
-    let work_id = submit(&pointer.socket, "watch test");
+    let work_id = submit(&estate, &pointer.socket, "watch test");
 
     // 8a: dial before any further append — the watcher must at least
     // see everything `submit` itself already journaled.
@@ -232,8 +237,8 @@ fn a_second_works_appends_are_not_delivered_to_the_first_works_watcher() {
             .expect("spawn wirkd"),
     );
     let pointer = wait_for_pointer(&estate);
-    let work_a = submit(&pointer.socket, "work a");
-    let work_b = submit(&pointer.socket, "work b");
+    let work_a = submit(&estate, &pointer.socket, "work a");
+    let work_b = submit(&estate, &pointer.socket, "work b");
 
     let (rx_a, _handle_a) = spawn_watch(&pointer.socket, &work_a);
     // Drain work_a's own submit-time events first.
@@ -286,7 +291,7 @@ fn wirkd_stopping_ends_the_watch_stream_for_the_client() {
             .expect("spawn wirkd"),
     );
     let pointer = wait_for_pointer(&estate);
-    let work_id = submit(&pointer.socket, "watch eof test");
+    let work_id = submit(&estate, &pointer.socket, "watch eof test");
 
     let (rx, handle) = spawn_watch(&pointer.socket, &work_id);
     let _ = recv_event(&rx, "the WorkSubmitted event submit already journaled");
