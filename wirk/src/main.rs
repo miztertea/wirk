@@ -49,9 +49,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod wirkd;
 
 // Deterministic (child/docker) executors, wirk-owned per 0001 D4, in
-// the `wirk` bin per 0022 D78 (no fifth crate). W1 (this wave, item 5
-// build-brief.md §3): `ChildExecutor`. `DockerExecutor` is W2.
+// the `wirk` bin per 0022 D78 (no fifth crate). W1 (item 5 build-brief.md
+// §3): `ChildExecutor`. `DockerExecutor` is W2.
 mod executors;
+
+// `wirk run` (item 4, W3, `knowledge/work/p1-herdr-executor/orient/
+// build-brief.md`): drives one Actor Waypoint's Run against a live
+// Herdr session and wirkd via `wirk_herdr::run_loop::RunLoop`.
+mod executor;
 
 use wirkd::{ClaimPayload, FailPayload, Reply, Request, SubmitPayload};
 
@@ -79,9 +84,10 @@ fn main() -> ExitCode {
         Some("wirkd") => wirkd_command(&args[2..]),
         Some("work") => work_command(&args[2..]),
         Some("run-deterministic") => run_deterministic_command(&args[2..]),
+        Some("run") => executor::run_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping --estate <root> | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind deterministic --command <argv...>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping --estate <root> | wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind actor|deterministic --repo-path <path> | --command <argv...>] | wirk run --estate <root> --work <id> --session <name> [--nudge-after <secs>] [--herdr-socket <path>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker"
             );
             ExitCode::FAILURE
         }
@@ -261,7 +267,11 @@ fn wirkd_client_call(
 }
 
 /// Dispatches `wirk work <rest>`: `submit --estate <root> --intent
-/// <text> --repo <name>:<read|write> (repeatable) --base <ref>`.
+/// <text> --repo <name>:<read|write> (repeatable) --base <ref>
+/// [--kind actor|deterministic --repo-path <path>]`. `--kind`/
+/// `--repo-path` are item 4's W3 addition (additive: omitted, `submit`
+/// behaves exactly as before — the original hardcoded "smoke" World,
+/// unresolved `base_ref`).
 fn work_command(rest: &[String]) -> ExitCode {
     if rest.first().map(String::as_str) != Some("submit") {
         return work_usage();
@@ -274,7 +284,6 @@ fn work_command(rest: &[String]) -> ExitCode {
         return work_usage();
     };
     let base_ref = flag_value(rest, "--base").unwrap_or_default();
-    let kind = flag_value(rest, "--kind");
 
     let mut repositories = Vec::new();
     let mut command: Option<Vec<String>> = None;
@@ -316,12 +325,16 @@ fn work_command(rest: &[String]) -> ExitCode {
         i += 1;
     }
 
+    let kind = flag_value(rest, "--kind");
+    let repo_path = flag_value(rest, "--repo-path");
+
     let payload = SubmitPayload {
         intent,
         repositories,
         base_ref,
         kind,
         command,
+        repo_path,
     };
     wirkd_client_call(&estate, &Request::submit(payload), |result| {
         println!(
@@ -335,7 +348,7 @@ fn work_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind deterministic --command <argv...>]"
+        "usage: wirk work submit --estate <root> --intent <text> --repo <name>:<read|write> --base <ref> [--kind actor|deterministic --repo-path <path> | --command <argv...>]"
     );
     ExitCode::from(1)
 }

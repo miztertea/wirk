@@ -5,19 +5,31 @@
 //! request and per reply, the Journal's own line-delimited convention
 //! reused (R2).
 //!
-//! Six verbs (transport.md §2, `fail` new this wave): `ping`, `submit`,
-//! `claim`, `status`, `stop`, `fail`. `ping` and `stop` carry no payload
-//! fields; `submit`, `claim`, `status`, `fail` each have a typed
-//! payload struct so a caller does not hand-build JSON, but
-//! `Request.payload` itself stays a `serde_json::Value` — the one shape
-//! both a typed payload (via `Request::submit`/`claim`/`status`/`fail`)
-//! and a scripted fake server's literal JSON (the W2 test) can produce
-//! identically.
+//! Seven verbs (transport.md §2; `record` and `fail` both new since W2):
+//! `ping`, `submit`, `claim`, `status`, `record`, `stop`, `fail`. `ping`
+//! and `stop` carry no payload fields; `submit`, `claim`, `status`,
+//! `record`, `fail` each have a typed payload struct so a caller does
+//! not hand-build JSON, but `Request.payload` itself stays a
+//! `serde_json::Value` — the one shape both a typed payload (via
+//! `Request::submit`/`claim`/`status`/`record`/`fail`) and a scripted
+//! fake server's literal JSON (the W2 test) can produce identically.
 //!
-//! `fail` (W3, `orient/build-brief.md` §3 W3; `orient/child.md` §7 item
-//! 2): the only way `wirk run-deterministic` — a separate `wirk`
-//! invocation from the wirkd it talks to, never a library call into it
-//! — can turn a local executor `launch` error or a
+//! `record` (item 4 W3, `orient/build-brief.md`): appends one
+//! `EventKind` to a Work's journal through the same single write path
+//! `submit`/`claim` already use, for the journal writes `RunLoop` needs
+//! (`RunLaunched`, `RunFailed`, `RunVanished`, `LifecycleObserved`,
+//! `WorktreeCreated`, and a re-emitted `WaypointReserved` carrying the
+//! worktree path once it exists — R1: no new event type for "the
+//! World's worktree_path changed", the existing `WaypointReserved` is
+//! re-recorded with the field filled in, `server.rs` reading the *last*
+//! one). `ClaimFiled`/`ClaimRecorded` are refused through this verb:
+//! those two are written only by `claim`'s own validated path, never by
+//! a caller naming them directly.
+//!
+//! `fail` (item 5 W3, `orient/build-brief.md` §3 W3; `orient/child.md`
+//! §7 item 2): the only way `wirk run-deterministic` — a separate
+//! `wirk` invocation from the wirkd it talks to, never a library call
+//! into it — can turn a local executor `launch` error or a
 //! `RunObservation::Failed` into a journaled `RunFailed`; the Journal
 //! itself lives behind wirkd's own socket, not a handle that process
 //! holds.
@@ -37,7 +49,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use wirk_core::{ClaimKind, ExecutionTriple, RepositoryBinding, WorkId};
+use wirk_core::{ClaimKind, EventKind, ExecutionTriple, RepositoryBinding, RunId, WorkId};
 
 pub mod client;
 pub mod server;
@@ -54,6 +66,7 @@ pub enum Verb {
     Submit,
     Claim,
     Status,
+    Record,
     Stop,
     Fail,
 }
@@ -111,6 +124,17 @@ impl Request {
         }
     }
 
+    /// W3: `RunLoop`'s journal writes and `wirk run`'s own worktree/
+    /// World-update writes, both routed through wirkd's single write
+    /// path rather than opening the Work's journal file directly (item
+    /// 3's design: "the Journal the only writer").
+    pub fn record(payload: RecordPayload) -> Self {
+        Request {
+            verb: Verb::Record,
+            payload: serde_json::to_value(payload).expect("RecordPayload always serializes"),
+        }
+    }
+
     /// `fail`'s request: `run-deterministic`'s own way of journaling a
     /// local executor failure (module doc) — never invented by wirkd
     /// itself.
@@ -128,14 +152,20 @@ impl Request {
 /// W3, R6) — `submit` names only what W3's hardcoded "smoke" Route
 /// needs to open a Run against.
 ///
-/// `kind`/`command` are additive this wave (item 5, `wirk work submit
-/// --kind deterministic --command <argv...>`, kept minimal so item 4's
-/// own sibling branch touching `submit` stays a small merge, per the
-/// task): `#[serde(default)]` so an old caller sending neither field
-/// still deserializes, `kind` absent or `"actor"` keeps today's
-/// hardcoded `ActorWorld` path unchanged, `"deterministic"` (with
-/// `command` non-empty) reserves a `World::Deterministic` instead —
-/// `wirkd`'s own smoke Route stays hardcoded either way (R6).
+/// `kind`/`command`/`repo_path` are additive across both items (item 4's
+/// `--kind actor --repo-path <path>` and item 5's `--kind deterministic
+/// --command <argv...>`, `orient/build-brief.md` "Outcome" for each):
+/// `#[serde(default)]` on all three keeps every existing caller that
+/// never sets them (the W2/W3 item-3 tests) parsing exactly as before,
+/// taking the original "smoke" `World::Actor` path unchanged when `kind`
+/// is absent. `kind: Some("actor")` with a `repo_path` resolves
+/// `base_ref` to a commit SHA with git at submit time (issue 285: an
+/// unresolved ref left the worktree's pin meaningless) and reserves an
+/// `ActorWorld` with an empty `worktree_path` — `wirk run` fills it in
+/// once the worktree exists (`RecordPayload`, below). `kind: Some(
+/// "deterministic")` with `command` non-empty reserves a
+/// `World::Deterministic` instead — `wirkd`'s own smoke Route stays
+/// hardcoded either way (R6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitPayload {
     pub intent: String,
@@ -145,6 +175,8 @@ pub struct SubmitPayload {
     pub kind: Option<String>,
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
 }
 
 /// `claim`'s payload (transport.md §2): the injected
@@ -167,8 +199,23 @@ pub struct StatusPayload {
     pub work_id: WorkId,
 }
 
-/// `fail`'s payload (W3, `run-deterministic`'s own verb, module doc):
-/// the triple names which Work's journal and which Run; `status`/
+/// `record`'s payload (item 4 W3): the `EventKind` to append, the `Work`
+/// it belongs to, and the `Run` it is scoped to when the event kind
+/// carries one (`WaypointReserved`, like `WorkSubmitted`, names no
+/// `Run` — `Event.run` is `None` for both, `wirk-core`'s own
+/// convention, `main.rs`'s `demo_events`). `wirkd` refuses
+/// `ClaimFiled`/`ClaimRecorded` here (`server.rs::handle_record`):
+/// those travel only through `claim`'s own validated path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordPayload {
+    pub work_id: WorkId,
+    #[serde(default)]
+    pub run: Option<RunId>,
+    pub kind: EventKind,
+}
+
+/// `fail`'s payload (item 5 W3, `run-deterministic`'s own verb, module
+/// doc): the triple names which Work's journal and which Run; `status`/
 /// `detail` become `FailureCause.status`/`.detail` verbatim (wirkd
 /// stamps `at`, same as every other server-minted event timestamp) —
 /// wirkd refuses (`TripleMismatch`) a `run_id` naming no `RunOpened` in

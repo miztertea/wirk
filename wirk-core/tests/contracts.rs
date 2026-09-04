@@ -1,10 +1,11 @@
 //! D9 contract tests (0001 D9). Each test is named for its contract
-//! number; #2, #5 (partial), and the World hash resume-key test are real;
-//! #1, #3, #4, #6 are `#[should_panic]` stubs naming the contract stub and
-//! the item that lifts them, per W2 build brief §3 W2 ("the stubs are
-//! `#[should_panic(expected = "D9#<n> contract stub")]` tests: the suite
-//! is green, the stub names its contract, and the item that implements it
-//! removes the attribute and writes the assertion, inheriting its red").
+//! number. All are real as of item 4, W2 (#6's `wirk-core`-side half:
+//! the event carries the exact SHA byte-for-byte; the real `git
+//! worktree add` half lives in `wirk-herdr/tests/run_loop.rs`, since
+//! `wirk-core` cannot depend on `wirk-herdr`, 0001 D7). The original
+//! stub convention (`#[should_panic(expected = "D9#<n> contract
+//! stub")]`, per the W2 (p1-executor-design) build brief §3) is gone
+//! now that every number here is lifted.
 
 use wirk_core::{
     Access, ActorWorld, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimVerdict,
@@ -468,18 +469,23 @@ fn d9_5_vanished_run_ends_unresolved_not_complete() {
 }
 
 /// D9#6 (0001 D9): "Worktree creation pins the exact base SHA; branch
-/// retained after retirement." Stub half: the real assertion — the `git
-/// worktree add` call pinning the SHA — is item 4's (0022 D77; build-brief
-/// §2: "the executor", not item 5), out of scope here (BRIEF: "Any carve
-/// of sergeant code (items 5, 9)"). This test proves the type carries the
-/// exact string (`WorktreeCreated{repo, base_sha}`), then panics naming
-/// item 4 as the item that lifts it. W2 build brief §7: "stays
-/// should_panic" — it can no longer borrow `fold`'s own stub panic
-/// (`fold` is real as of this item), so the panic is explicit here
-/// instead (J1: local, reversible, test-only).
+/// retained after retirement." `wirk-core` cannot depend on `wirk-herdr`
+/// (0001 D7's crate boundary; `wirk/tests/boundary.rs` enforces it), so
+/// the real `git worktree add`/`worktree remove` half of this contract
+/// cannot run from here — that half is
+/// `wirk-herdr/tests/run_loop.rs::d9_6_worktree_pins_the_exact_base_sha`
+/// (item 4, W2; `wirk-herdr/src/git.rs`), which runs real git in a
+/// tempdir: init, two commits, `worktree_add` at the first commit's
+/// SHA, assert the new worktree's `HEAD` equals it, `worktree_remove`,
+/// assert the branch survives. This test stays narrow to what
+/// `wirk-core` alone can pin: `EventKind::WorktreeCreated` carries the
+/// exact SHA string byte-for-byte, with no truncation or
+/// normalization, so a caller journaling the git call's own output has
+/// something exact to journal. No longer a stub (W2 lifts it; J1,
+/// local and reversible — the `should_panic` this test used to carry
+/// is gone, not narrowed).
 #[test]
-#[should_panic(expected = "item 4 contract stub: worktree base_sha pin")]
-fn d9_6_worktree_base_sha_pinned() {
+fn d9_6_worktree_created_carries_the_exact_base_sha() {
     let exact_sha = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
     let created = event(
         "ev-worktree",
@@ -490,12 +496,12 @@ fn d9_6_worktree_base_sha_pinned() {
         },
     );
     match &created.kind {
-        EventKind::WorktreeCreated { base_sha, .. } => assert_eq!(base_sha, exact_sha),
+        EventKind::WorktreeCreated { repo, base_sha } => {
+            assert_eq!(repo, "wirk");
+            assert_eq!(base_sha, exact_sha);
+        }
         other => panic!("expected WorktreeCreated, got {other:?}"),
     }
-    // The event carries the exact SHA (asserted above); the real pin — the
-    // `git worktree add` call itself — is item 4's.
-    panic!("item 4 contract stub: worktree base_sha pin");
 }
 
 /// Not a D9 number, but pins the resume key (world.md §2): the same

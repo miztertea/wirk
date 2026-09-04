@@ -11,3 +11,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 thiserror = "2.0.20"
+
+[dev-dependencies]
+# tests/socket.rs's tempdir sockets (R2/R5: same pin already used by
+# wirk/Cargo.toml and wirk-core/Cargo.toml's fixtures, ruling 0031
+# D97's latest-then-pin, checked 2026-09-04 there).
+tempfile = "3.27.0"

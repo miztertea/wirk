@@ -44,6 +44,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,8 +59,8 @@ use wirk_core::{
 };
 
 use super::{
-    ClaimPayload, ErrorDetail, FailPayload, Reply, Request, StatusPayload, SubmitPayload, Verb,
-    WirkdPointer,
+    ClaimPayload, ErrorDetail, FailPayload, RecordPayload, Reply, Request, StatusPayload,
+    SubmitPayload, Verb, WirkdPointer,
 };
 
 /// Envelope reply plus what the server does after writing it: `stop`
@@ -375,6 +376,10 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {
             Ok(payload) => Outcome::Reply(handle_fail(state, payload)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
+        Verb::Record => match serde_json::from_value::<RecordPayload>(request.payload.clone()) {
+            Ok(payload) => Outcome::Reply(handle_record(state, payload)),
+            Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+        },
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
     }
 }
@@ -392,11 +397,6 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
     let waypoint_id = WaypointId(format!("smoke/{}", "wp-1"));
     let route_id = RouteId("smoke".to_string());
 
-    let repository = payload
-        .repositories
-        .first()
-        .map(|binding| binding.name.clone())
-        .unwrap_or_else(|| "smoke".to_string());
     let triple = ExecutionTriple {
         estate_root: state.estate_root.display().to_string(),
         work_id: work_id.clone(),
@@ -406,12 +406,15 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         name: "report.md".to_string(),
         required: true,
     }]);
+    let branch = format!("wirk/{}", work_id.0);
 
-    // W3 (build-brief.md §3 W3): `--kind deterministic --command
-    // <argv...>` reserves a `World::Deterministic` instead of the
-    // always-`Actor` World every earlier wave built; `kind` absent or
-    // any other value keeps today's behavior unchanged (additive, R6 —
-    // module doc).
+    // W3 (build-brief.md §3 W3, both items): `--kind deterministic
+    // --command <argv...>` (item 5) reserves a `World::Deterministic`;
+    // `--kind actor --repo-path <path>` (item 4) reserves an `ActorWorld`
+    // with `base_ref` resolved to a commit SHA and an empty
+    // `worktree_path` filled in later by `wirk run`; `kind` absent or
+    // any other value keeps today's original "smoke" World unchanged —
+    // `worktree_path: state.estate_root`, the raw unresolved `base_ref`.
     let deterministic = payload.kind.as_deref() == Some("deterministic");
     if deterministic && payload.command.as_ref().is_none_or(|c| c.is_empty()) {
         return err_reply(
@@ -428,11 +431,43 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             env: BTreeMap::new(),
             expected_artifacts: output_contract,
         })
+    } else if payload.kind.as_deref() == Some("actor") {
+        let Some(repo_path) = payload.repo_path.clone() else {
+            return err_reply("BadRequest", "--repo-path is required for --kind actor");
+        };
+        // Issue 285: resolve `base_ref` to a commit SHA with git at
+        // submit time, so the World reserved here — not the worktree
+        // `wirk run` creates later — is what pins the base. An empty or
+        // unresolvable ref refuses submit rather than reserving a World
+        // whose base can never be honoured.
+        let base_sha = match resolve_git_sha(&repo_path, &payload.base_ref) {
+            Ok(sha) => sha,
+            Err(detail) => return err_reply("GitError", &detail),
+        };
+        World::Actor(ActorWorld {
+            repository: repo_path.clone(),
+            // Empty until `wirk run` creates the worktree and records
+            // the update (`handle_record`, `RecordPayload`'s doc
+            // comment): the World is reserved before any worktree
+            // exists.
+            worktree_path: PathBuf::new(),
+            branch,
+            base_sha,
+            triple,
+            intent: payload.intent.clone(),
+            output_contract,
+            boundary: Boundary(vec![repo_path]),
+        })
     } else {
+        let repository = payload
+            .repositories
+            .first()
+            .map(|binding| binding.name.clone())
+            .unwrap_or_else(|| "smoke".to_string());
         World::Actor(ActorWorld {
             repository,
             worktree_path: state.estate_root.clone(),
-            branch: format!("wirk/{}", work_id.0),
+            branch,
             base_sha: payload.base_ref.clone(),
             triple,
             intent: payload.intent.clone(),
@@ -488,6 +523,59 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         "run_id": run_id.0,
         "waypoint": waypoint_id.0,
     }))
+}
+
+/// `git -C <repo_path> rev-parse <base_ref>` (R4: native platform CLI,
+/// the same call every other git use in this estate makes — `git.rs`'s
+/// own doc comment reasons identically for `wirk-herdr`'s side). Issue
+/// 285: refuses submit rather than reserving a World pinned to a ref
+/// git itself could not resolve.
+fn resolve_git_sha(repo_path: &str, base_ref: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", base_ref])
+        .output()
+        .map_err(|err| format!("failed to spawn git: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git -C {repo_path} rev-parse {base_ref} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// W3: appends one `EventKind` through the same single write path
+/// `submit`/`claim` use, for the journal writes `RunLoop` and `wirk
+/// run` themselves need to make (`RunLaunched`, `RunFailed`,
+/// `RunVanished`, `LifecycleObserved`, `WorktreeCreated`, and a
+/// re-emitted `WaypointReserved` that fills in the worktree path —
+/// `RecordPayload`'s doc comment). `ClaimFiled`/`ClaimRecorded` are
+/// refused: those two travel only through `claim`'s own validated path
+/// (build-brief.md's own "Implement wirkd's record verb... refuse
+/// ClaimRecorded and ClaimFiled through it").
+fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
+    if matches!(
+        payload.kind,
+        EventKind::ClaimFiled { .. } | EventKind::ClaimRecorded { .. }
+    ) {
+        return err_reply(
+            "Forbidden",
+            "ClaimFiled/ClaimRecorded are written only by the claim verb, never by record",
+        );
+    }
+
+    let journal = match journal_for(state, &payload.work_id) {
+        Ok(journal) => journal,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let event = new_event(&payload.work_id, payload.run, payload.kind);
+    if let Err(err) = journal.append(&event) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    ok_reply(json!({}))
 }
 
 fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
@@ -625,18 +713,18 @@ fn record_and_reply(
     }
 }
 
-/// W3 (build-brief.md §3 W3): alongside item 3's original three fields
-/// (`state`, `current_waypoint`, `events`), now also carries
-/// `run_id`/`attempt`/`world_hash`/`run_state` and, when the Work's
-/// current Waypoint has one, the reserved `world` itself — the shape
-/// `wirk run-deterministic` reads (module doc: "reads the reserved
-/// World from wirkd status"). All five are additive and only present
-/// once a Run has actually been opened for the current Waypoint (a
-/// freshly submitted Work's own first `status` call, before `submit`'s
-/// own `RunOpened` — never observable here since `submit` journals all
-/// three of `WorkSubmitted`/`WaypointReserved`/`RunOpened` atomically
-/// under one lock hold, module doc — always finds one), so an old
-/// caller reading only the first three fields is unaffected.
+/// W3 (both items, build-brief.md §3 W3 / §2.2): alongside item 3's
+/// original three fields (`state`, `current_waypoint`, `events`), now
+/// also carries `run_id`/`attempt`/`world_hash`/`run_state` and, when
+/// the Work's current Waypoint has one, the reserved `world` itself —
+/// the shape `wirk run-deterministic` reads (module doc: "reads the
+/// reserved World from wirkd status") — and a `"runs"` array, one entry
+/// per `RunOpened` this Work's journal carries: the reconstructed `Run`
+/// (state included) plus its Waypoint's most-recently reserved `World`,
+/// so `wirk run` can read both the Run to drive and the World to launch
+/// it with from one verb (`wirk_herdr::run_loop::WirkdApi::status`).
+/// All of these are additive; an old caller reading only the first
+/// three fields is unaffected.
 fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
     let journal = match journal_for(state, &payload.work_id) {
         Ok(journal) => journal,
@@ -651,10 +739,24 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         return err_reply("NotFound", "no such work");
     }
     let work = fold(&events);
+
+    let runs: Vec<Value> = all_run_ids(&events)
+        .into_iter()
+        .filter_map(|run_id| {
+            let run = find_run(&events, &run_id)?;
+            let world = world_for_waypoint(&events, &run.waypoint);
+            Some(json!({
+                "run": serde_json::to_value(&run).ok()?,
+                "world": world.and_then(|w| serde_json::to_value(&w).ok()),
+            }))
+        })
+        .collect();
+
     let mut result = json!({
         "state": work_state_name(work.state),
         "current_waypoint": work.current_waypoint.as_ref().map(|w| w.0.clone()),
         "events": events.len(),
+        "runs": runs,
     });
 
     if let Some(waypoint) = &work.current_waypoint
@@ -724,6 +826,34 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
     ok_reply(json!({}))
 }
 
+/// Every `RunId` this Work's journal has opened, in journal order (one
+/// per `RunOpened` event) — `handle_status`'s own iteration order for
+/// building `"runs"`.
+fn all_run_ids(events: &[Event]) -> Vec<RunId> {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::RunOpened { run, .. } => Some(run.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `World` most recently reserved for `waypoint` — the *last*
+/// matching `WaypointReserved` wins, not the first (`.rev()`): `wirk
+/// run` (W3) re-emits `WaypointReserved` through `record` once the
+/// worktree exists, carrying the same `waypoint`/`world_hash` but a
+/// filled-in `worktree_path` (`RecordPayload`'s doc comment, R1 — no
+/// new event type for a World field that changed after reservation).
+fn world_for_waypoint(events: &[Event], waypoint: &WaypointId) -> Option<World> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::WaypointReserved {
+            waypoint: w, world, ..
+        } if w == waypoint => Some(world.clone()),
+        _ => None,
+    })
+}
+
 /// Fetches (opening on first touch) the `Arc<Mutex<Journal>>` for
 /// `work_id`, journaled at `$estate_root/works/<work_id>/journal.ndjson`
 /// (0033 D101). The outer map lock is held only long enough to
@@ -785,21 +915,21 @@ fn find_run(events: &[Event], run_id: &RunId) -> Option<Run> {
 /// reserved for `run_id`'s Waypoint, when the journal carries one —
 /// build-brief amendment 3: "wirkd checks artifact paths exist on disk
 /// relative to the Run's worktree path when the World carries one, else
-/// by name only".
+/// by name only". Reads the Waypoint's *most recent* World
+/// (`world_for_waypoint`, R2): an Actor Run's `worktree_path` starts
+/// empty at reservation and is filled in by `wirk run` (W3) once the
+/// worktree exists, through a re-emitted `WaypointReserved` — the first
+/// `WaypointReserved` alone would check artifacts against an empty
+/// path and always refuse.
 fn worktree_path_for_run(events: &[Event], run_id: &RunId) -> Option<PathBuf> {
     let waypoint_id = events.iter().find_map(|event| match &event.kind {
         EventKind::RunOpened { run, waypoint, .. } if run == run_id => Some(waypoint.clone()),
         _ => None,
     })?;
-    events.iter().find_map(|event| match &event.kind {
-        EventKind::WaypointReserved {
-            waypoint, world, ..
-        } if *waypoint == waypoint_id => match world {
-            World::Actor(actor) => Some(actor.worktree_path.clone()),
-            World::Deterministic(deterministic) => Some(deterministic.cwd.clone()),
-        },
-        _ => None,
-    })
+    match world_for_waypoint(events, &waypoint_id)? {
+        World::Actor(actor) => Some(actor.worktree_path),
+        World::Deterministic(deterministic) => Some(deterministic.cwd),
+    }
 }
 
 /// The most recently opened Run for `waypoint_id` — the last
@@ -818,20 +948,6 @@ fn latest_run_for_waypoint(
             attempt,
             world_hash,
         } if waypoint == waypoint_id => Some((run.clone(), *attempt, world_hash.clone())),
-        _ => None,
-    })
-}
-
-/// The `World` reserved for `waypoint_id` — the last `WaypointReserved`
-/// naming it (mirrors `worktree_path_for_run`'s own lookup, generalized
-/// to the whole `World` rather than only its `worktree_path`/`cwd`, for
-/// `handle_status` to hand back verbatim so `wirk run-deterministic`
-/// never has to recompile it).
-fn world_for_waypoint(events: &[Event], waypoint_id: &WaypointId) -> Option<World> {
-    events.iter().rev().find_map(|event| match &event.kind {
-        EventKind::WaypointReserved {
-            waypoint, world, ..
-        } if waypoint == waypoint_id => Some(world.clone()),
         _ => None,
     })
 }
