@@ -1,0 +1,26 @@
+{
+  "id": "w4-orient-build-verify",
+  "waypoints": [
+    {
+      "id": "w4-orient-build-verify/orient",
+      "kind": "Actor",
+      "intent": "write orient.md",
+      "declared_outputs": [{"name": "orient.md", "required": true}],
+      "boundary": ["orient.md"]
+    },
+    {
+      "id": "w4-orient-build-verify/build",
+      "kind": "Actor",
+      "intent": "edit src/lib.rs, commit it on this branch, write build.md",
+      "declared_outputs": [{"name": "build.md", "required": true}],
+      "boundary": ["src/**", "build.md"]
+    },
+    {
+      "id": "w4-orient-build-verify/verify",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "echo verified > verify.log"],
+      "declared_outputs": [{"name": "verify.log", "required": true}],
+      "boundary": ["verify.log"]
+    }
+  ]
+}

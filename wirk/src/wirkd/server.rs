@@ -1356,7 +1356,7 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 // here already passed the escape guard above (verdict
                 // is still `Validated`), so `strip_prefix` never fails;
                 // `unwrap_or_default` only guards a defensive fallback.
-                let declared: std::collections::BTreeSet<String> = claim
+                let mut declared: std::collections::BTreeSet<String> = claim
                     .artifacts
                     .iter()
                     .map(|a| {
@@ -1366,6 +1366,34 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                             .into_owned()
                     })
                     .collect();
+                // W4 (P2.6 run 3, rerun3's `orient.md`-vs-`build`
+                // finding): a Route's own earlier Waypoints (of this
+                // same Work, in the journaled Route order) already left
+                // their own declared outputs sitting untracked in the
+                // shared worktree — `orient.md` for `orient`, before
+                // `build` ever runs. Excluded from `offending` the same
+                // way this Claim's *own* declared artifacts already are
+                // just above (0050): a Waypoint's boundary names what
+                // *it* may write, never a refusal of evidence a prior,
+                // already-Claimed Waypoint of the same Work left behind.
+                // A later Waypoint that legitimately edits an earlier
+                // one's output is unaffected — only the *name itself*
+                // is excluded from `offending`, not from `boundary`'s
+                // own glob check, so a later Waypoint whose own boundary
+                // covers that path can still declare and reclaim it.
+                let route_order = route_waypoints(&events);
+                if let Some(pos) = route_order.iter().position(|w| w == &waypoint.id) {
+                    for def in journaled_defs.iter().filter(|def| {
+                        route_order
+                            .iter()
+                            .position(|w| w == &def.id)
+                            .is_some_and(|def_pos| def_pos < pos)
+                    }) {
+                        for output in &def.declared_outputs {
+                            declared.insert(output.name.clone());
+                        }
+                    }
+                }
                 // P2.4 W2 (build-brief.md §3 W2; refuse.md §2): a Work
                 // whose one repository binding is `Access::Read`
                 // refuses any changed path at all, whatever the
@@ -1423,13 +1451,37 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             let prior_world = world_for_waypoint(&events, &run.waypoint);
             let cwd = worktree_path_for_run(&events, &run_id)
                 .unwrap_or_else(|| state.estate_root.clone());
-            let base_sha = prior_world
-                .as_ref()
-                .map(|world| match world {
-                    World::Actor(actor) => actor.base_sha.clone(),
-                    World::Deterministic(deterministic) => deterministic.base_sha.clone(),
-                })
-                .unwrap_or_default();
+            // W4 (P2.6 run 3, rerun3's `verify`-vs-`build` finding): the
+            // *next* Waypoint's boundary check (above, this function) diffs
+            // the worktree against whatever `base_sha` its own reserved
+            // World carries — carrying the *prior* Waypoint's `base_sha`
+            // forward unchanged (the pre-W4 behaviour) means every
+            // already-Claimed change the prior Waypoint itself just made
+            // reads as out-of-boundary for the one after it. The next
+            // Waypoint's Run has not started yet, so "the worktree as it
+            // stood when its Run started" is the branch tip right now, in
+            // this same worktree — read fresh with git (`resolve_git_sha`,
+            // R2, the same call `handle_submit` already makes to pin a
+            // Work's original base) rather than carried from the prior
+            // World's own field. A worktree git cannot read from (the
+            // no-repo-path test harness's own bare-estate `cwd`) falls back
+            // to the prior World's `base_sha` unchanged — today's behaviour,
+            // never a hard failure of auto-advance itself. The Work's
+            // *original* base stays exactly where `handle_submit` already
+            // put it, on the first Waypoint's own reserved World — nothing
+            // here touches that.
+            let prior_base_sha = || {
+                prior_world
+                    .as_ref()
+                    .map(|world| match world {
+                        World::Actor(actor) => actor.base_sha.clone(),
+                        World::Deterministic(deterministic) => deterministic.base_sha.clone(),
+                    })
+                    .unwrap_or_default()
+            };
+            let base_sha = resolve_git_sha(&cwd.display().to_string(), "HEAD")
+                .ok()
+                .unwrap_or_else(prior_base_sha);
             // Wave 1 (P2.6, orient/route.md §3): minted before the match,
             // not after — an Actor World's `triple` needs the new Run's
             // own id (`ExecutionTriple` names the Run it belongs to); a
@@ -1732,11 +1784,22 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
 /// class Wave 1 fixed for auto-advance's `next_world` (`handle_claim`)
 /// on this sibling code path Wave 1 never touched. Fixed the same way:
 /// a fresh World is minted before the new `RunOpened`, carrying the new
-/// Run's own triple — an `Actor` World only (`ActorWorld.triple` is the
-/// only run-id-bearing field either variant has; `Deterministic` has
-/// none, so nothing is re-reserved for it and `world_hash` never moves,
-/// `WorldHash::of` already excluding `triple` from both). The old Run
-/// is also marked `RunFailed{status: "retried"}` here: a Claim refused
+/// Run's own triple.
+///
+/// W4 (P2.6 run 3): the "`Deterministic` has no triple, so nothing is
+/// re-reserved for it" half of that fix was only half right — a
+/// `Deterministic` World's own `base_sha` can go just as stale as an
+/// `Actor` World's `triple.run_id` did (`03-orient.log`'s
+/// `build-wave/verify` finding: a retry that reuses the prior World
+/// verbatim reuses its stale `base_sha` too, so an `OutOfBoundary`
+/// refusal caused by that staleness recurs identically on every retry,
+/// with no path to self-correct). Both arms now mint a fresh World —
+/// `Actor` a fresh triple *and* `base_sha`, `Deterministic` a fresh
+/// `base_sha` alone — read from the worktree with git at this retry's
+/// own start, the same call auto-advance's `next_world` makes
+/// (`resolve_git_sha`, R2); a worktree git cannot read from falls back
+/// to the prior World's own `base_sha`, never a hard failure. The old
+/// Run is also marked `RunFailed{status: "retried"}` here: a Claim refused
 /// leaves a Run `Open` (D9#3, `Run::apply`), so without this a Work
 /// that had two Runs — the refused one and the retry — would still
 /// read as having two `Open` Runs, and a caller that picks "the" open
@@ -1784,34 +1847,49 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
 
     let new_run_id = RunId(mint_id("run"));
 
-    let world_hash = match &prior_world {
-        World::Actor(actor) => {
-            let fresh_world = World::Actor(ActorWorld {
-                triple: ExecutionTriple {
-                    run_id: new_run_id.clone(),
-                    ..actor.triple.clone()
-                },
-                ..actor.clone()
-            });
-            let world_hash = WorldHash::of(&fresh_world);
-            let reserved = new_event(
-                &work_id,
-                None,
-                EventKind::WaypointReserved {
-                    waypoint: run.waypoint.clone(),
-                    world_hash: world_hash.clone(),
-                    world: fresh_world,
-                },
-            );
-            if let Err(err) = append_event(state, &mut journal, &work_id, &reserved) {
-                return err_reply("JournalError", &err.to_string());
-            }
-            world_hash
-        }
-        // No triple to go stale: reusing the prior World verbatim
-        // (unchanged behaviour) is already correct.
-        World::Deterministic(_) => WorldHash::of(&prior_world),
+    // W4: the worktree this retry's fresh Run is about to start against,
+    // read fresh with git — same reasoning and same call as auto-advance's
+    // `next_world` above (`resolve_git_sha`, R2). Falls back to the prior
+    // World's own `base_sha` when git cannot read it (no worktree yet).
+    let cwd = match &prior_world {
+        World::Actor(actor) => actor.worktree_path.clone(),
+        World::Deterministic(deterministic) => deterministic.cwd.clone(),
     };
+    let prior_base_sha = || match &prior_world {
+        World::Actor(actor) => actor.base_sha.clone(),
+        World::Deterministic(deterministic) => deterministic.base_sha.clone(),
+    };
+    let fresh_base_sha = resolve_git_sha(&cwd.display().to_string(), "HEAD")
+        .ok()
+        .unwrap_or_else(prior_base_sha);
+
+    let fresh_world = match &prior_world {
+        World::Actor(actor) => World::Actor(ActorWorld {
+            base_sha: fresh_base_sha,
+            triple: ExecutionTriple {
+                run_id: new_run_id.clone(),
+                ..actor.triple.clone()
+            },
+            ..actor.clone()
+        }),
+        World::Deterministic(deterministic) => World::Deterministic(DeterministicWorld {
+            base_sha: fresh_base_sha,
+            ..deterministic.clone()
+        }),
+    };
+    let world_hash = WorldHash::of(&fresh_world);
+    let reserved = new_event(
+        &work_id,
+        None,
+        EventKind::WaypointReserved {
+            waypoint: run.waypoint.clone(),
+            world_hash: world_hash.clone(),
+            world: fresh_world,
+        },
+    );
+    if let Err(err) = append_event(state, &mut journal, &work_id, &reserved) {
+        return err_reply("JournalError", &err.to_string());
+    }
 
     let superseded = new_event(
         &work_id,

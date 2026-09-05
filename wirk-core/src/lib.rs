@@ -1330,7 +1330,26 @@ pub fn validate_claim(waypoint: &WaypointDefinition, run: &Run, claim: &Claim) -
     // against an already-`Claimed` Run is refused; `Open`, `Failed`,
     // and `Vanished` all proceed (d9_5's precedent — a late claim is
     // evidence the work completed, not stale).
+    //
+    // W4 (P2.6 run 3, rerun3's own second-Claim finding): a Run marked
+    // `Failed{status: "retried"}` is not an ordinary Failed run — it was
+    // explicitly superseded by `handle_retry`'s own new Run for the same
+    // Waypoint (`server.rs::handle_retry`'s own `"superseded by retry
+    // <id>"` detail), so d9_5's "late claim is evidence the work
+    // completed" precedent does not apply to it: its Waypoint's
+    // completion path already moved to the retry, and any further Claim
+    // against the superseded Run is stale, not late — refused the same
+    // way an already-`Claimed` Run's second Claim is, so it can never
+    // re-trigger auto-advance a second time for the Waypoint the retry
+    // already carried forward. An ordinary `Failed` (no retry, e.g. a
+    // crashed child process or a `RunFailed` filed by `run-deterministic`
+    // itself) and `Vanished` are unchanged: still honored.
     if matches!(run.state, RunState::Claimed(_)) {
+        return ClaimVerdict::Refused(ClaimRefusal::AlreadyClaimed);
+    }
+    if let RunState::Failed(cause) = &run.state
+        && cause.status.as_deref() == Some("retried")
+    {
         return ClaimVerdict::Refused(ClaimRefusal::AlreadyClaimed);
     }
 
