@@ -43,6 +43,18 @@ fn boundary_src_only_route(estate: &Path) -> PathBuf {
     path
 }
 
+/// P2.7 W1: a Waypoint with two required declared outputs
+/// (`report.md`, `summary.md`), boundary `["**"]` so a boundary refusal
+/// never masks the artifact check this fixture exists to exercise.
+fn two_required_outputs_route(estate: &Path) -> PathBuf {
+    let text: &str = include_str!("fixtures/routes/two_required_outputs.json");
+    let dir = estate.join("fixtures").join("routes");
+    fs::create_dir_all(&dir).expect("create estate fixtures/routes/ dir");
+    let path = dir.join("two_required_outputs.json");
+    fs::write(&path, text).expect("write embedded fixture");
+    path
+}
+
 fn wait_for_wirkd(estate: &Path) -> WirkdPointer {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1083,6 +1095,120 @@ fn retry_after_out_of_boundary_refusal_keeps_the_world_otherwise_unchanged() {
         world_hash_after, world_hash_before,
         "WorldHash::of excludes triple, so a retry's World hashes identically"
     );
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// P2.7 Wave 1 (`orient/build-brief.md` §6.2, `orient/reorient.md` §D):
+/// `wirk claim` with no `--artifact` flags asks wirkd for the current
+/// Waypoint's declared output contract (the existing `status` verb,
+/// `handle_status`'s `result["world"]`, R2 — no new wire method) and
+/// files a Done Claim naming each declared output at its own name as
+/// the worktree-relative path, before this change refused
+/// `MissingArtifact` naming the one required output (`smoke.json`'s
+/// `report.md`) since `claim.artifacts` was empty. This is the red
+/// check: on `main` the assertion below is `Refused: MissingArtifact
+/// report.md`; after the change it is `Validated`.
+#[test]
+fn claim_with_no_artifact_flags_uses_the_waypoint_output_contract() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route_text: &str = include_str!("fixtures/routes/smoke.json");
+    let route_dir = estate.join("fixtures").join("routes");
+    fs::create_dir_all(&route_dir).expect("create estate fixtures/routes/ dir");
+    let route = route_dir.join("smoke.json");
+    fs::write(&route, route_text).expect("write embedded fixture");
+
+    let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
+    let worktree =
+        create_worktree_for_run(estate, &pointer.socket, &work_id, &run_id, "smoke/wp-1");
+
+    // The declared output exists in the worktree at its own name; the
+    // actor never types `wirk claim --artifact report.md=report.md`.
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+
+    let (code, stdout) = claim(estate, &work_id, &run_id, &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "expected exit 0 (Validated) once the declared output exists, stdout: {stdout}"
+    );
+    assert_eq!(stdout, "Validated");
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// (b) Two declared outputs, one absent: the Claim is refused, naming
+/// the absent one, when `wirk claim` is run with no `--artifact` flags.
+#[test]
+fn claim_with_no_artifact_flags_names_the_missing_declared_output() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = two_required_outputs_route(estate);
+    let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "two-required-outputs/wp-1",
+    );
+
+    // report.md is written; summary.md never is.
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+
+    let (code, stdout) = claim(estate, &work_id, &run_id, &[]);
+    assert_eq!(code, Some(3), "expected exit 3 (Refused), stdout: {stdout}");
+    assert!(
+        stdout.starts_with("Refused: MissingArtifact"),
+        "expected a MissingArtifact refusal, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("summary.md"),
+        "refusal must name the absent declared output, got: {stdout}"
+    );
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// (a) Once both declared outputs exist, the same no-flag Claim
+/// Validates.
+#[test]
+fn claim_with_no_artifact_flags_validates_once_all_declared_outputs_exist() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = two_required_outputs_route(estate);
+    let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "two-required-outputs/wp-1",
+    );
+
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+    fs::write(worktree.join("summary.md"), b"# summary\n").expect("write summary.md");
+
+    let (code, stdout) = claim(estate, &work_id, &run_id, &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "expected exit 0 (Validated), stdout: {stdout}"
+    );
+    assert_eq!(stdout, "Validated");
 
     stop_wirkd(estate, wirkd_child);
 }

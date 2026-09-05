@@ -1,0 +1,15 @@
+{
+  "id": "two-required-outputs",
+  "waypoints": [
+    {
+      "id": "two-required-outputs/wp-1",
+      "kind": "Actor",
+      "intent": "write report.md and summary.md",
+      "declared_outputs": [
+        {"name": "report.md", "required": true},
+        {"name": "summary.md", "required": true}
+      ],
+      "boundary": ["**"]
+    }
+  ]
+}

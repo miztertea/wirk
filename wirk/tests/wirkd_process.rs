@@ -198,8 +198,20 @@ fn wirkd_process_lifecycle() {
     assert_eq!(status(&pointer.socket, &work1), "completed");
 
     // -- missing artifact: refused, Run/Work stay open --------------------
+    // P2.7 W1: `wirk claim` with no `--artifact` flags now asks wirkd
+    // for the Waypoint's declared output contract and self-populates
+    // (`orient/reorient.md` §D), so an empty-args claim here would
+    // exercise that new path instead of this scenario's own point —
+    // an explicit `--artifact` naming a path nothing ever wrote still
+    // proves the MissingArtifact refusal this test names, unaffected
+    // by the wave (an explicit flag keeps its meaning exactly).
     let (work2, run2, _waypoint2) = submit(&estate, "demo:write");
-    let (code, stdout) = claim(&estate, &work2, &run2, &[]);
+    let (code, stdout) = claim(
+        &estate,
+        &work2,
+        &run2,
+        &["--artifact", "report.md=never-written.md"],
+    );
     assert_eq!(code, Some(3), "missing-artifact claim stdout: {stdout}");
     assert!(stdout.contains("MissingArtifact"), "stdout: {stdout}");
     assert_eq!(status(&pointer.socket, &work2), "active");

@@ -153,6 +153,7 @@ fn claim(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     let estate_root = triple["WIRK_ESTATE_ROOT"].clone();
+    let work_id = WorkId(triple["WIRK_WORK_ID"].clone());
 
     let pointer = match wirkd::client::locate(Path::new(&estate_root)) {
         Ok(pointer) => pointer,
@@ -161,6 +162,29 @@ fn claim(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // P2.7 W1 (`orient/reorient.md` §D, R2 over R7): no explicit
+    // `--artifact` flags and no `--question` means the actor never
+    // named its outputs by hand — ask wirkd for the current Waypoint's
+    // declared output contract (the `status` verb it already returns,
+    // `handle_status`'s `result["world"]`, unchanged wire method) and
+    // claim each declared output at its own name as the worktree-
+    // relative path; wirkd's own validator still refuses whatever is
+    // actually missing. An explicit `--artifact` flag keeps its
+    // meaning exactly — this only fires when the caller supplied none.
+    if artifacts.is_empty() && question.is_none() {
+        match fetch_output_contract_names(&pointer.socket, &work_id) {
+            Ok(names) => {
+                for name in names {
+                    artifacts.insert(name.clone(), name);
+                }
+            }
+            Err(err) => {
+                eprintln!("wirk claim: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     let kind = match question {
         Some(text) => ClaimKind::Question(text),
@@ -191,6 +215,41 @@ fn claim(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Asks wirkd's existing `status` verb for the current Waypoint's
+/// reserved World (`handle_status`'s `result["world"]`, the same field
+/// `wirk run-deterministic`'s `reserved_deterministic` and
+/// `boundary_claim.rs`'s own `reserved_world` test helper already
+/// read) and returns its declared output names, in the order the Route
+/// authored them — `ActorWorld.output_contract` for an actor Waypoint,
+/// `DeterministicWorld.expected_artifacts` for a deterministic one, R2
+/// over adding a new wire method (`orient/reorient.md` §D).
+fn fetch_output_contract_names(socket: &Path, work_id: &WorkId) -> Result<Vec<String>, String> {
+    let reply = wirkd::client::call(
+        socket,
+        &Request::status(StatusPayload {
+            work_id: work_id.clone(),
+        }),
+    )
+    .map_err(|err| err.to_string())?;
+    let result = match reply {
+        Reply::Ok { result, .. } => result,
+        Reply::Err { error, .. } => {
+            return Err(format!("status refused: {} {}", error.code, error.message));
+        }
+    };
+    let world_value = result
+        .get("world")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| "wirkd status carries no World for this Work".to_string())?;
+    let world: World = serde_json::from_value(world_value.clone())
+        .map_err(|err| format!("malformed World from wirkd status: {err}"))?;
+    let contract: OutputContract = match world {
+        World::Actor(actor) => actor.output_contract,
+        World::Deterministic(det) => det.expected_artifacts,
+    };
+    Ok(contract.0.into_iter().map(|spec| spec.name).collect())
 }
 
 fn claim_usage() -> ExitCode {
