@@ -47,11 +47,22 @@
 //! Blocked (P2.3 W4, build-brief.md §8 finding 2): the loop never
 //! prompts a `Blocked` pane (unchanged), but on the *transition* to
 //! `Blocked` it now calls `HerdrClient::notify` once and prints one
-//! line — a human waiting on the pane has something to see. The Work's
-//! own state and journal are untouched (`LifecycleObserved{Blocked}` is
-//! already journaled by `observe_herdr`'s existing status-change write);
-//! a later `Working` clears the notified flag, so a second `Blocked`
-//! episode on the same Run notifies again.
+//! line — a human waiting on the pane has something to see. A later
+//! `Working` clears the notified flag, so a second `Blocked` episode on
+//! the same Run notifies again.
+//!
+//! **P2.6 W2 (ruling 0052 D156):** a Blocked pane is an actor waiting
+//! on a human, not a failed Run — `observe_herdr`'s existing
+//! status-change write now carries the pane's last screen lines
+//! (`HerdrClient::read_pane`) as `LifecycleObserved{Blocked}.detail`,
+//! and `fold` (`wirk-core`) reads that same event to put the Work in
+//! `NeedsInput` with cause `"blocked"`; `wirk work retry`/`wirk work
+//! fail` then apply exactly as they do to any other `NeedsInput` Work
+//! (0049 D147). The loop itself makes no new decision here — it
+//! journals what it observes, same as every other status; the fold is
+//! what turns `Blocked` into `NeedsInput`, and a later
+//! `LifecycleObserved{Working}` is what clears it back to `Active`
+//! (already journaled by this same write, for every status).
 //!
 //! **P2.3 W5 (build-brief.md §9): `Done` is a turn end, exactly like
 //! `Idle`.** Herdr's own `status_name` (`refs/herdr/src/app/
@@ -606,12 +617,38 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
 
         self.blocked = matches!(agent_status, AgentStatus::Blocked);
         self.prompt_gate.release_on_working(*agent_status);
+
+        // Ruling 0052 D156 (P2.6 W2): a Blocked observation's cause
+        // carries the pane's last screen lines — read now, via the pane
+        // still being watched (`HerdrClient::read_pane`, R2/R5: the
+        // trait wraps Herdr's own `pane.read`), since only the loop
+        // holds a live pane to read; `fold` (`wirk-core`) has no pane to
+        // read from, only whatever `detail` this event carries. Every
+        // other status still journals no detail (`None`, unchanged from
+        // before this wave). Best-effort: a `read_pane` failure names
+        // itself in `detail` rather than failing this whole observation
+        // — the Blocked fact itself (`status`) is what matters most, and
+        // is never lost to a screen-read error.
+        let pane_id = self.launched_pane.clone().unwrap_or_default();
+        let detail = if matches!(agent_status, AgentStatus::Blocked) {
+            let screen = self
+                .executor
+                .client()
+                .read_pane(&pane_id)
+                .unwrap_or_else(|err| format!("(pane {pane_id}'s screen unreadable: {err})"));
+            Some(format!(
+                "the actor is waiting on its pane {pane_id}:\n{screen}"
+            ))
+        } else {
+            None
+        };
         self.wirkd
             .record(
                 work_id,
                 &run.id,
                 EventKind::LifecycleObserved {
                     status: format!("{agent_status:?}"),
+                    detail,
                 },
             )
             .map_err(RunLoopError::Wirkd)?;

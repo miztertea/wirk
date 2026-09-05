@@ -121,6 +121,7 @@ pub const METHODS: &[&str] = &[
     "agent.prompt",
     "agent.wait",
     "pane.get",
+    "pane.read",
     "agent.get",
     "agent.list",
     "agent.send_keys",
@@ -661,6 +662,14 @@ pub mod params {
         json!({"pane_id": pane_id})
     }
 
+    /// P2.6 W2 (ruling 0052 D156): `source: "visible"` (the vendored
+    /// fixture's `ReadSource` enum) — the pane's currently onscreen
+    /// text, not full scrollback; `lines`/`format`/`strip_ansi` left
+    /// unset, taking the server's own defaults (R6).
+    pub fn pane_read(pane_id: &str) -> Value {
+        json!({"pane_id": pane_id, "source": "visible"})
+    }
+
     pub fn agent_get(target: &str) -> Value {
         json!({"target": target})
     }
@@ -818,6 +827,16 @@ impl HerdrClient for SocketClient {
     fn get_pane(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
         let result = self.call("pane.get", params::pane_get(pane_id))?;
         extract(result, "pane_info", "pane")
+    }
+
+    fn read_pane(&self, pane_id: &str) -> Result<String, HerdrError> {
+        #[derive(serde::Deserialize)]
+        struct PaneReadText {
+            text: String,
+        }
+        let result = self.call("pane.read", params::pane_read(pane_id))?;
+        let read: PaneReadText = extract(result, "pane_read", "read")?;
+        Ok(read.text)
     }
 
     fn get_agent(&self, target: &str) -> Result<PaneInfo, HerdrError> {

@@ -331,6 +331,7 @@ fn request_params_by_method() -> Vec<(&'static str, Value)> {
             wirk_herdr::socket::params::agent_wait("pane1", AgentStatus::Working, 1_000),
         ),
         ("pane.get", wirk_herdr::socket::params::pane_get("pane1")),
+        ("pane.read", wirk_herdr::socket::params::pane_read("pane1")),
         ("agent.get", wirk_herdr::socket::params::agent_get("pane1")),
         ("agent.list", wirk_herdr::socket::params::agent_list()),
         (

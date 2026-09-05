@@ -320,6 +320,59 @@ fn working_then_blocked_sends_zero_prompts() {
     );
 }
 
+/// P2.6 W2 (ruling 0052 D156): the `LifecycleObserved` the loop
+/// journals on the transition into `Blocked` carries the pane's last
+/// screen lines (`HerdrClient::read_pane`, R2/R5) as `detail` — the
+/// fold side of D156 (`wirk-core`'s `needs_input.rs`) is pinned
+/// separately; this pins that the loop is the one supplying the text
+/// `fold` reads. Red before this wave: `LifecycleObserved` carried no
+/// `detail` field at all.
+#[test]
+fn blocked_observation_journals_the_panes_screen_lines() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let (tx, rx) = mpsc::channel();
+    let screen = "┃ Permission required\n┃ Access external directory /tmp".to_string();
+    let client = Arc::new(
+        FakeHerdrClient::default()
+            .with_split_pane_response(pane_info(&run.id.0, AgentStatus::Idle, 1))
+            .with_pane_read_response(&run.id.0, Ok(screen.clone()))
+            .with_subscribe_channel(rx),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    tx.send(Ok(status_changed(&run, AgentStatus::Blocked)))
+        .unwrap();
+    wait_until("blocked notify sent", || {
+        client.notify_calls.lock().unwrap().len() == 1
+    });
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+
+    let recorded = wirkd.recorded();
+    let blocked_event = recorded
+        .iter()
+        .find(|(_, _, kind)| matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "Blocked"))
+        .map(|(_, _, kind)| kind)
+        .expect("a LifecycleObserved{Blocked} must be recorded");
+    let EventKind::LifecycleObserved { detail, .. } = blocked_event else {
+        unreachable!()
+    };
+    let detail = detail
+        .as_ref()
+        .expect("a Blocked observation must carry Some(detail)");
+    assert!(
+        detail.contains(&run.id.0) && detail.contains(&screen),
+        "detail must name the pane and carry its last screen lines verbatim: {detail:?}"
+    );
+}
+
 /// A Blocked episode that clears (a later Working) and recurs notifies
 /// again — the flag is per-episode, not per-Run.
 #[test]

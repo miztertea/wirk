@@ -138,6 +138,7 @@ fn d9_1_journal_replay_rebuilds_work_state() {
         Some("run-1"),
         EventKind::LifecycleObserved {
             status: "idle".to_string(),
+            detail: None,
         },
     ));
     let work = wirk_core::fold(&events);
@@ -219,6 +220,7 @@ fn d9_2_lifecycle_events_never_advance_a_waypoint() {
             Some("run-1"),
             EventKind::LifecycleObserved {
                 status: status.to_string(),
+                detail: None,
             },
         ));
         assert!(matches!(run.state, RunState::Open), "status {status}");

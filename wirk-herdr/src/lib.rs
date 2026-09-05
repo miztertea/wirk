@@ -529,6 +529,18 @@ pub trait HerdrClient: Send + Sync {
     fn report_metadata(&self, req: ReportMetadata) -> Result<(), HerdrError>;
     fn notify(&self, req: Notify) -> Result<(), HerdrError>;
     fn focus_pane(&self, req: FocusPane) -> Result<(), HerdrError>;
+    /// Row 23 (map.md:40): available on the wire (`pane.read`,
+    /// vendored fixture), previously unused — 0017 D57 kept wirk off it
+    /// for *Claim evidence* ("evidence is what the actor writes to
+    /// files plus its Claim"). Ruling 0052 D156 (P2.6 W2) needs the
+    /// pane's last screen lines on a `Blocked` Work's `NeedsInput`
+    /// cause: a human-facing surface, not Claim evidence, so D57's
+    /// scope does not bar this call — R2/R5: the capability already
+    /// exists in the protocol, wrapped the same way every other verb
+    /// on this trait is. `source: "visible"` (the currently-onscreen
+    /// text, not full scrollback); returns the pane's text as-is, one
+    /// line per screen row.
+    fn read_pane(&self, pane_id: &str) -> Result<String, HerdrError>;
     /// Row 20: subscribe, hand back raw events; dedup-by-identity lives
     /// above this trait in `Reconciler`, not inside the client — a fake
     /// can replay a fixed `Vec<HerdrEvent>` with no dedup of its own.
@@ -610,6 +622,9 @@ impl<T: HerdrClient + ?Sized> HerdrClient for std::sync::Arc<T> {
     }
     fn focus_pane(&self, req: FocusPane) -> Result<(), HerdrError> {
         (**self).focus_pane(req)
+    }
+    fn read_pane(&self, pane_id: &str) -> Result<String, HerdrError> {
+        (**self).read_pane(pane_id)
     }
     fn subscribe(
         &self,

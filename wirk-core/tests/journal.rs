@@ -22,6 +22,7 @@ fn lifecycle_event(id: &str, work: &str, run: &str, status: &str) -> Event {
         at: Timestamp(0),
         kind: EventKind::LifecycleObserved {
             status: status.to_string(),
+            detail: None,
         },
     }
 }
@@ -95,6 +96,7 @@ fn append_fills_an_empty_event_id_with_a_ulid() {
         at: Timestamp(0),
         kind: EventKind::LifecycleObserved {
             status: "working".to_string(),
+            detail: None,
         },
     };
     journal.append(&blank).expect("append");

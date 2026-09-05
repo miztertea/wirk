@@ -176,6 +176,7 @@ fn a_watcher_sees_events_before_and_after_it_dials() {
         &work_id,
         EventKind::LifecycleObserved {
             status: "Working".to_string(),
+            detail: None,
         },
     );
     // Drain whatever `submit` itself wrote (WaypointReserved, RunOpened)
@@ -183,7 +184,8 @@ fn a_watcher_sees_events_before_and_after_it_dials() {
     let mut saw_live = false;
     for _ in 0..8 {
         let event = recv_event(&rx_before, "the live LifecycleObserved append");
-        if matches!(&event.kind, EventKind::LifecycleObserved { status } if status == "Working") {
+        if matches!(&event.kind, EventKind::LifecycleObserved { status, .. } if status == "Working")
+        {
             saw_live = true;
             break;
         }
@@ -202,7 +204,8 @@ fn a_watcher_sees_events_before_and_after_it_dials() {
     let mut saw_live_after = false;
     for _ in 0..8 {
         let event = recv_event(&rx_after, "the earlier live LifecycleObserved, replayed");
-        if matches!(&event.kind, EventKind::LifecycleObserved { status } if status == "Working") {
+        if matches!(&event.kind, EventKind::LifecycleObserved { status, .. } if status == "Working")
+        {
             saw_live_after = true;
             break;
         }
@@ -254,6 +257,7 @@ fn a_second_works_appends_are_not_delivered_to_the_first_works_watcher() {
         &work_b,
         EventKind::LifecycleObserved {
             status: "should-never-reach-a".to_string(),
+            detail: None,
         },
     );
     // work_a's own watcher must not receive anything more within a

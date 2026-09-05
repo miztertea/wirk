@@ -178,7 +178,10 @@ fn d9_2_status_events_with_no_claim_leave_run_open() {
         run.apply(&event(
             "ev-lifecycle",
             Some(&pane.pane_id),
-            EventKind::LifecycleObserved { status },
+            EventKind::LifecycleObserved {
+                status,
+                detail: None,
+            },
         ));
         assert!(matches!(run.state, RunState::Open));
     }

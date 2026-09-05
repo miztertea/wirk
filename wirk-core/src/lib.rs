@@ -189,10 +189,12 @@ pub struct Work {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NeedsInputCause {
     pub run: RunId,
-    /// `"run_failed"` | `"run_vanished"` | `"question"` — a stuck actor
-    /// is a `RunFailed` too (states.md §1), distinguished by
-    /// `cause.status == Some("stuck")` on the Run, not a fourth string
-    /// here.
+    /// `"run_failed"` | `"run_vanished"` | `"question"` | `"blocked"`
+    /// (ruling 0052 D156, P2.6 W2) — a stuck actor is a `RunFailed` too
+    /// (states.md §1), distinguished by `cause.status ==
+    /// Some("stuck")` on the Run, not a fifth string here. `"blocked"`
+    /// is the one reason `fold` also clears on its own (a later
+    /// `LifecycleObserved{Working}`), never through a human verb.
     pub reason: String,
     pub detail: String,
 }
@@ -754,11 +756,24 @@ pub struct Event {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum EventKind {
-    /// D9#2: folding this NEVER changes RunState; sergeant's
-    /// stage-lifecycle events WERE authoritative (projection.rs:1093-1101),
-    /// wirk's is inert.
+    /// D9#2: folding this NEVER changes RunState (`Run::apply`'s own
+    /// `{ .. }` arm stays inert); sergeant's stage-lifecycle events WERE
+    /// authoritative (projection.rs:1093-1101), wirk's is inert there.
+    ///
+    /// Ruling 0052 D156 (P2.6 W2): at the *Work* level this is no
+    /// longer wholly inert — `fold`'s own arm now acts on
+    /// `status == "Blocked"`/`"Working"` (below), reusing this event
+    /// kind rather than adding a new one (R2: the loop already journals
+    /// `LifecycleObserved` for every changed status, Blocked included;
+    /// the only gap was `fold` ignoring it). `detail` carries the
+    /// pane's last screen lines for a `Blocked` observation (`None` for
+    /// every other status this loop journals) — `#[serde(default)]` so
+    /// a journal written before this wave (no `detail` field at all)
+    /// still deserializes.
     LifecycleObserved {
         status: String,
+        #[serde(default)]
+        detail: Option<String>,
     },
     RunFailed {
         cause: FailureCause,
@@ -964,11 +979,49 @@ pub fn fold(events: &[Event]) -> Work {
                 }
             }
             EventKind::RunLaunched { .. } => {}
-            // D9#2: inert at Run level (0001 D9 #2; 0017 D56); equally
-            // inert here — a lifecycle event alone never advances or
-            // otherwise changes WorkState (fold.md §6, rejecting
-            // sergeant's KIND_WORK_COMPLETED jump table).
-            EventKind::LifecycleObserved { .. } => {}
+            // D9#2: inert at Run level (0001 D9 #2; 0017 D56) and, for
+            // every status but the two named below, equally inert here
+            // — a lifecycle event alone does not otherwise advance or
+            // change WorkState (fold.md §6, rejecting sergeant's
+            // KIND_WORK_COMPLETED jump table).
+            //
+            // Ruling 0052 D156 (P2.6 W2): `Blocked` is an actor waiting
+            // on a human, not a failed Run — the Work surfaces the same
+            // way `RunFailed`/`RunVanished` do (guarded by
+            // `is_terminal()`, same as every other non-terminal arm),
+            // reason `"blocked"`, `detail` the observation the loop
+            // journaled (the pane and its last screen lines). `Working`
+            // clears it back to `Active` — but *only* when the Work is
+            // `NeedsInput` for `"blocked"` specifically: a `Working`
+            // observed while `NeedsInput` for a different reason (a
+            // filed Question, a different Run's failure) must not
+            // clobber that human decision with an unrelated pane's
+            // lifecycle event.
+            EventKind::LifecycleObserved { status, detail } => match status.as_str() {
+                "Blocked" => {
+                    if !w.state.is_terminal() {
+                        w.state = WorkState::NeedsInput;
+                        w.needs_input = Some(NeedsInputCause {
+                            run: event
+                                .run
+                                .clone()
+                                .expect("LifecycleObserved always names a run"),
+                            reason: "blocked".into(),
+                            detail: detail.clone().unwrap_or_default(),
+                        });
+                    }
+                }
+                "Working"
+                    if w.state == WorkState::NeedsInput
+                        && w.needs_input
+                            .as_ref()
+                            .is_some_and(|cause| cause.reason == "blocked") =>
+                {
+                    w.state = WorkState::Active;
+                    w.needs_input = None;
+                }
+                _ => {}
+            },
             EventKind::ClaimFiled { .. } => {}
             EventKind::ClaimRecorded {
                 claim_kind,

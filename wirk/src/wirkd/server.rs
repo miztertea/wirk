@@ -1502,6 +1502,23 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 }
             };
             if let Some(next_world) = next_world {
+                // W2b (land finding 2026-09-05, `w2b/BUILD.md`): the
+                // reserved Actor World's triple is read from the Run
+                // this advance actually opens — `next_run_id`, the one
+                // value both the triple (above) and `RunOpened` (below)
+                // are cloned from. Checked here, not merely assumed, so
+                // a future edit that clones the wrong `RunId` (the
+                // *prior* Run's — the exact mistake VERIFY.md's probe
+                // (c) and `actor_then_actor_auto_advance_reserves_a_
+                // world_for_the_second_actor` both pin) fails loudly
+                // here rather than shipping a pane whose `WIRK_RUN_ID`
+                // claims against the wrong Run.
+                if let World::Actor(actor) = &next_world {
+                    debug_assert_eq!(
+                        actor.triple.run_id, next_run_id,
+                        "the reserved Actor World's triple must carry the Run this advance opens, not a prior one"
+                    );
+                }
                 let world_hash = WorldHash::of(&next_world);
                 let reserved = new_event(
                     &work_id,

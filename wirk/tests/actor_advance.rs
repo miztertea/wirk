@@ -243,6 +243,24 @@ fn actor_then_actor_auto_advance_reserves_a_world_for_the_second_actor() {
         actor.output_contract.0[0].name, "verdict.md",
         "wp-2's own declared outputs, not wp-1's"
     );
+    // P2.6 W2 (build-brief.md §8; VERIFY.md probe (c), the W1 verifier's
+    // finding): nothing pinned `ActorWorld.triple.run_id` against the
+    // newly-minted Run id it is supposed to carry — reverting
+    // `next_world`'s `triple.run_id` to the *prior* Run's id left every
+    // W1 test green, since both only ever compared `status`'s top-level
+    // `run_id` field (from the journaled `RunOpened` event), never the
+    // World's own embedded triple. That triple is what an actor pane's
+    // env carries forward (`WIRK_RUN_ID` and siblings); a stale run id
+    // here would silently send wp-2's actor to `wirk claim` against
+    // wp-1's Run instead of its own.
+    assert_eq!(
+        actor.triple.run_id.0, run2,
+        "wp-2's World must carry a triple keyed to its own (new) Run id"
+    );
+    assert_ne!(
+        actor.triple.run_id.0, run1,
+        "wp-2's triple must not carry wp-1's (prior) Run id"
+    );
 
     stop_wirkd(&estate, wirkd_child);
 }

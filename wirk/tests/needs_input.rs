@@ -144,6 +144,29 @@ fn workfail(socket: &Path, work_id: &str, reason: &str) -> Reply {
     .expect("workfail call succeeds")
 }
 
+/// P2.6 W2 (ruling 0052 D156): journals `LifecycleObserved{Blocked}`
+/// for `run_id` through wirkd's generic `record` verb directly over
+/// the socket — the same wire call `wirk-herdr::run_loop::RunLoop`'s
+/// `WirkdApi::record` makes when it observes a Blocked pane
+/// (`observe_herdr`), so this simulates the loop's own write, not a
+/// dedicated "blocked" verb (there is none — `fold`, not a new wire
+/// endpoint, is what turns this into `NeedsInput`).
+fn blocked(socket: &Path, work_id: &str, run_id: &str, detail: &str) {
+    let reply = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::LifecycleObserved {
+                status: "Blocked".to_string(),
+                detail: Some(detail.to_string()),
+            },
+        }),
+    )
+    .expect("record call succeeds");
+    assert!(matches!(reply, Reply::Ok { .. }), "{reply:?}");
+}
+
 /// Replays a Work's journal straight off disk (`<estate>/works/<id>`,
 /// the same layout `journal_for` uses server-side) — for assertions the
 /// wire's `status` reply doesn't carry, like `WorkFailed`'s own reason
@@ -667,4 +690,159 @@ fn cli_work_fail_prints_reason() {
         stdout.contains(&format!("WorkFailed {work_id}: giving up on this Work")),
         "stdout must name the reason: {stdout:?}"
     );
+}
+
+// ---- P2.6 W2 (ruling 0052 D156) --------------------------------------
+//
+// (c) A Blocked Work accepts `wirk work retry` and `wirk work fail`
+// exactly as any other `NeedsInput` Work does — `handle_retry`/
+// `handle_fail` (and the CLI verbs over them) read `WorkState::
+// NeedsInput` alone, with no branch on *why*, so getting there via a
+// `LifecycleObserved{Blocked}` observation instead of a `RunFailed`
+// needs no change to either verb; these tests pin that the fold change
+// alone is sufficient. Red before this wave: `LifecycleObserved` was
+// folded inert, so `blocked()` above left the Work `active`, and both
+// verbs refused it `NotNeedsInput` (the same refusal
+// `handle_workfail_refuses_not_needs_input` pins for an untouched
+// Work).
+
+/// `wirkd_status` carries `needs_input.reason == "blocked"` and the
+/// pane's screen-lines detail once a `LifecycleObserved{Blocked}` has
+/// been journaled — the wire-level twin of
+/// `wirkd_status_reports_needs_input_cause` above, sourced from a
+/// Blocked observation instead of a `RunFailed`.
+#[test]
+fn wirkd_status_reports_needs_input_cause_for_blocked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().to_path_buf();
+    let (_wirkd_child, pointer) = start_wirkd(&estate);
+
+    let (work_id, run_id, _waypoint) = submit(&estate, "demo:write");
+    blocked(
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "the actor is waiting on its pane w1:p1:\n\
+         Permission required -- Access external directory /tmp",
+    );
+
+    let reply = wirkd::client::call(
+        &pointer.socket,
+        &Request::status(StatusPayload {
+            work_id: WorkId(work_id.clone()),
+        }),
+    )
+    .expect("status call succeeds");
+    let result = match reply {
+        Reply::Ok { result, .. } => result,
+        Reply::Err { error, .. } => panic!(
+            "status unexpectedly refused: {} {}",
+            error.code, error.message
+        ),
+    };
+
+    assert_eq!(result["state"].as_str(), Some("needs_input"));
+    let cause = &result["needs_input"];
+    assert_eq!(cause["run"].as_str(), Some(run_id.as_str()));
+    assert_eq!(cause["reason"].as_str(), Some("blocked"));
+    assert!(
+        cause["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("w1:p1") && d.contains("Permission required")),
+        "cause.detail must carry the pane and its last screen lines: {cause:?}"
+    );
+}
+
+/// `wirk work retry` succeeds on a Blocked-caused `NeedsInput` Work,
+/// opening a fresh Run the same way it does after a `RunFailed`
+/// (`cli_work_retry_prints_old_and_new_run_id`'s live twin) — no
+/// `NotNeedsInput` refusal, a new run id printed.
+#[test]
+fn cli_work_retry_succeeds_on_a_blocked_needs_input_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().to_path_buf();
+    let (_wirkd_child, pointer) = start_wirkd(&estate);
+
+    let (work_id, run_id, _waypoint) = submit(&estate, "demo:write");
+    blocked(&pointer.socket, &work_id, &run_id, "waiting on pane w1:p1");
+
+    let output = Command::new(wirk_bin())
+        .args(["work", "retry", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id])
+        .output()
+        .expect("work retry runs");
+    assert!(
+        output.status.success(),
+        "work retry failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .trim_start()
+            .starts_with(&format!("Retried {run_id} -> ")),
+        "stdout must name the old and new run id: {stdout:?}"
+    );
+
+    let status_reply = wirkd::client::call(
+        &pointer.socket,
+        &Request::status(StatusPayload {
+            work_id: WorkId(work_id.clone()),
+        }),
+    )
+    .expect("status call succeeds");
+    let result = match status_reply {
+        Reply::Ok { result, .. } => result,
+        Reply::Err { error, .. } => panic!("status refused: {} {}", error.code, error.message),
+    };
+    assert_eq!(
+        result["state"].as_str(),
+        Some("active"),
+        "a retry's RunOpened clears needs_input back to active: {result:?}"
+    );
+}
+
+/// `wirk work fail` succeeds on a Blocked-caused `NeedsInput` Work,
+/// reaching terminal `failed` with the given reason
+/// (`cli_work_fail_prints_reason`'s live twin) — no `NotNeedsInput`
+/// refusal.
+#[test]
+fn cli_work_fail_succeeds_on_a_blocked_needs_input_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().to_path_buf();
+    let (_wirkd_child, pointer) = start_wirkd(&estate);
+
+    let (work_id, run_id, _waypoint) = submit(&estate, "demo:write");
+    blocked(&pointer.socket, &work_id, &run_id, "waiting on pane w1:p1");
+
+    let output = Command::new(wirk_bin())
+        .args(["work", "fail", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--reason", "giving up on this Work"])
+        .output()
+        .expect("work fail runs");
+    assert!(
+        output.status.success(),
+        "work fail failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("WorkFailed {work_id}: giving up on this Work")),
+        "stdout must name the reason: {stdout:?}"
+    );
+
+    let status_reply = wirkd::client::call(
+        &pointer.socket,
+        &Request::status(StatusPayload {
+            work_id: WorkId(work_id.clone()),
+        }),
+    )
+    .expect("status call succeeds");
+    let result = match status_reply {
+        Reply::Ok { result, .. } => result,
+        Reply::Err { error, .. } => panic!("status refused: {} {}", error.code, error.message),
+    };
+    assert_eq!(result["state"].as_str(), Some("failed"), "{result:?}");
 }

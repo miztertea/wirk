@@ -20,15 +20,20 @@ use crate::{
 /// A `HerdrClient` whose responses are fixed in advance, recording the
 /// requests it receives. `Mutex`, not `RefCell` (R6): `HerdrClient:
 /// Send + Sync` requires interior mutability that is `Sync`, and
-/// `RefCell` is not. Only `split_pane`, `get_pane`, `snapshot`, and
-/// `subscribe` are configurable; every other verb returns an inert `Ok`
-/// (or `Err(Transport)` where there is no sensible default), since no
-/// D9 test in this item exercises them.
+/// `RefCell` is not. Only `split_pane`, `get_pane`, `read_pane`,
+/// `snapshot`, and `subscribe` are configurable; every other verb
+/// returns an inert `Ok` (or `Err(Transport)` where there is no
+/// sensible default), since no D9 test in this item exercises them.
 #[derive(Default)]
 pub struct FakeHerdrClient {
     pub split_pane_calls: Mutex<Vec<SplitPane>>,
     pub split_pane_response: Mutex<Option<PaneInfo>>,
     pub get_pane_responses: Mutex<BTreeMap<String, Result<PaneInfo, HerdrError>>>,
+    /// P2.6 W2 (ruling 0052 D156): scripted `pane.read` replies, same
+    /// shape as `get_pane_responses`; unset defaults to `Ok(String::new())`
+    /// (unlike `get_pane`'s `NotFound` default) since most existing
+    /// tests never touch `Blocked` and should not have to configure it.
+    pub pane_read_responses: Mutex<BTreeMap<String, Result<String, HerdrError>>>,
     pub snapshots: Mutex<VecDeque<Snapshot>>,
     pub subscribe_events: Mutex<Vec<HerdrEvent>>,
     /// Fix 2 (0040, ruling 0044): a real channel a test can feed and
@@ -71,6 +76,18 @@ impl FakeHerdrClient {
         result: Result<PaneInfo, HerdrError>,
     ) -> Self {
         self.get_pane_responses
+            .lock()
+            .unwrap()
+            .insert(pane_id.to_string(), result);
+        self
+    }
+
+    pub fn with_pane_read_response(
+        self,
+        pane_id: &str,
+        result: Result<String, HerdrError>,
+    ) -> Self {
+        self.pane_read_responses
             .lock()
             .unwrap()
             .insert(pane_id.to_string(), result);
@@ -174,6 +191,15 @@ impl HerdrClient for FakeHerdrClient {
 
     fn get_agent(&self, target: &str) -> Result<PaneInfo, HerdrError> {
         self.get_pane(target)
+    }
+
+    fn read_pane(&self, pane_id: &str) -> Result<String, HerdrError> {
+        self.pane_read_responses
+            .lock()
+            .unwrap()
+            .get(pane_id)
+            .cloned()
+            .unwrap_or_else(|| Ok(String::new()))
     }
 
     fn list_agents(&self) -> Result<Vec<PaneInfo>, HerdrError> {

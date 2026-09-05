@@ -333,3 +333,180 @@ fn needs_input_cause_is_comparable() {
     let b = a.clone();
     assert_eq!(a, b);
 }
+
+// ---- P2.6 W2 (ruling 0052 D156) --------------------------------------
+//
+// A `Blocked` pane is an actor waiting on a human, not a failed Run —
+// distinct from `RunFailed`/`RunVanished` above (0049 D147 amended).
+// Red before this wave: `EventKind::LifecycleObserved { .. } => {}`
+// (wholly inert at the Work level, D9#2's own comment).
+
+/// (a) A `LifecycleObserved{Blocked}` on a non-terminal Work moves it
+/// to `NeedsInput` carrying the reason `"blocked"` and the event's own
+/// `detail` (the pane and its last screen lines, journaled by the
+/// loop) verbatim — the same shape `RunFailed`/`RunVanished` already
+/// get, guarded by `is_terminal()` the same way. Probed by hand
+/// (BUILD.md): reverting the fold's `"Blocked"` arm to a no-op (the
+/// pre-wave inert shape) makes this fail — the Work stays `Active`.
+#[test]
+fn fold_lifecycle_blocked_moves_work_to_needs_input_with_screen_lines() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::LifecycleObserved {
+            status: "Blocked".to_string(),
+            detail: Some(
+                "the actor is waiting on its pane w1:p1:\n\
+                 ┃ Permission required\n\
+                 ┃ Access external directory /tmp"
+                    .to_string(),
+            ),
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::NeedsInput),
+        "{:?}",
+        work.state
+    );
+    let cause = work
+        .needs_input
+        .expect("needs_input must be Some after a Blocked observation");
+    assert_eq!(cause.run, RunId("run-1".to_string()));
+    assert_eq!(cause.reason, "blocked");
+    assert!(
+        cause.detail.contains("w1:p1") && cause.detail.contains("Permission required"),
+        "cause.detail must carry the pane and its last screen lines verbatim: {:?}",
+        cause.detail
+    );
+}
+
+/// (b) A later `LifecycleObserved{Working}` — the same event kind the
+/// loop already journals for every status — clears a `"blocked"`
+/// `NeedsInput` back to `Active` with `needs_input` reset to `None`.
+/// Red before this wave: `LifecycleObserved` folded inert, so the Work
+/// never left `NeedsInput` at all (there was nothing to clear it).
+#[test]
+fn fold_lifecycle_working_clears_a_blocked_needs_input() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::LifecycleObserved {
+            status: "Blocked".to_string(),
+            detail: Some("waiting on pane w1:p1".to_string()),
+        },
+    ));
+    let blocked_work = wirk_core::fold(&events);
+    assert!(matches!(blocked_work.state, WorkState::NeedsInput));
+
+    events.push(event(
+        "ev-5",
+        "work-1",
+        Some("run-1"),
+        2,
+        EventKind::LifecycleObserved {
+            status: "Working".to_string(),
+            detail: None,
+        },
+    ));
+    let resolved_work = wirk_core::fold(&events);
+    assert!(
+        matches!(resolved_work.state, WorkState::Active),
+        "{:?}",
+        resolved_work.state
+    );
+    assert_eq!(
+        resolved_work.needs_input, None,
+        "a Working observation must clear a blocked needs_input"
+    );
+}
+
+/// Guard: a `Working` observation must not clear a `NeedsInput` caused
+/// by something else (a validated Question here) — only a `"blocked"`
+/// cause is this arm's to clear. Otherwise an unrelated pane going
+/// Working on the same Run could silently discard a human's still-open
+/// Question.
+#[test]
+fn fold_lifecycle_working_does_not_clear_a_non_blocked_needs_input() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::ClaimRecorded {
+            claim: wirk_core::ClaimId("claim-q".to_string()),
+            claim_kind: wirk_core::ClaimKind::Question("which base branch?".to_string()),
+            verdict: wirk_core::ClaimVerdict::Validated,
+        },
+    ));
+    events.push(event(
+        "ev-5",
+        "work-1",
+        Some("run-1"),
+        2,
+        EventKind::LifecycleObserved {
+            status: "Working".to_string(),
+            detail: None,
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::NeedsInput),
+        "a Working observation must not clear a Question's needs_input: {:?}",
+        work.state
+    );
+    assert_eq!(
+        work.needs_input.expect("still needs_input").reason,
+        "question"
+    );
+}
+
+/// Guard probe (states.md §4, mirroring `fold_terminal_work_ignores_a_later_run_failed`):
+/// once a Work is terminal, a later `Blocked` observation changes
+/// neither `state` nor `needs_input`.
+#[test]
+fn fold_terminal_work_ignores_a_later_blocked_observation() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::WorkFailed {
+            cause: FailureCause {
+                status: None,
+                request_id: None,
+                at: Timestamp(1),
+                detail: Some("boundary violation".to_string()),
+            },
+        },
+    ));
+    events.push(event(
+        "ev-5",
+        "work-1",
+        Some("run-1"),
+        2,
+        EventKind::LifecycleObserved {
+            status: "Blocked".to_string(),
+            detail: Some("waiting on pane w1:p1".to_string()),
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::Failed),
+        "a terminal Work must stay terminal: {:?}",
+        work.state
+    );
+    assert!(
+        work.needs_input.is_none(),
+        "a Blocked observation after WorkFailed must not populate needs_input: {:?}",
+        work.needs_input
+    );
+}
