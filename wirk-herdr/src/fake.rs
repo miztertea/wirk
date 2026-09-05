@@ -46,6 +46,11 @@ pub struct FakeHerdrClient {
     /// `RunLoop` test can assert how many prompts were sent and what
     /// they said.
     pub prompt_agent_calls: Mutex<Vec<PromptAgent>>,
+    /// P2.3 W1 (states.md §2): records every `notification.show` call
+    /// so a `RunLoop` test can assert `notify` fired exactly once on
+    /// the stuck-actor path, with the run id in `body` — 0040: a real
+    /// recording fake, not a canned reply standing in for the call.
+    pub notify_calls: Mutex<Vec<Notify>>,
 }
 
 impl FakeHerdrClient {
@@ -194,7 +199,8 @@ impl HerdrClient for FakeHerdrClient {
         Ok(())
     }
 
-    fn notify(&self, _req: Notify) -> Result<(), HerdrError> {
+    fn notify(&self, req: Notify) -> Result<(), HerdrError> {
+        self.notify_calls.lock().unwrap().push(req);
         Ok(())
     }
 

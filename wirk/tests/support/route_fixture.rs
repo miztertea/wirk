@@ -15,19 +15,34 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes")
+/// The canonical fixtures under `wirk/tests/fixtures/routes/`, embedded
+/// at compile time (`include_str!`, R3) so a test binary carries its
+/// fixtures and never reads a path at run time: a binary compiled in
+/// one worktree and reused from the shared cargo cache after that
+/// worktree is gone (the `env!("CARGO_MANIFEST_DIR")` read this
+/// replaced) failed eleven tests at the P2.3 land, 2026-09-05.
+fn fixture_text(name: &str) -> &'static str {
+    match name {
+        "smoke" => include_str!("../fixtures/routes/smoke.json"),
+        "proving" => include_str!("../fixtures/routes/proving.json"),
+        "proving_reversed" => include_str!("../fixtures/routes/proving_reversed.json"),
+        "three_waypoint" => include_str!("../fixtures/routes/three_waypoint.json"),
+        "two_waypoint_distinctive" => {
+            include_str!("../fixtures/routes/two_waypoint_distinctive.json")
+        }
+        "malformed_json" => include_str!("../fixtures/routes/malformed_json.json"),
+        "unknown_field" => include_str!("../fixtures/routes/unknown_field.json"),
+        other => panic!("no route fixture named {other}.json under wirk/tests/fixtures/routes/"),
+    }
 }
 
-/// Copies the canonical `<name>.json` fixture (`wirk/tests/fixtures/
-/// routes/`) into `<estate>/routes/<name>.json`, creating the directory
-/// as needed — ready for a bare `--route <name>` submit.
+/// Copies the canonical `<name>.json` fixture into
+/// `<estate>/routes/<name>.json`, creating the directory as needed —
+/// ready for a bare `--route <name>` submit.
 pub fn install_route_fixture(estate: &Path, name: &str) {
-    let text = fs::read_to_string(fixture_dir().join(format!("{name}.json")))
-        .unwrap_or_else(|err| panic!("read fixture {name}.json: {err}"));
-    write_route(estate, name, &text);
+    write_route(estate, name, fixture_text(name));
 }
 
 /// Writes `text` verbatim as `<estate>/routes/<name>.json` — for a

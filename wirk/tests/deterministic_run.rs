@@ -185,10 +185,14 @@ fn run_deterministic_child_completes_and_fails() {
         stdout.contains(&format!("RunFailed {run2}")),
         "stdout: {stdout}"
     );
-    // `Work` state stays `active`: "a failed Run is not a failed Work"
-    // (incident file; fold.md §1) — asserted so this test would catch a
-    // regression of that rule, not only the journal-level fact below.
-    assert_eq!(status_state(&pointer.socket, &work2), "active");
+    // `Work` moves to `needs_input` (P2.3 W1, 0033 D102; 0044;
+    // superseding fold.md §1's earlier "a failed Run is not a failed
+    // Work" — the incident-file rule was that a Run's failure never
+    // silently becomes a Work *failure*, which still holds: this is
+    // `NeedsInput`, not `Failed`, and stays a human decision, never
+    // inferred) — asserted so this test would catch a regression of
+    // the new surfacing, not only the journal-level fact below.
+    assert_eq!(status_state(&pointer.socket, &work2), "needs_input");
 
     let work_dir = estate.join("works").join(&work2);
     let journal = Journal::open(&work_dir).expect("open journal");

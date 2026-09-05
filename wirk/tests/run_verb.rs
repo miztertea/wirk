@@ -43,8 +43,10 @@ mod wirkd;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wirkd::{ClaimPayload, Reply, Request, WirkdPointer};
@@ -208,6 +210,9 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
     else {
         return;
     };
+    // Held for the whole test body: this test starts a real opencode
+    // agent against the one local model endpoint (live_herdr.rs).
+    let _live_model_guard = live_herdr::live_model_lock();
 
     let estate_dir = tempfile::tempdir().expect("estate tempdir");
     let estate = estate_dir.path().to_path_buf();
@@ -388,6 +393,9 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
     ) else {
         return;
     };
+    // Held for the whole test body: this test starts a real opencode
+    // agent against the one local model endpoint (live_herdr.rs).
+    let _live_model_guard = live_herdr::live_model_lock();
 
     let estate_dir = tempfile::tempdir().expect("estate tempdir");
     let estate = estate_dir.path().to_path_buf();
@@ -428,21 +436,26 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
         matches!(kind, EventKind::RunLaunched { .. })
     });
 
-    // Bounded poll (issue 359) confirming no RunFailed lands during
-    // QUIET_POLL — the defect this test pins: a stale read timeout on a
-    // quiet pane must not fail the Run. `wirk run` itself may exit on
-    // its own before the deadline (item C's no-progress check,
-    // legitimately, this test's own doc comment) — that ends the loop
-    // early, never with a RunFailed, so the poll below breaks the
-    // moment the process exits too.
+    // Bounded poll (issue 359) confirming no *bogus* RunFailed lands
+    // during QUIET_POLL — the defect this test pins: a stale read
+    // timeout on a quiet pane must not fail the Run. `wirk run` itself
+    // may exit on its own before the deadline (item C's no-progress
+    // check, legitimately, this test's own doc comment) — P2.3 W1
+    // journals that legitimate case as `RunFailed{cause.status:
+    // Some("stuck")}` now (states.md §1), so only a RunFailed whose
+    // `cause.status` is *not* `"stuck"` is the regression this poll
+    // still watches for.
     let mut run_child = guard.0.pop().expect("wirk run child is in guard");
     let deadline = Instant::now() + QUIET_POLL;
     loop {
         if let Ok(journal) = Journal::open(estate.join("works").join(&work_id))
             && let Ok(events) = journal.replay()
-            && let Some(failed) = events
-                .iter()
-                .find(|e| matches!(&e.kind, EventKind::RunFailed { .. }))
+            && let Some(failed) = events.iter().find(|e| {
+                matches!(
+                    &e.kind,
+                    EventKind::RunFailed { cause } if cause.status.as_deref() != Some("stuck")
+                )
+            })
         {
             panic!("RunFailed landed during the quiet window: {failed:?}");
         }
@@ -500,17 +513,24 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
 
     let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
     let events = journal.replay().expect("journal replays cleanly");
-    let run_failed = events
-        .iter()
-        .find(|e| matches!(&e.kind, EventKind::RunFailed { .. }));
+    // P2.3 W1: a `RunFailed{cause.status: Some("stuck")}` is the
+    // legitimate no-progress surfacing (exit 4, `NeedsInput`), not the
+    // stale-read-timeout defect this test pins — only a differently
+    // caused RunFailed is still a failure here.
+    let bogus_run_failed = events.iter().find(|e| {
+        matches!(
+            &e.kind,
+            EventKind::RunFailed { cause } if cause.status.as_deref() != Some("stuck")
+        )
+    });
     assert!(
         matches!(run_status.code(), Some(0) | Some(4)),
         "wirk run exit status: {run_status:?} (0 Claimed or 4 NeedsInput expected); stderr: \
-         {run_stderr:?}; journal RunFailed: {run_failed:?}"
+         {run_stderr:?}; journal RunFailed: {bogus_run_failed:?}"
     );
     assert!(
-        run_failed.is_none(),
-        "expected no RunFailed, found {run_failed:?}"
+        bogus_run_failed.is_none(),
+        "expected no bogus RunFailed, found {bogus_run_failed:?}"
     );
 
     let stop = Command::new(wirk_bin())
@@ -552,6 +572,9 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
     ) else {
         return;
     };
+    // Held for the whole test body: this test starts a real opencode
+    // agent against the one local model endpoint (live_herdr.rs).
+    let _live_model_guard = live_herdr::live_model_lock();
 
     let estate_dir = tempfile::tempdir().expect("estate tempdir");
     let estate = estate_dir.path().to_path_buf();
@@ -574,19 +597,40 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
     let (work_id, run_id, _waypoint) =
         submit_actor(&estate, &repo, "reply with the word ready and stop");
 
-    guard.0.push(
-        Command::new(wirk_bin())
-            .args(["run", "--estate"])
-            .arg(&estate)
-            .args(["--work", &work_id, "--session", session.name()])
-            .args(["--herdr-socket"])
-            .arg(session.socket_path())
-            .args(["--actor-kind", "opencode"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn wirk run"),
-    );
+    let mut run_child = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session.name()])
+        .args(["--herdr-socket"])
+        .arg(session.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wirk run");
+
+    // P2.3 W3: read `wirk run`'s own stdout on its own thread as it is
+    // produced (never after `wait()` — the pipe would fill and this
+    // long-lived driver would deadlock before Claimed). This is the
+    // live twin's own way of "capturing the child's stdout" (BUILD.md's
+    // choice, over injecting a sink as `wirk-herdr/tests/run_loop.rs`'s
+    // fake-backed test does): a real process, its real pipe, read
+    // concurrently — exactly as `stderr` is already read elsewhere in
+    // this file, but after the child exits there; here read live
+    // instead, since this test's own driver keeps running well past
+    // the first prompt.
+    let run_stdout = run_child.stdout.take().expect("wirk run stdout piped");
+    let run_stdout_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let run_stdout_reader = {
+        let lines = Arc::clone(&run_stdout_lines);
+        std::thread::spawn(move || {
+            for line in BufReader::new(run_stdout).lines().map_while(Result::ok) {
+                lines.lock().unwrap().push(line);
+            }
+        })
+    };
+
+    guard.0.push(run_child);
 
     wait_for_event(&estate, &work_id, |kind| {
         matches!(kind, EventKind::RunLaunched { .. })
@@ -594,12 +638,18 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
 
     let client = session.client();
 
-    // First Idle: the agent finished its one turn.
-    wait_agent_status(
+    // First turn end: the agent finished its one turn. P2.3 W5
+    // (build-brief.md §9): Herdr's own `status_name` reports this as
+    // `Done`, not `Idle`, whenever the pane has not been viewed since —
+    // every pane `wirk run` drives, since it drives headless — so this
+    // accepts either rather than pinning `Idle` alone (the rerun
+    // observed `Done` here live: `knowledge/evidence/
+    // p2-retry-escalation-2026-09-04/rerun/03-stuck.log`).
+    wait_agent_status_any(
         &client,
         &run_id,
-        wirk_herdr::AgentStatus::Idle,
-        "the agent's first Idle",
+        &[wirk_herdr::AgentStatus::Idle, wirk_herdr::AgentStatus::Done],
+        "the agent's first turn end (Idle or Done)",
     );
 
     // A return to Working after that Idle: `wirk run`'s own
@@ -662,6 +712,44 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
         .expect("reap wirk run");
     assert!(run_status.success(), "wirk run exit status: {run_status:?}");
 
+    run_stdout_reader.join().expect("stdout reader thread");
+    let stdout_lines = run_stdout_lines.lock().unwrap().clone();
+    let prompt_lines: Vec<&String> = stdout_lines
+        .iter()
+        .filter(|line| line.starts_with("prompt:"))
+        .collect();
+    // P2.3 W3: this test's own doc comment already pins that `wirk run`
+    // prompts the pane exactly once (the Working transition observed
+    // above) before the Claim is filed — the driver's stdout must carry
+    // that one prompt line, naming the Idle it answered and the first
+    // words of what was sent.
+    assert_eq!(
+        prompt_lines.len(),
+        1,
+        "wirk run's stdout must carry exactly one prompt line: {stdout_lines:?}"
+    );
+    // P2.3 W5: the prompt line names whichever turn-ended status it
+    // actually answered (`Idle` or `Done` — build-brief.md §9), not a
+    // hardcoded "Idle", since a headless pane reports `Done` live.
+    assert!(
+        (prompt_lines[0].contains("Idle answered") || prompt_lines[0].contains("Done answered"))
+            && prompt_lines[0].contains("sending:"),
+        "the prompt line must name the turn-ended status it answered (Idle or Done) and the \
+         prompt text sent: {:?}",
+        prompt_lines[0]
+    );
+
+    // P2.3 W5 (build-brief.md §9, second gap: the rerun's driver exited
+    // with no printed line naming its outcome, cause unobserved). This
+    // run claims, so the outcome line is the plain `Claimed` `run_command`
+    // already prints on that exit path — asserted explicitly here as
+    // this test's own "the driver's stdout carries a final line naming
+    // its outcome" check.
+    assert!(
+        stdout_lines.iter().any(|line| line == "Claimed"),
+        "wirk run's stdout must carry a final line naming its outcome: {stdout_lines:?}"
+    );
+
     let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
     let events = journal.replay().expect("journal replays cleanly");
     let run_failed = events
@@ -670,6 +758,179 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
     assert!(
         run_failed.is_none(),
         "expected no RunFailed, found {run_failed:?}"
+    );
+
+    let stop = Command::new(wirk_bin())
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// P2.3 W6 (build-brief.md §10, rerun2's own correction, ruling 0044):
+/// live proof that the progress baseline is taken only after a
+/// *continuation* prompt, never after the very first (the intent). The
+/// stall intent below is rerun2's own, verbatim
+/// (`knowledge/evidence/p2-retry-escalation-2026-09-04/rerun2/
+/// journal-B.ndjson`): the actor replies once with the single word
+/// "waiting" and does nothing else, however many times it is prompted.
+/// Expected sequence (`wirk-herdr/src/run_loop.rs` module doc): the
+/// intent prompt (turn end 1, no baseline taken -- it is the task, not
+/// a continuation), the actor's first reply ends its turn (turn end 2;
+/// no baseline existed yet, so this earns an unconditional
+/// *continuation* prompt, and the baseline is taken now), the actor's
+/// second identical reply ends its turn again with the worktree still
+/// untouched (turn end 3) -- a baseline now exists, unchanged, so this
+/// is the actor judged stuck. Before this wave's fix, the loop declared
+/// stuck already at turn end 2 -- never having sent a continuation at
+/// all -- exactly the rerun2 evidence (`driver.log`: stuck 22s after
+/// launch, on the actor's very first turn end, one prompt total).
+#[test]
+fn wirk_run_stuck_after_the_first_continuation_exits_4() {
+    let Some(session) =
+        live_herdr::LiveHerdrSession::start("wirk_run_stuck_after_the_first_continuation_exits_4")
+    else {
+        return;
+    };
+    // Held for the whole test body: this test starts a real opencode
+    // agent against the one local model endpoint (live_herdr.rs).
+    let _live_model_guard = live_herdr::live_model_lock();
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate); // wirkd is up; no direct socket call needed in this test
+
+    let (work_id, _run_id, _waypoint) = submit_actor(
+        &estate,
+        &repo,
+        "Reply with the single word waiting and then stop. Do not read or edit any file, do not \
+         run any command, do not run wirk claim, do not ask a question. Whenever you are \
+         prompted again, reply with the single word waiting and stop.",
+    );
+
+    let mut run_child = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session.name()])
+        .args(["--herdr-socket"])
+        .arg(session.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wirk run");
+
+    // Same live-capture shape as `wirk_run_prompts_an_idle_unclaimed_
+    // pane_again_then_claims`: read on its own thread as the lines are
+    // produced, never after `wait()`.
+    let run_stdout = run_child.stdout.take().expect("wirk run stdout piped");
+    let run_stdout_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let run_stdout_reader = {
+        let lines = Arc::clone(&run_stdout_lines);
+        std::thread::spawn(move || {
+            for line in BufReader::new(run_stdout).lines().map_while(Result::ok) {
+                lines.lock().unwrap().push(line);
+            }
+        })
+    };
+
+    wait_for_event(&estate, &work_id, |kind| {
+        matches!(kind, EventKind::RunLaunched { .. })
+    });
+
+    // The test's own wait is a bounded poll on the child's exit (issue
+    // 359's own shape; 0044 D134: a termination bound is reported as
+    // "never observed", never a verdict about the agent) -- rerun2's own
+    // evidence put the whole sequence at ~22s, so 120s is headroom, not
+    // a product timeout.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if run_child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never observed: wirk run exiting on its own; stdout so far {:?}",
+            run_stdout_lines.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let run_status = run_child.wait().expect("reap wirk run");
+    run_stdout_reader.join().expect("stdout reader thread");
+    guard.0.push(run_child);
+
+    let stdout_lines = run_stdout_lines.lock().unwrap().clone();
+    let prompt_lines: Vec<&String> = stdout_lines
+        .iter()
+        .filter(|line| line.starts_with("prompt:"))
+        .collect();
+    let continuation_count = prompt_lines
+        .iter()
+        .filter(|line| line.contains("first continuation"))
+        .count();
+    assert_eq!(
+        continuation_count, 1,
+        "exactly one continuation prompt: the intent itself never earns a baseline (W6): \
+         {stdout_lines:?}"
+    );
+
+    let continuation_index = stdout_lines
+        .iter()
+        .position(|l| l.starts_with("prompt:") && l.contains("first continuation"))
+        .expect("continuation prompt line present");
+    let needs_input_index = stdout_lines
+        .iter()
+        .position(|l| l == "NeedsInput")
+        .unwrap_or_else(|| panic!("no NeedsInput outcome line in stdout: {stdout_lines:?}"));
+    let stuck_index = stdout_lines
+        .iter()
+        .position(|l| l.contains("stuck:"))
+        .unwrap_or_else(|| panic!("no stuck observation line in stdout: {stdout_lines:?}"));
+    assert!(
+        continuation_index < needs_input_index && needs_input_index < stuck_index,
+        "expected order in the driver's stdout: the continuation prompt, then the NeedsInput \
+         outcome, then the stuck detail naming what was observed (rerun2's own driver.log \
+         order): {stdout_lines:?}"
+    );
+
+    assert_eq!(
+        run_status.code(),
+        Some(4),
+        "wirk run must exit 4 (NeedsInput) on a stuck actor: {run_status:?}, stdout \
+         {stdout_lines:?}"
+    );
+
+    let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
+    let events = journal.replay().expect("journal replays cleanly");
+    let stuck_failed = events.iter().find(|e| {
+        matches!(
+            &e.kind,
+            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck")
+        )
+    });
+    assert!(
+        stuck_failed.is_some(),
+        "expected a journaled RunFailed{{status: stuck}}: {events:?}"
     );
 
     let stop = Command::new(wirk_bin())
@@ -704,5 +965,31 @@ fn wait_agent_status(
             return;
         }
         assert!(Instant::now() < deadline, "never observed: {what}");
+    }
+}
+
+/// P2.3 W5 (build-brief.md §9): the same bounded poll as
+/// `wait_agent_status`, widened to accept any of `statuses` — Herdr's
+/// own `agent.wait` verb (`HerdrClient::wait_agent`) takes a single
+/// target status, so this polls `get_agent` directly instead (a plain
+/// point-in-time read, R2: already on the trait, used elsewhere in this
+/// crate) rather than racing several blocking waits against one
+/// deadline.
+fn wait_agent_status_any(
+    client: &wirk_herdr::SocketClient,
+    agent_name: &str,
+    statuses: &[wirk_herdr::AgentStatus],
+    what: &str,
+) {
+    use wirk_herdr::HerdrClient;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Ok(pane) = client.get_agent(agent_name)
+            && statuses.contains(&pane.agent_status)
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "never observed: {what}");
+        std::thread::sleep(Duration::from_millis(200));
     }
 }

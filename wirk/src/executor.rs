@@ -240,7 +240,28 @@ impl WirkdApi for WirkdRunLoopApi {
 /// (Claimed), 4 (NeedsInput), or 5 (Vanished, a subscription stream that
 /// ended with nothing terminal, or any setup/drive error) — a status
 /// line is printed for each transition this function itself observes.
+///
+/// P2.3 W5 (build-brief.md §9, second gap): the rerun's driver exited
+/// silently, with no journaled outcome and no printed line, cause
+/// unobserved (`knowledge/evidence/p2-retry-escalation-2026-09-04/
+/// rerun/RESULT-rerun.md`). Audited every `return` below against this
+/// function's own body, read whole: every one already `eprintln!`s
+/// (setup errors) or `println!`s (`RunLoop::drive`'s own `Outcome`
+/// match, all four arms, plus the generic `Err` arm) before returning —
+/// none was silent. The one gap an audit of `return`s cannot close is a
+/// panic escaping this thread with Rust's own default handler having
+/// been silenced or lost (e.g. its message landing in a piped stderr
+/// nothing reads before teardown, the rerun's own suspected shape); the
+/// hook below names itself so the line is unmistakably this command's,
+/// not merely "thread panicked" noise indistinguishable from any other
+/// crate's (R3: `std::panic::set_hook`, stdlib, no new dependency).
+/// Scoped to this process (a fresh `wirk` invocation per subcommand —
+/// `main.rs` never dispatches two), so setting it here never touches
+/// any other verb.
 pub fn run_command(rest: &[String]) -> ExitCode {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("wirk run: panic: {info}");
+    }));
     let actor_kind = match parse_actor_kind(rest) {
         Ok(kind) => kind,
         Err(()) => {

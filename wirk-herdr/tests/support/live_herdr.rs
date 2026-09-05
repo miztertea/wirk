@@ -25,9 +25,42 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use wirk_herdr::{HerdrClient, SocketClient};
+
+/// The one local inference endpoint (`llama.cpp` serving a single
+/// model, `knowledge/evidence/hosts/cerberus-2026-09-03.md`) answers
+/// one opencode session at a time; two live opencode agents racing it
+/// in the same process miss their tests' own termination bounds
+/// (`w6/VERIFY.md`, `w5/VERIFY.md`). This guard makes every test that
+/// starts an opencode agent hold it for its whole body, so within one
+/// test binary those tests run one at a time while everything else
+/// (fake-backed tests, tests against other Herdr sessions that never
+/// touch the model) keeps running in parallel around them.
+///
+/// This serializes only *within* a test binary — `cargo test` compiles
+/// each integration-test file (`tests/*.rs`) to its own binary, and
+/// runs those binaries one at a time by default (The Cargo Book,
+/// "Integration Tests": "each integration test results in a separate
+/// executable binary, and `cargo test` will run them serially"), so a
+/// second binary never races this one against the same endpoint
+/// regardless of this lock. Widening this to a cross-process lock (a
+/// lockfile, a socket) would be solving a problem the default already
+/// doesn't have (R1).
+static LIVE_MODEL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the process-wide guard on the local model endpoint. A poisoned
+/// lock (an earlier test panicked while holding it) must not fail every
+/// later test that also starts an opencode agent, so a poison is
+/// recovered rather than propagated — the mutex protects only mutual
+/// exclusion here, no shared data a panic could have left inconsistent.
+pub fn live_model_lock() -> MutexGuard<'static, ()> {
+    LIVE_MODEL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Bound on how long `start` polls for the session's socket to appear.
 /// Generous for a live `herdr` server spawn on this box (P1's own tried

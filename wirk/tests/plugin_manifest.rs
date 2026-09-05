@@ -10,14 +10,40 @@ use std::path::PathBuf;
 use std::process::Command;
 use toml::Value;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
+/// The manifest and the plugin directory as the repo carries them,
+/// embedded at compile time (`include_str!`, R3) and materialized into
+/// a temp root per test, so the binary never reads a source path at run
+/// time (a binary compiled in one worktree and reused from the shared
+/// cargo cache after that worktree was removed failed at the P2.3 land,
+/// 2026-09-05). The temp root is removed when the guard drops.
+fn repo_root() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("wirk-plugin-manifest-")
+        .tempdir_in("/var/tmp")
+        .expect("temp root under /var/tmp");
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("herdr-plugin.toml"), MANIFEST_TEXT).unwrap();
+    std::fs::create_dir_all(root.join("plugin")).unwrap();
+    std::fs::write(root.join("plugin/startup.sh"), STARTUP_SH).unwrap();
+    std::fs::write(root.join("plugin/README.md"), PLUGIN_README).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.join("plugin/startup.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    (dir, root)
 }
 
+const MANIFEST_TEXT: &str = include_str!("../../herdr-plugin.toml");
+const STARTUP_SH: &str = include_str!("../../plugin/startup.sh");
+const PLUGIN_README: &str = include_str!("../../plugin/README.md");
+
 fn manifest() -> Value {
-    let text = std::fs::read_to_string(repo_root().join("herdr-plugin.toml"))
-        .expect("herdr-plugin.toml must exist at the repo root");
-    toml::from_str(&text).expect("herdr-plugin.toml must parse as TOML")
+    toml::from_str(MANIFEST_TEXT).expect("herdr-plugin.toml must parse as TOML")
 }
 
 #[test]
@@ -77,7 +103,7 @@ fn no_events_table() {
 #[test]
 fn every_command_resolves_to_a_repo_script_or_the_wirk_binary() {
     let doc = manifest();
-    let root = repo_root();
+    let (_guard, root) = repo_root();
 
     let mut commands: Vec<&Value> = doc["startup"]
         .as_array()
@@ -125,7 +151,8 @@ fn every_command_resolves_to_a_repo_script_or_the_wirk_binary() {
 
 #[test]
 fn startup_script_is_executable_and_syntactically_valid() {
-    let path = repo_root().join("plugin/startup.sh");
+    let (_guard, root) = repo_root();
+    let path = root.join("plugin/startup.sh");
     assert!(path.is_file(), "plugin/startup.sh must exist");
 
     #[cfg(unix)]
@@ -156,7 +183,8 @@ fn startup_script_is_executable_and_syntactically_valid() {
 /// half is pinned here).
 #[test]
 fn startup_script_no_ops_without_a_configured_estate() {
-    let path = repo_root().join("plugin/startup.sh");
+    let (_guard, root) = repo_root();
+    let path = root.join("plugin/startup.sh");
     let config_dir =
         std::env::temp_dir().join(format!("wirk-plugin-manifest-test-{}", std::process::id()));
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -165,7 +193,7 @@ fn startup_script_no_ops_without_a_configured_estate() {
         .arg(&path)
         .env("HERDR_PLUGIN_CONFIG_DIR", &config_dir)
         .env("HERDR_PLUGIN_STATE_DIR", &config_dir)
-        .env("HERDR_PLUGIN_ROOT", repo_root())
+        .env("HERDR_PLUGIN_ROOT", &root)
         .output()
         .expect("startup.sh must run under bash");
 

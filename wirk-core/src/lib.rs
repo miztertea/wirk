@@ -167,6 +167,34 @@ pub struct Work {
     /// working" and "wedged" are distinguishable without transcript
     /// reading.
     pub last_activity: Timestamp,
+    /// P2.3 W1 (0033 D102; 0044): why the Work is (or last was)
+    /// `NeedsInput` — a failed Run, a vanished Run, a stuck actor
+    /// (`RunFailed` with `cause.status == Some("stuck")`), or a
+    /// validated Question claim. Set by `fold` on the transition, left
+    /// as history once the Work moves on (a retry verb clearing it is
+    /// P2.3 W2's decision, out of scope here). `#[serde(default)]`: a
+    /// `Work` is never itself journaled, only rebuilt fresh by `fold`
+    /// on every read (no cached projection), so this is a pure
+    /// in-memory addition — the default only matters if `Work` is ever
+    /// round-tripped, which it is not today.
+    #[serde(default)]
+    pub needs_input: Option<NeedsInputCause>,
+}
+
+/// P2.3 W1 (states.md §1): one three-field struct rather than a
+/// `reason` variant per underlying cause string (R6) — a caller
+/// distinguishing an exit failure from a stuck actor reads
+/// `cause.status` off the named Run (already surfaced by
+/// `handle_status`'s `failure_status`), not a second field here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NeedsInputCause {
+    pub run: RunId,
+    /// `"run_failed"` | `"run_vanished"` | `"question"` — a stuck actor
+    /// is a `RunFailed` too (states.md §1), distinguished by
+    /// `cause.status == Some("stuck")` on the Run, not a fourth string
+    /// here.
+    pub reason: String,
+    pub detail: String,
 }
 
 /// A repository this Work may touch, with its declared access mode
@@ -892,6 +920,7 @@ pub fn fold(events: &[Event]) -> Work {
                     state: WorkState::Pending,
                     current_waypoint: None,
                     last_activity: event.at,
+                    needs_input: None,
                 });
             }
             // No `Work` exists yet and this isn't `WorkSubmitted`: there
@@ -918,6 +947,21 @@ pub fn fold(events: &[Event]) -> Work {
             }
             EventKind::RunOpened { run, waypoint, .. } => {
                 run_waypoints.insert(run.clone(), waypoint.clone());
+                // P2.3 W2 (decide.md §1, build-brief.md §7): a retry's
+                // own `RunOpened` clears `NeedsInput` back to `Active`
+                // on the same reserved World — the human's decision is
+                // this one event, no count invented (0044 D134).
+                // Auto-advance's own `RunOpened` (handle_claim) only
+                // ever fires from a Validated Done claim, which never
+                // reaches this arm while `w.state == NeedsInput` (a
+                // Question/RunFailed/RunVanished already moved the Work
+                // there and a Done claim on that Run cannot validate
+                // afterward), so this guard is a no-op on that path,
+                // never a special case for it.
+                if w.state == WorkState::NeedsInput {
+                    w.state = WorkState::Active;
+                    w.needs_input = None;
+                }
             }
             EventKind::RunLaunched { .. } => {}
             // D9#2: inert at Run level (0001 D9 #2; 0017 D56); equally
@@ -944,9 +988,17 @@ pub fn fold(events: &[Event]) -> Work {
                             w.state = WorkState::Active;
                         }
                     }
-                    (ClaimVerdict::Validated, ClaimKind::Question(_)) => {
+                    (ClaimVerdict::Validated, ClaimKind::Question(reason)) => {
                         if !w.state.is_terminal() {
                             w.state = WorkState::NeedsInput;
+                            w.needs_input = Some(NeedsInputCause {
+                                run: event
+                                    .run
+                                    .clone()
+                                    .expect("a validated Claim always names a run"),
+                                reason: "question".into(),
+                                detail: reason.clone(),
+                            });
                         }
                     }
                     // A refusal is not a Work fact, mirrors Run::apply
@@ -954,10 +1006,31 @@ pub fn fold(events: &[Event]) -> Work {
                     (ClaimVerdict::Refused(_), _) => {}
                 }
             }
-            // "A failed Run is not a failed Work" (incident file;
-            // fold.md §1) — activity only.
-            EventKind::RunFailed { .. } => {}
-            EventKind::RunVanished => {}
+            // P2.3 W1 (0033 D102; 0044; states.md §1): superseded — a
+            // failed Run now surfaces the Work as `NeedsInput` with its
+            // cause, guarded like every other non-terminal transition
+            // so a Work already `Failed`/`Completed`/`Canceled` is left
+            // alone by a later `RunFailed`/`RunVanished`.
+            EventKind::RunFailed { cause } => {
+                if !w.state.is_terminal() {
+                    w.state = WorkState::NeedsInput;
+                    w.needs_input = Some(NeedsInputCause {
+                        run: event.run.clone().expect("RunFailed always names a run"),
+                        reason: "run_failed".into(),
+                        detail: cause.detail.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            EventKind::RunVanished => {
+                if !w.state.is_terminal() {
+                    w.state = WorkState::NeedsInput;
+                    w.needs_input = Some(NeedsInputCause {
+                        run: event.run.clone().expect("RunVanished always names a run"),
+                        reason: "run_vanished".into(),
+                        detail: "the actor's pane ended (Herdr stream EOF)".into(),
+                    });
+                }
+            }
             EventKind::WorktreeCreated { .. } => {}
             EventKind::WorkFailed { .. } => {
                 w.state = WorkState::Failed;

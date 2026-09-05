@@ -58,7 +58,10 @@ mod executors;
 // Herdr session and wirkd via `wirk_herdr::run_loop::RunLoop`.
 mod executor;
 
-use wirkd::{ClaimPayload, FailPayload, Reply, Request, StatusPayload, SubmitPayload};
+use wirkd::{
+    ClaimPayload, FailPayload, Reply, Request, RetryPayload, StatusPayload, SubmitPayload,
+    WorkFailPayload,
+};
 
 use wirk_core::{
     Access, ClaimId, ClaimKind, ClaimVerdict, DeterministicWorld, Event, EventId, EventKind,
@@ -381,11 +384,24 @@ fn wirkd_status_command(estate: &str, work_filter: Option<String>) -> ExitCode {
         );
         match reply {
             Ok(Reply::Ok { result, .. }) => {
+                // P2.3 W1 (states.md §2): `needs_input` is absent from
+                // the reply when the Work never has been NeedsInput
+                // (`handle_status`'s own additive field) — printed as
+                // `-` then, same convention as `current_waypoint`.
+                let needs_input = match result.get("needs_input") {
+                    Some(cause) => format!(
+                        "{}: {}",
+                        cause["reason"].as_str().unwrap_or("?"),
+                        cause["detail"].as_str().unwrap_or("")
+                    ),
+                    None => "-".to_string(),
+                };
                 println!(
-                    "work_id {} state {} current_waypoint {}",
+                    "work_id {} state {} current_waypoint {} needs_input {}",
                     work_id,
                     result["state"].as_str().unwrap_or("?"),
-                    result["current_waypoint"].as_str().unwrap_or("-")
+                    result["current_waypoint"].as_str().unwrap_or("-"),
+                    needs_input
                 );
             }
             Ok(Reply::Err { error, .. }) => {
@@ -482,8 +498,111 @@ fn work_command(rest: &[String]) -> ExitCode {
             };
             wirkd_status_command(&estate, Some(work_id))
         }
+        // P2.3 W2 (decide.md §1): `wirk work retry --estate <root>
+        // --work <id>` opens a fresh Run on the failed Waypoint's
+        // reserved World; refused when the Work is not `NeedsInput`.
+        Some("retry") => work_retry_command(&rest[1..]),
+        // P2.3 W2 (decide.md §1): `wirk work fail --estate <root>
+        // --work <id> --reason <text>` appends `WorkFailed` with the
+        // reason; refused when the Work is not `NeedsInput`.
+        Some("fail") => work_fail_command(&rest[1..]),
         _ => work_usage(),
     }
+}
+
+/// `wirk work retry --estate <root> --work <id>`: resolves the failed
+/// `run_id` itself from `wirk work status`'s own `run_id` field (one
+/// extra round trip) rather than asking the human to copy an id
+/// (decide.md §1's own CLI design), then calls wirkd's `retry` verb.
+/// Prints `"Retried <old_run_id> -> <new_run_id>"` on success, or
+/// wirkd's refusal text (`NotNeedsInput` when the Work isn't
+/// `NeedsInput`).
+fn work_retry_command(rest: &[String]) -> ExitCode {
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return work_usage();
+    };
+    let Some(work_id) = flag_value(rest, "--work") else {
+        return work_usage();
+    };
+
+    let pointer = match wirkd::client::locate(Path::new(&estate)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk work retry: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let status_reply = wirkd::client::call(
+        &pointer.socket,
+        &Request::status(StatusPayload {
+            work_id: WorkId(work_id.clone()),
+        }),
+    );
+    let run_id = match status_reply {
+        Ok(Reply::Ok { result, .. }) => match result["run_id"].as_str() {
+            Some(run_id) => run_id.to_string(),
+            None => {
+                eprintln!("wirk work retry: {work_id} has no run_id on its current Waypoint");
+                return ExitCode::from(2);
+            }
+        },
+        Ok(Reply::Err { error, .. }) => {
+            eprintln!(
+                "wirk work retry: {work_id} {} {}",
+                error.code, error.message
+            );
+            return ExitCode::from(2);
+        }
+        Err(err) => {
+            eprintln!("wirk work retry: {work_id} {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    wirkd_client_call(
+        &estate,
+        &Request::retry(RetryPayload {
+            triple: ExecutionTriple {
+                estate_root: estate.clone(),
+                work_id: WorkId(work_id.clone()),
+                run_id: RunId(run_id.clone()),
+            },
+        }),
+        |result| {
+            println!(
+                "Retried {} -> {}",
+                result["old_run_id"].as_str().unwrap_or(&run_id),
+                result["new_run_id"].as_str().unwrap_or_default()
+            );
+        },
+    )
+}
+
+/// `wirk work fail --estate <root> --work <id> --reason <text>`: calls
+/// wirkd's `workfail` verb, printing `"WorkFailed <work_id>: <reason>"`
+/// on success, or wirkd's refusal text (`NotNeedsInput`).
+fn work_fail_command(rest: &[String]) -> ExitCode {
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return work_usage();
+    };
+    let Some(work_id) = flag_value(rest, "--work") else {
+        return work_usage();
+    };
+    let Some(reason) = flag_value(rest, "--reason") else {
+        return work_usage();
+    };
+
+    wirkd_client_call(
+        &estate,
+        &Request::workfail(WorkFailPayload {
+            work_id: WorkId(work_id.clone()),
+            reason: reason.clone(),
+        }),
+        |_result| {
+            println!("WorkFailed {work_id}: {reason}");
+        },
+    )
 }
 
 fn work_submit_command(rest: &[String]) -> ExitCode {
@@ -595,7 +714,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id>"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> | wirk work retry --estate <root> --work <id> | wirk work fail --estate <root> --work <id> --reason <text>"
     );
     ExitCode::from(1)
 }

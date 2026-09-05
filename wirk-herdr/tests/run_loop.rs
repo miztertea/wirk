@@ -15,6 +15,7 @@ mod live_herdr;
 
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -193,6 +194,7 @@ fn wait_until(what: &str, predicate: impl Fn() -> bool) {
 fn the_run2_bug_a_second_identical_idle_is_still_prompted() {
     let run = open_run("run-1");
     let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
     let world = actor_world(&run, dir.path());
     let (client, herdr_tx) = client_for(&run);
     let wirkd = Arc::new(FakeWirkdApi::default());
@@ -202,13 +204,19 @@ fn the_run2_bug_a_second_identical_idle_is_still_prompted() {
 
     // Idle, Working, then a second Idle identical in content to the
     // first (fix 2's own bug: the old `Reconciler` hashed this as a
-    // replay and dropped it).
+    // replay and dropped it). The second prompt here is the intent's
+    // own first *continuation* (P2.3 W6: no baseline existed after the
+    // intent, so it is earned unconditionally regardless of the
+    // worktree) — the `b.txt` write below is not what earns it, it just
+    // keeps this scenario a real turn rather than a no-op one, since a
+    // later wave may add a comparison here too.
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Idle)))
         .unwrap();
     wait_until("first prompt sent", || {
         client.prompt_agent_calls.lock().unwrap().len() == 1
     });
+    std::fs::write(dir.path().join("b.txt"), b"a real turn happened\n").expect("write b.txt");
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Working)))
         .unwrap();
@@ -225,7 +233,7 @@ fn the_run2_bug_a_second_identical_idle_is_still_prompted() {
     assert_eq!(outcome, Outcome::Claimed);
 }
 
-// ---- (2) Working then Blocked across many events: zero prompts -----------
+// ---- (2) Working then Blocked across many events: zero prompts, one notify
 
 #[test]
 fn working_then_blocked_sends_zero_prompts() {
@@ -244,6 +252,14 @@ fn working_then_blocked_sends_zero_prompts() {
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Blocked)))
         .unwrap();
+    // P2.3 W4 (build-brief.md §8 finding 2): the transition into Blocked
+    // notifies once — waited for here so the 20 `PaneUpdated` events
+    // below (a different `HerdrEvent` variant `observe_herdr` ignores
+    // outright, standing in for Herdr's own chatter while a pane sits
+    // idle-blocked) cannot race the assertion below.
+    wait_until("blocked notify sent", || {
+        client.notify_calls.lock().unwrap().len() == 1
+    });
     for _ in 0..20 {
         herdr_tx
             .send(Ok(HerdrEvent::PaneUpdated {
@@ -258,6 +274,99 @@ fn working_then_blocked_sends_zero_prompts() {
         client.prompt_agent_calls.lock().unwrap().len(),
         0,
         "never prompted while Working or Blocked"
+    );
+    let notify_calls = client.notify_calls.lock().unwrap();
+    assert_eq!(
+        notify_calls.len(),
+        1,
+        "exactly one notify on the transition to Blocked, none of the 20 no-op \
+         PaneUpdated events after it firing a second: {notify_calls:?}"
+    );
+    assert_eq!(
+        notify_calls[0].body, run.id.0,
+        "the notify body must name the pane: {:?}",
+        notify_calls[0]
+    );
+}
+
+/// A Blocked episode that clears (a later Working) and recurs notifies
+/// again — the flag is per-episode, not per-Run.
+#[test]
+fn blocked_then_working_then_blocked_notifies_twice() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Blocked)))
+        .unwrap();
+    wait_until("first blocked notify sent", || {
+        client.notify_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Blocked)))
+        .unwrap();
+    wait_until("second blocked notify sent", || {
+        client.notify_calls.lock().unwrap().len() == 2
+    });
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+    assert_eq!(
+        client.notify_calls.lock().unwrap().len(),
+        2,
+        "a second Blocked episode notifies again, once each"
+    );
+}
+
+/// The pane reporting `Blocked` again with no `Working` between (Herdr
+/// re-announcing the same status, or a duplicate status event) is not a
+/// new episode — `observe_herdr`'s own `changed` guard means this
+/// scenario never actually reaches the notify branch a second time, but
+/// pinned explicitly since it is the shape build-brief.md §8 names
+/// ("Blocked staying Blocked across several polls: still one").
+#[test]
+fn blocked_staying_blocked_across_several_polls_still_notifies_once() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    for _ in 0..5 {
+        herdr_tx
+            .send(Ok(status_changed(&run, AgentStatus::Blocked)))
+            .unwrap();
+    }
+    wait_until("blocked notify sent", || {
+        client.notify_calls.lock().unwrap().len() == 1
+    });
+    // A few more identical Blocked events after the notify already fired.
+    for _ in 0..5 {
+        herdr_tx
+            .send(Ok(status_changed(&run, AgentStatus::Blocked)))
+            .unwrap();
+    }
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+    assert_eq!(
+        client.notify_calls.lock().unwrap().len(),
+        1,
+        "staying Blocked across many polls notifies only once"
     );
 }
 
@@ -351,13 +460,34 @@ fn the_watch_channel_closing_errors_naming_wirkd() {
         matches!(err, RunLoopError::WirkdGone { .. }),
         "expected WirkdGone, got {err:?}"
     );
+    // (d), P2.3 W5 (build-brief.md §9): the loop's own error text names
+    // wirkd -- the live twin (`wirk/tests/run_verb.rs`) is where the
+    // driver's printed line carrying this text is read; this fake-backed
+    // test pins only the error text itself, which `wirk run`'s generic
+    // `Err(err) => eprintln!("wirk run: {err}")` arm prints verbatim.
+    assert!(
+        err.to_string().contains("wirkd"),
+        "the error must name wirkd: {err}"
+    );
 }
 
 // ---- (6) no progress vs. progress -----------------------------------------
+//
+// P2.3 W4 (build-brief.md §8 finding 1): progress since a prompt is the
+// worktree fingerprint alone -- the pane's own revision left the
+// comparison, because any output by the actor (answering a prompt,
+// thinking aloud) advances it whether or not the actor did anything, so
+// counting it as progress meant an actor that only ever answers and
+// never edits was never judged stuck.
 
-/// A prompt, then Idle again with the pane's own revision and the
-/// worktree both unchanged: the actor is stuck — `NeedsInput`, and no
-/// second prompt is ever sent.
+/// The intent prompt, an unconditional first continuation (P2.3 W6: no
+/// baseline existed after the intent, so this Idle earns a prompt no
+/// matter what — build-brief.md §10), then Idle again with the worktree
+/// still unchanged: *now* the actor is stuck — `NeedsInput`, and no
+/// third prompt is ever sent. The pane's own `get_pane` response is not
+/// even configured here (`launch_actor` still needs a pane to open, via
+/// `client_for`'s own `with_split_pane_response`) — the stuck path no
+/// longer reads it at all.
 #[test]
 fn no_progress_since_the_last_prompt_stops_the_loop_needs_input() {
     let run = open_run("run-1");
@@ -365,22 +495,32 @@ fn no_progress_since_the_last_prompt_stops_the_loop_needs_input() {
     git_init_repo(dir.path());
     let world = actor_world(&run, dir.path());
     let (client, herdr_tx) = client_for(&run);
-    client.get_pane_responses.lock().unwrap().insert(
-        run.id.0.clone(),
-        Ok(pane_info(&run.id.0, AgentStatus::Idle, 7)),
-    );
     let wirkd = Arc::new(FakeWirkdApi::default());
     let loop_ = RunLoop::new(client.clone(), wirkd.clone());
 
     let handle = spawn_drive(loop_, run.clone(), world);
 
+    // Turn end 1: the intent prompt (P2.3 W6: no baseline taken after
+    // it).
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Idle)))
         .unwrap();
-    wait_until("first prompt sent", || {
+    wait_until("intent prompt sent", || {
         client.prompt_agent_calls.lock().unwrap().len() == 1
     });
-    // Nothing about the pane or the worktree changes.
+    // Turn end 2: still no baseline existed, so this earns the first
+    // *continuation* unconditionally — the baseline is taken now.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Turn end 3: nothing about the worktree changed since that
+    // continuation's own baseline — the actor is now judged stuck.
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Working)))
         .unwrap();
@@ -392,15 +532,21 @@ fn no_progress_since_the_last_prompt_stops_the_loop_needs_input() {
     assert_eq!(outcome, Outcome::NeedsInput);
     assert_eq!(
         client.prompt_agent_calls.lock().unwrap().len(),
-        1,
-        "no second prompt once the actor is judged stuck"
+        2,
+        "no third prompt once the actor is judged stuck"
     );
 }
 
-/// The same shape, but the pane's own revision changes between the
-/// prompt and the next Idle: not stuck, prompted again.
+/// (a) The pane's own revision advances between prompts, but the
+/// worktree never does: still stuck once a baseline exists to compare
+/// against — `NeedsInput`, no prompt beyond the intent and its first
+/// continuation. Red before P2.3 W4's fix: the old comparison
+/// (`ProgressBaseline` carrying `pane_revision`) counted the revision
+/// bump alone as progress, so this same scenario used to prompt again
+/// (see `worktree_change_is_progress_prompts_again` below for the
+/// scenario that legitimately does).
 #[test]
-fn progress_since_the_last_prompt_prompts_again() {
+fn pane_revision_alone_is_not_progress_stops_the_loop_needs_input() {
     let run = open_run("run-1");
     let dir = tempdir().expect("tempdir");
     git_init_repo(dir.path());
@@ -415,30 +561,695 @@ fn progress_since_the_last_prompt_prompts_again() {
 
     let handle = spawn_drive(loop_, run.clone(), world);
 
+    // Turn end 1: the intent prompt, no baseline taken.
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Idle)))
         .unwrap();
-    wait_until("first prompt sent", || {
+    wait_until("intent prompt sent", || {
         client.prompt_agent_calls.lock().unwrap().len() == 1
     });
-    // Progress: the pane's own revision moved on (a real turn happened).
+    // The pane's own revision moves on between every turn -- Herdr's own
+    // accounting of the actor answering -- but the worktree is untouched
+    // throughout.
     client.get_pane_responses.lock().unwrap().insert(
         run.id.0.clone(),
         Ok(pane_info(&run.id.0, AgentStatus::Idle, 8)),
     );
+    // Turn end 2: no baseline existed yet -- the first continuation,
+    // unconditional, baseline taken now.
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Working)))
         .unwrap();
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Idle)))
         .unwrap();
-    wait_until("second prompt sent", || {
+    wait_until("first continuation prompt sent", || {
         client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    client.get_pane_responses.lock().unwrap().insert(
+        run.id.0.clone(),
+        Ok(pane_info(&run.id.0, AgentStatus::Idle, 9)),
+    );
+    // Turn end 3: the revision moved again, the worktree never did.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(
+        outcome,
+        Outcome::NeedsInput,
+        "the pane revision alone must not count as progress"
+    );
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        2,
+        "no prompt beyond the intent and its first continuation: the actor answered but never \
+         touched the worktree"
+    );
+}
+
+/// (b) The worktree changes between the first continuation and the
+/// turn end after it (the pane's own revision held fixed, to isolate
+/// the claim): not stuck, prompted a third time.
+#[test]
+fn worktree_change_is_progress_prompts_again() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    client.get_pane_responses.lock().unwrap().insert(
+        run.id.0.clone(),
+        Ok(pane_info(&run.id.0, AgentStatus::Idle, 7)),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    // Turn end 1: the intent prompt, no baseline taken.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    // Turn end 2: no baseline existed yet -- the first continuation,
+    // unconditional, baseline taken now (worktree still untouched).
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Progress since that continuation's own baseline: the worktree
+    // itself changed (the pane's own revision is left exactly as it
+    // was, at 7, to isolate this from (a) above).
+    std::fs::write(dir.path().join("b.txt"), b"a real edit happened\n").expect("write b.txt");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("third prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 3
     });
 
     wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
     let outcome = handle.join().unwrap().expect("drive");
     assert_eq!(outcome, Outcome::Claimed);
+}
+
+// ---- P2.3 W5: Done is a turn end, exactly like Idle -----------------------
+//
+// build-brief.md §9 (the rerun): Herdr's own `status_name` (`refs/herdr/
+// src/app/agent_view.rs`) reports the actor's turn ending as `Done`, not
+// `Idle`, whenever the pane has not been *viewed* since -- every pane
+// `wirk run` drives, since it is headless. Red before this wave's fix
+// (`git stash push -- wirk-herdr/src/run_loop.rs`, pasted in BUILD.md):
+// `observe_herdr`'s guard was `matches!(agent_status, AgentStatus::Idle)`
+// alone, so a pane that never reported a second `Idle` -- only `Done` --
+// fell straight through every one of these three scenarios: no prompt,
+// no stuck check, nothing.
+
+/// (a) The intent prompt, then an unconditional first continuation
+/// (P2.3 W6: no baseline existed after the intent), then the pane's
+/// next turn end reports `Done` (never a second `Idle`) with the
+/// worktree unchanged since that continuation: the actor is stuck --
+/// `NeedsInput` with the stuck observation journaled, exactly as an
+/// unchanged `Idle` would be.
+#[test]
+fn prompted_then_done_with_worktree_unchanged_is_stuck() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    // Turn end 1: the intent prompt, no baseline taken.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    // Turn end 2: no baseline existed yet -- the first continuation,
+    // unconditional, baseline taken now. This run's own pane reports
+    // `Done`, never a second `Idle` -- headless, never viewed.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Turn end 3: nothing about the worktree changed since that
+    // continuation's own baseline; the pane's next turn end reports
+    // `Done` again.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        2,
+        "no third prompt once the actor is judged stuck on a Done turn end"
+    );
+    let stuck_failures: Vec<_> = wirkd
+        .recorded()
+        .into_iter()
+        .filter_map(|(_, _, kind)| match kind {
+            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck") => {
+                Some(cause)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stuck_failures.len(),
+        1,
+        "the stuck observation must be journaled from a Done turn end too"
+    );
+}
+
+/// (b) Working then Done (never a second Idle), the Run unclaimed: a
+/// prompt is sent -- Done alone earns it, exactly as an Idle would.
+#[test]
+fn working_then_done_prompts_the_pane() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("prompt sent on Done", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+}
+
+/// (c) Blocked then Done, no Working in between: the Blocked flag
+/// clears on the transition (proven here by the prompt firing at all --
+/// `maybe_prompt` refuses outright while `self.blocked` is still true)
+/// and the pane is prompted, exactly as a Blocked-then-Idle transition
+/// already was.
+#[test]
+fn blocked_then_done_clears_blocked_and_prompts() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Blocked)))
+        .unwrap();
+    wait_until("blocked notify sent", || {
+        client.notify_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("prompt sent after Blocked cleared by Done", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+}
+
+// ---- P2.3 W6: the baseline is taken after a continuation, not the intent -
+//
+// build-brief.md §10 (rerun2's own correction, ruling 0044): the
+// progress baseline used to be taken right after *every* prompt this
+// loop sent, the very first one (the intent) included — so an actor
+// whose first turn is reading and planning, ending with no worktree
+// edit yet, was declared stuck without ever having been told to
+// continue (rerun2's own evidence: stuck 22s after launch, on the very
+// first turn end). Red before this wave's fix (probed by hand, BUILD.md:
+// taking the baseline after the intent again makes (a) below fail —
+// `NeedsInput` fires one turn end early, with only one prompt ever sent,
+// not two).
+
+/// (a) The intent prompt, then a turn end with the worktree unchanged:
+/// no baseline existed yet (none is ever taken after the intent), so
+/// this earns an unconditional *continuation* prompt — the baseline is
+/// taken now — and the actor is **not** yet judged stuck, even though
+/// the worktree has not moved since the intent was sent.
+#[test]
+fn intent_then_unchanged_turn_end_earns_a_continuation_not_stuck() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    // Turn end 1: the intent prompt.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    // Turn end 2: Done (headless — never a second Idle), worktree
+    // untouched since the intent. Not stuck: no baseline existed to
+    // compare against, so this is the first continuation instead.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    assert!(
+        wirkd.recorded().into_iter().all(|(_, _, kind)| !matches!(
+            kind,
+            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck")
+        )),
+        "no stuck RunFailed yet — the actor has not been told to continue and failed to yet"
+    );
+
+    let prompt_lines_progress = client.prompt_agent_calls.lock().unwrap().len();
+    assert_eq!(
+        prompt_lines_progress, 2,
+        "exactly the intent and its first continuation, nothing judged stuck"
+    );
+
+    // End the drive cleanly: a Claim on the watch stream.
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+}
+
+/// (b) Continuing from (a)'s own scenario: a *second* turn end with the
+/// worktree still unchanged — this time a baseline does exist (taken
+/// right after the first continuation), so this is the actor judged
+/// stuck: told to continue once, and did nothing since.
+#[test]
+fn second_unchanged_turn_end_after_the_continuation_is_stuck() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Second turn end: still nothing since the continuation's own
+    // baseline.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        2,
+        "no third prompt: the actor is judged stuck instead"
+    );
+    let stuck_failures: Vec<_> = wirkd
+        .recorded()
+        .into_iter()
+        .filter_map(|(_, _, kind)| match kind {
+            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck") => {
+                Some(cause)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stuck_failures.len(),
+        1,
+        "the stuck observation must be journaled once told to continue and doing nothing since"
+    );
+}
+
+/// (c) Continuing from (a)'s own scenario, but this time the worktree
+/// *does* change before the next turn end: progress since the
+/// continuation's own baseline — another continuation is sent, never
+/// `NeedsInput`.
+#[test]
+fn worktree_change_after_the_continuation_prompts_again_not_stuck() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Progress since the continuation's own baseline: a real edit.
+    std::fs::write(
+        dir.path().join("c.txt"),
+        b"progress after the continuation\n",
+    )
+    .expect("write c.txt");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("second continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 3
+    });
+
+    assert!(
+        wirkd.recorded().into_iter().all(|(_, _, kind)| !matches!(
+            kind,
+            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck")
+        )),
+        "worktree progress since the continuation must never be judged stuck"
+    );
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+}
+
+// ---- P2.3 W3/W4: the loop prints one line per prompt it sends ------------
+
+/// `worktree_change_is_progress_prompts_again`'s own scenario (a first
+/// prompt, then a second once the worktree itself changes), extended to
+/// assert on the printed lines themselves rather than only the prompt
+/// count: BRIEF.md's amendment names the gap this pins ("the loop
+/// prints nothing when it prompts, so run 3's evidence counted zero
+/// prompts where the journal shows two"). `with_captured_output`
+/// redirects `log_line` here instead of the real stdout (its own doc:
+/// many fake-backed tests share one process, so reading the real stdout
+/// is not reliable) -- the live twin below reads the real child
+/// process's stdout instead, needing no such redirection. P2.3 W4: the
+/// second line's wording asserts on the worktree fingerprint change,
+/// not a pane revision (build-brief.md §8 finding 1).
+#[test]
+fn the_loop_prints_one_line_per_prompt_it_sends() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let output: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone()).with_captured_output(output.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    // Turn end 1: the intent prompt (no baseline exists to compare).
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    // Turn end 2: still no baseline (none is taken after the intent,
+    // P2.3 W6) -- the first continuation, unconditional, baseline taken
+    // now.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Progress since that continuation's own baseline: the worktree
+    // itself changed (a real turn happened).
+    std::fs::write(dir.path().join("b.txt"), b"a real edit happened\n").expect("write b.txt");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("third prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 3
+    });
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    handle.join().unwrap().expect("drive");
+
+    let lines = output.lock().unwrap().clone();
+    let prompt_lines: Vec<&String> = lines.iter().filter(|l| l.starts_with("prompt:")).collect();
+    assert_eq!(
+        prompt_lines.len(),
+        3,
+        "one printed line per prompt sent (three prompts): {lines:?}"
+    );
+    assert!(
+        prompt_lines[0].contains("Idle answered") && prompt_lines[0].contains("first prompt"),
+        "the intent's own line must name the Idle it answered and that no earlier baseline \
+         existed to compare -- the same shape a later prompt's line takes: {:?}",
+        prompt_lines[0]
+    );
+    assert!(
+        prompt_lines[1].contains("Idle answered") && prompt_lines[1].contains("first continuation"),
+        "the first continuation's line must name the Idle it answered and that this is the \
+         first continuation, the point the baseline is taken (P2.3 W6): {:?}",
+        prompt_lines[1]
+    );
+    assert!(
+        prompt_lines[2].contains("Idle answered") && prompt_lines[2].contains("worktree changed"),
+        "the third prompt's line must name the Idle it answered and the worktree progress \
+         observed since the first continuation's own baseline (P2.3 W4: the fingerprint, not a \
+         pane revision): {:?}",
+        prompt_lines[2]
+    );
+    for line in &prompt_lines {
+        assert!(
+            line.contains("sending:"),
+            "every prompt line must name the first words of the prompt text: {line:?}"
+        );
+    }
+}
+
+// ---- P2.3 W1: the stuck observation is journaled, and notify fires once --
+
+/// The no-progress branch journals exactly one `RunFailed` whose
+/// `cause.status == Some("stuck")` and whose `detail` names the pane
+/// (build-brief.md §7 amendment 2), through `WirkdApi::record` — before
+/// this wave the branch journaled nothing (states.md's own red).
+#[test]
+fn run_loop_no_progress_journals_run_failed_stuck() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    client.get_pane_responses.lock().unwrap().insert(
+        run.id.0.clone(),
+        Ok(pane_info(&run.id.0, AgentStatus::Idle, 7)),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    // Turn end 1: the intent prompt, no baseline taken.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    // Turn end 2: no baseline existed yet -- the first continuation,
+    // unconditional, baseline taken now.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Turn end 3: nothing about the worktree changed since that
+    // continuation's own baseline -- the actor is now judged stuck.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+
+    let stuck_failures: Vec<_> = wirkd
+        .recorded()
+        .into_iter()
+        .filter_map(|(_, _, kind)| match kind {
+            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck") => {
+                Some(cause)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stuck_failures.len(),
+        1,
+        "exactly one RunFailed{{status:\"stuck\"}} must be journaled"
+    );
+    let detail = stuck_failures[0]
+        .detail
+        .as_deref()
+        .expect("the stuck cause carries a detail");
+    assert!(
+        detail.contains(&run.id.0),
+        "the stuck observation must name the pane (run id {}): {detail:?}",
+        run.id.0
+    );
+}
+
+/// `notify` fires exactly once on the stuck path, through the fake
+/// client that records `notification.show` calls, carrying the run id
+/// in `body` (states.md §2/§4; the loop calls `notify` only from the
+/// no-progress branch, never from `observe_watch`'s own `NeedsInput`
+/// fold — `drive_channel` returns on the first `Some(Outcome)` any
+/// branch produces, so the two branches can never both run inside one
+/// `drive()` call; a second `notify_needs_input` call added to
+/// `observe_watch` is therefore inert against this exact scenario).
+/// Mutation probe run by hand (BUILD.md): duplicating the
+/// `notify_needs_input` call within the stuck branch itself makes this
+/// assertion fail (2 != 1); reverted before landing.
+#[test]
+fn run_loop_needs_input_calls_notify_once() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    client.get_pane_responses.lock().unwrap().insert(
+        run.id.0.clone(),
+        Ok(pane_info(&run.id.0, AgentStatus::Idle, 7)),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    // Turn end 1: the intent prompt, no baseline taken.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    // Turn end 2: no baseline existed yet -- the first continuation,
+    // unconditional, baseline taken now.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Turn end 3: nothing about the worktree changed since that
+    // continuation's own baseline -- the actor is now judged stuck.
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+
+    let notify_calls = client.notify_calls.lock().unwrap();
+    assert_eq!(
+        notify_calls.len(),
+        1,
+        "notify must fire exactly once: {notify_calls:?}"
+    );
+    assert!(
+        notify_calls[0].body.contains(&run.id.0),
+        "the notify body must name the run: {:?}",
+        notify_calls[0]
+    );
 }
 
 // ---- (7) the prompt text carries the artifact name and the claim ---------

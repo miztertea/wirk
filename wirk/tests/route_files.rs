@@ -25,10 +25,30 @@ fn wirk_bin() -> &'static str {
     env!("CARGO_BIN_EXE_wirk")
 }
 
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/routes")
-        .join(name)
+/// Writes the named canonical fixture (embedded at compile time,
+/// `include_str!`, R3) under `<estate>/fixtures/<name>` and returns its
+/// path: a test binary carries its fixtures and never reads a source
+/// path at run time (a binary compiled in one worktree and reused from
+/// the shared cargo cache after that worktree was removed failed here
+/// at the P2.3 land, 2026-09-05).
+fn fixture(estate: &Path, name: &str) -> PathBuf {
+    let text: &str = match name {
+        "unknown_field.json" => include_str!("fixtures/routes/unknown_field.json"),
+        "malformed_json.json" => include_str!("fixtures/routes/malformed_json.json"),
+        "three_waypoint.json" => include_str!("fixtures/routes/three_waypoint.json"),
+        "two_waypoint_distinctive.json" => {
+            include_str!("fixtures/routes/two_waypoint_distinctive.json")
+        }
+        "proving_reversed.json" => include_str!("fixtures/routes/proving_reversed.json"),
+        "proving.json" => include_str!("fixtures/routes/proving.json"),
+        "smoke.json" => include_str!("fixtures/routes/smoke.json"),
+        other => panic!("no route fixture named {other} under wirk/tests/fixtures/routes/"),
+    };
+    let dir = estate.join("fixtures");
+    fs::create_dir_all(&dir).expect("create estate fixtures/ dir");
+    let path = dir.join(name);
+    fs::write(&path, text).expect("write embedded fixture");
+    path
 }
 
 fn wait_for_pointer(estate: &Path) -> WirkdPointer {
@@ -295,7 +315,11 @@ fn route_file_unknown_field_is_refused_no_journal_over_the_wire() {
     let estate = dir.path().to_path_buf();
     let (wirkd_child, _pointer) = start_wirkd(&estate);
 
-    let output = submit_route(&estate, &fixture("unknown_field.json"), "demo:write");
+    let output = submit_route(
+        &estate,
+        &fixture(&estate, "unknown_field.json"),
+        "demo:write",
+    );
     assert!(
         !output.status.success(),
         "submit with an unknown-field Route file must fail"
@@ -316,7 +340,11 @@ fn route_file_malformed_json_is_refused() {
     let estate = dir.path().to_path_buf();
     let (wirkd_child, _pointer) = start_wirkd(&estate);
 
-    let output = submit_route(&estate, &fixture("malformed_json.json"), "demo:write");
+    let output = submit_route(
+        &estate,
+        &fixture(&estate, "malformed_json.json"),
+        "demo:write",
+    );
     assert!(
         !output.status.success(),
         "submit with a malformed Route file must fail"
@@ -340,7 +368,11 @@ fn three_waypoint_route_from_file_journals_three_ids() {
     let estate = dir.path().to_path_buf();
     let (wirkd_child, _pointer) = start_wirkd(&estate);
 
-    let output = submit_route(&estate, &fixture("three_waypoint.json"), "demo:write");
+    let output = submit_route(
+        &estate,
+        &fixture(&estate, "three_waypoint.json"),
+        "demo:write",
+    );
     assert!(
         output.status.success(),
         "submit with a valid three-Waypoint Route file failed: {}",
@@ -396,7 +428,7 @@ fn auto_advance_reads_journaled_waypoint_def_not_hardcoded() {
 
     let output = submit_route(
         &estate,
-        &fixture("two_waypoint_distinctive.json"),
+        &fixture(&estate, "two_waypoint_distinctive.json"),
         "demo:write",
     );
     assert!(
@@ -448,8 +480,11 @@ fn editing_the_route_file_after_submit_does_not_change_the_reserved_command() {
     let dir = tempfile::tempdir().expect("tempdir");
     let estate = dir.path().to_path_buf();
     let route_path = dir.path().join("mutable-route.json");
-    fs::copy(fixture("two_waypoint_distinctive.json"), &route_path)
-        .expect("copy fixture to a mutable path");
+    fs::copy(
+        fixture(&estate, "two_waypoint_distinctive.json"),
+        &route_path,
+    )
+    .expect("copy fixture to a mutable path");
 
     let (wirkd_child, pointer) = start_wirkd(&estate);
 
@@ -597,7 +632,11 @@ fn hand_edited_reversed_route_advances_in_the_journaled_file_order() {
     let estate = dir.path().to_path_buf();
     let (wirkd_child, pointer) = start_wirkd(&estate);
 
-    let output = submit_route(&estate, &fixture("proving_reversed.json"), "demo:write");
+    let output = submit_route(
+        &estate,
+        &fixture(&estate, "proving_reversed.json"),
+        "demo:write",
+    );
     assert!(
         output.status.success(),
         "submit failed: {}",

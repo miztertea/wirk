@@ -66,8 +66,8 @@ use wirk_core::{
 };
 
 use super::{
-    ClaimPayload, ErrorDetail, FailPayload, RecordPayload, Reply, Request, StatusPayload,
-    SubmitPayload, Verb, WirkdPointer,
+    ClaimPayload, ErrorDetail, FailPayload, RecordPayload, Reply, Request, RetryPayload,
+    StatusPayload, SubmitPayload, Verb, WirkdPointer, WorkFailPayload,
 };
 
 /// Envelope reply plus what the server does after writing it: `stop`
@@ -461,6 +461,16 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {
             Ok(payload) => Outcome::Reply(handle_fail(state, payload)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
+        Verb::Retry => match serde_json::from_value::<RetryPayload>(request.payload.clone()) {
+            Ok(payload) => Outcome::Reply(handle_retry(state, payload)),
+            Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+        },
+        Verb::WorkFail => {
+            match serde_json::from_value::<WorkFailPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_workfail(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::Record => match serde_json::from_value::<RecordPayload>(request.payload.clone()) {
             Ok(payload) => Outcome::Reply(handle_record(state, payload)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
@@ -1134,6 +1144,17 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         "runs": runs,
     });
 
+    // P2.3 W1 (states.md §2): why the Work is (or last was) NeedsInput
+    // — additive, absent when `needs_input` is `None` so an old caller
+    // reading only the fields above is unaffected.
+    if let Some(cause) = &work.needs_input {
+        result["needs_input"] = json!({
+            "run": cause.run.0,
+            "reason": cause.reason,
+            "detail": cause.detail,
+        });
+    }
+
     if let Some(waypoint) = &work.current_waypoint
         && let Some((run_id, attempt, world_hash)) = latest_run_for_waypoint(&events, waypoint)
     {
@@ -1195,6 +1216,114 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
         detail: payload.detail,
     };
     let event = new_event(&work_id, Some(run_id), EventKind::RunFailed { cause });
+    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    ok_reply(json!({}))
+}
+
+/// P2.3 W2 (decide.md §1): the human's "try again" verb. Refuses
+/// `NotNeedsInput` unless the folded Work is `NeedsInput` (no journal
+/// write on refusal, mirrors 0046 D139's malformed-Route refusal);
+/// `TripleMismatch` if the triple's `run_id` names no `RunOpened`
+/// (D9#4, same check `claim`/`fail` make). Appends **only** a fresh
+/// `RunOpened{run: <new RunId>, waypoint, attempt: 1, world_hash}` on
+/// the failed Run's own Waypoint — no new `WaypointReserved`:
+/// `world_for_waypoint` (the same "last `WaypointReserved` wins"
+/// lookup `handle_status` uses) reads the World already reserved
+/// there, so a Waypoint reserved twice since the failure retries
+/// against the *second* World, never a stale one recomputed here
+/// (decide.md §5's hazard). No count is invented: the human's choice is
+/// the one `RunOpened`, D134 bars a count, not the event itself.
+/// `fold`'s own `RunOpened` arm clears `NeedsInput` back to `Active` on
+/// replay — this handler never sets `Work.state` itself, the journal
+/// is the only truth (D9#1).
+fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
+    let work_id = payload.triple.work_id.clone();
+    let run_id = payload.triple.run_id.clone();
+
+    let journal = match journal_for(state, &work_id) {
+        Ok(journal) => journal,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let events = match journal.replay() {
+        Ok(events) => events,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    if events.is_empty() {
+        return err_reply("NotFound", "no such work");
+    }
+    let work = fold(&events);
+    if !matches!(work.state, WorkState::NeedsInput) {
+        return err_reply("NotNeedsInput", "retry refused: the Work is not NeedsInput");
+    }
+
+    let Some(run) = find_run(&events, &run_id) else {
+        return err_reply(
+            "TripleMismatch",
+            "the run id does not match any Run opened for this Work",
+        );
+    };
+
+    let Some(world) = world_for_waypoint(&events, &run.waypoint) else {
+        return err_reply(
+            "JournalError",
+            "no World is reserved for this Run's Waypoint",
+        );
+    };
+    let world_hash = WorldHash::of(&world);
+    let new_run_id = RunId(mint_id("run"));
+    let event = new_event(
+        &work_id,
+        Some(new_run_id.clone()),
+        EventKind::RunOpened {
+            run: new_run_id.clone(),
+            waypoint: run.waypoint.clone(),
+            attempt: 1,
+            world_hash,
+        },
+    );
+    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    ok_reply(json!({"old_run_id": run_id.0, "new_run_id": new_run_id.0}))
+}
+
+/// P2.3 W2 (decide.md §1): the human's "give up" verb. Same refusal as
+/// `retry` — `NotNeedsInput` unless the Work is `NeedsInput`, no
+/// journal write — then appends `WorkFailed{cause}` with the reason
+/// carried verbatim (0033 D102: explicit, never inferred from a
+/// `RunFailed`); `fold`'s existing `WorkFailed` arm sets `Failed`,
+/// terminal, so a second `workfail` call on the same Work is refused
+/// too — the same guard, now reading `Failed` instead of `NeedsInput`.
+fn handle_workfail(state: &Arc<WirkdState>, payload: WorkFailPayload) -> Reply {
+    let work_id = payload.work_id.clone();
+
+    let journal = match journal_for(state, &work_id) {
+        Ok(journal) => journal,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let events = match journal.replay() {
+        Ok(events) => events,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    if events.is_empty() {
+        return err_reply("NotFound", "no such work");
+    }
+    let work = fold(&events);
+    if !matches!(work.state, WorkState::NeedsInput) {
+        return err_reply("NotNeedsInput", "fail refused: the Work is not NeedsInput");
+    }
+
+    let cause = FailureCause {
+        status: None,
+        request_id: None,
+        at: now_ts(),
+        detail: Some(payload.reason),
+    };
+    let event = new_event(&work_id, None, EventKind::WorkFailed { cause });
     if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
         return err_reply("JournalError", &err.to_string());
     }

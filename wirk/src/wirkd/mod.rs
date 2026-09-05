@@ -51,6 +51,13 @@ use serde_json::Value;
 
 use wirk_core::{ClaimKind, EventKind, ExecutionTriple, RepositoryBinding, RunId, WorkId};
 
+// P2.3 W2 (decide.md §1): `Verb::Retry`/`Verb::WorkFail` and their
+// payloads land in this module alongside every other verb's — `Fail`
+// (item 5, `run-deterministic`'s own verb) already names the Run-level
+// failure; `Retry`/`WorkFail` are the human's decision verbs, named
+// distinctly so `wirk work retry`/`wirk work fail` read as one thing
+// each, not a second reading of `fail`.
+
 pub mod client;
 pub mod server;
 
@@ -69,6 +76,13 @@ pub enum Verb {
     Record,
     Stop,
     Fail,
+    /// P2.3 W2 (decide.md §1): opens a fresh Run on the same reserved
+    /// World for a `NeedsInput` Work — the human's "try again" verb.
+    Retry,
+    /// P2.3 W2 (decide.md §1): terminal `WorkFailed{cause}` with the
+    /// human's reason — 0033 D102's event, never inferred from a
+    /// `RunFailed`.
+    WorkFail,
     /// Item B, ruling 0044: a long-lived connection, not the usual
     /// one-request-one-reply shape — `server::handle_connection`
     /// special-cases it before the normal `dispatch`/single-`Reply`
@@ -148,6 +162,24 @@ impl Request {
         Request {
             verb: Verb::Fail,
             payload: serde_json::to_value(payload).expect("FailPayload always serializes"),
+        }
+    }
+
+    /// `retry`'s request (P2.3 W2, decide.md §1): the failed Run's own
+    /// triple names the Work and which Run to reopen against.
+    pub fn retry(payload: RetryPayload) -> Self {
+        Request {
+            verb: Verb::Retry,
+            payload: serde_json::to_value(payload).expect("RetryPayload always serializes"),
+        }
+    }
+
+    /// `workfail`'s request (P2.3 W2, decide.md §1): the Work to fail
+    /// and the human's reason, verbatim into `WorkFailed.cause.detail`.
+    pub fn workfail(payload: WorkFailPayload) -> Self {
+        Request {
+            verb: Verb::WorkFail,
+            payload: serde_json::to_value(payload).expect("WorkFailPayload always serializes"),
         }
     }
 
@@ -248,6 +280,24 @@ pub struct FailPayload {
     pub status: Option<String>,
     #[serde(default)]
     pub detail: Option<String>,
+}
+
+/// `retry`'s payload (P2.3 W2, decide.md §1): the triple names the
+/// Work and the failed Run — `handle_retry` refuses `NotNeedsInput`
+/// unless the folded Work is `NeedsInput`, then `TripleMismatch` if
+/// `run_id` names no `RunOpened` (same D9#4 shape `claim`/`fail` use).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPayload {
+    pub triple: ExecutionTriple,
+}
+
+/// `workfail`'s payload (P2.3 W2, decide.md §1): the Work to fail and
+/// the human's reason, carried verbatim onto `WorkFailed.cause.detail`
+/// — 0033 D102's explicit event, never inferred from a `RunFailed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkFailPayload {
+    pub work_id: WorkId,
+    pub reason: String,
 }
 
 /// `watch`'s payload (item B): the Work whose journal to stream.

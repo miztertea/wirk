@@ -30,11 +30,69 @@
 //! reused for every prompt, not only the first). Prompting stops on a
 //! `ClaimRecorded` for this Run (`Claimed`), the Work moving to
 //! `NeedsInput`, Herdr saying the pane is gone, or **no progress**: a
-//! prompt's own baseline (one `get_pane` call's `revision`, one
-//! worktree fingerprint, `wirk_herdr::git::fingerprint`) compared
-//! against the same two readings at the *next* Idle — unchanged is the
-//! actor stuck (`Outcome::NeedsInput`, `stuck_observation()` names
-//! what was observed); changed prompts again.
+//! prompt's own baseline (one worktree fingerprint,
+//! `wirk_herdr::git::fingerprint`) compared against the same reading at
+//! the *next* Idle — unchanged is the actor stuck (`Outcome::
+//! NeedsInput`, `stuck_observation()` names what was observed); changed
+//! prompts again. **P2.3 W4 (build-brief.md §8 finding 1):** the pane's
+//! own `revision` left this comparison — any output by the actor
+//! (answering a prompt, thinking aloud) advances the pane's revision
+//! whether or not it did anything, so counting it as progress meant an
+//! actor that only ever answers prompts and never edits was never
+//! judged stuck. Progress since the last prompt now means the worktree
+//! changed; the journal's own movement (a Claim, a Question) already
+//! ends the loop through `observe_watch`'s own `NeedsInput` fold and
+//! needs no part in this snapshot either.
+//!
+//! Blocked (P2.3 W4, build-brief.md §8 finding 2): the loop never
+//! prompts a `Blocked` pane (unchanged), but on the *transition* to
+//! `Blocked` it now calls `HerdrClient::notify` once and prints one
+//! line — a human waiting on the pane has something to see. The Work's
+//! own state and journal are untouched (`LifecycleObserved{Blocked}` is
+//! already journaled by `observe_herdr`'s existing status-change write);
+//! a later `Working` clears the notified flag, so a second `Blocked`
+//! episode on the same Run notifies again.
+//!
+//! **P2.3 W5 (build-brief.md §9): `Done` is a turn end, exactly like
+//! `Idle`.** Herdr's own `status_name` (`refs/herdr/src/app/
+//! agent_view.rs`) maps one detector state, `AgentState::Idle`, to two
+//! wire values by whether the pane has been *viewed* since:
+//! `(Idle, seen=true) -> "idle"`, `(Idle, seen=false) -> "done"`. Every
+//! pane `wirk run` drives is headless — nothing ever views it — so the
+//! actor's turn ending reports `Done`, never `Idle`, live (confirmed by
+//! the rerun, `knowledge/evidence/p2-retry-escalation-2026-09-04/
+//! rerun/03-stuck.log`: `Idle -> Working -> Done`, never a second
+//! `Idle`). `turn_ended` below is the one place this equivalence is
+//! decided (R2: Herdr's own, `src/cli/agent.rs`'s `idle | done`
+//! readiness check makes the same call) — every place this loop used to
+//! read `AgentStatus::Idle` as "the turn ended" (the prompt gate, the
+//! no-progress comparison, the `Blocked`-flag clearing) now reads
+//! `turn_ended` instead, so a `Done` pane is prompted, its progress
+//! compared, and `Blocked` cleared exactly as an `Idle` one always was.
+//!
+//! **P2.3 W6 (build-brief.md §10, rerun2's own correction, 0044):** the
+//! progress baseline used to be captured right after *every* prompt this
+//! loop ever sent, the very first one included — the very first prompt a
+//! `RunLoop` sends carries the Waypoint's own intent (`compose_first_
+//! prompt`, always the task, never a nudge to continue), so an actor
+//! whose first turn is reading and planning, ending with no worktree
+//! edit yet, was declared stuck without ever having been told to
+//! continue — exactly the rerun2 evidence (`knowledge/evidence/
+//! p2-retry-escalation-2026-09-04/rerun2/driver.log`,
+//! `journal-B.ndjson`): stuck fired 22s after launch, on the very first
+//! turn end. Fixed: the baseline is now taken only after a
+//! **continuation** prompt — any prompt sent while `has_prompted` is
+//! already true, i.e. the second prompt onward. The very first prompt
+//! (`PromptProgress::First`) sets `has_prompted` and takes no baseline;
+//! the next turn end therefore finds no baseline either and earns its
+//! own unconditional prompt (`PromptProgress::FirstContinuation`) — the
+//! first *continuation*, this time with the baseline taken right after
+//! it. Only the turn end after that compares against a baseline at all.
+//! "Stuck" now always means: told to continue at least once, and did
+//! nothing since. One more turn granted to every actor, no number
+//! involved (0044 D134: no count or timer governs this — `has_prompted`
+//! and `progress_baseline`'s own presence are read state, exactly like
+//! the existing `blocked`/`claimed`/`needs_input` flags, never a budget).
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -47,7 +105,7 @@ use wirk_core::{
 };
 
 use crate::{
-    AgentStatus, HerdrClient, HerdrError, HerdrEvent, HerdrExecutor, HerdrExecutorError,
+    AgentStatus, HerdrClient, HerdrError, HerdrEvent, HerdrExecutor, HerdrExecutorError, Notify,
     PromptAgent, PromptGate,
 };
 
@@ -160,12 +218,78 @@ enum LoopMsg {
     WatchEnded(Option<String>),
 }
 
-/// Captured right after a prompt is sent, compared against the same two
-/// readings at the next Idle (item C's no-progress check).
+/// Captured right after a prompt is sent, compared against the same
+/// reading at the next Idle (item C's no-progress check). P2.3 W4
+/// (build-brief.md §8 finding 1): the pane's own revision left this —
+/// only the worktree fingerprint (`wirk_herdr::git::fingerprint`, which
+/// never fails: an unreadable/non-repo path folds to "" via its own
+/// `unwrap_or_default`) counts as progress.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProgressBaseline {
-    pane_revision: u64,
     fingerprint: String,
+}
+
+/// P2.3 W3: what `observe_herdr` found when it decided this Idle earns
+/// another prompt rather than the stuck path -- handed to `maybe_prompt`
+/// so its printed line can name it. `First` is not itself a comparison
+/// (there is no earlier baseline to compare against, and none is taken
+/// after it either -- W6, module doc: the first prompt carries the
+/// intent, not a continuation). `FirstContinuation` (W6) is the next
+/// turn end after that: still no baseline to compare against (none was
+/// taken after `First`), but this prompt *is* a continuation, so the
+/// baseline is taken right after sending it -- the first turn end this
+/// `RunLoop` will ever judge for progress is the one after this. Every
+/// later prompt is `SinceLastPrompt`, carrying both readings
+/// `observe_herdr` already took to decide the actor was not stuck
+/// (always a genuine worktree change -- an unchanged fingerprint is the
+/// stuck path, returned before `maybe_prompt` is ever reached, so
+/// `describe` never needs to print "unchanged" for a prompt line).
+enum PromptProgress {
+    First,
+    FirstContinuation,
+    SinceLastPrompt {
+        before: ProgressBaseline,
+        after: ProgressBaseline,
+    },
+}
+
+impl PromptProgress {
+    fn describe(&self) -> String {
+        match self {
+            PromptProgress::First => "first prompt, no earlier baseline to compare".to_string(),
+            PromptProgress::FirstContinuation => "first continuation, baseline taken".to_string(),
+            PromptProgress::SinceLastPrompt { before, after } => format!(
+                "progress since the last prompt: worktree changed, fingerprint {} -> {}",
+                before.fingerprint, after.fingerprint
+            ),
+        }
+    }
+}
+
+/// P2.3 W5 (build-brief.md §9, R6: one helper, used everywhere this
+/// loop used to check `matches!(status, AgentStatus::Idle)` alone).
+/// True for `Idle` and `Done` — Herdr's own `status_name` (`refs/herdr/
+/// src/app/agent_view.rs`) reports the same underlying "actor's turn
+/// ended" detector state as `Done` instead of `Idle` whenever the pane
+/// has not been *viewed* since, which is every pane `wirk run` drives
+/// (headless). `Working`, `Blocked`, and `Unknown` are never turn ends.
+fn turn_ended(status: AgentStatus) -> bool {
+    matches!(status, AgentStatus::Idle | AgentStatus::Done)
+}
+
+/// The first `n` words of `text`, joined back with single spaces and
+/// suffixed `...` when more remain — the prompt line's own trimmed
+/// naming of what was sent (BRIEF.md: "the first words of the prompt
+/// text"), never the whole (multi-artifact, multi-paragraph) prompt.
+fn first_words(text: &str, n: usize) -> String {
+    let mut words = text.split_whitespace();
+    let head: Vec<&str> = words.by_ref().take(n).collect();
+    let joined = head.join(" ");
+    if words.next().is_some() {
+        format!("{joined}...")
+    } else {
+        joined
+    }
 }
 
 /// Drives one `Run` end to end against a `HerdrClient` + `WirkdApi`
@@ -182,9 +306,15 @@ pub struct RunLoop<C: HerdrClient, W: WirkdApi> {
     claimed: bool,
     needs_input: bool,
     last_status: Option<AgentStatus>,
-    /// The actor pane `launch` opened, once it has one: `pane.get`
-    /// takes a structured pane id and never an agent name, so
-    /// `progress_snapshot` asks by this once it is known.
+    /// P2.3 W4 (build-brief.md §8 finding 2): true once `notify_blocked`
+    /// has fired for the *current* `Blocked` episode — set on the
+    /// transition into `Blocked`, cleared on the next `Working`, so a
+    /// second `Blocked` episode on the same Run notifies again while a
+    /// pane that stays `Blocked` across many polls notifies only once.
+    blocked_notified: bool,
+    /// The actor pane `launch` opened, once it has one: used both by
+    /// `notify_blocked`/`notify_needs_input` to name the pane and, in
+    /// production, by `get_pane` callers elsewhere in this crate.
     launched_pane: Option<String>,
     /// Reconstructed from the watch stream's own `Event`s, incrementally
     /// (`Run::apply` already ignores an event naming a different Run) —
@@ -197,11 +327,33 @@ pub struct RunLoop<C: HerdrClient, W: WirkdApi> {
     /// in place.
     watch_events: Vec<Event>,
     progress_baseline: Option<ProgressBaseline>,
+    /// P2.3 W6 (build-brief.md §10): true once this `RunLoop` has sent
+    /// its very first prompt (the intent, `PromptProgress::First`) --
+    /// read by `observe_herdr` to tell that first prompt apart from the
+    /// first *continuation* (`PromptProgress::FirstContinuation`), the
+    /// next turn end after it, since both are reached with
+    /// `progress_baseline` still `None`. Never cleared: one `RunLoop`
+    /// drives exactly one `Run` end to end (module doc), so there is
+    /// only ever one "first prompt" for it to remember.
+    has_prompted: bool,
     /// Set by item C's no-progress check when it concludes the actor is
     /// stuck — the caller reads this alongside `Outcome::NeedsInput` to
     /// print what was observed (exit 4 stays as today; needs-input
     /// surfacing itself is P2.3).
     stuck_observation: Option<String>,
+    /// P2.3 W3: where `log_line` writes. `None` (the only value
+    /// `RunLoop::new` sets, unchanged — no caller outside this file
+    /// constructs one differently) means the real path `notify_
+    /// needs_input` already used before this wave: `println!`, the
+    /// same mechanism `wirk run` prints `Claimed`/`NeedsInput` through
+    /// (`wirk/src/executor.rs`, R2). A fake-backed test that cannot
+    /// read the process's own stdout reliably (many tests share one
+    /// process) instead calls `with_captured_output` to redirect every
+    /// line here — the live twin (`wirk/tests/run_verb.rs`) needs no
+    /// such thing, since it already reads the real child process's
+    /// piped stdout (R2 over inventing a sink trait: this is the
+    /// narrowest thing that makes the fake-backed case observable).
+    captured_output: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
@@ -211,6 +363,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             wirkd,
             prompt_gate: PromptGate::default(),
             blocked: false,
+            blocked_notified: false,
             claimed: false,
             needs_input: false,
             last_status: None,
@@ -218,7 +371,29 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             run_state: None,
             watch_events: Vec::new(),
             progress_baseline: None,
+            has_prompted: false,
             stuck_observation: None,
+            captured_output: None,
+        }
+    }
+
+    /// P2.3 W3: redirect `log_line`'s output into `sink` instead of
+    /// the real `println!` — a fake-backed test's own way to assert on
+    /// the loop's printed lines (see `captured_output`'s own doc).
+    /// Never called from production code (`wirk/src/executor.rs` keeps
+    /// using the unadorned `RunLoop::new`).
+    pub fn with_captured_output(mut self, sink: Arc<Mutex<Vec<String>>>) -> Self {
+        self.captured_output = Some(sink);
+        self
+    }
+
+    /// The one place every line this loop prints goes through — real
+    /// `println!` in production, `captured_output` in a fake-backed
+    /// test (see that field's doc).
+    fn log_line(&self, line: &str) {
+        match &self.captured_output {
+            Some(sink) => sink.lock().unwrap().push(line.to_string()),
+            None => println!("{line}"),
         }
     }
 
@@ -407,23 +582,91 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             )
             .map_err(RunLoopError::Wirkd)?;
 
-        if !matches!(agent_status, AgentStatus::Idle) {
+        // P2.3 W4 (build-brief.md §8 finding 2): the loop never prompts
+        // a Blocked pane (below, `maybe_prompt`'s own guard, unchanged),
+        // but on the *transition* into Blocked it now notifies once — a
+        // human waiting on the pane has something to see. The Work's
+        // own state and journal are untouched beyond the
+        // `LifecycleObserved` write just above (already journaled for
+        // every changed status, Blocked included). A later Working
+        // clears `blocked_notified`, so a second Blocked episode on the
+        // same Run notifies again; staying Blocked across many polls
+        // notifies only once, since only a *changed* status reaches
+        // this point at all (the `if !changed` return above).
+        match agent_status {
+            AgentStatus::Blocked => {
+                if !self.blocked_notified {
+                    self.notify_blocked(work_id);
+                    self.blocked_notified = true;
+                }
+            }
+            AgentStatus::Working => {
+                self.blocked_notified = false;
+            }
+            _ => {}
+        }
+
+        if !turn_ended(*agent_status) {
             return Ok(None);
         }
 
-        if let Some(baseline) = self.progress_baseline.take() {
+        let progress = if let Some(baseline) = self.progress_baseline.take() {
             let now = self.progress_snapshot(actor);
-            if now.as_ref() == Some(&baseline) {
-                self.stuck_observation = Some(format!(
-                    "no progress since the last prompt: pane revision {} and the worktree \
-                     unchanged",
-                    baseline.pane_revision
-                ));
+            if now == baseline {
+                let pane_id = self.launched_pane.clone().unwrap_or_default();
+                // build-brief.md §7 amendment 2: the observation names
+                // the pane (it stays alive after the loop exits, a
+                // human reads it there) and the fingerprint compared
+                // (P2.3 W4, build-brief.md §8 finding 1: the pane's own
+                // revision no longer participates — any output by the
+                // actor advanced it whether or not the actor did
+                // anything, so it never actually pinned "stuck"). The
+                // pane's own screen text is not read here — Herdr's
+                // `pane.read` is not on `HerdrClient` today (map row 23:
+                // available, never called, 0017 D57 kept wirk off it for
+                // Claim evidence) and adding it crosses this wave's file
+                // allow-list (`wirk-herdr/src/lib.rs`, `socket.rs`);
+                // named gap, BUILD.md.
+                let observation = format!(
+                    "stuck: pane {pane_id} — no progress since the last prompt: worktree \
+                     fingerprint {} unchanged",
+                    baseline.fingerprint
+                );
+                self.stuck_observation = Some(observation.clone());
+                self.wirkd
+                    .record(
+                        work_id,
+                        &run.id,
+                        EventKind::RunFailed {
+                            cause: FailureCause {
+                                status: Some("stuck".to_string()),
+                                request_id: None,
+                                at: Timestamp(0),
+                                detail: Some(observation.clone()),
+                            },
+                        },
+                    )
+                    .map_err(RunLoopError::Wirkd)?;
+                self.notify_needs_input(work_id, "stuck", &observation);
                 return Ok(Some(Outcome::NeedsInput));
             }
-        }
+            // Progress *was* observed: the worktree fingerprint changed.
+            PromptProgress::SinceLastPrompt {
+                before: baseline,
+                after: now,
+            }
+        } else if self.has_prompted {
+            // W6: no baseline exists, but a prompt (the intent) was
+            // already sent once before -- this turn end earns the first
+            // *continuation*, unconditionally, with the baseline taken
+            // right after it (`maybe_prompt`). Only the turn end after
+            // this one is ever compared for progress.
+            PromptProgress::FirstContinuation
+        } else {
+            PromptProgress::First
+        };
 
-        self.maybe_prompt(run, actor)?;
+        self.maybe_prompt(run, actor, *agent_status, progress)?;
         Ok(None)
     }
 
@@ -462,8 +705,35 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
     /// D133: prompted only while Idle (the caller's own guard),
     /// unclaimed, the Work not `NeedsInput`, and not `Blocked` — gated
     /// by `PromptGate` so a prompt already in flight never doubles up
-    /// (D56). Captures item C's own baseline immediately after sending.
-    fn maybe_prompt(&mut self, run: &Run, actor: &ActorWorld) -> Result<(), RunLoopError<W>> {
+    /// (D56). Takes item C's own baseline right after sending, except
+    /// for the very first prompt this `RunLoop` ever sends (W6, module
+    /// doc: that prompt is the intent, not a continuation).
+    ///
+    /// P2.3 W3 (BRIEF.md's amendment): prints one line, through
+    /// `log_line`, for every prompt actually sent — the gap the
+    /// amendment names ("the loop prints nothing when it prompts, so
+    /// run 3's evidence counted zero prompts where the journal shows
+    /// two"). Printed only inside the `try_acquire` success branch, so
+    /// a call that finds the gate already busy (a prompt already in
+    /// flight) prints nothing for it — there is no second prompt to
+    /// name. `progress` is `PromptProgress::First` for the very first
+    /// prompt this `RunLoop` ever sends (the intent; no baseline is
+    /// taken after it — W6), `FirstContinuation` for the next one (the
+    /// baseline *is* taken now), and `SinceLastPrompt` for every one
+    /// after that — "the first prompt prints the same shape" (BRIEF.md),
+    /// just with each variant's own wording in place of a comparison.
+    /// `agent_status` is the turn-ended status that earned this prompt
+    /// (P2.3 W5: `Idle` or `Done`, per `turn_ended`) — named in the
+    /// printed line so a headless run's `Done`-answered prompts read the
+    /// same as an `Idle`-answered one always did, not a hardcoded
+    /// "Idle".
+    fn maybe_prompt(
+        &mut self,
+        run: &Run,
+        actor: &ActorWorld,
+        agent_status: AgentStatus,
+        progress: PromptProgress,
+    ) -> Result<(), RunLoopError<W>> {
         if self.blocked || self.claimed || self.needs_input {
             return Ok(());
         }
@@ -475,26 +745,94 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             .client()
             .prompt_agent(PromptAgent {
                 target: run.id.0.clone(),
-                text,
+                text: text.clone(),
             })
             .map_err(HerdrExecutorError::from)?;
-        self.progress_baseline = self.progress_snapshot(actor);
+        let describe = progress.describe();
+        // W6 (module doc, build-brief.md §10): the baseline is taken
+        // after every prompt *except* the very first (the intent) — that
+        // first prompt only marks `has_prompted`, so the next turn end
+        // earns an unconditional continuation instead of being compared
+        // against a baseline that was never a "continue" ask.
+        match progress {
+            PromptProgress::First => self.has_prompted = true,
+            PromptProgress::FirstContinuation | PromptProgress::SinceLastPrompt { .. } => {
+                self.progress_baseline = Some(self.progress_snapshot(actor));
+            }
+        }
+        self.log_line(&format!(
+            "prompt: {agent_status:?} answered (run {}); {}; sending: {}",
+            run.id.0,
+            describe,
+            first_words(&text, 8)
+        ));
         Ok(())
     }
 
-    /// One `get_pane` request plus one worktree fingerprint (item C,
-    /// literal: "one get_pane request and one worktree fingerprint") —
-    /// `None` when the pane cannot be read (about to be Vanished on the
-    /// merged channel regardless, so no baseline is ever compared
-    /// against a reading that failed).
-    fn progress_snapshot(&self, actor: &ActorWorld) -> Option<ProgressBaseline> {
-        let pane_id = self.launched_pane.as_ref()?;
-        let pane = self.executor.client().get_pane(pane_id).ok()?;
-        let fingerprint = crate::git::fingerprint(&actor.worktree_path);
-        Some(ProgressBaseline {
-            pane_revision: pane.revision,
-            fingerprint,
-        })
+    /// One worktree fingerprint (P2.3 W4, build-brief.md §8 finding 1:
+    /// the pane's own revision left this — item C's original "one
+    /// `get_pane` request and one worktree fingerprint" is now just the
+    /// fingerprint). `wirk_herdr::git::fingerprint` never fails on its
+    /// own terms (an unreadable or non-repo path folds to `""` via its
+    /// own `unwrap_or_default`), so this always returns a value; kept
+    /// non-fallible rather than wrapped in `Option` for the same reason.
+    fn progress_snapshot(&self, actor: &ActorWorld) -> ProgressBaseline {
+        ProgressBaseline {
+            fingerprint: crate::git::fingerprint(&actor.worktree_path),
+        }
+    }
+
+    /// P2.3 W1 (states.md §2, R2: `HerdrClient::notify` already
+    /// defined, `wirk-herdr/src/lib.rs:530`, zero call sites before
+    /// this wave). Called exactly once, from the stuck-actor path only
+    /// (build-brief.md's own wording: "the loop, on no progress after
+    /// a prompt ... calls `HerdrClient::notify` once") — never from
+    /// `observe_watch`'s own `NeedsInput` branch: a Question claim or a
+    /// deterministic Waypoint's `RunFailed` arriving on the watch
+    /// stream is surfaced by `wirk work status` and the pane's own
+    /// `watch`, not a desktop notification (build-brief.md §7 item 1).
+    /// Probed by hand (BUILD.md): duplicating this call within the
+    /// stuck branch itself makes `run_loop_needs_input_calls_notify_once`
+    /// fail (2 != 1); reverted before landing. Prints one line naming
+    /// the reply — `notify` itself returns no reply payload
+    /// (`Result<(), HerdrError>`, unchanged), so the line names success
+    /// or the transport error.
+    fn notify_needs_input(&self, work_id: &WorkId, reason: &str, detail: &str) {
+        let title = format!("wirk: Work {} needs input ({reason})", work_id.0);
+        match self.executor.client().notify(Notify {
+            title,
+            body: detail.to_string(),
+        }) {
+            Ok(()) => self.log_line(&format!("notify: sent (work {})", work_id.0)),
+            Err(err) => self.log_line(&format!("notify: failed (work {}): {err}", work_id.0)),
+        }
+    }
+
+    /// P2.3 W4 (build-brief.md §8 finding 2, R2: the same `HerdrClient::
+    /// notify` `notify_needs_input` already calls). Called once per
+    /// `Blocked` episode, from `observe_herdr`'s own transition check —
+    /// never from `maybe_prompt`, since a Blocked pane is never
+    /// prompted. Title names the Work and that the actor is waiting on
+    /// its pane; body is the pane id, so a human reading the
+    /// notification knows exactly which pane to look at (the pane
+    /// itself is untouched and still waiting — this call journals
+    /// nothing, `LifecycleObserved{Blocked}` already covers that).
+    fn notify_blocked(&self, work_id: &WorkId) {
+        let pane_id = self.launched_pane.clone().unwrap_or_default();
+        let title = format!("wirk: Work {} — actor waiting on its pane", work_id.0);
+        match self.executor.client().notify(Notify {
+            title,
+            body: pane_id.clone(),
+        }) {
+            Ok(()) => self.log_line(&format!(
+                "notify: sent (work {}, pane {pane_id} blocked)",
+                work_id.0
+            )),
+            Err(err) => self.log_line(&format!(
+                "notify: failed (work {}, pane {pane_id} blocked): {err}",
+                work_id.0
+            )),
+        }
     }
 
     /// `RunFailed{cause.detail}` for a failure the loop is about to
