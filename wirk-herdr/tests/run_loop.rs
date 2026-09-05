@@ -24,11 +24,13 @@ use tempfile::tempdir;
 use wirk_core::{
     ActorKind, ActorWorld, ArtifactSpec, Boundary, ClaimId, ClaimKind, ClaimVerdict, Event,
     EventId, EventKind, ExecutionTriple, FailureCause, OutputContract, RouteId, Run, RunId,
-    RunState, Timestamp, WaypointId, WorkId, World, WorldHash,
+    RunState, Timestamp, WaypointId, WorkId, WorkState, World, WorldHash,
 };
 use wirk_herdr::fake::FakeHerdrClient;
-use wirk_herdr::run_loop::{FakeWirkdApi, Outcome, RunLoop, RunLoopError};
-use wirk_herdr::{AgentStatus, HerdrError, HerdrEvent, PaneInfo};
+use wirk_herdr::run_loop::{
+    FakeWirkdApi, Outcome, RunLoop, RunLoopError, RunStatusEntry, WorkStatus,
+};
+use wirk_herdr::{AgentStatus, HerdrError, HerdrEvent, HerdrExecutor, PaneInfo};
 
 fn work_id() -> WorkId {
     WorkId("work-1".to_string())
@@ -454,10 +456,19 @@ fn blocked_staying_blocked_across_several_polls_still_notifies_once() {
     );
 }
 
-// ---- (3) ClaimRecorded stops the loop with zero status calls -------------
+// ---- (3) ClaimRecorded stops the loop with no *ongoing* status poll ------
 
+/// P2.6 W3 (rerun findings; ruling 0052) revises this test's own name
+/// and count: `launch` now makes exactly *one* `status` call of its
+/// own, up front, to check for an earlier Run's stale pane to release
+/// before this Run's own launch (`release_earlier_panes`) — never
+/// configured here (`FakeWirkdApi::default()`), so it errors and is
+/// swallowed, changing nothing else. The point this test still pins is
+/// unchanged: once driving is underway, `Claimed` is learned from the
+/// watch stream alone, never a status poll — `status_calls()` does not
+/// grow past that one launch-time call.
 #[test]
-fn claim_recorded_on_the_watch_stream_stops_the_loop_with_no_status_call() {
+fn claim_recorded_on_the_watch_stream_stops_the_loop_with_one_launch_time_status_call() {
     let run = open_run("run-1");
     let dir = tempdir().expect("tempdir");
     let world = actor_world(&run, dir.path());
@@ -472,8 +483,9 @@ fn claim_recorded_on_the_watch_stream_stops_the_loop_with_no_status_call() {
     assert_eq!(outcome, Outcome::Claimed);
     assert_eq!(
         wirkd.status_calls(),
-        0,
-        "Claimed is learned from the watch stream, never a status poll"
+        1,
+        "Claimed is learned from the watch stream; the one status call is launch's own \
+         earlier-pane check, never a completion poll"
     );
 }
 
@@ -1510,6 +1522,204 @@ fn d9_6_worktree_pins_the_exact_base_sha() {
         branches.contains("p1/base-pin"),
         "the branch must survive worktree remove (0017 D54): {branches:?}"
     );
+}
+
+// ---- P2.6 W3 (rerun findings; ruling 0052) ---------------------------
+
+/// The driver, launching a Run whose Work has an earlier Run with a
+/// live pane, releases that pane first through Herdr's own `pane.close`
+/// verb (the fake records it) and journals what it did before ever
+/// calling `agent.start` for its own Run — the client-side half of the
+/// same live collision `handle_retry`'s server-side fix answers
+/// (`03-orient.log`: `agent_name_taken` on the retry's own launch, the
+/// old pane still alive and `working` in Herdr's own snapshot). Red
+/// before this wave: nothing ever called `pane.close` for the earlier
+/// Run.
+#[test]
+fn launch_releases_an_earlier_runs_live_pane_before_launching() {
+    let old_run = open_run("run-1");
+    let run = open_run("run-2");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+
+    let (tx, rx) = mpsc::channel();
+    let client = Arc::new(
+        FakeHerdrClient::default()
+            .with_split_pane_response(pane_info(&run.id.0, AgentStatus::Idle, 1))
+            .with_subscribe_channel(rx)
+            .with_get_pane_response(
+                &old_run.id.0,
+                Ok(pane_info(&old_run.id.0, AgentStatus::Working, 3)),
+            ),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    wirkd.set_status(WorkStatus {
+        work_state: WorkState::Active,
+        runs: vec![
+            RunStatusEntry {
+                run_id: old_run.id.clone(),
+                state: RunState::Failed(FailureCause {
+                    status: Some("retried".to_string()),
+                    request_id: None,
+                    at: Timestamp(0),
+                    detail: None,
+                }),
+            },
+            RunStatusEntry {
+                run_id: run.id.clone(),
+                state: RunState::Open,
+            },
+        ],
+    });
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    wait_until("the earlier Run's pane released", || {
+        !client.close_pane_calls.lock().unwrap().is_empty()
+    });
+    assert_eq!(
+        client.close_pane_calls.lock().unwrap().as_slice(),
+        [old_run.id.0.as_str()],
+        "the earlier Run's pane, and only that one, must be closed"
+    );
+
+    let _tx = tx; // keep Herdr's subscription open; end the drive via the watch stream
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+
+    let recorded = wirkd.recorded();
+    assert!(
+        recorded
+            .iter()
+            .any(|(_, run_id, kind)| run_id == &old_run.id
+                && matches!(
+                    kind,
+                    EventKind::LifecycleObserved { status, .. } if status == "released"
+                )),
+        "releasing the earlier Run's pane must be journaled against that Run: {recorded:?}"
+    );
+}
+
+/// A Work whose earlier Run's pane was never actually launched (no
+/// `get_pane` response configured, Herdr's own `NotFound`) is left
+/// alone — nothing to release, `close_pane` never called, and no
+/// `LifecycleObserved` invented for a pane that was never there.
+#[test]
+fn launch_does_not_release_an_earlier_run_with_no_live_pane() {
+    let old_run = open_run("run-1");
+    let run = open_run("run-2");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    wirkd.set_status(WorkStatus {
+        work_state: WorkState::Active,
+        runs: vec![
+            RunStatusEntry {
+                run_id: old_run.id.clone(),
+                state: RunState::Failed(FailureCause {
+                    status: Some("retried".to_string()),
+                    request_id: None,
+                    at: Timestamp(0),
+                    detail: None,
+                }),
+            },
+            RunStatusEntry {
+                run_id: run.id.clone(),
+                state: RunState::Open,
+            },
+        ],
+    });
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+
+    assert!(
+        client.close_pane_calls.lock().unwrap().is_empty(),
+        "no live pane existed for the earlier Run, so nothing should be closed"
+    );
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+}
+
+/// The actor pane's env carries `CARGO_TARGET_DIR` when the driver's
+/// own process env has it set (the same mechanism `actor_pane` already
+/// uses for `PATH`), and carries no such key when it does not — an
+/// actor never chooses its own cargo cache location (P2.6's own rerun:
+/// the actor built inside the worktree at `.target-local/`, 345M,
+/// `03-orient.log`). Single test, sequential env mutation, so it never
+/// races another test over this process-global key (R6: no other test
+/// in this suite reads or writes it).
+#[test]
+fn actor_pane_env_carries_cargo_target_dir_from_the_driver_when_set() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+
+    let previous = std::env::var("CARGO_TARGET_DIR").ok();
+
+    unsafe {
+        std::env::set_var("CARGO_TARGET_DIR", "/var/tmp/wirk-target");
+    }
+    let client_with = Arc::new(
+        FakeHerdrClient::default().with_split_pane_response(pane_info(
+            &run.id.0,
+            AgentStatus::Idle,
+            1,
+        )),
+    );
+    HerdrExecutor::new(client_with.clone())
+        .launch_actor(&run, &world)
+        .expect("launch_actor succeeds");
+    let calls_with = client_with.split_pane_calls.lock().unwrap();
+    assert_eq!(
+        calls_with[0]
+            .env
+            .get("CARGO_TARGET_DIR")
+            .map(String::as_str),
+        Some("/var/tmp/wirk-target"),
+        "the pane's env must carry the driver's own CARGO_TARGET_DIR"
+    );
+    drop(calls_with);
+
+    unsafe {
+        std::env::remove_var("CARGO_TARGET_DIR");
+    }
+    let client_without = Arc::new(
+        FakeHerdrClient::default().with_split_pane_response(pane_info(
+            &run.id.0,
+            AgentStatus::Idle,
+            1,
+        )),
+    );
+    HerdrExecutor::new(client_without.clone())
+        .launch_actor(&run, &world)
+        .expect("launch_actor succeeds");
+    let calls_without = client_without.split_pane_calls.lock().unwrap();
+    assert!(
+        !calls_without[0].env.contains_key("CARGO_TARGET_DIR"),
+        "no CARGO_TARGET_DIR in the driver's own env must mean none in the pane's env either"
+    );
+    drop(calls_without);
+
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("CARGO_TARGET_DIR", value),
+            None => std::env::remove_var("CARGO_TARGET_DIR"),
+        }
+    }
 }
 
 fn git_init_repo(dir: &std::path::Path) {

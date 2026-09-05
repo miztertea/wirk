@@ -331,10 +331,20 @@ fn handle_retry_unknown_run_id_refuses_triple_mismatch() {
 }
 
 /// P2.3 W2 (decide.md §1): `retry` on a `NeedsInput` Work opens a fresh
-/// Run (a new `RunId`, one new `RunOpened`, no new `WaypointReserved`)
-/// on the same reserved World — `wirk work status`'s `run_id` and
-/// `world_hash` both move to the retry, `world_hash` unchanged (the
-/// last `WaypointReserved` still wins). Red before this wave.
+/// Run (a new `RunId`, one new `RunOpened`) — `wirk work status`'s
+/// `run_id` and `world_hash` both move to the retry, `world_hash`
+/// unchanged (`WorldHash::of` excludes `triple`, the only field that
+/// moves). Red before this wave.
+///
+/// P2.6 W3 (rerun findings; ruling 0052) revises this test's own prior
+/// assertion: an Actor World's retry now *does* write one new
+/// `WaypointReserved`, carrying a triple that names the new Run rather
+/// than reusing the refused/failed Run's stale one
+/// (`retry_after_out_of_boundary_refusal_reserves_a_world_naming_the_
+/// new_run`, `boundary_claim.rs`, is this same fix's live-boundary
+/// twin). The old assertion ("no new WaypointReserved") pinned the
+/// defect this wave answers; updated here rather than left contradicting
+/// the fix it exists to prove.
 #[test]
 fn handle_retry_opens_fresh_run_same_world() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -406,8 +416,10 @@ fn handle_retry_opens_fresh_run_same_world() {
         "retry must append exactly one new RunOpened"
     );
     assert_eq!(
-        waypoint_reserved_count_after, waypoint_reserved_count_before,
-        "retry must not write a new WaypointReserved"
+        waypoint_reserved_count_after,
+        waypoint_reserved_count_before + 1,
+        "retry on an Actor World must write one new WaypointReserved carrying the new Run's \
+         own triple"
     );
 
     let after = status_before(&pointer);
@@ -415,8 +427,16 @@ fn handle_retry_opens_fresh_run_same_world() {
     assert_eq!(after["run_id"].as_str(), Some(new_run_id));
     assert_eq!(
         after["world_hash"], world_hash_before,
-        "retry reuses the same reserved World"
+        "WorldHash::of excludes triple, so the retried World still hashes the same"
     );
+    let world: World = serde_json::from_value(after["world"].clone()).expect("world deserializes");
+    match world {
+        World::Actor(actor) => assert_eq!(
+            actor.triple.run_id.0, new_run_id,
+            "the retried Run's reserved World must name the new Run, not the old one"
+        ),
+        World::Deterministic(_) => panic!("expected an Actor World"),
+    }
 }
 
 /// Probe (decide.md §5's own named hazard): `retry` reuses

@@ -458,6 +458,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         world: &World,
     ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>, RunLoopError<W>>
     {
+        self.release_earlier_panes(work_id, run);
         match self.executor.launch_actor(run, world) {
             Ok(launched) => {
                 self.launched_pane = Some(launched.pane.pane_id.clone());
@@ -491,6 +492,51 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                     .map_err(RunLoopError::Wirkd)?;
                 Err(RunLoopError::Herdr(err))
             }
+        }
+    }
+
+    /// P2.6 W3 (rerun findings, `03-orient.log`; ruling 0052): before
+    /// this Run's own pane is ever created, close any *other* Run this
+    /// Work knows about whose pane (named by convention for `run.id.0`,
+    /// `actor_pane`'s own doc) is still alive in Herdr — a retry's own
+    /// abandoned predecessor is the live case (`handle_retry`,
+    /// `server.rs`, now marks it `RunFailed`, but that journal write
+    /// alone never touches Herdr; only `pane.close` does), reproduced
+    /// live as `agent_name_taken` when the collision was never
+    /// released. Best-effort throughout: a `status` this build cannot
+    /// reach, a pane that was never actually launched (`get_pane`
+    /// refuses `NotFound`), or a `close_pane`/`record` call that itself
+    /// fails, are none of them fatal to this Run's own launch — the
+    /// worst case is the collision this step exists to prevent, not
+    /// silently, since a real `agent_name_taken` still surfaces from
+    /// `launch_actor` itself right after. Never called for its own Run
+    /// (`entry.run_id == run.id` is skipped).
+    fn release_earlier_panes(&self, work_id: &WorkId, run: &Run) {
+        let Ok(status) = self.wirkd.status(work_id) else {
+            return;
+        };
+        for entry in status.runs {
+            if entry.run_id == run.id {
+                continue;
+            }
+            let pane_id = entry.run_id.0.clone();
+            let Ok(pane) = self.executor.client().get_pane(&pane_id) else {
+                continue;
+            };
+            if self.executor.client().close_pane(&pane.pane_id).is_err() {
+                continue;
+            }
+            let _ = self.wirkd.record(
+                work_id,
+                &entry.run_id,
+                EventKind::LifecycleObserved {
+                    status: "released".to_string(),
+                    detail: Some(format!(
+                        "closed pane {} for a stale Run before launching {}",
+                        pane.pane_id, run.id.0
+                    )),
+                },
+            );
         }
     }
 

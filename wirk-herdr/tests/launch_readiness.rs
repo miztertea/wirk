@@ -281,6 +281,21 @@ fn actor_pane_env_path_begins_with_the_running_executable_directory() {
         first_entry, exe_dir,
         "PATH's first entry must be the running executable's own directory: {path_value:?}"
     );
-    // The triple stays alongside it.
-    assert_eq!(env.len(), 4, "PATH added to the existing triple: {env:?}");
+    // The triple stays alongside it, plus `CARGO_TARGET_DIR` only when
+    // this test process's own env carries one (P2.6 W3: `actor_pane`
+    // passes it through exactly when set, same mechanism as `PATH`
+    // above) — asserted by content, not a fixed count, since whether
+    // `CARGO_TARGET_DIR` is set is this test run's own environment, not
+    // this test's own concern.
+    let expected_len = if std::env::var("CARGO_TARGET_DIR").is_ok() {
+        5
+    } else {
+        4
+    };
+    assert_eq!(
+        env.len(),
+        expected_len,
+        "PATH added to the existing triple, plus CARGO_TARGET_DIR only when the driver's own \
+         env carries one: {env:?}"
+    );
 }

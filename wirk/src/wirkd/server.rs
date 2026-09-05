@@ -1721,15 +1721,29 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
 /// `NotNeedsInput` unless the folded Work is `NeedsInput` (no journal
 /// write on refusal, mirrors 0046 D139's malformed-Route refusal);
 /// `TripleMismatch` if the triple's `run_id` names no `RunOpened`
-/// (D9#4, same check `claim`/`fail` make). Appends **only** a fresh
-/// `RunOpened{run: <new RunId>, waypoint, attempt: 1, world_hash}` on
-/// the failed Run's own Waypoint — no new `WaypointReserved`:
-/// `world_for_waypoint` (the same "last `WaypointReserved` wins"
-/// lookup `handle_status` uses) reads the World already reserved
-/// there, so a Waypoint reserved twice since the failure retries
-/// against the *second* World, never a stale one recomputed here
-/// (decide.md §5's hazard). No count is invented: the human's choice is
-/// the one `RunOpened`, D134 bars a count, not the event itself.
+/// (D9#4, same check `claim`/`fail` make).
+///
+/// P2.6 W3 (rerun findings, `knowledge/evidence/p2-build-wave-2026-09-05/
+/// rerun/`; ruling 0052): this used to reuse the Waypoint's
+/// already-reserved World verbatim, so an `ActorWorld.triple.run_id`
+/// still named whichever Run *first* reserved it — a retried Run's
+/// pane launch then collided `agent_name_taken` on that stale Run's
+/// still-alive pane (`03-orient.log` lines 21-23), the exact defect
+/// class Wave 1 fixed for auto-advance's `next_world` (`handle_claim`)
+/// on this sibling code path Wave 1 never touched. Fixed the same way:
+/// a fresh World is minted before the new `RunOpened`, carrying the new
+/// Run's own triple — an `Actor` World only (`ActorWorld.triple` is the
+/// only run-id-bearing field either variant has; `Deterministic` has
+/// none, so nothing is re-reserved for it and `world_hash` never moves,
+/// `WorldHash::of` already excluding `triple` from both). The old Run
+/// is also marked `RunFailed{status: "retried"}` here: a Claim refused
+/// leaves a Run `Open` (D9#3, `Run::apply`), so without this a Work
+/// that had two Runs — the refused one and the retry — would still
+/// read as having two `Open` Runs, and a caller that picks "the" open
+/// Run to drive (`wirk/src/executor.rs::fetch_open_run`) could still
+/// find the abandoned one first and collide on its pane name exactly as
+/// the rerun did live. No count is invented: the human's one retry verb
+/// is the one `RunOpened` (D134 bars a count, not the event itself).
 /// `fold`'s own `RunOpened` arm clears `NeedsInput` back to `Active` on
 /// replay — this handler never sets `Work.state` itself, the journal
 /// is the only truth (D9#1).
@@ -1761,14 +1775,60 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
         );
     };
 
-    let Some(world) = world_for_waypoint(&events, &run.waypoint) else {
+    let Some(prior_world) = world_for_waypoint(&events, &run.waypoint) else {
         return err_reply(
             "JournalError",
             "no World is reserved for this Run's Waypoint",
         );
     };
-    let world_hash = WorldHash::of(&world);
+
     let new_run_id = RunId(mint_id("run"));
+
+    let world_hash = match &prior_world {
+        World::Actor(actor) => {
+            let fresh_world = World::Actor(ActorWorld {
+                triple: ExecutionTriple {
+                    run_id: new_run_id.clone(),
+                    ..actor.triple.clone()
+                },
+                ..actor.clone()
+            });
+            let world_hash = WorldHash::of(&fresh_world);
+            let reserved = new_event(
+                &work_id,
+                None,
+                EventKind::WaypointReserved {
+                    waypoint: run.waypoint.clone(),
+                    world_hash: world_hash.clone(),
+                    world: fresh_world,
+                },
+            );
+            if let Err(err) = append_event(state, &mut journal, &work_id, &reserved) {
+                return err_reply("JournalError", &err.to_string());
+            }
+            world_hash
+        }
+        // No triple to go stale: reusing the prior World verbatim
+        // (unchanged behaviour) is already correct.
+        World::Deterministic(_) => WorldHash::of(&prior_world),
+    };
+
+    let superseded = new_event(
+        &work_id,
+        Some(run_id.clone()),
+        EventKind::RunFailed {
+            cause: FailureCause {
+                status: Some("retried".to_string()),
+                request_id: None,
+                at: now_ts(),
+                detail: Some(format!("superseded by retry {}", new_run_id.0)),
+            },
+        },
+    );
+    if let Err(err) = append_event(state, &mut journal, &work_id, &superseded) {
+        return err_reply("JournalError", &err.to_string());
+    }
+
     let event = new_event(
         &work_id,
         Some(new_run_id.clone()),

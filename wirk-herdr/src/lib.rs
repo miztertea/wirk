@@ -865,6 +865,19 @@ impl<C: HerdrClient> HerdrExecutor<C> {
             env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
         }
 
+        // P2.6 W3 (rerun findings, `03-orient.log`): the actor built the
+        // whole workspace in place inside its worktree, into a stray
+        // `.target-local/` (345M, out of boundary), because the pane it
+        // ran in carried no `CARGO_TARGET_DIR` of its own — nothing told
+        // it where the named-kept cache (0030; 0039 D126) lives. Same
+        // mechanism as `PATH` above: read from the driver's own process
+        // env and passed through only when set, never invented (an
+        // actor pane started against a driver with none configured gets
+        // none either, same as today).
+        if let Ok(cache) = std::env::var("CARGO_TARGET_DIR") {
+            env.insert("CARGO_TARGET_DIR".to_string(), cache);
+        }
+
         // Workspace-vs-pane branching (item 4, W2; loop.md §2, build
         // brief §2.2 row 4: "CreateWorkspace{cwd,env} (no open
         // workspace) or SplitPane{...} (one exists)"). `ActorWorld`

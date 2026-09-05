@@ -17,9 +17,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use wirkd::{ClaimPayload, RecordPayload, Reply, Request, StatusPayload, WirkdPointer};
+use wirkd::{
+    ClaimPayload, RecordPayload, Reply, Request, RetryPayload, StatusPayload, WirkdPointer,
+};
 
-use wirk_core::{ClaimKind, EventKind, ExecutionTriple, RunId, WorkId, World, WorldHash};
+use wirk_core::{ClaimKind, EventKind, ExecutionTriple, RunId, RunState, WorkId, World, WorldHash};
 
 fn wirk_bin() -> &'static str {
     env!("CARGO_BIN_EXE_wirk")
@@ -864,6 +866,222 @@ fn wirk_claim_prints_out_of_boundary_paths_exit_3() {
     assert_eq!(
         stdout, "Refused: OutOfBoundary docs/notes.md, docs/second.md",
         "wirk claim's own printed line must name every offending path"
+    );
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// Calls wirkd's `retry` verb directly over the socket, same shape as
+/// `needs_input.rs`'s own helper (R2, duplicated per this file's
+/// existing precedent of a small per-file copy over a shared module —
+/// `flag_value`, `executor.rs`).
+fn retry(socket: &Path, estate: &Path, work_id: &str, run_id: &str) -> Reply {
+    wirkd::client::call(
+        socket,
+        &Request::retry(RetryPayload {
+            triple: ExecutionTriple {
+                estate_root: estate.display().to_string(),
+                work_id: WorkId(work_id.to_string()),
+                run_id: RunId(run_id.to_string()),
+            },
+        }),
+    )
+    .expect("retry call succeeds")
+}
+
+/// Reads back the folded `Run` for `run_id`, straight from the socket
+/// `status` verb's `"runs"` array (`server.rs::handle_status`), so a
+/// test can check a Run's own terminal state without opening the
+/// journal file directly.
+fn run_state(socket: &Path, work_id: &str, run_id: &str) -> RunState {
+    let reply = wirkd::client::call(
+        socket,
+        &Request::status(StatusPayload {
+            work_id: WorkId(work_id.to_string()),
+        }),
+    )
+    .expect("status call succeeds");
+    let result = match reply {
+        Reply::Ok { result, .. } => result,
+        Reply::Err { error, .. } => panic!(
+            "status unexpectedly refused: {} {}",
+            error.code, error.message
+        ),
+    };
+    result["runs"]
+        .as_array()
+        .expect("runs array present")
+        .iter()
+        .find_map(|entry| {
+            let run: wirk_core::Run = serde_json::from_value(entry["run"].clone()).ok()?;
+            (run.id.0 == run_id).then_some(run.state)
+        })
+        .unwrap_or_else(|| panic!("no Run {run_id} in status's runs array"))
+}
+
+/// P2.6 W3 (rerun findings, `evidence/p2-build-wave-2026-09-05/rerun/`;
+/// ruling 0052): after a Claim is `Refused OutOfBoundary` (leaving the
+/// Run `Open`, D9#3) and the Work retried, the *new* Run's reserved
+/// World must carry a triple naming the *new* Run — not the refused
+/// Run's id, the exact staleness `handle_retry` (`server.rs:1736`
+/// pre-fix) reproduced live (`03-orient.log` lines 21-23:
+/// `agent_name_taken` on the retried pane launch). Red before this
+/// wave: the World's `triple.run_id` was still the old, refused Run's
+/// id.
+#[test]
+fn retry_after_out_of_boundary_refusal_reserves_a_world_naming_the_new_run() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = boundary_src_only_route(estate);
+    let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "boundary-src-only/wp-1",
+    );
+
+    fs::write(worktree.join("src/lib.rs"), b"// lib\n// edited\n").expect("edit src/lib.rs");
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+    fs::write(worktree.join("docs/notes.md"), b"notes\nedited\n").expect("edit docs/notes.md");
+
+    let (code, claim_stdout) = claim(estate, &work_id, &run_id, &[("report.md", "report.md")]);
+    assert_eq!(
+        code,
+        Some(3),
+        "expected exit 3 (Refused), stdout: {claim_stdout}"
+    );
+
+    let reply = retry(&pointer.socket, estate, &work_id, &run_id);
+    let result = match reply {
+        Reply::Ok { result, .. } => result,
+        Reply::Err { error, .. } => panic!(
+            "retry unexpectedly refused: {} {}",
+            error.code, error.message
+        ),
+    };
+    let new_run_id = result["new_run_id"]
+        .as_str()
+        .expect("new_run_id present")
+        .to_string();
+    assert_ne!(new_run_id, run_id, "retry must open a fresh RunId");
+
+    let world = reserved_world(&pointer.socket, &work_id);
+    let actor = match world {
+        World::Actor(actor) => actor,
+        World::Deterministic(_) => panic!("expected an Actor World"),
+    };
+    assert_eq!(
+        actor.triple.run_id.0, new_run_id,
+        "the retried Run's reserved World must carry a triple naming the new Run, not the \
+         refused Run {run_id}"
+    );
+
+    // The refused Run must no longer read as `Open` -- otherwise a
+    // caller that picks "the" open Run by folding the Work's runs
+    // (`wirk/src/executor.rs::fetch_open_run`) can still find the
+    // abandoned Run first and collide on its still-alive pane name,
+    // the exact live failure this wave answers.
+    assert!(
+        !matches!(
+            run_state(&pointer.socket, &work_id, &run_id),
+            RunState::Open
+        ),
+        "the refused, retried-away Run must not still read as Open"
+    );
+    assert!(
+        matches!(
+            run_state(&pointer.socket, &work_id, &new_run_id),
+            RunState::Open
+        ),
+        "the new Run must be the one reading as Open"
+    );
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// P2.6 W3: the retried World is the old one in everything but the
+/// triple -- worktree, branch, repository, intent, outputs, and
+/// boundary all carry over unchanged (the same worktree a human or
+/// actor may already be looking at), only `triple.run_id` moves to the
+/// new Run.
+#[test]
+fn retry_after_out_of_boundary_refusal_keeps_the_world_otherwise_unchanged() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = boundary_src_only_route(estate);
+    let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "boundary-src-only/wp-1",
+    );
+
+    fs::write(worktree.join("src/lib.rs"), b"// lib\n// edited\n").expect("edit src/lib.rs");
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+    fs::write(worktree.join("docs/notes.md"), b"notes\nedited\n").expect("edit docs/notes.md");
+
+    let (code, claim_stdout) = claim(estate, &work_id, &run_id, &[("report.md", "report.md")]);
+    assert_eq!(
+        code,
+        Some(3),
+        "expected exit 3 (Refused), stdout: {claim_stdout}"
+    );
+
+    let before = match reserved_world(&pointer.socket, &work_id) {
+        World::Actor(actor) => actor,
+        World::Deterministic(_) => panic!("expected an Actor World"),
+    };
+    let world_hash_before = WorldHash::of(&World::Actor(before.clone()));
+
+    let reply = retry(&pointer.socket, estate, &work_id, &run_id);
+    match reply {
+        Reply::Ok { .. } => {}
+        Reply::Err { error, .. } => panic!(
+            "retry unexpectedly refused: {} {}",
+            error.code, error.message
+        ),
+    };
+
+    let after = match reserved_world(&pointer.socket, &work_id) {
+        World::Actor(actor) => actor,
+        World::Deterministic(_) => panic!("expected an Actor World"),
+    };
+    let world_hash_after = WorldHash::of(&World::Actor(after.clone()));
+
+    assert_eq!(after.repository, before.repository);
+    assert_eq!(after.worktree_path, before.worktree_path);
+    assert_eq!(after.branch, before.branch);
+    assert_eq!(after.base_sha, before.base_sha);
+    assert_eq!(after.intent, before.intent);
+    assert_eq!(after.boundary.0, before.boundary.0);
+    assert_eq!(
+        after.output_contract.0.len(),
+        before.output_contract.0.len()
+    );
+    assert_eq!(
+        after.triple.estate_root, before.triple.estate_root,
+        "only the triple's run_id should move"
+    );
+    assert_eq!(after.triple.work_id.0, before.triple.work_id.0);
+    assert_ne!(
+        after.triple.run_id.0, before.triple.run_id.0,
+        "the triple's run_id must move to the retry's own Run"
+    );
+    assert_eq!(
+        world_hash_after, world_hash_before,
+        "WorldHash::of excludes triple, so a retry's World hashes identically"
     );
 
     stop_wirkd(estate, wirkd_child);

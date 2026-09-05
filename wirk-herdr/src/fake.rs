@@ -62,6 +62,11 @@ pub struct FakeHerdrClient {
     /// the stuck-actor path, with the run id in `body` — 0040: a real
     /// recording fake, not a canned reply standing in for the call.
     pub notify_calls: Mutex<Vec<Notify>>,
+    /// P2.6 W3 (rerun findings; ruling 0052): records every `pane.close`
+    /// call so a test can assert the driver released a stale Run's pane
+    /// before launching a retry's own, the way `split_pane_calls`
+    /// already does for `split_pane`.
+    pub close_pane_calls: Mutex<Vec<String>>,
 }
 
 impl FakeHerdrClient {
@@ -214,7 +219,11 @@ impl HerdrClient for FakeHerdrClient {
         Ok(())
     }
 
-    fn close_pane(&self, _pane_id: &str) -> Result<(), HerdrError> {
+    fn close_pane(&self, pane_id: &str) -> Result<(), HerdrError> {
+        self.close_pane_calls
+            .lock()
+            .unwrap()
+            .push(pane_id.to_string());
         Ok(())
     }
 
