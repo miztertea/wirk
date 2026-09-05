@@ -952,17 +952,22 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // (`hecate/qwen3.8-27b-udiq3s-mtp`, orient/actor.md §5, passed
         // explicitly the first live run rather than relying on
         // opencode's own bare-args default).
-        let (kind_str, args) = match run.kind {
-            wirk_core::ActorKind::Claude => {
-                ("claude", vec!["--model".to_string(), "sonnet".to_string()])
-            }
-            wirk_core::ActorKind::Opencode => (
+        //
+        // 0056 D164: per-kind launch defaults stay exactly as main has
+        // them for claude and opencode and are not extended to any other
+        // kind — a kind with no row here launches bare (no args), passed
+        // through to `agent.start` verbatim; Herdr's own answer to that
+        // call is the validation, not a match arm added here.
+        let (kind_str, args) = match run.kind.0.as_str() {
+            "claude" => ("claude", vec!["--model".to_string(), "sonnet".to_string()]),
+            "opencode" => (
                 "opencode",
                 vec![
                     "--model".to_string(),
                     "hecate/qwen3.8-27b-udiq3s-mtp".to_string(),
                 ],
             ),
+            other => (other, Vec::new()),
         };
         self.client.start_agent(StartAgent {
             pane_id: pane_id.to_string(),

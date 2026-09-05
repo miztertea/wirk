@@ -650,7 +650,7 @@ fn world_hash_covers_deterministic_base_sha() {
 
 /// W1 (0041 D129): a `RunLaunched` written before the `kind` field
 /// existed on it still folds — `#[serde(default)]` means the missing
-/// field deserializes to `ActorKind::Claude` (the pre-existing,
+/// field deserializes to `ActorKind::claude()` (the pre-existing,
 /// only-ever-Claude behavior) rather than refusing the journal line.
 #[test]
 fn run_launched_without_kind_field_still_folds() {
@@ -658,12 +658,12 @@ fn run_launched_without_kind_field_still_folds() {
     let parsed: EventKind = serde_json::from_str(pre_existing_json)
         .expect("a RunLaunched event written before this change still deserializes");
     let mut run = open_run("run-1");
-    assert_eq!(run.kind, wirk_core::ActorKind::Claude);
+    assert_eq!(run.kind, wirk_core::ActorKind::claude());
     let event = event("e-1", Some("run-1"), parsed);
     run.apply(&event);
     assert_eq!(
         run.kind,
-        wirk_core::ActorKind::Claude,
+        wirk_core::ActorKind::claude(),
         "a pre-existing RunLaunched with no kind field folds to the Claude default"
     );
 }
@@ -674,17 +674,48 @@ fn run_launched_without_kind_field_still_folds() {
 #[test]
 fn run_launched_with_opencode_kind_updates_run() {
     let mut run = open_run("run-1");
-    assert_eq!(run.kind, wirk_core::ActorKind::Claude);
+    assert_eq!(run.kind, wirk_core::ActorKind::claude());
     let event = event(
         "e-1",
         Some("run-1"),
         EventKind::RunLaunched {
             run: RunId("run-1".to_string()),
-            actor_kind: wirk_core::ActorKind::Opencode,
+            actor_kind: wirk_core::ActorKind::opencode(),
         },
     );
     run.apply(&event);
-    assert_eq!(run.kind, wirk_core::ActorKind::Opencode);
+    assert_eq!(run.kind, wirk_core::ActorKind::opencode());
+}
+
+/// 0056 D164 ("wirk accepts every agent kind Herdr accepts... wirk
+/// adds no list of its own"): a `RunLaunched` carrying a kind wirk has
+/// never heard of — the Aria probe's `codex` — folds and serde
+/// round-trips exactly like `claude`/`opencode` do above. `ActorKind`
+/// is a newtype over `String` (0041 D129's closed enum, superseded);
+/// there is no match arm here to have missed.
+#[test]
+fn run_launched_with_an_unlisted_kind_updates_run_and_round_trips() {
+    let mut run = open_run("run-1");
+    let event = event(
+        "e-1",
+        Some("run-1"),
+        EventKind::RunLaunched {
+            run: RunId("run-1".to_string()),
+            actor_kind: wirk_core::ActorKind("codex".to_string()),
+        },
+    );
+    run.apply(&event);
+    assert_eq!(run.kind, wirk_core::ActorKind("codex".to_string()));
+
+    let json = serde_json::to_string(&event).expect("event serializes");
+    let parsed: Event = serde_json::from_str(&json).expect("event round-trips through JSON");
+    match parsed.kind {
+        EventKind::RunLaunched { run, actor_kind } => {
+            assert_eq!(run, RunId("run-1".to_string()));
+            assert_eq!(actor_kind, wirk_core::ActorKind("codex".to_string()));
+        }
+        other => panic!("expected RunLaunched, got {other:?}"),
+    }
 }
 
 /// P2.4 W2 verify finding (w2/VERIFY.md §6(c)): the `OutOfBoundary`

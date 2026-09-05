@@ -43,7 +43,7 @@ fn open_run(run_id: &str) -> Run {
         attempt: 1,
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
-        kind: ActorKind::Opencode,
+        kind: ActorKind::opencode(),
     }
 }
 
@@ -151,7 +151,7 @@ fn waypoint_reserved(run: &Run, world: World) -> EventKind {
 fn run_launched(run: &Run) -> EventKind {
     EventKind::RunLaunched {
         run: run.id.clone(),
-        actor_kind: run.kind,
+        actor_kind: run.kind.clone(),
     }
 }
 

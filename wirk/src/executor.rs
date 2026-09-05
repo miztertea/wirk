@@ -262,13 +262,7 @@ pub fn run_command(rest: &[String]) -> ExitCode {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("wirk run: panic: {info}");
     }));
-    let actor_kind = match parse_actor_kind(rest) {
-        Ok(kind) => kind,
-        Err(()) => {
-            eprintln!("wirk run: --actor-kind must be claude or opencode");
-            return run_usage();
-        }
-    };
+    let actor_kind = parse_actor_kind(rest);
     let Some(estate) = flag_value(rest, "--estate") else {
         return run_usage();
     };
@@ -443,17 +437,16 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
-/// `--actor-kind claude|opencode` (0041 D129), default `claude` when
-/// the flag is absent; any other value is refused (`Err(())`) so
-/// `run_command` can turn it into the usage exit without inventing a
-/// silent fallback (AGENTS.md's "a defect with a standard answer is not
-/// J0" — here the standard answer is refuse, not guess).
-fn parse_actor_kind(rest: &[String]) -> Result<wirk_core::ActorKind, ()> {
-    match flag_value(rest, "--actor-kind").as_deref() {
-        None => Ok(wirk_core::ActorKind::Claude),
-        Some("claude") => Ok(wirk_core::ActorKind::Claude),
-        Some("opencode") => Ok(wirk_core::ActorKind::Opencode),
-        Some(_) => Err(()),
+/// `--actor-kind <kind>` (0056 D164, superseding 0041 D129's closed
+/// `claude|opencode` list): default `claude` when the flag is absent;
+/// any other value is carried through as given, never refused here —
+/// Herdr's own `agent.start` is the validation (0056 D164 "wirk adds no
+/// list of its own"), and a wirk-side rejection of a kind Herdr accepts
+/// is exactly the block the owner ruled out.
+fn parse_actor_kind(rest: &[String]) -> wirk_core::ActorKind {
+    match flag_value(rest, "--actor-kind") {
+        None => wirk_core::ActorKind::default(),
+        Some(kind) => wirk_core::ActorKind(kind),
     }
 }
 
@@ -463,24 +456,40 @@ mod tests {
 
     #[test]
     fn actor_kind_defaults_to_claude_when_absent() {
-        assert_eq!(parse_actor_kind(&[]), Ok(wirk_core::ActorKind::Claude));
+        assert_eq!(parse_actor_kind(&[]), wirk_core::ActorKind::claude());
     }
 
     #[test]
     fn actor_kind_opencode_selects_opencode() {
         let rest = vec!["--actor-kind".to_string(), "opencode".to_string()];
-        assert_eq!(parse_actor_kind(&rest), Ok(wirk_core::ActorKind::Opencode));
+        assert_eq!(parse_actor_kind(&rest), wirk_core::ActorKind::opencode());
     }
 
     #[test]
     fn actor_kind_claude_selects_claude() {
         let rest = vec!["--actor-kind".to_string(), "claude".to_string()];
-        assert_eq!(parse_actor_kind(&rest), Ok(wirk_core::ActorKind::Claude));
+        assert_eq!(parse_actor_kind(&rest), wirk_core::ActorKind::claude());
+    }
+
+    /// 0056 D164's decisive case: a kind wirk has never heard of is
+    /// carried through, not refused — the Aria probe's `codex` and an
+    /// arbitrary `somekind`, both accepted here where main's
+    /// `actor_kind_bogus_is_refused` returned `Err(())`.
+    #[test]
+    fn actor_kind_codex_is_carried_through() {
+        let rest = vec!["--actor-kind".to_string(), "codex".to_string()];
+        assert_eq!(
+            parse_actor_kind(&rest),
+            wirk_core::ActorKind("codex".to_string())
+        );
     }
 
     #[test]
-    fn actor_kind_bogus_is_refused() {
-        let rest = vec!["--actor-kind".to_string(), "bogus".to_string()];
-        assert_eq!(parse_actor_kind(&rest), Err(()));
+    fn actor_kind_arbitrary_kind_is_carried_through() {
+        let rest = vec!["--actor-kind".to_string(), "somekind".to_string()];
+        assert_eq!(
+            parse_actor_kind(&rest),
+            wirk_core::ActorKind("somekind".to_string())
+        );
     }
 }

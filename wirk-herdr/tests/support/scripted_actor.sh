@@ -45,7 +45,7 @@ set -eu
 report() {
     # $1: idle | working | blocked -- the exact `pane.report_agent`
     # shape every real hook on this box sends (source "herdr:opencode",
-    # agent "opencode": wirk's ActorKind::Opencode always sends
+    # agent "opencode": wirk's ActorKind::opencode() always sends
     # kind_str "opencode", 0041 D129). Measured live against a real
     # Herdr session (`w1/BUILD.md`): Herdr's own full-lifecycle
     # hook-authority gate (`refs/herdr/src/terminal/state.rs::

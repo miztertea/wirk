@@ -20,7 +20,7 @@ use wirk_core::{
 use wirk_herdr::fake::FakeHerdrClient;
 use wirk_herdr::{
     AgentStatus, CreateWorkspace, EventSubscription, HerdrClient, HerdrError, HerdrEvent,
-    HerdrExecutor, PaneInfo, ReportAgent, SocketClient, SplitDirection, SplitPane,
+    HerdrExecutor, PaneInfo, ReportAgent, SocketClient, SplitDirection, SplitPane, StartAgent,
 };
 
 /// Reports `state` for `pane_id` through `pane.report_agent` — the same
@@ -286,12 +286,12 @@ fn d9_4_launch_carries_the_runs_triple_in_split_pane_env() {
 }
 
 /// W1 (0041 D129): `start_actor_agent` sends `StartAgent{kind:"claude",
-/// args:["--model","sonnet"]}` for `ActorKind::Claude` — the
+/// args:["--model","sonnet"]}` for `ActorKind::claude()` — the
 /// pre-existing behavior, now driven by `run.kind` rather than
 /// hardcoded (`orient/actor.md` §1).
 #[test]
 fn start_actor_agent_sends_claude_kind_and_model() {
-    let run = open_run_with_kind("run-1", wirk_core::ActorKind::Claude);
+    let run = open_run_with_kind("run-1", wirk_core::ActorKind::claude());
     let world = actor_world(&run);
 
     let fake =
@@ -315,12 +315,12 @@ fn start_actor_agent_sends_claude_kind_and_model() {
 
 /// W1 (0041 D129): `start_actor_agent` sends
 /// `StartAgent{kind:"opencode", args:["--model",
-/// "hecate/qwen3.8-27b-udiq3s-mtp"]}` for `ActorKind::Opencode`
+/// "hecate/qwen3.8-27b-udiq3s-mtp"]}` for `ActorKind::opencode()`
 /// (`orient/actor.md` §1, §5 — the model passed explicitly the first
 /// live run).
 #[test]
 fn start_actor_agent_sends_opencode_kind_and_model() {
-    let run = open_run_with_kind("run-1", wirk_core::ActorKind::Opencode);
+    let run = open_run_with_kind("run-1", wirk_core::ActorKind::opencode());
     let world = actor_world(&run);
 
     let fake =
@@ -342,6 +342,32 @@ fn start_actor_agent_sends_opencode_kind_and_model() {
             "--model".to_string(),
             "hecate/qwen3.8-27b-udiq3s-mtp".to_string()
         ]
+    );
+}
+
+/// 0056 D164: "per-kind launch defaults... are not extended" — a kind
+/// with no row in `start_actor_agent`'s match (`wirk-herdr/src/lib.rs`)
+/// launches bare: `StartAgent.kind` carries the string through
+/// verbatim and `args` is empty, never a wirk-invented default guessed
+/// for a kind wirk has never heard of.
+#[test]
+fn start_actor_agent_sends_an_unlisted_kind_bare() {
+    let run = open_run_with_kind("run-1", wirk_core::ActorKind("codex".to_string()));
+    let world = actor_world(&run);
+
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+
+    executor.launch(&run, &world).expect("launch");
+
+    let calls = executor.client().start_agent_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].kind, "codex");
+    assert_eq!(
+        calls[0].args,
+        Vec::<String>::new(),
+        "an unlisted kind gets no per-kind launch args"
     );
 }
 
@@ -438,6 +464,78 @@ fn poll_maps_not_found_to_vanished() {
     let executor = HerdrExecutor::new(client);
     let observation = executor.poll(&run).expect("poll");
     assert!(matches!(observation, RunObservation::Vanished));
+}
+
+/// Live decisive check (0056 D164, 0040): `agent.start{kind:"notakind"}`
+/// against a real Herdr session, direct on `SocketClient` — the wirk
+/// layer above no longer has a parser to reject this kind at all
+/// (`parse_actor_kind` is now infallible, `wirk/src/executor.rs`), so
+/// any error observed here can only be Herdr's own answer. Confirmed
+/// live 2026-09-05 against a throwaway named session: Herdr's
+/// `start_agent` (`refs/herdr` `src/app/agents.rs::start_agent`,
+/// `AgentStartError::UnsupportedKind`) refuses before any process is
+/// spawned — `crate::detect::parse_agent_label("notakind")` returns
+/// `None` because Herdr's own closed `Agent` enum (`refs/herdr`
+/// `src/detect/mod.rs`) has no such label either — encoded as the
+/// business error `{"code":"unsupported_agent_kind","message":
+/// "unsupported interactive agent kind notakind"}`, which
+/// `SocketClient` maps to `HerdrError::Invalid` (D51's map, `lib.rs`:
+/// not `pane_not_found`/`agent_not_found`/`workspace_not_found` so not
+/// `NotFound`, not `agent_not_ready` so not `Blocked`). No `claude`,
+/// `codex`, or `opencode` binary is ever named or spawned by this test
+/// (standing line): "notakind" never resolves to a real agent kind on
+/// either side, so `start_agent` fails at Herdr's own kind-parse step,
+/// before any executable lookup.
+#[test]
+fn live_agent_start_with_an_unknown_kind_surfaces_herdrs_own_error_not_wirks() {
+    let Some(session) = live_herdr::LiveHerdrSession::start(
+        "live_agent_start_with_an_unknown_kind_surfaces_herdrs_own_error_not_wirks",
+    ) else {
+        return;
+    };
+    let client = session.client();
+    let (repo, _sha) = session.repo();
+
+    let ws = client
+        .create_workspace(CreateWorkspace {
+            cwd: repo.clone(),
+            env: BTreeMap::new(),
+            label: Some("wirk-test-unknown-kind".to_string()),
+        })
+        .expect("workspace.create");
+    let pane = client
+        .split_pane(SplitPane {
+            workspace_id: Some(ws.workspace_id),
+            target_pane_id: None,
+            direction: SplitDirection::Right,
+            cwd: repo,
+            env: BTreeMap::new(),
+        })
+        .expect("pane.split");
+
+    let err = client
+        .start_agent(StartAgent {
+            pane_id: pane.pane_id.clone(),
+            kind: "notakind".to_string(),
+            name: "live-unknown-kind-run".to_string(),
+            args: Vec::new(),
+            timeout_ms: None,
+        })
+        .expect_err("Herdr refuses a kind its own detector does not name");
+
+    match err {
+        HerdrError::Invalid(msg) => {
+            assert!(
+                msg.contains("unsupported_agent_kind"),
+                "expected Herdr's unsupported_agent_kind business error, got: {msg}"
+            );
+            assert!(
+                msg.contains("notakind"),
+                "Herdr's own message should name the refused kind: {msg}"
+            );
+        }
+        other => panic!("expected HerdrError::Invalid(unsupported_agent_kind...), got {other:?}"),
+    }
 }
 
 // `Reconciler::admit`'s own dedup-by-`event_identity` tests are gone

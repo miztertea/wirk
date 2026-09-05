@@ -468,7 +468,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                         &run.id,
                         EventKind::RunLaunched {
                             run: run.id.clone(),
-                            actor_kind: run.kind,
+                            actor_kind: run.kind.clone(),
                         },
                     )
                     .map_err(RunLoopError::Wirkd)?;

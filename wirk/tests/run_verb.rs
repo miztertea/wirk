@@ -51,7 +51,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use wirkd::{ClaimPayload, Request, WirkdPointer};
+use wirkd::{ClaimPayload, Reply, Request, StatusPayload, WirkdPointer};
 
 use wirk_core::{ClaimKind, EventKind, ExecutionTriple, Journal, RunId, WorkId};
 
@@ -284,7 +284,7 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
             .spawn()
             .expect("spawn wirkd"),
     );
-    let _pointer = wait_for_pointer(&estate);
+    let pointer = wait_for_pointer(&estate);
 
     let (work_id, run_id, _waypoint) = submit_actor(&estate, &repo, "write report.md, then claim");
 
@@ -353,12 +353,41 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
     let run_launched_opencode = events.iter().any(|event| {
         matches!(
             &event.kind,
-            EventKind::RunLaunched { run, actor_kind } if run.0 == run_id && matches!(actor_kind, wirk_core::ActorKind::Opencode)
+            EventKind::RunLaunched { run, actor_kind } if run.0 == run_id && *actor_kind == wirk_core::ActorKind::opencode()
         )
     });
     assert!(
         run_launched_opencode,
         "expected RunLaunched{{actor_kind: Opencode}} for {run_id}"
+    );
+
+    // 0056 D164's round trip: the kind given at `wirk run --actor-kind`
+    // is carried, as given, all the way to `wirk work status`'s own
+    // reply — not just the journal file read directly above. `Run`'s
+    // `Serialize` (wirk-core/src/lib.rs) puts `kind` on the wire
+    // unconditionally, so the raw `status` reply's `runs[].run.kind`
+    // already carries it; asserted here against the live wirkd this
+    // test already stood up, the same socket call `reserved_world`
+    // (`wirk/tests/boundary_claim.rs`) makes for `world`.
+    let status_reply = wirkd::client::call(
+        &pointer.socket,
+        &Request::status(StatusPayload {
+            work_id: WorkId(work_id.clone()),
+        }),
+    )
+    .expect("status call reaches wirkd");
+    let Reply::Ok { result, .. } = status_reply else {
+        panic!("status unexpectedly refused: {status_reply:?}");
+    };
+    let runs = result["runs"].as_array().expect("runs is an array");
+    let status_kind = runs
+        .iter()
+        .find(|entry| entry["run"]["id"] == run_id)
+        .and_then(|entry| entry["run"]["kind"].as_str())
+        .expect("the launched run's kind is on the status reply");
+    assert_eq!(
+        status_kind, "opencode",
+        "wirk work status should carry the actor kind through as given"
     );
 
     let claimed = events.iter().any(|event| {

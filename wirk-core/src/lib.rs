@@ -523,26 +523,44 @@ pub enum World {
 
 // ---- Run ------------------------------------------------------------------
 
-/// Which program drives this Run's actor pane (0041 D129). Not content
-/// the actor must produce, only which executor runs the intent — the
-/// same distinction `ActorWorld.triple`/`env` already draw between
-/// content and execution mechanism (`WorldHash::of` excludes both), so
-/// `kind` lives on `Run`, never `World`, and is never hashed (orient/
-/// actor.md §2). `Default` is `Claude`: every journal on disk before
-/// this field existed only ever ran Claude.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum ActorKind {
-    #[default]
-    Claude,
-    Opencode,
+/// Which program drives this Run's actor pane (0041 D129, superseded by
+/// 0056 D164). Not content the actor must produce, only which executor
+/// runs the intent — the same distinction `ActorWorld.triple`/`env`
+/// already draw between content and execution mechanism (`WorldHash::of`
+/// excludes both), so `kind` lives on `Run`, never `World`, and is never
+/// hashed (orient/actor.md §2).
+///
+/// 0056 D164 ("wirk accepts every agent kind Herdr accepts... wirk adds
+/// no list of its own"): the closed two-variant enum of 0041 D129 is
+/// superseded as a gate. R6 on the type: a newtype over `String` is the
+/// smallest change that lets `ActorKind` carry any kind string Herdr
+/// names — a plain field, no match arm to extend, no list anywhere —
+/// while `claude()`/`opencode()` keep the two kinds Herdr and wirk both
+/// already know about nameable by call site instead of by string
+/// literal. `Default` is `claude()`: every journal on disk before this
+/// field existed only ever ran Claude.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorKind(pub String);
+
+impl ActorKind {
+    pub fn claude() -> Self {
+        ActorKind("claude".to_string())
+    }
+
+    pub fn opencode() -> Self {
+        ActorKind("opencode".to_string())
+    }
+}
+
+impl Default for ActorKind {
+    fn default() -> Self {
+        ActorKind::claude()
+    }
 }
 
 impl std::fmt::Display for ActorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            ActorKind::Claude => "claude",
-            ActorKind::Opencode => "opencode",
-        })
+        f.write_str(&self.0)
     }
 }
 
@@ -652,7 +670,7 @@ impl Run {
             // known) to the kind `wirk run` actually launched —
             // `run_launched_with_opencode_kind_updates_run` pins it.
             EventKind::RunLaunched { actor_kind, .. } => {
-                self.kind = *actor_kind;
+                self.kind = actor_kind.clone();
             }
             // W2 (p1-journal): RunOpened is Run-scoped bookkeeping the
             // Work-level `fold` owns (fold.md §1);

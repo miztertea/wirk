@@ -32,7 +32,7 @@ fn run_id() -> Run {
         attempt: 1,
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
-        kind: ActorKind::Opencode,
+        kind: ActorKind::opencode(),
     }
 }
 
