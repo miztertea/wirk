@@ -1,0 +1,12 @@
+{
+  "id": "boundary-src-only",
+  "waypoints": [
+    {
+      "id": "boundary-src-only/wp-1",
+      "kind": "Actor",
+      "intent": "edit only under src/",
+      "declared_outputs": [{"name": "report.md", "required": true}],
+      "boundary": ["src/**"]
+    }
+  ]
+}

@@ -58,13 +58,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use wirk_core::{
-    ActorWorld, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimRefusal,
-    ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple, FailureCause, Journal,
-    JournalError, OutputContract, Route, RouteId, Run, RunId, RunState, Timestamp,
-    WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash, fold,
-    load_route, validate_claim,
+    Access, ActorWorld, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind,
+    ClaimRefusal, ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple,
+    FailureCause, Journal, JournalError, OutputContract, Route, RouteId, Run, RunId, RunState,
+    Timestamp, WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash,
+    fold, load_route, validate_claim,
 };
 
+use super::boundary;
 use super::{
     ClaimPayload, ErrorDetail, FailPayload, RecordPayload, Reply, Request, RetryPayload,
     StatusPayload, SubmitPayload, Verb, WirkdPointer, WorkFailPayload,
@@ -719,7 +720,13 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // line's.
                 intent: first_def.intent.clone().unwrap_or_default(),
                 output_contract,
-                boundary: Boundary(vec![repo_path]),
+                // P2.4 W1 (build-brief.md §8 amendment 1): the World's
+                // boundary is the Route-authored Waypoint's own globs,
+                // not the repository path — `repo_path` stays only the
+                // `repository` field above. `WorldHash::of` already
+                // hashes `actor.boundary.0` (0029 D95, landed before
+                // this item); only the value fed into it changes here.
+                boundary: first_def.boundary.clone(),
             })
         }
         WaypointKind::Actor => {
@@ -736,7 +743,10 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 triple,
                 intent: first_def.intent.clone().unwrap_or_default(),
                 output_contract,
-                boundary: Boundary(Vec::new()),
+                // P2.4 W1 (build-brief.md §8 amendment 1): same fix as
+                // the sibling arm above — the Route's own globs, not a
+                // hardcoded empty boundary.
+                boundary: first_def.boundary.clone(),
             })
         }
     };
@@ -850,6 +860,45 @@ fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
     ok_reply(json!({}))
 }
 
+/// Whether `worktree_path.join(artifact_path)` (`server.rs`'s own join,
+/// used both by the artifact-exists check below and by the boundary
+/// diff's own membership test) would land outside `worktree_path` —
+/// lexical only, no filesystem read, so an artifact path that does not
+/// exist yet is still answerable (P2.4 W1, `orient/refuse.md` §4).
+///
+/// Handles both directions correctly: an *absolute* `artifact_path`
+/// already inside `worktree_path` (the Deterministic executor's own
+/// shape, `executors/child.rs`: `cwd.join(&spec.name)` display()-
+/// formatted, where `cwd == worktree_path`) is not an escape; a
+/// *relative* `artifact_path` with enough `..` segments to walk back
+/// out of `worktree_path`, or an absolute path naming somewhere else
+/// entirely, is. `Path::join` alone cannot tell the two apart (an
+/// absolute second argument replaces the first outright, and neither
+/// `starts_with` nor `..` resolves without normalizing first) — this
+/// builds the same joined path `server.rs:956`'s own `.join()` builds,
+/// then collapses `.`/`..` components against it (never touching the
+/// filesystem) before comparing prefixes.
+fn artifact_join_escapes(worktree_path: &Path, artifact_path: &str) -> bool {
+    let candidate = Path::new(artifact_path);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        worktree_path.join(candidate)
+    };
+    let mut normalized: Vec<std::path::Component> = Vec::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    let normalized: PathBuf = normalized.into_iter().collect();
+    !normalized.starts_with(worktree_path)
+}
+
 fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     let work_id = payload.triple.work_id.clone();
     let run_id = payload.triple.run_id.clone();
@@ -952,11 +1001,90 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     if matches!(verdict, ClaimVerdict::Validated)
         && let Some(worktree_path) = worktree_path_for_run(&events, &run_id)
     {
-        for artifact in &claim.artifacts {
-            if !worktree_path.join(&artifact.path).exists() {
-                verdict =
-                    ClaimVerdict::Refused(ClaimRefusal::MissingArtifact(artifact.name.clone()));
-                break;
+        // P2.4 W1 (build-brief.md §8 amendment 1; `orient/refuse.md`
+        // §4): a declared artifact path escaping the worktree join
+        // just below (`worktree_path.join(&artifact.path)`) is refused
+        // before that join is ever taken — checked first so an
+        // escaping path is never asked whether it "exists" at the
+        // escaped location, which would otherwise read as an unrelated
+        // `MissingArtifact`.
+        //
+        // Not a bare "contains `..` or is absolute" string test
+        // (`refuse.md`'s own first cut, tried and reverted — probed
+        // against `child_executor.rs::d5_1_true_completes_by_claim`,
+        // 0040's real service, not a hypothesis): a Deterministic
+        // Waypoint's own executor (`executors/child.rs`) always claims
+        // an *absolute* artifact path, `cwd.join(&spec.name)`
+        // display()-formatted — legitimate, since `cwd` there equals
+        // `worktree_path` itself. Rejecting every absolute path
+        // refused that real, correct Claim `OutOfBoundary`. The actual
+        // question `server.rs:956`'s join needs answered is narrower:
+        // does the join land inside `worktree_path`, not whether the
+        // string looks suspicious — `artifact_join_escapes` answers
+        // that directly, lexically (no filesystem read, the artifact
+        // need not exist yet).
+        if let Some(escaping) = claim
+            .artifacts
+            .iter()
+            .find(|a| artifact_join_escapes(&worktree_path, &a.path))
+        {
+            verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(escaping.path.clone()));
+        }
+
+        if matches!(verdict, ClaimVerdict::Validated) {
+            for artifact in &claim.artifacts {
+                if !worktree_path.join(&artifact.path).exists() {
+                    verdict =
+                        ClaimVerdict::Refused(ClaimRefusal::MissingArtifact(artifact.name.clone()));
+                    break;
+                }
+            }
+        }
+
+        // P2.4 W1: the worktree's own changes since the World's
+        // `base_sha`, outside the Waypoint's Route-authored `boundary`,
+        // refuse the Claim `OutOfBoundary` naming them — `worktree_path`
+        // above already covers a Deterministic Waypoint's `cwd` too
+        // (`worktree_path_for_run`'s own doc), so this one call site
+        // enforces both kinds (`orient/check.md` "Item 5").
+        if matches!(verdict, ClaimVerdict::Validated) {
+            let base_sha = world_for_waypoint(&events, &run.waypoint)
+                .map(|world| match world {
+                    World::Actor(actor) => actor.base_sha,
+                    World::Deterministic(deterministic) => deterministic.base_sha,
+                })
+                .unwrap_or_default();
+            // A worktree the diff cannot read folds to "nothing
+            // observed" rather than a hard failure — same reasoning as
+            // `git.rs::fingerprint`'s own doc comment: unreadable is not
+            // itself evidence of an out-of-boundary write.
+            if let Ok(changed) = wirk_herdr::git::changed_paths(&worktree_path, &base_sha) {
+                let declared: std::collections::BTreeSet<&str> =
+                    claim.artifacts.iter().map(|a| a.path.as_str()).collect();
+                // P2.4 W2 (build-brief.md §3 W2; refuse.md §2): a Work
+                // whose one repository binding is `Access::Read`
+                // refuses any changed path at all, whatever the
+                // Waypoint's globs say — `work.repositories.first()`
+                // per orient's own read (a single-binding case; the
+                // name/path match against `ActorWorld.repository` is
+                // P2.5's question, carried, not answered here).
+                let is_read_binding = work
+                    .repositories
+                    .first()
+                    .is_some_and(|binding| binding.access == Access::Read);
+                let offending: Vec<&String> = changed
+                    .iter()
+                    .filter(|p| !declared.contains(p.as_str()))
+                    .filter(|p| is_read_binding || !boundary::allows(&waypoint.boundary, p))
+                    .collect();
+                if !offending.is_empty() {
+                    let joined = offending
+                        .iter()
+                        .map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(joined));
+                }
             }
         }
     }

@@ -58,6 +58,10 @@ use wirk_core::{ClaimKind, EventKind, ExecutionTriple, RepositoryBinding, RunId,
 // distinctly so `wirk work retry`/`wirk work fail` read as one thing
 // each, not a second reading of `fail`.
 
+/// The boundary glob matcher (P2.4 W1): `server`'s own submodule, not
+/// `pub` — nothing outside `wirkd` reaches a Waypoint's boundary
+/// directly.
+mod boundary;
 pub mod client;
 pub mod server;
 

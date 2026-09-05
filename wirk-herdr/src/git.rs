@@ -82,6 +82,55 @@ pub fn fingerprint(cwd: &Path) -> String {
     format!("{}\n{}", status.trim(), head.trim())
 }
 
+/// Worktree-relative paths that differ from `base_sha` (P2.4 W1,
+/// `orient/check.md` §2): the union of `git diff --name-only -M
+/// <base_sha>` (committed, staged, and unstaged changes to tracked
+/// files — `-M` forces rename detection explicitly since `diff.renames`
+/// is unset on this box, and with `--name-only` a detected rename
+/// prints only its new path) and `git status --porcelain
+/// --untracked-files=all` parsed for its own path column (adds
+/// untracked files `diff` never reports; a rename line there also
+/// resolves to its new path via `" -> "`, redundant with `diff -M` but
+/// harmless — the result is deduplicated). Same `run_git` shape as
+/// every other call in this file (R2/R3); a new function beside
+/// `worktree_add`/`fingerprint`, not a reuse of `fingerprint` — its
+/// return is an opaque comparison string, not a path list.
+///
+/// Deterministic in the paths it reports, not merely in whether it
+/// errs: returned in sorted order (`BTreeSet`) so a caller comparing
+/// the set, or joining it into a message, never depends on git's own
+/// listing order.
+pub fn changed_paths(worktree: &Path, base_sha: &str) -> Result<Vec<String>, GitError> {
+    let diff = run_git(worktree, &["diff", "--name-only", "-M", base_sha])?;
+    let status = run_git(
+        worktree,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )?;
+
+    let mut paths = std::collections::BTreeSet::new();
+    for line in diff.lines() {
+        let path = line.trim();
+        if !path.is_empty() {
+            paths.insert(path.to_string());
+        }
+    }
+    for line in status.lines() {
+        // Porcelain v1 format: two status-code columns then a space,
+        // then the path (`"XY path"`, e.g. `" M src/keep.txt"`, `"??
+        // new.md"`, `"R  old -> new"`). A rename's path column reads
+        // `"old -> new"`; keep only the new path.
+        if line.len() <= 3 {
+            continue;
+        }
+        let rest = &line[3..];
+        let path = rest.rsplit(" -> ").next().unwrap_or(rest).trim();
+        if !path.is_empty() {
+            paths.insert(path.to_string());
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {
     let output = Command::new("git").current_dir(cwd).args(args).output()?;
     if !output.status.success() {

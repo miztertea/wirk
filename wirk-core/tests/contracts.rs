@@ -578,6 +578,40 @@ fn world_hash_covers_content_not_location_or_identity() {
     assert_ne!(WorldHash::of(&det3), WorldHash::of(&det4));
 }
 
+/// P2.4 W1 (`orient/build-brief.md` §8 amendment 1): the World's
+/// `boundary` at reservation is now the Route's own Waypoint globs,
+/// not the repository path (`server.rs`'s two `Actor` arms) — a fix at
+/// the *value* fed into `WorldHash::of`, not to the hashing mechanism
+/// itself. Read directly (`wirk-core/src/lib.rs`'s `WorldHash::of`,
+/// `Actor` arm): `actor.boundary.0` was already hashed before this
+/// item (0029 D95, landed for p1-executor-design) — `actor_world`'s own
+/// helper above has carried a fixed `boundary: Boundary(vec!["src/
+/// **"])` since p1, and `world_hash_covers_content_not_location_or_
+/// identity` already holds that boundary constant across every World it
+/// builds. This test makes that coverage explicit: an unchanged Route
+/// (identical content, including `boundary`) hashes identically twice,
+/// and changing only `boundary` changes the hash.
+#[test]
+fn world_hash_stable_for_unchanged_route() {
+    let a = actor_world("wirk", "p2/boundary", "abc123", "/var/tmp/w1");
+    let b = actor_world("wirk", "p2/boundary", "abc123", "/var/tmp/w1");
+    assert_eq!(
+        WorldHash::of(&a),
+        WorldHash::of(&b),
+        "an unchanged Route (same content, same boundary) must hash identically"
+    );
+
+    let mut c = actor_world("wirk", "p2/boundary", "abc123", "/var/tmp/w1");
+    if let World::Actor(actor) = &mut c {
+        actor.boundary = Boundary(vec!["docs/**".to_string()]);
+    }
+    assert_ne!(
+        WorldHash::of(&a),
+        WorldHash::of(&c),
+        "a changed boundary (a changed Route) must change the hash"
+    );
+}
+
 /// Item 5 (issue 285; child.md §7 item 1): `DeterministicWorld.base_sha`
 /// is covered by the hash, same principle as `ActorWorld.base_sha`
 /// above — a changed base ref is a changed World even when the command
@@ -649,4 +683,108 @@ fn run_launched_with_opencode_kind_updates_run() {
     );
     run.apply(&event);
     assert_eq!(run.kind, wirk_core::ActorKind::Opencode);
+}
+
+/// P2.4 W2 verify finding (w2/VERIFY.md §6(c)): the `OutOfBoundary`
+/// fold arm's `if !w.state.is_terminal()` guard (`lib.rs`'s
+/// `ClaimRecorded` match) was unverified by any test — a regression
+/// that made the arm fire unconditionally passed the whole workspace
+/// suite. A completed Work (`Done` Claim validated on its one and
+/// only waypoint) that later receives an `OutOfBoundary` refusal on
+/// the same Run stays `Completed`, and `needs_input` stays `None` —
+/// exactly as `RunFailed`/`RunVanished` already leave a terminal Work
+/// alone.
+#[test]
+fn out_of_boundary_refusal_on_a_terminal_work_leaves_state_and_needs_input_untouched() {
+    let events = vec![
+        event("ev-1", None, work_submitted(vec!["wp-1"])),
+        event("ev-2", None, waypoint_reserved("wp-1")),
+        event("ev-3", Some("run-1"), run_opened("run-1", "wp-1")),
+        event(
+            "ev-4",
+            Some("run-1"),
+            claim_recorded("claim-1", ClaimKind::Done, ClaimVerdict::Validated),
+        ),
+    ];
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::Completed),
+        "precondition: Work must already be Completed before the probe, got {:?}",
+        work.state
+    );
+    assert!(work.needs_input.is_none());
+
+    let mut events = events;
+    events.push(event(
+        "ev-5",
+        Some("run-1"),
+        claim_recorded(
+            "claim-2",
+            ClaimKind::Done,
+            ClaimVerdict::Refused(wirk_core::ClaimRefusal::OutOfBoundary(
+                "docs/notes.md".to_string(),
+            )),
+        ),
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::Completed),
+        "an OutOfBoundary refusal must leave an already-terminal Work's state untouched, got {:?}",
+        work.state
+    );
+    assert!(
+        work.needs_input.is_none(),
+        "an OutOfBoundary refusal must leave a terminal Work's needs_input untouched, got {:?}",
+        work.needs_input
+    );
+
+    // Same check for a `Failed` Work: `WorkFailed` is unconditional and
+    // terminal (`fold`'s own arm), then the same later refusal must
+    // still leave it alone.
+    let mut failed_events = vec![
+        event("f-1", None, work_submitted(vec!["wp-1"])),
+        event("f-2", None, waypoint_reserved("wp-1")),
+        event("f-3", Some("run-1"), run_opened("run-1", "wp-1")),
+        event(
+            "f-4",
+            None,
+            EventKind::WorkFailed {
+                cause: FailureCause {
+                    status: Some("stuck".to_string()),
+                    request_id: None,
+                    at: Timestamp(0),
+                    detail: Some("gave up".to_string()),
+                },
+            },
+        ),
+    ];
+    let work = wirk_core::fold(&failed_events);
+    assert!(
+        matches!(work.state, WorkState::Failed),
+        "precondition: Work must already be Failed before the probe, got {:?}",
+        work.state
+    );
+
+    failed_events.push(event(
+        "f-5",
+        Some("run-1"),
+        claim_recorded(
+            "claim-3",
+            ClaimKind::Done,
+            ClaimVerdict::Refused(wirk_core::ClaimRefusal::OutOfBoundary(
+                "docs/notes.md".to_string(),
+            )),
+        ),
+    ));
+    let work = wirk_core::fold(&failed_events);
+    assert!(
+        matches!(work.state, WorkState::Failed),
+        "an OutOfBoundary refusal must leave an already-Failed Work's state untouched, got {:?}",
+        work.state
+    );
+    assert!(
+        work.needs_input.is_none(),
+        "an OutOfBoundary refusal must leave a Failed Work's needs_input untouched, got {:?}",
+        work.needs_input
+    );
 }

@@ -21,6 +21,16 @@ serde_json = "1.0.151"
 # max_stable_version 0.2.189 (1.0.0-alpha.4 is a prerelease, excluded);
 # matches the cached series (0.2.173/.183/.186/.189).
 libc = "0.2.189"
+# The boundary matcher (P2.4 W1, orient/build-brief.md §8 amendment 1):
+# the predecessor's own crate for the same problem
+# (`refs/sergeant-rs/Cargo.toml`, S3 X2: R2/R3/R4/R5/R6 all fail for a
+# hand-rolled `**`-crossing-slashes matcher; `globset` is ripgrep's own,
+# `default-features = false` because the only default feature is `log`,
+# which buys nothing here). Latest stable on crates.io today (0031
+# D97), checked 2026-09-05: `curl -s
+# https://crates.io/api/v1/crates/globset -A wirk` -> max_stable_version
+# 0.4.20, matching the cached series (0.4.16/.18/.20).
+globset = { version = "0.4.20", default-features = false }
 
 [dev-dependencies]
 # wirk/tests/journal_demo.rs's tempdirs (R5, cache-resolvable; same pin

@@ -205,7 +205,6 @@ fn d5_1_true_completes_by_claim() {
     let (work_id, run_id, waypoint) =
         submit_deterministic(&estate, "abc123", &["sh", "-c", "echo hi > report.md"]);
 
-    let cwd = tempfile::tempdir().expect("cwd tempdir");
     let executor = ChildExecutor::new(estate.clone(), WorkId(work_id.clone()));
     let run = Run {
         id: RunId(run_id.clone()),
@@ -215,9 +214,19 @@ fn d5_1_true_completes_by_claim() {
         state: RunState::Open,
         kind: Default::default(),
     };
+    // P2.4 W1: `cwd` must be the *journaled* World's own `cwd`
+    // (`estate`, `handle_submit`'s ad hoc deterministic arm — real
+    // usage, `run_deterministic_command`, always launches with the
+    // World it read back from wirkd, never a World it built itself), so
+    // `handle_claim`'s boundary/escape checks — which now read the
+    // journaled World's `worktree_path`, not this local one — see the
+    // artifact land where it says it did. A separate tempdir here
+    // (worked before those checks existed, since the artifact path was
+    // already absolute and `Path::join` on an absolute argument
+    // silently discards the base) is not a real executor's shape.
     let world = deterministic_world(
         vec!["sh", "-c", "echo hi > report.md"],
-        cwd.path(),
+        &estate,
         OutputContract(vec![wirk_core::ArtifactSpec {
             name: "report.md".to_string(),
             required: true,

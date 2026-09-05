@@ -1001,8 +1001,30 @@ pub fn fold(events: &[Event]) -> Work {
                             });
                         }
                     }
-                    // A refusal is not a Work fact, mirrors Run::apply
-                    // line ~443 (fold.md §1).
+                    // P2.4 W2 (build-brief.md §3 W2; refuse.md §1):
+                    // `OutOfBoundary` is the one refusal a Work cannot
+                    // route around by re-filing the same Claim
+                    // correctly — the actor touched the wrong path, a
+                    // human decides what happens next. Same shape as
+                    // `RunFailed`/`RunVanished` above, guarded the same
+                    // way so an already-terminal Work is left alone.
+                    (ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(what)), _) => {
+                        if !w.state.is_terminal() {
+                            w.state = WorkState::NeedsInput;
+                            w.needs_input = Some(NeedsInputCause {
+                                run: event
+                                    .run
+                                    .clone()
+                                    .expect("a refused Claim always names a run"),
+                                reason: "out_of_boundary".into(),
+                                detail: what.clone(),
+                            });
+                        }
+                    }
+                    // Every other refusal kind is not a Work fact,
+                    // actor-fixable by re-filing the same Claim
+                    // correctly, mirrors Run::apply line ~443 (fold.md
+                    // §1).
                     (ClaimVerdict::Refused(_), _) => {}
                 }
             }
