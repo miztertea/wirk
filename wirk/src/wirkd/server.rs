@@ -1145,6 +1145,26 @@ fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
 /// then collapses `.`/`..` components against it (never touching the
 /// filesystem) before comparing prefixes.
 fn artifact_join_escapes(worktree_path: &Path, artifact_path: &str) -> bool {
+    artifact_relative_to_worktree(worktree_path, artifact_path).is_none()
+}
+
+/// The lexical join of `artifact_path` against `worktree_path`
+/// (`artifact_join_escapes`'s own normalize), expressed relative to
+/// `worktree_path` — `None` when the join escapes. W6 (P2.4 W1 follow-
+/// up): the boundary diff's own membership test just below compares
+/// each declared artifact against `changed_paths`' output, which is
+/// always worktree-relative (`git diff --name-only`/`git status
+/// --porcelain`, `wirk-herdr::git::changed_paths`) — an *absolute*
+/// declared artifact path (the Docker/child executors' own shape,
+/// `cwd.join(&spec.name)` display()-formatted) never matched that set
+/// by raw string equality even when it named the exact file `git`
+/// reported, so a Route's own declared output written as an absolute
+/// path self-refused `OutOfBoundary` on itself. Canonicalizing both
+/// sides once here (a lexical resolve of the join, R3 — no filesystem
+/// read, so an artifact that does not exist yet is still answerable)
+/// and comparing worktree-relative forms throughout fixes both the
+/// escape check and this membership test with one shared computation.
+fn artifact_relative_to_worktree(worktree_path: &Path, artifact_path: &str) -> Option<PathBuf> {
     let candidate = Path::new(artifact_path);
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -1162,7 +1182,10 @@ fn artifact_join_escapes(worktree_path: &Path, artifact_path: &str) -> bool {
         }
     }
     let normalized: PathBuf = normalized.into_iter().collect();
-    !normalized.starts_with(worktree_path)
+    normalized
+        .strip_prefix(worktree_path)
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
@@ -1325,8 +1348,24 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             // `git.rs::fingerprint`'s own doc comment: unreadable is not
             // itself evidence of an out-of-boundary write.
             if let Ok(changed) = wirk_herdr::git::changed_paths(&worktree_path, &base_sha) {
-                let declared: std::collections::BTreeSet<&str> =
-                    claim.artifacts.iter().map(|a| a.path.as_str()).collect();
+                // Each declared artifact in its worktree-relative form
+                // (W6 above): an absolute declared path — the
+                // Docker/child executors' own shape — now matches
+                // `changed`'s worktree-relative entries the same way a
+                // relative declared path always has. Every artifact
+                // here already passed the escape guard above (verdict
+                // is still `Validated`), so `strip_prefix` never fails;
+                // `unwrap_or_default` only guards a defensive fallback.
+                let declared: std::collections::BTreeSet<String> = claim
+                    .artifacts
+                    .iter()
+                    .map(|a| {
+                        artifact_relative_to_worktree(&worktree_path, &a.path)
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
                 // P2.4 W2 (build-brief.md §3 W2; refuse.md §2): a Work
                 // whose one repository binding is `Access::Read`
                 // refuses any changed path at all, whatever the

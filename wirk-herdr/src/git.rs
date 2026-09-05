@@ -40,6 +40,30 @@ pub enum GitError {
 /// `base_sha` named (a worktree's `HEAD` after `add` at an exact commit
 /// *is* that commit; the round-trip through `rev-parse` is the same
 /// check the tried step's checkpoint list uses, `session.md` §7).
+///
+/// W6 (`p2-concurrency/tried/RESULT.md` stage 04's own finding: a
+/// retry's second launch names the same `path`/`branch` as the first —
+/// `wirk/<work_id>`, `run_command`'s own naming, unchanged by a retry).
+/// W6b (`p2-concurrency/land/LAND-w6.md`: W6's own path-only reuse
+/// check reached `git worktree add -b` — and its "fatal: branch already
+/// exists" — the one time `path` did not exist on disk but `branch`
+/// still did; see `p2-concurrency/w6b/BUILD.md` for the traced cause).
+/// Three states, checked in this order, each naming the git call it
+/// takes:
+///
+/// 1. **`path` exists on disk** — this Work's worktree is already live
+///    (the common retry case, W6): reused as-is, `git -C <path>
+///    rev-parse HEAD` reads its HEAD, no `worktree add` run at all.
+/// 2. **`path` absent, `branch` exists** (`git -C <repo> show-ref
+///    --verify --quiet refs/heads/<branch>`, R3 — plumbing built for
+///    exactly this test, no `git branch --list` output to parse) — the
+///    branch survived something that removed only the worktree
+///    directory (W6b's own traced cause). `git worktree add <path>
+///    <branch>` (no `-b`) checks that branch out fresh at `path` rather
+///    than trying to recreate it.
+/// 3. **Neither exists** — a fresh Work, or one whose worktree and
+///    branch were both genuinely removed: `git worktree add -b <branch>
+///    <path> <base_sha>` creates both, exactly as before.
 pub fn worktree_add(
     repo: &Path,
     path: &Path,
@@ -49,11 +73,20 @@ pub fn worktree_add(
     if base_sha.trim().is_empty() {
         return Err(GitError::EmptyBaseSha);
     }
+    if path.exists() {
+        let head = run_git(path, &["rev-parse", "HEAD"])?;
+        return Ok(head.trim().to_string());
+    }
     let path_str = path.to_string_lossy().into_owned();
-    run_git(
-        repo,
-        &["worktree", "add", "-b", branch, &path_str, base_sha],
-    )?;
+    let branch_ref = format!("refs/heads/{branch}");
+    if run_git(repo, &["show-ref", "--verify", "--quiet", &branch_ref]).is_ok() {
+        run_git(repo, &["worktree", "add", &path_str, branch])?;
+    } else {
+        run_git(
+            repo,
+            &["worktree", "add", "-b", branch, &path_str, base_sha],
+        )?;
+    }
     let head = run_git(path, &["rev-parse", "HEAD"])?;
     Ok(head.trim().to_string())
 }

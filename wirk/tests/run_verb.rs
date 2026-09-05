@@ -1245,6 +1245,238 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
     );
 }
 
+/// W6 (`p2-concurrency/tried/RESULT.md` stage 04's own carried finding,
+/// 0050 D151): the sibling of
+/// `wirk_run_retries_a_stuck_run_and_reaches_claimed` above, with that
+/// test's own manual cleanup (`git worktree remove --force` + `git
+/// branch -D`) deliberately **not** run before the retry — the second
+/// `wirk run` must reuse the first attempt's still-present worktree and
+/// branch on its own (`wirk_herdr::git::worktree_add`'s W6 fix) rather
+/// than failing on `git worktree add -b <branch>`'s "branch already
+/// exists". Reaches `Claimed`, and exactly one `wirk/<work_id>` branch
+/// exists afterward — never two, never zero.
+#[test]
+fn wirk_run_retry_reuses_the_worktree_and_branch() {
+    let stuck_scripted = scripted_actor::ScriptedActor::install(&["idle", "idle"]);
+    let stuck_path_env = scripted_actor_path(&stuck_scripted);
+    let stuck_script_path = stuck_scripted.script_path();
+    let stuck_script_path = stuck_script_path.to_str().expect("script path is utf-8");
+
+    let Some(session1) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_retry_reuses_the_worktree_and_branch_1",
+        &[
+            ("PATH", &stuck_path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", stuck_script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_id, _run1_id, _waypoint) = submit_actor(
+        &estate,
+        &repo,
+        "Reply with the single word waiting and then stop. Do not read or edit any file, do not \
+         run any command, do not run wirk claim, do not ask a question. Whenever you are \
+         prompted again, reply with the single word waiting and stop.",
+    );
+
+    // First attempt: stuck, `NeedsInput`, exactly as the sibling test.
+    let run1_status = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session1.name()])
+        .args(["--herdr-socket"])
+        .arg(session1.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .env("PATH", &stuck_path_env)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("run wirk run (first attempt)");
+    assert_eq!(
+        run1_status.code(),
+        Some(4),
+        "the first attempt must exit 4 (NeedsInput/stuck): {run1_status:?}"
+    );
+    wait_for_event(
+        &estate,
+        &work_id,
+        |kind| matches!(kind, EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck")),
+    );
+    drop(session1);
+
+    let worktree_path = estate.join("worktrees").join(&work_id);
+    let branch = format!("wirk/{work_id}");
+    assert!(
+        worktree_path.exists(),
+        "the first attempt's worktree must still be on disk (nothing removed it)"
+    );
+
+    // No manual cleanup here — this is the whole point of the fix.
+    let retry = Command::new(wirk_bin())
+        .args(["work", "retry", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id])
+        .output()
+        .expect("wirk work retry runs");
+    assert!(
+        retry.status.success(),
+        "wirk work retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+
+    let claims_scripted = scripted_actor::ScriptedActor::install(&[
+        "idle",
+        "edit:report.md:a throwaway repo for the retry's own reuse test",
+        "claim:--artifact report.md=report.md",
+    ]);
+    let claims_path_env = scripted_actor_path(&claims_scripted);
+    let claims_script_path = claims_scripted.script_path();
+    let claims_script_path = claims_script_path.to_str().expect("script path is utf-8");
+
+    let Some(session2) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_retry_reuses_the_worktree_and_branch_2",
+        &[
+            ("PATH", &claims_path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", claims_script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let mut run2_child = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session2.name()])
+        .args(["--herdr-socket"])
+        .arg(session2.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .env("PATH", &claims_path_env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wirk run (retry)");
+
+    let run2_stdout = run2_child.stdout.take().expect("wirk run stdout piped");
+    let run2_stdout_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let run2_stdout_reader = {
+        let lines = Arc::clone(&run2_stdout_lines);
+        std::thread::spawn(move || {
+            for line in BufReader::new(run2_stdout).lines().map_while(Result::ok) {
+                lines.lock().unwrap().push(line);
+            }
+        })
+    };
+    let run2_stderr = run2_child.stderr.take().expect("wirk run stderr piped");
+    let run2_stderr_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let run2_stderr_reader = {
+        let lines = Arc::clone(&run2_stderr_lines);
+        std::thread::spawn(move || {
+            for line in BufReader::new(run2_stderr).lines().map_while(Result::ok) {
+                lines.lock().unwrap().push(line);
+            }
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if run2_child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never observed: wirk run (retry) exiting on its own; stdout so far {:?}",
+            run2_stdout_lines.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let run2_status = run2_child.wait().expect("reap wirk run (retry)");
+    run2_stdout_reader.join().expect("stdout reader thread");
+    run2_stderr_reader.join().expect("stderr reader thread");
+    guard.0.push(run2_child);
+
+    let run2_stdout_lines = run2_stdout_lines.lock().unwrap().clone();
+    let run2_stderr_lines = run2_stderr_lines.lock().unwrap().clone();
+    assert!(
+        run2_status.success(),
+        "the retry's own driver must reach Claimed (exit 0) by reusing the existing worktree \
+         and branch, not failing on \"branch already exists\": {run2_status:?}, stdout \
+         {run2_stdout_lines:?}, stderr {run2_stderr_lines:?}"
+    );
+
+    let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
+    let events = journal.replay().expect("journal replays cleanly");
+    let claimed_run = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            EventKind::ClaimRecorded {
+                claim_kind: ClaimKind::Done,
+                verdict: wirk_core::ClaimVerdict::Validated,
+                ..
+            }
+        )
+    });
+    assert!(
+        claimed_run,
+        "expected a ClaimRecorded{{Done, Validated}} in the journal: {events:?}"
+    );
+
+    // Exactly one branch for this Work — the retry's reuse never left a
+    // second one behind, and the collision never forced a manual `-D`
+    // that would also leave zero.
+    let branch_list = Command::new("git")
+        .current_dir(&repo)
+        .args(["branch", "--list", &branch])
+        .output()
+        .expect("git branch --list runs");
+    let branch_lines: Vec<String> = String::from_utf8_lossy(&branch_list.stdout)
+        .lines()
+        .map(|line| {
+            line.trim()
+                .trim_start_matches(['*', '+'])
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        branch_lines,
+        vec![branch.clone()],
+        "expected exactly one {branch} branch for the Work, got {branch_lines:?}"
+    );
+
+    let stop = Command::new(wirk_bin())
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
 /// P2.5 W4 (BRIEF.md item 3, `orient/two-works.md` §1): two Works, two
 /// scratch repos, one estate/wirkd, **one Herdr session**, two `wirk
 /// run` drivers backgrounded concurrently — each driving its own

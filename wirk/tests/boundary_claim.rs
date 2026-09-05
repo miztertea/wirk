@@ -25,6 +25,22 @@ fn wirk_bin() -> &'static str {
     env!("CARGO_BIN_EXE_wirk")
 }
 
+/// Writes the canonical `boundary_src_only.json` fixture (embedded at
+/// compile time, `include_str!`, R3) under `<estate>/fixtures/routes/`
+/// and returns its path: a test binary carries its fixtures and never
+/// reads a source path at run time — a binary compiled in one worktree
+/// and reused from the shared cargo cache after that worktree was
+/// removed failed all twelve tests in this file at the W6b land,
+/// 2026-09-05 (the `env!("CARGO_MANIFEST_DIR")` read this replaced).
+fn boundary_src_only_route(estate: &Path) -> PathBuf {
+    let text: &str = include_str!("fixtures/routes/boundary_src_only.json");
+    let dir = estate.join("fixtures").join("routes");
+    fs::create_dir_all(&dir).expect("create estate fixtures/routes/ dir");
+    let path = dir.join("boundary_src_only.json");
+    fs::write(&path, text).expect("write embedded fixture");
+    path
+}
+
 fn wait_for_wirkd(estate: &Path) -> WirkdPointer {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -347,8 +363,7 @@ fn claim_refused_out_of_boundary_names_the_path() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
     let worktree = create_worktree_for_run(
         estate,
@@ -392,8 +407,7 @@ fn claim_validated_when_change_stays_inside_boundary() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
     let worktree = create_worktree_for_run(
         estate,
@@ -430,8 +444,7 @@ fn claim_declared_artifact_output_does_not_self_refuse() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
     let worktree = create_worktree_for_run(
         estate,
@@ -468,8 +481,7 @@ fn claim_refused_on_artifact_path_escape() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
     let worktree = create_worktree_for_run(
         estate,
@@ -500,6 +512,99 @@ fn claim_refused_on_artifact_path_escape() {
     stop_wirkd(estate, wirkd_child);
 }
 
+/// W6 (P2.4 W1 follow-up, `p2-concurrency/ASSESSMENT.md`'s "two
+/// defects"): an *absolute* artifact path landing inside the worktree
+/// — the shape the Docker/child executors always claim in
+/// (`cwd.join(&spec.name)` display()-formatted, `cwd == worktree_path`)
+/// — is Validated, not refused `OutOfBoundary` on itself. Red before
+/// this wave: the boundary diff's own membership test compared the raw
+/// absolute string against `changed_paths`' worktree-relative output
+/// and never matched, so the Claim's own declared output looked like
+/// an undeclared, out-of-boundary write.
+#[test]
+fn claim_validated_when_artifact_path_is_absolute_inside_worktree() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = boundary_src_only_route(estate);
+    let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "boundary-src-only/wp-1",
+    );
+
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+
+    let absolute_report = worktree.join("report.md").display().to_string();
+    let (code, stdout) = claim(
+        estate,
+        &work_id,
+        &run_id,
+        &[("report.md", &absolute_report)],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "an absolute artifact path inside the worktree must be Validated, stdout: {stdout}"
+    );
+    assert_eq!(stdout, "Validated");
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// The absolute-path twin of `claim_refused_on_artifact_path_escape`:
+/// an absolute artifact path naming somewhere else entirely (here, a
+/// sibling of the worktree under the same estate) is still refused
+/// `OutOfBoundary` — canonicalizing the join must never turn an
+/// escaping absolute path into an accepted one.
+#[test]
+fn claim_refused_when_absolute_artifact_path_escapes_worktree() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = boundary_src_only_route(estate);
+    let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "boundary-src-only/wp-1",
+    );
+
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+    let escaping = estate.join("outside.txt");
+    fs::write(&escaping, b"escaped\n").expect("write outside the worktree");
+    let escaping_str = escaping.display().to_string();
+
+    let (code, stdout) = claim(
+        estate,
+        &work_id,
+        &run_id,
+        &[("report.md", "report.md"), ("evidence", &escaping_str)],
+    );
+    assert_eq!(code, Some(3), "expected exit 3 (Refused), stdout: {stdout}");
+    assert!(
+        stdout.starts_with("Refused: OutOfBoundary"),
+        "expected an OutOfBoundary refusal, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("outside.txt"),
+        "refusal must name the escaping artifact path, got: {stdout}"
+    );
+
+    stop_wirkd(estate, wirkd_child);
+}
+
 /// P2.4 W1, item 1 (`orient/build-brief.md` §8 amendment 1): the
 /// World's `boundary` at reservation is the Route-authored Waypoint's
 /// own globs, not the repository path — `server.rs:722`'s (and its
@@ -512,8 +617,7 @@ fn world_boundary_at_reservation_is_the_waypoints_globs() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, _run_id) = submit_actor(estate, &route, repo, &base_sha);
 
     let world = reserved_world(&pointer.socket, &work_id);
@@ -550,8 +654,7 @@ fn claim_refused_out_of_boundary_on_read_binding_for_any_change() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor_with_repo(estate, &route, repo, &base_sha, "demo:read");
     let worktree = create_worktree_for_run(
         estate,
@@ -597,8 +700,7 @@ fn claim_refused_out_of_boundary_on_read_binding_for_untracked_file() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor_with_repo(estate, &route, repo, &base_sha, "demo:read");
     let worktree = create_worktree_for_run(
         estate,
@@ -641,8 +743,7 @@ fn needs_input_set_on_out_of_boundary_refusal() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
     let worktree = create_worktree_for_run(
         estate,
@@ -694,8 +795,7 @@ fn other_refusal_kinds_stay_silent_no_needs_input() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
     create_worktree_for_run(
         estate,
@@ -745,8 +845,7 @@ fn wirk_claim_prints_out_of_boundary_paths_exit_3() {
     let estate = estate_dir.path();
     let (wirkd_child, pointer) = start_wirkd(estate);
 
-    let route =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routes/boundary_src_only.json");
+    let route = boundary_src_only_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
     let worktree = create_worktree_for_run(
         estate,

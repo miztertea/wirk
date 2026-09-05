@@ -290,7 +290,6 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
     }
     let estate_dir = tempfile::tempdir().expect("estate tempdir");
     let estate = estate_dir.path().to_path_buf();
-    let cwd = tempfile::tempdir().expect("cwd tempdir");
 
     // The wirkd half is real (0040 D127): a real `wirk wirkd`, a real
     // `wirk work submit --kind deterministic`, whose Waypoint always
@@ -322,11 +321,14 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         name: "report.md".to_string(),
         required: true,
     }]);
-    let world = deterministic_world(
-        vec!["sh", "-c", "echo hi > report.md"],
-        cwd.path(),
-        artifacts,
-    );
+    // `cwd` is the estate root itself — matching what a real `wirk
+    // run-deterministic` actually hands the executor (`main.rs`'s
+    // `reserved_deterministic` reads the World wirkd journaled at
+    // submit, whose `cwd` is `state.estate_root`, `server.rs::
+    // handle_submit`); an ad-hoc, unrelated tempdir here would make
+    // the container's real write land outside the Run's own journaled
+    // worktree, which the boundary guard (W6) correctly refuses.
+    let world = deterministic_world(vec!["sh", "-c", "echo hi > report.md"], &estate, artifacts);
     executor.launch(&run, &world).expect("launch");
     let container_name = executor
         .container_name(&run.id)
@@ -368,7 +370,7 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         "the real wirkd's journal never recorded ClaimRecorded{{Validated}}"
     );
     assert!(
-        cwd.path().join("report.md").exists(),
+        estate.join("report.md").exists(),
         "the container's write through the /work bind mount must land on the host cwd"
     );
 
