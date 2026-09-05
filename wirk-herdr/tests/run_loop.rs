@@ -1729,8 +1729,9 @@ fn actor_pane_env_carries_cargo_target_dir_from_the_driver_when_set() {
 // the claim from this pane: `wirk claim --artifact <name>=<path> ...
 // --done`" — a flag `wirk claim` (`wirk/src/main.rs`) has never had, and
 // advice that contradicted the Waypoint's own intent for a kind whose
-// Claim is already filed by W2's hook at turn end (`actor_pane`'s own
-// `run.kind.0 == "opencode"` check, `wirk-herdr/src/lib.rs`). Both tests
+// Claim is already filed by a hook at turn end
+// (`claim_hook::hook_installed_for`, `wirk-herdr/src/claim_hook.rs`,
+// widened by P2.7 W3 to name claude alongside opencode). Both tests
 // below render `compose_first_prompt` through the same
 // `client.prompt_agent_calls` seam every other prompt test in this file
 // reads, rather than calling it directly, so a regression in the
@@ -1783,7 +1784,7 @@ fn opencode_run_is_never_told_to_claim_by_hand() {
 }
 
 #[test]
-fn claude_run_keeps_the_by_hand_instruction_with_the_real_flags() {
+fn claude_run_is_never_told_to_claim_by_hand() {
     let mut run = open_run("run-1");
     run.kind = wirk_core::ActorKind::claude();
     let dir = tempdir().expect("tempdir");
@@ -1807,14 +1808,28 @@ fn claude_run_keeps_the_by_hand_instruction_with_the_real_flags() {
 
     let calls = client.prompt_agent_calls.lock().unwrap();
     let text = &calls[0].text;
+    // Red on `main` (P2.7 W3, `build-brief.md` §6 item 1): `main`'s
+    // `hook_installed_for` names only opencode, so a claude Run still
+    // got the by-hand instruction here — this assertion fails until
+    // claude gets its own hook (a `--settings`-delivered `Stop` hook,
+    // `claim_hook.rs`) and `hook_installed_for` widens to include it.
     assert!(
-        text.contains("wirk claim"),
-        "a claude Run has no hook (W2 built opencode only); the by-hand \
-         instruction must stay: {text:?}"
+        !text.contains("wirk claim --artifact"),
+        "a claude Run's hook now already files the claim; the prompt must \
+         not tell the actor to claim by hand with a flag: {text:?}"
     );
     assert!(
         !text.contains("--done"),
         "wirk claim has no --done flag (wirk/src/main.rs): {text:?}"
+    );
+    assert!(
+        text.contains("end your turn: the claim is filed for you"),
+        "a claude Run now gets the hooked prompt form, same as opencode: {text:?}"
+    );
+    assert!(
+        text.contains("report.md"),
+        "the required output must still be named so the actor knows what \
+         to produce: {text:?}"
     );
 }
 

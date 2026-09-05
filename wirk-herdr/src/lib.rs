@@ -21,9 +21,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub mod claim_hook;
 pub mod fake;
 pub mod git;
-pub mod opencode_hook;
 pub mod run_loop;
 pub mod socket;
 
@@ -772,7 +772,7 @@ impl<C: HerdrClient> HerdrExecutor<C> {
             },
         ])?;
 
-        self.start_actor_agent_when_ready(run, &pane.pane_id, &mut events)?;
+        self.start_actor_agent_when_ready(run, &pane.pane_id, world, &mut events)?;
 
         Ok(LaunchedRun { pane, events })
     }
@@ -795,10 +795,11 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         &self,
         run: &wirk_core::Run,
         pane_id: &str,
+        world: &wirk_core::World,
         events: &mut Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>,
     ) -> Result<(), HerdrExecutorError> {
         loop {
-            match self.start_actor_agent(run, pane_id) {
+            match self.start_actor_agent(run, pane_id, world) {
                 Ok(()) => return Ok(()),
                 Err(err) if is_agent_pane_busy(&err) => {
                     println!(
@@ -883,19 +884,25 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // Run gets wirk's own claim-filing plugin delivered with no
         // write into the worktree and no write under `~/` —
         // `w2-probe.md`'s Mechanism 2, measured live. The directory is
-        // wirk-owned, under the estate root (`opencode_hook::run_dir`,
+        // wirk-owned, under the estate root (`claim_hook::run_dir`,
         // the same `.wirk` convention `wirkd::client::locate` already
         // uses), never `actor.worktree_path`. A write failure here
         // does not fail the launch: the actor still starts, just
         // without the hook, the same "degrade, don't block" posture
         // `CARGO_TARGET_DIR` above already has (best-effort, passed
-        // through only when it can be).
-        if opencode_hook::hook_installed_for(&run.kind)
+        // through only when it can be). Gated on `run.kind` directly
+        // (not `claim_hook::hook_installed_for`, which W3 widened to
+        // include claude too): opencode's own delivery mechanism is an
+        // env var, claude's is an argv element built in
+        // `start_actor_agent` below — the two kinds share the "is a
+        // hook installed" predicate for the standing prompt, never the
+        // delivery mechanism itself.
+        if run.kind == wirk_core::ActorKind::opencode()
             && let Ok(config_path) =
-                opencode_hook::write_wirk_claim_hook(&actor.triple.estate_root, &run.id.0)
+                claim_hook::write_wirk_claim_hook(&actor.triple.estate_root, &run.id.0)
         {
             env.insert(
-                opencode_hook::OPENCODE_CONFIG_ENV.to_string(),
+                claim_hook::OPENCODE_CONFIG_ENV.to_string(),
                 config_path.to_string_lossy().into_owned(),
             );
         }
@@ -968,6 +975,7 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         &self,
         run: &wirk_core::Run,
         pane_id: &str,
+        world: &wirk_core::World,
     ) -> Result<(), HerdrExecutorError> {
         // W1 (0041 D129): `run.kind`, not a hardcoded `"claude"` — the
         // opencode row starts with its own configured default model
@@ -980,7 +988,7 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // kind — a kind with no row here launches bare (no args), passed
         // through to `agent.start` verbatim; Herdr's own answer to that
         // call is the validation, not a match arm added here.
-        let (kind_str, args) = match run.kind.0.as_str() {
+        let (kind_str, mut args) = match run.kind.0.as_str() {
             "claude" => ("claude", vec!["--model".to_string(), "sonnet".to_string()]),
             "opencode" => (
                 "opencode",
@@ -991,6 +999,26 @@ impl<C: HerdrClient> HerdrExecutor<C> {
             ),
             other => (other, Vec::new()),
         };
+
+        // P2.7 Wave 3 (`build-brief.md` §6 item 1, `reorient.md` §C): a
+        // claude Run gets wirk's own Claim-filing hook via one
+        // `--settings <path>` argv element pair naming a wirk-owned
+        // settings file under the estate root (never the worktree,
+        // never `~/`) — hooks merge across settings levels, so this
+        // coexists with whatever `~/.claude/settings.json` or the
+        // worktree's own `.claude/settings.json` already declare. Same
+        // "degrade, don't block" posture as opencode's env-var delivery
+        // above: a write failure leaves the launch unaffected, just
+        // without the hook.
+        if run.kind == wirk_core::ActorKind::claude()
+            && let wirk_core::World::Actor(actor) = world
+            && let Ok(settings_path) =
+                claim_hook::write_claude_claim_hook(&actor.triple.estate_root, &run.id.0)
+        {
+            args.push("--settings".to_string());
+            args.push(settings_path.to_string_lossy().into_owned());
+        }
+
         self.client.start_agent(StartAgent {
             pane_id: pane_id.to_string(),
             kind: kind_str.to_string(),
@@ -1054,7 +1082,7 @@ impl<C: HerdrClient> wirk_core::Executor for HerdrExecutor<C> {
     /// before `agent.start` per D51 and returns it.
     fn launch(&self, run: &wirk_core::Run, world: &wirk_core::World) -> Result<(), Self::Error> {
         let pane = self.actor_pane(run, world)?;
-        self.start_actor_agent(run, &pane.pane_id)
+        self.start_actor_agent(run, &pane.pane_id, world)
     }
 
     fn poll(&self, run: &wirk_core::Run) -> Result<wirk_core::RunObservation, Self::Error> {

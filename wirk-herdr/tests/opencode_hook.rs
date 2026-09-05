@@ -23,8 +23,8 @@ use wirk_core::{
     ActorKind, ActorWorld, ArtifactSpec, Boundary, ExecutionTriple, Executor, OutputContract, Run,
     RunId, RunState, WaypointId, WorkId, World, WorldHash,
 };
+use wirk_herdr::claim_hook::{OPENCODE_CONFIG_ENV, WIRK_CLAIM_PLUGIN_JS};
 use wirk_herdr::fake::FakeHerdrClient;
-use wirk_herdr::opencode_hook::{OPENCODE_CONFIG_ENV, WIRK_CLAIM_PLUGIN_JS};
 use wirk_herdr::{AgentStatus, HerdrExecutor, PaneInfo};
 
 fn run_with_kind(kind: ActorKind) -> Run {

@@ -1077,7 +1077,7 @@ fn spawn_watch_reader<E: std::error::Error + Send + 'static>(
 /// actor to file the claim by hand even for a kind whose hook already
 /// files it at turn end — the actor followed that instruction over its
 /// own Waypoint's contrary intent. Two corrections, one predicate
-/// (`opencode_hook::hook_installed_for`, R2 — the same condition
+/// (`claim_hook::hook_installed_for`, R2 — the same condition
 /// `actor_pane` already uses to decide whether to write the hook at
 /// all, never a second list of kinds):
 ///
@@ -1103,7 +1103,7 @@ pub fn compose_first_prompt(actor: &ActorWorld, kind: &ActorKind) -> String {
     } else {
         format!("\n\nRequired artifacts (by name): {}", required.join(", "))
     };
-    let claim_line = if crate::opencode_hook::hook_installed_for(kind) {
+    let claim_line = if crate::claim_hook::hook_installed_for(kind) {
         "When the required outputs above exist, end your turn: the claim is filed for you. \
          If you need input before you can finish, file `wirk claim --question \"...\"` instead."
     } else {

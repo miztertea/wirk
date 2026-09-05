@@ -20,7 +20,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 
-use wirk_herdr::opencode_hook::WIRK_CLAIM_PLUGIN_JS;
+use wirk_herdr::claim_hook::WIRK_CLAIM_PLUGIN_JS;
 
 const FAKE_WIRK_SH: &str = include_str!("support/fake_wirk.sh");
 
