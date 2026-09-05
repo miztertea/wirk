@@ -326,6 +326,19 @@ pub struct RunLoop<C: HerdrClient, W: WirkdApi> {
     /// reduced to a single "current Work state" the loop updates
     /// in place.
     watch_events: Vec<Event>,
+    /// P2.5 W3 (0050 D151; build-brief.md §7.1 amendment): `false`
+    /// until the watch stream has delivered *this Run's own*
+    /// `RunOpened` (matched on `run_state`'s id). `handle_watch_connection`
+    /// always replays the *entire* journal before live-tailing, so on a
+    /// retry this replay still carries a previous attempt's own
+    /// `RunFailed`/question that once put the Work in `NeedsInput` --
+    /// `fold` runs over every event pushed so far exactly as before
+    /// (nothing is filtered out of the accumulation), but a `NeedsInput`
+    /// decision drawn from that fold is withheld while this is `false`:
+    /// before this Run's own `RunOpened` arrives, the replayed prefix is
+    /// history being caught up on, not yet "now". Cleared at the top of
+    /// every `drive` alongside `watch_events`.
+    run_opened_this_run: bool,
     progress_baseline: Option<ProgressBaseline>,
     /// P2.3 W6 (build-brief.md §10): true once this `RunLoop` has sent
     /// its very first prompt (the intent, `PromptProgress::First`) --
@@ -370,6 +383,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             launched_pane: None,
             run_state: None,
             watch_events: Vec::new(),
+            run_opened_this_run: false,
             progress_baseline: None,
             has_prompted: false,
             stuck_observation: None,
@@ -484,7 +498,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         run: &Run,
         world: &World,
     ) -> Result<Outcome, RunLoopError<W>> {
-        let actor = match world {
+        let mut actor = match world {
             World::Actor(actor) => actor.clone(),
             World::Deterministic(_) => {
                 return Err(RunLoopError::Herdr(
@@ -492,11 +506,31 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                 ));
             }
         };
+        // P2.5 W3, found live building this wave's own tried step: a
+        // retry (`wirk work retry`, `handle_retry`) reuses the
+        // Waypoint's already-reserved `World` verbatim for the new Run
+        // it opens — it mints a fresh `run_id` but never re-reserves the
+        // World, so `actor.triple.run_id` still names whichever Run
+        // *first* reserved this Waypoint's World, not the Run this
+        // `drive` call is actually driving. `actor_pane`'s env map is
+        // built from exactly that field (`lib.rs`'s `actor.triple`), so
+        // an actor's `wirk claim` on a retried Run filed itself against
+        // the stale, previous Run's id — reproduced live: `ClaimRecorded`
+        // landed on the first attempt's own `run_id`, never the retry's,
+        // and the retry's driver never saw its own Claim. The same
+        // precedent as `run.kind = actor_kind` in `wirk/src/executor.rs`
+        // (a Run-specific field corrected against the actual driven Run
+        // before use, not the reservation's stale copy): reconciled here
+        // rather than in `wirkd`'s own `handle_retry` — R7, local to
+        // this crate boundary, the only file this wave touches.
+        actor.triple.run_id = run.id.clone();
+        let world = World::Actor(actor.clone());
         self.run_state = Some(run.clone());
         self.watch_events.clear();
+        self.run_opened_this_run = false;
 
         let watch_events = self.wirkd.watch(work_id).map_err(RunLoopError::Wirkd)?;
-        let herdr_events = self.launch(work_id, run, world)?;
+        let herdr_events = self.launch(work_id, run, &world)?;
 
         let (tx, rx) = mpsc::channel::<LoopMsg>();
         spawn_herdr_reader(herdr_events, tx.clone());
@@ -674,14 +708,51 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
     /// `Run` (`Claimed` stops the loop) and the accumulated Work
     /// (`NeedsInput` stops it too) — the only two ways `drive_channel`
     /// ever learns either, never a status poll (item C).
+    ///
+    /// P2.5 W3 (0050 D151; build-brief.md §7.1 amendment): `wirkd`'s
+    /// `watch` always replays the entire journal before live-tailing
+    /// (`handle_watch_connection`), so on a retry this method is handed
+    /// the previous attempt's own `RunOpened`/`RunFailed` (and the
+    /// `NeedsInput` that `RunFailed` caused) *before* it ever sees the
+    /// retry's own `RunOpened` — the very event whose fold arm clears
+    /// `NeedsInput` back to `Active`. Every event is still pushed onto
+    /// `watch_events` and still folded exactly as before (nothing is
+    /// dropped or filtered out of the accumulation: `fold` needs the
+    /// full slice from `WorkSubmitted` on, and a real journal's own
+    /// later events, this Run's `RunOpened` included, depend on the
+    /// reservation/waypoint bookkeeping earlier events establish); what
+    /// changes is that a `NeedsInput` *decision* drawn from that fold is
+    /// withheld until `run_opened_this_run` is set — i.e. until the
+    /// stream has delivered *this* Run's own `RunOpened`. Before that
+    /// point the replayed prefix is history being caught up on, not yet
+    /// "now", so it is accumulated only. A stream with no retry at all
+    /// reaches this Run's own `RunOpened` on (or before) the very event
+    /// that later fails it, so `NeedsInput` still surfaces exactly as
+    /// today once it does.
+    ///
+    /// `Claimed` needs no such gate: it is decided from `run_state.apply`
+    /// alone, which already ignores any event whose `run` is not this
+    /// Run's own id (`Run::apply`'s own guard, `wirk-core/src/lib.rs`) —
+    /// a stale prior attempt's events can never be folded onto *this*
+    /// Run's state, so there is no equivalent stale-prefix hazard for it
+    /// to gate.
     fn observe_watch(&mut self, event: &Event) -> Option<Outcome> {
         self.watch_events.push(event.clone());
+        if !self.run_opened_this_run
+            && let Some(run_state) = self.run_state.as_ref()
+            && matches!(&event.kind, EventKind::RunOpened { run, .. } if run == &run_state.id)
+        {
+            self.run_opened_this_run = true;
+        }
         if let Some(run_state) = self.run_state.as_mut() {
             run_state.apply(event);
             if matches!(run_state.state, RunState::Claimed(_)) {
                 self.claimed = true;
                 return Some(Outcome::Claimed);
             }
+        }
+        if !self.run_opened_this_run {
+            return None;
         }
         // `fold` panics on a slice with no `WorkSubmitted` at all (its
         // own documented precondition) — a real journal always starts

@@ -38,6 +38,8 @@
 mod live_herdr;
 #[path = "support/route_fixture.rs"]
 mod route_fixture;
+#[path = "../../wirk-herdr/tests/support/scripted_actor.rs"]
+mod scripted_actor;
 #[path = "../src/wirkd/mod.rs"]
 mod wirkd;
 
@@ -49,12 +51,30 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use wirkd::{ClaimPayload, Reply, Request, WirkdPointer};
+use wirkd::{ClaimPayload, Request, WirkdPointer};
 
 use wirk_core::{ClaimKind, EventKind, ExecutionTriple, Journal, RunId, WorkId};
 
 fn wirk_bin() -> &'static str {
     env!("CARGO_BIN_EXE_wirk")
+}
+
+/// `PATH` for a scripted-actor session: the scripted actor's own bin
+/// directory first (so Herdr's `agent.start{kind:"opencode"}` finds it
+/// ahead of any real `opencode`), then the built `wirk` binary's own
+/// directory (so a `claim:` script step's bare `wirk claim` resolves,
+/// 0050 D151), then whatever this test process's own `PATH` already
+/// was.
+fn scripted_actor_path(scripted: &scripted_actor::ScriptedActor) -> String {
+    let wirk_dir = Path::new(wirk_bin())
+        .parent()
+        .expect("wirk binary has a parent directory");
+    format!(
+        "{}:{}:{}",
+        scripted.bin_dir().display(),
+        wirk_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
 }
 
 /// Bounded poll (issue 359) for `<estate>/.wirk/wirkd.json` to exist —
@@ -126,15 +146,30 @@ fn git_rev_parse(dir: &Path, rev: &str) -> String {
 /// `wirkd_process.rs`'s `submit` uses, R6 duplicate — the two tests
 /// submit different World kinds).
 fn submit_actor(estate: &Path, repo: &Path, intent: &str) -> (String, String, String) {
+    submit_actor_named(estate, repo, intent, "smoke")
+}
+
+/// `submit_actor`, parameterized by Route name/id (P2.5 W4): two Works
+/// submitted against the *same* estate need distinct `routes/<name>.json`
+/// files (`resolve_route_path` reads by name, `route_fixture::write_route`
+/// would otherwise overwrite one Work's Route with the other's) and
+/// distinct Waypoint ids, so their journals stay tellable apart by
+/// waypoint as well as by `work_id`/`run_id`.
+fn submit_actor_named(
+    estate: &Path,
+    repo: &Path,
+    intent: &str,
+    name: &str,
+) -> (String, String, String) {
     let route_json = format!(
-        r#"{{"id":"smoke","waypoints":[{{"id":"smoke/wp-1","kind":"Actor","intent":{intent:?},"declared_outputs":[{{"name":"report.md","required":true}}],"boundary":["**"]}}]}}"#
+        r#"{{"id":{name:?},"waypoints":[{{"id":"{name}/wp-1","kind":"Actor","intent":{intent:?},"declared_outputs":[{{"name":"report.md","required":true}}],"boundary":["**"]}}]}}"#
     );
-    route_fixture::write_route(estate, "smoke", &route_json);
+    route_fixture::write_route(estate, name, &route_json);
 
     let output = Command::new(wirk_bin())
         .args(["work", "submit", "--estate"])
         .arg(estate)
-        .args(["--route", "smoke", "--kind", "actor", "--repo-path"])
+        .args(["--route", name, "--kind", "actor", "--repo-path"])
         .arg(repo)
         .args(["--base", "HEAD"])
         .output()
@@ -205,14 +240,32 @@ impl Drop for KillOnDrop {
 
 #[test]
 fn wirk_run_drives_one_actor_run_to_claimed() {
-    let Some(session) =
-        live_herdr::LiveHerdrSession::start("wirk_run_drives_one_actor_run_to_claimed")
-    else {
+    // P2.5 W1 (ruling 0049 D148): a scripted actor, not a real model,
+    // drives this live pane deterministically. Three turns: the first
+    // ends idle with no worktree change (the intent alone earns no
+    // baseline, W6), the loop's first continuation earns the file
+    // write, and the loop's next continuation earns the actor's own
+    // `wirk claim` — the same claim path a real actor would take,
+    // proven here without a model's cooperation.
+    let scripted = scripted_actor::ScriptedActor::install(&[
+        "idle",
+        "edit:report.md:a throwaway repo for the tried step",
+        "claim:--artifact report.md=report.md",
+    ]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_drives_one_actor_run_to_claimed",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
         return;
     };
-    // Held for the whole test body: this test starts a real opencode
-    // agent against the one local model endpoint (live_herdr.rs).
-    let _live_model_guard = live_herdr::live_model_lock();
 
     let estate_dir = tempfile::tempdir().expect("estate tempdir");
     let estate = estate_dir.path().to_path_buf();
@@ -231,7 +284,7 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
             .spawn()
             .expect("spawn wirkd"),
     );
-    let pointer = wait_for_pointer(&estate);
+    let _pointer = wait_for_pointer(&estate);
 
     let (work_id, run_id, _waypoint) = submit_actor(&estate, &repo, "write report.md, then claim");
 
@@ -243,6 +296,16 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
             .args(["--herdr-socket"])
             .arg(session.socket_path())
             .args(["--actor-kind", "opencode"])
+            // P2.5 W2 (0050 D151): `HerdrExecutor::actor_pane` now sets
+            // the actor pane's own `PATH` from *this* process's
+            // inherited `PATH` (prepending the running `wirk`
+            // executable's directory), not the herdr session's — so
+            // `wirk run` needs the scripted actor's directory on its
+            // own `PATH` too, the same value the session above got via
+            // `start_with_env`, or the pane's `PATH` would fall back to
+            // this test binary's ambient one and resolve the real
+            // `opencode` instead of the scripted actor.
+            .env("PATH", &path_env)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -250,54 +313,17 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
     );
 
     // Bounded poll (issue 359) for `RunLaunched`: `wirk run`'s own
-    // worktree + Herdr launch has happened, so this test's own write
-    // and Claim (below) land after it, never racing a Run that has not
-    // opened yet.
+    // worktree + Herdr launch has happened.
     wait_for_event(&estate, &work_id, |kind| {
         matches!(kind, EventKind::RunLaunched { .. })
     });
 
-    // The worktree convention `wirk/src/executor.rs` documents:
-    // `<estate>/worktrees/<work_id>`.
-    let worktree_path = estate.join("worktrees").join(&work_id);
-    fs::write(
-        worktree_path.join("report.md"),
-        b"a throwaway repo for the tried step",
-    )
-    .expect("write report.md into the worktree");
-
-    let claim_reply = wirkd::client::call(
-        &pointer.socket,
-        &Request::claim(ClaimPayload {
-            triple: ExecutionTriple {
-                estate_root: estate.display().to_string(),
-                work_id: WorkId(work_id.clone()),
-                run_id: RunId(run_id.clone()),
-            },
-            kind: ClaimKind::Done,
-            artifacts: BTreeMap::from([("report.md".to_string(), "report.md".to_string())]),
-        }),
-    )
-    .expect("claim call reaches wirkd");
-    match claim_reply {
-        Reply::Ok { result, .. } => {
-            assert_eq!(result["verdict"], "Validated", "claim result: {result:?}");
-        }
-        Reply::Err { error, .. } => {
-            panic!(
-                "claim unexpectedly refused: {} {}",
-                error.code, error.message
-            )
-        }
-    }
-
     // `wirk run` exits 0 (Claimed) — the last of `guard.0`. Bounded by
-    // the test harness's own timeout (no fixed wait here): a real
-    // opencode agent's own pane may keep producing status events for a
-    // while after the Claim already landed by the path above, and
-    // `wirk run`'s loop only re-checks wirkd's status after each
-    // observed event or once its subscription goes quiet (this item's
-    // disclosed fix in `wirk-herdr/src/run_loop.rs`).
+    // the test harness's own timeout (no fixed wait here): the scripted
+    // actor's own `claim:` step files `wirk claim` itself once its
+    // three-turn script runs out, and `wirk run`'s loop only re-checks
+    // wirkd's status after each observed event (this item's disclosed
+    // fix in `wirk-herdr/src/run_loop.rs`).
     let run_status = guard
         .0
         .last_mut()
@@ -388,14 +414,26 @@ const QUIET_POLL: Duration = Duration::from_secs(40);
 
 #[test]
 fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
-    let Some(session) = live_herdr::LiveHerdrSession::start(
+    // P2.5 W1 (ruling 0049 D148): an empty script is a deliberate,
+    // guaranteed "idle forever" pane (module doc, scripted_actor.sh) —
+    // it reports its boot idle and then never reports again, no matter
+    // how many prompts `wirk run` sends, genuinely quiet rather than
+    // hoping a real model stays quiet.
+    let scripted = scripted_actor::ScriptedActor::install(&[]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
         "wirk_run_survives_a_quiet_pane_past_the_subscription_timeout",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
     ) else {
         return;
     };
-    // Held for the whole test body: this test starts a real opencode
-    // agent against the one local model endpoint (live_herdr.rs).
-    let _live_model_guard = live_herdr::live_model_lock();
 
     let estate_dir = tempfile::tempdir().expect("estate tempdir");
     let estate = estate_dir.path().to_path_buf();
@@ -426,6 +464,7 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
             .args(["--herdr-socket"])
             .arg(session.socket_path())
             .args(["--actor-kind", "opencode"])
+            .env("PATH", &path_env)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -567,14 +606,32 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
 /// 0 with no `RunFailed` journaled.
 #[test]
 fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
-    let Some(session) = live_herdr::LiveHerdrSession::start(
+    // P2.5 W1 (ruling 0049 D148): the first turn ends idle with no
+    // worktree change (the script's own `idle` step) -- asserted, not
+    // hoped for, since the loop's re-prompt path only used to be
+    // reached if a real model happened to end its first turn with
+    // nothing changed. The loop's continuation then earns the edit,
+    // and its next continuation earns the actor's own `wirk claim`.
+    let scripted = scripted_actor::ScriptedActor::install(&[
+        "idle",
+        "edit:report.md:filed by the scripted actor, proving the pane was still unclaimed and \
+         prompted again",
+        "claim:--artifact report.md=report.md",
+    ]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
         "wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
     ) else {
         return;
     };
-    // Held for the whole test body: this test starts a real opencode
-    // agent against the one local model endpoint (live_herdr.rs).
-    let _live_model_guard = live_herdr::live_model_lock();
 
     let estate_dir = tempfile::tempdir().expect("estate tempdir");
     let estate = estate_dir.path().to_path_buf();
@@ -592,7 +649,7 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
             .spawn()
             .expect("spawn wirkd"),
     );
-    let pointer = wait_for_pointer(&estate);
+    let _pointer = wait_for_pointer(&estate);
 
     let (work_id, run_id, _waypoint) =
         submit_actor(&estate, &repo, "reply with the word ready and stop");
@@ -604,6 +661,7 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
         .args(["--herdr-socket"])
         .arg(session.socket_path())
         .args(["--actor-kind", "opencode"])
+        .env("PATH", &path_env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -664,46 +722,11 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
 
     // The Working transition just observed is itself the proof this
     // test exists to pin: `wirk run` prompted the pane again after its
-    // first Idle. The Claim is filed now, not after a second Idle — the
-    // continuation prompt's own reply ("ready", again) makes no
-    // worktree progress by design (the instruction is a no-op), so
-    // waiting for a second Idle would race item C's own no-progress
-    // check (`RunLoop::observe_herdr`), which would legitimately (and
-    // separately from what this test is about) judge that second Idle
-    // stuck and stop the loop `NeedsInput` before this test ever got to
-    // file the Claim.
-    let worktree_path = estate.join("worktrees").join(&work_id);
-    fs::write(
-        worktree_path.join("report.md"),
-        b"filed by the test, proving the pane was still unclaimed and prompted again",
-    )
-    .expect("write report.md into the worktree");
-
-    let claim_reply = wirkd::client::call(
-        &pointer.socket,
-        &Request::claim(ClaimPayload {
-            triple: ExecutionTriple {
-                estate_root: estate.display().to_string(),
-                work_id: WorkId(work_id.clone()),
-                run_id: RunId(run_id.clone()),
-            },
-            kind: ClaimKind::Done,
-            artifacts: BTreeMap::from([("report.md".to_string(), "report.md".to_string())]),
-        }),
-    )
-    .expect("claim call reaches wirkd");
-    match claim_reply {
-        Reply::Ok { result, .. } => {
-            assert_eq!(result["verdict"], "Validated", "claim result: {result:?}");
-        }
-        Reply::Err { error, .. } => {
-            panic!(
-                "claim unexpectedly refused: {} {}",
-                error.code, error.message
-            )
-        }
-    }
-
+    // first Idle. The scripted actor's own `edit` step now runs (in
+    // answer to that continuation prompt), then the loop's *next*
+    // continuation (the worktree changed, so this is not the stuck
+    // path) earns the actor's own `wirk claim` — the real claim path,
+    // not a claim the test files behind the actor's back.
     let run_status = guard
         .0
         .last_mut()
@@ -718,25 +741,36 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
         .iter()
         .filter(|line| line.starts_with("prompt:"))
         .collect();
-    // P2.3 W3: this test's own doc comment already pins that `wirk run`
-    // prompts the pane exactly once (the Working transition observed
-    // above) before the Claim is filed — the driver's stdout must carry
-    // that one prompt line, naming the Idle it answered and the first
-    // words of what was sent.
-    assert_eq!(
-        prompt_lines.len(),
-        1,
-        "wirk run's stdout must carry exactly one prompt line: {stdout_lines:?}"
-    );
-    // P2.3 W5: the prompt line names whichever turn-ended status it
-    // actually answered (`Idle` or `Done` — build-brief.md §9), not a
-    // hardcoded "Idle", since a headless pane reports `Done` live.
+    // P2.5 W1: the re-prompt path is now asserted, not hoped for — at
+    // least the intent's own first prompt and one continuation prompt
+    // must appear (the scripted actor's three-turn script earns a
+    // second continuation too, once the Claim lands); every prompt line
+    // names whichever turn-ended status it answered (`Idle` or `Done` —
+    // build-brief.md §9), not a hardcoded "Idle", since a headless pane
+    // reports `Done` live. A `SinceLastPrompt` line's own `describe()`
+    // (`wirk-herdr/src/run_loop.rs`) embeds `wirk_herdr::git::
+    // fingerprint`'s value, which is itself `"{status}\n{head_sha}"` —
+    // a genuine embedded newline, so that one printed line can arrive
+    // as two physical stdout lines; the "names sending:" half of this
+    // check is not asserted per fragment for that reason.
     assert!(
-        (prompt_lines[0].contains("Idle answered") || prompt_lines[0].contains("Done answered"))
-            && prompt_lines[0].contains("sending:"),
-        "the prompt line must name the turn-ended status it answered (Idle or Done) and the \
-         prompt text sent: {:?}",
-        prompt_lines[0]
+        prompt_lines.len() >= 2,
+        "wirk run's stdout must carry at least the intent prompt and one continuation: \
+         {stdout_lines:?}"
+    );
+    for line in &prompt_lines {
+        assert!(
+            line.contains("Idle answered") || line.contains("Done answered"),
+            "every prompt line must name the turn-ended status it answered (Idle or Done): \
+             {line:?}"
+        );
+    }
+    assert!(
+        prompt_lines
+            .iter()
+            .any(|line| line.contains("first continuation")),
+        "expected a FirstContinuation prompt line (the re-prompt this test pins): \
+         {stdout_lines:?}"
     );
 
     // P2.3 W5 (build-brief.md §9, second gap: the rerun's driver exited
@@ -792,14 +826,28 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
 /// launch, on the actor's very first turn end, one prompt total).
 #[test]
 fn wirk_run_stuck_after_the_first_continuation_exits_4() {
-    let Some(session) =
-        live_herdr::LiveHerdrSession::start("wirk_run_stuck_after_the_first_continuation_exits_4")
-    else {
+    // P2.5 W1 (ruling 0049 D148): two `idle` turns in a row — the
+    // intent earns no baseline (W6), the loop's first continuation
+    // earns an unconditional second prompt (`FirstContinuation`) and
+    // takes its baseline right after, and the scripted actor's second
+    // `idle` turn makes no worktree change, so it must be judged stuck
+    // on every run, not only when a real model happens to repeat
+    // itself.
+    let scripted = scripted_actor::ScriptedActor::install(&["idle", "idle"]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_stuck_after_the_first_continuation_exits_4",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
         return;
     };
-    // Held for the whole test body: this test starts a real opencode
-    // agent against the one local model endpoint (live_herdr.rs).
-    let _live_model_guard = live_herdr::live_model_lock();
 
     let estate_dir = tempfile::tempdir().expect("estate tempdir");
     let estate = estate_dir.path().to_path_buf();
@@ -834,6 +882,7 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
         .args(["--herdr-socket"])
         .arg(session.socket_path())
         .args(["--actor-kind", "opencode"])
+        .env("PATH", &path_env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -931,6 +980,530 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
     assert!(
         stuck_failed.is_some(),
         "expected a journaled RunFailed{{status: stuck}}: {events:?}"
+    );
+
+    let stop = Command::new(wirk_bin())
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// The live twin of `wirk-herdr/tests/run_loop.rs::
+/// retry_does_not_exit_needs_input_on_the_previous_runs_history` (P2.5
+/// W3, ruling 0050 D151): a Work fails once (stuck, same shape as
+/// `wirk_run_stuck_after_the_first_continuation_exits_4` above), is
+/// retried (`wirk work retry`), and the retry's own driver — reading
+/// the real `wirkd watch` stream, which replays the *whole* journal
+/// including the first attempt's own `NeedsInput`-causing `RunFailed`
+/// before ever reaching the retry's own `RunOpened` — reaches `Claimed`
+/// through the scripted actor with no spurious `NeedsInput` printed in
+/// its own stdout.
+#[test]
+fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
+    let stuck_scripted = scripted_actor::ScriptedActor::install(&["idle", "idle"]);
+    let stuck_path_env = scripted_actor_path(&stuck_scripted);
+    let stuck_script_path = stuck_scripted.script_path();
+    let stuck_script_path = stuck_script_path.to_str().expect("script path is utf-8");
+
+    let Some(session1) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_retries_a_stuck_run_and_reaches_claimed_1",
+        &[
+            ("PATH", &stuck_path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", stuck_script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_id, _run1_id, _waypoint) = submit_actor(
+        &estate,
+        &repo,
+        "Reply with the single word waiting and then stop. Do not read or edit any file, do not \
+         run any command, do not run wirk claim, do not ask a question. Whenever you are \
+         prompted again, reply with the single word waiting and stop.",
+    );
+
+    // First attempt: the same "stuck after the first continuation"
+    // shape as the test above -- `wirk run` exits 4, the Work is
+    // `NeedsInput`.
+    let run1_status = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session1.name()])
+        .args(["--herdr-socket"])
+        .arg(session1.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .env("PATH", &stuck_path_env)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("run wirk run (first attempt)");
+    assert_eq!(
+        run1_status.code(),
+        Some(4),
+        "the first attempt must exit 4 (NeedsInput/stuck): {run1_status:?}"
+    );
+    wait_for_event(
+        &estate,
+        &work_id,
+        |kind| matches!(kind, EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck")),
+    );
+    drop(session1); // this attempt's pane/session is done with
+
+    // A retry reserves the *same* Waypoint's World again -- same
+    // `branch`, same `worktree_path` (keyed on `work_id`, not `run_id`,
+    // `executor.rs`'s own `run_command`) -- and `worktree_add` always
+    // `git worktree add -b <branch>` fresh (`git.rs`): reattaching to
+    // an existing worktree/branch is 0050 D151's own carried, separate
+    // finding ("relaunch always tries `git worktree add` fresh and
+    // fails on the existing branch"), not this item's fix. This test's
+    // own cleanup -- removing the first attempt's worktree and branch,
+    // exactly what a human operator does today -- isolates the fix
+    // this item *does* make (the retry race in `observe_watch`) from
+    // that separate, unfixed one.
+    let worktree_path = estate.join("worktrees").join(&work_id);
+    let branch = format!("wirk/{work_id}");
+    let _ = Command::new("git")
+        .current_dir(&repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(&worktree_path)
+        .status();
+    let _ = Command::new("git")
+        .current_dir(&repo)
+        .args(["branch", "-D", &branch])
+        .status();
+
+    // `wirk work retry`: journals a fresh `RunOpened` for a new run id
+    // on the same Waypoint (`handle_retry`, `server.rs`) — the exact
+    // race 0050 D151 named: the next `wirk run`'s own `watch` stream
+    // will replay the first attempt's `RunOpened`/`RunFailed{stuck}`
+    // (which already put the Work in `NeedsInput`) *before* it ever
+    // reaches this new `RunOpened`.
+    let retry = Command::new(wirk_bin())
+        .args(["work", "retry", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id])
+        .output()
+        .expect("wirk work retry runs");
+    assert!(
+        retry.status.success(),
+        "wirk work retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+
+    // Second attempt: a scripted actor that actually claims, in a fresh
+    // session (the scripted actor's script is read from an env var set
+    // once at session start, `scripted_actor.rs`'s own doc).
+    let claims_scripted = scripted_actor::ScriptedActor::install(&[
+        "idle",
+        "edit:report.md:a throwaway repo for the retry's own tried step",
+        "claim:--artifact report.md=report.md",
+    ]);
+    let claims_path_env = scripted_actor_path(&claims_scripted);
+    let claims_script_path = claims_scripted.script_path();
+    let claims_script_path = claims_script_path.to_str().expect("script path is utf-8");
+
+    let Some(session2) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_retries_a_stuck_run_and_reaches_claimed_2",
+        &[
+            ("PATH", &claims_path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", claims_script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let mut run2_child = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session2.name()])
+        .args(["--herdr-socket"])
+        .arg(session2.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .env("PATH", &claims_path_env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wirk run (retry)");
+
+    let run2_stdout = run2_child.stdout.take().expect("wirk run stdout piped");
+    let run2_stdout_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let run2_stdout_reader = {
+        let lines = Arc::clone(&run2_stdout_lines);
+        std::thread::spawn(move || {
+            for line in BufReader::new(run2_stdout).lines().map_while(Result::ok) {
+                lines.lock().unwrap().push(line);
+            }
+        })
+    };
+    let run2_stderr = run2_child.stderr.take().expect("wirk run stderr piped");
+    let run2_stderr_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let run2_stderr_reader = {
+        let lines = Arc::clone(&run2_stderr_lines);
+        std::thread::spawn(move || {
+            for line in BufReader::new(run2_stderr).lines().map_while(Result::ok) {
+                lines.lock().unwrap().push(line);
+            }
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if run2_child.try_wait().ok().flatten().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never observed: wirk run (retry) exiting on its own; stdout so far {:?}",
+            run2_stdout_lines.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let run2_status = run2_child.wait().expect("reap wirk run (retry)");
+    run2_stdout_reader.join().expect("stdout reader thread");
+    run2_stderr_reader.join().expect("stderr reader thread");
+    guard.0.push(run2_child);
+
+    let run2_stdout_lines = run2_stdout_lines.lock().unwrap().clone();
+    let run2_stderr_lines = run2_stderr_lines.lock().unwrap().clone();
+    assert!(
+        run2_status.success(),
+        "the retry's own driver must reach Claimed (exit 0): {run2_status:?}, stdout \
+         {run2_stdout_lines:?}, stderr {run2_stderr_lines:?}"
+    );
+    assert!(
+        !run2_stdout_lines.iter().any(|line| line == "NeedsInput"),
+        "the retry's own driver must never print a spurious NeedsInput from the first \
+         attempt's replayed history: {run2_stdout_lines:?}"
+    );
+
+    let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
+    let events = journal.replay().expect("journal replays cleanly");
+    let run_opened_ids: Vec<RunId> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::RunOpened { run, .. } => Some(run.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        run_opened_ids.len(),
+        2,
+        "expected exactly two RunOpened (the stuck attempt and its retry): {events:?}"
+    );
+    let retry_run_id = &run_opened_ids[1];
+    let claimed_run = events.iter().find_map(|event| match &event.kind {
+        EventKind::ClaimRecorded {
+            claim_kind: ClaimKind::Done,
+            verdict: wirk_core::ClaimVerdict::Validated,
+            ..
+        } => event.run.clone(),
+        _ => None,
+    });
+    assert_eq!(
+        claimed_run.as_ref(),
+        Some(retry_run_id),
+        "the ClaimRecorded{{Done, Validated}} must name the retry's own RunOpened id, not the \
+         first (stuck) attempt's: {events:?}"
+    );
+
+    let stop = Command::new(wirk_bin())
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// P2.5 W4 (BRIEF.md item 3, `orient/two-works.md` §1): two Works, two
+/// scratch repos, one estate/wirkd, **one Herdr session**, two `wirk
+/// run` drivers backgrounded concurrently — each driving its own
+/// workspace (Herdr names a pane `run.id.0`, `wirk-herdr/src/
+/// lib.rs::actor_pane`, so two distinct Runs always get two distinct
+/// panes without any extra flag). The orient found no separate
+/// mechanism is needed for isolation beyond W2's launch-readiness fix:
+/// Herdr's own per-pane subscription filter (`launch_actor` subscribes
+/// scoped to its own `pane_id`) and wirkd's per-Work journal map
+/// already keep one driver from ever seeing the other's events. This
+/// test is the live proof of that read, not a new fix — it pins the
+/// isolation as a fact, not as this wave's own change.
+#[test]
+fn wirk_run_drives_two_works_at_once_with_no_cross_contamination() {
+    let scripted = scripted_actor::ScriptedActor::install(&[
+        "idle",
+        "edit:report.md:a throwaway repo for the two-Works tried step",
+        "claim:--artifact report.md=report.md",
+    ]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    // One Herdr session for both drivers — the isolation this test
+    // pins is Herdr's own per-pane subscription filter and wirkd's
+    // per-Work journal, not two sessions kept apart by construction.
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_drives_two_works_at_once_with_no_cross_contamination",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    // One estate, one wirkd: two Works' journals live side by side
+    // under it (`WirkdState::journals: Mutex<HashMap<WorkId, ...>>`,
+    // `orient/two-works.md` §1) — the isolation under test is between
+    // two Works of one estate, not between two estates.
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+
+    // Two Routes, two scratch repos (keeps each Work's own findings
+    // separate, `orient/two-works.md`'s own "tried step" shape).
+    let repo_a_dir = tempfile::tempdir().expect("repo A tempdir");
+    let repo_a = repo_a_dir.path().to_path_buf();
+    init_repo(&repo_a);
+    let repo_b_dir = tempfile::tempdir().expect("repo B tempdir");
+    let repo_b = repo_b_dir.path().to_path_buf();
+    init_repo(&repo_b);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_a, run_a, _wp_a) = submit_actor_named(
+        &estate,
+        &repo_a,
+        "write report.md, then claim (Work A)",
+        "two_works_a",
+    );
+    let (work_b, run_b, _wp_b) = submit_actor_named(
+        &estate,
+        &repo_b,
+        "write report.md, then claim (Work B)",
+        "two_works_b",
+    );
+    assert_ne!(work_a, work_b, "two submits must open two distinct Works");
+    assert_ne!(run_a, run_b, "two submits must open two distinct Runs");
+
+    // Two drivers, backgrounded concurrently, one session each Run's
+    // own pane lives in — same session name/socket, distinct `--work`.
+    fn spawn_driver(
+        wirk_bin: &str,
+        estate: &Path,
+        work_id: &str,
+        session: &live_herdr::LiveHerdrSession,
+        path_env: &str,
+    ) -> std::process::Child {
+        Command::new(wirk_bin)
+            .args(["run", "--estate"])
+            .arg(estate)
+            .args(["--work", work_id, "--session", session.name()])
+            .args(["--herdr-socket"])
+            .arg(session.socket_path())
+            .args(["--actor-kind", "opencode"])
+            .env("PATH", path_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirk run")
+    }
+
+    let mut driver_a = spawn_driver(wirk_bin(), &estate, &work_a, &session, &path_env);
+    let mut driver_b = spawn_driver(wirk_bin(), &estate, &work_b, &session, &path_env);
+
+    // Capture each driver's own stdout/stderr on a reader thread (the
+    // pattern `wirk_run_retries_a_stuck_run_and_reaches_claimed` already
+    // uses) — needed to assert neither driver ever prints the other's
+    // pane (`run.id.0` names the pane, `actor_pane`), not just to watch
+    // for the exit.
+    fn spawn_line_capture(
+        stream: impl std::io::Read + Send + 'static,
+    ) -> (Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let handle = {
+            let lines = Arc::clone(&lines);
+            std::thread::spawn(move || {
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    lines.lock().unwrap().push(line);
+                }
+            })
+        };
+        (lines, handle)
+    }
+
+    let (stdout_a, stdout_a_join) =
+        spawn_line_capture(driver_a.stdout.take().expect("driver A stdout piped"));
+    let (stderr_a, stderr_a_join) =
+        spawn_line_capture(driver_a.stderr.take().expect("driver A stderr piped"));
+    let (stdout_b, stdout_b_join) =
+        spawn_line_capture(driver_b.stdout.take().expect("driver B stdout piped"));
+    let (stderr_b, stderr_b_join) =
+        spawn_line_capture(driver_b.stderr.take().expect("driver B stderr piped"));
+
+    // Bounded poll (issue 359) — never a product-side wait — for both
+    // children to exit on their own.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let a_done = driver_a.try_wait().ok().flatten().is_some();
+        let b_done = driver_b.try_wait().ok().flatten().is_some();
+        if a_done && b_done {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never observed: both wirk run drivers exiting on their own (A done: {a_done}, B \
+             done: {b_done}); stdout A so far {:?}, stdout B so far {:?}",
+            stdout_a.lock().unwrap(),
+            stdout_b.lock().unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let status_a = driver_a.wait().expect("reap driver A");
+    let status_b = driver_b.wait().expect("reap driver B");
+    stdout_a_join.join().expect("driver A stdout reader");
+    stderr_a_join.join().expect("driver A stderr reader");
+    stdout_b_join.join().expect("driver B stdout reader");
+    stderr_b_join.join().expect("driver B stderr reader");
+    guard.0.push(driver_a);
+    guard.0.push(driver_b);
+
+    let stdout_a = stdout_a.lock().unwrap().clone();
+    let stderr_a = stderr_a.lock().unwrap().clone();
+    let stdout_b = stdout_b.lock().unwrap().clone();
+    let stderr_b = stderr_b.lock().unwrap().clone();
+
+    assert!(
+        status_a.success(),
+        "driver A must reach Claimed (exit 0): {status_a:?}, stdout {stdout_a:?}, stderr \
+         {stderr_a:?}"
+    );
+    assert!(
+        status_b.success(),
+        "driver B must reach Claimed (exit 0): {status_b:?}, stdout {stdout_b:?}, stderr \
+         {stderr_b:?}"
+    );
+    assert!(
+        stdout_a.iter().any(|line| line == "Claimed"),
+        "driver A stdout must print Claimed: {stdout_a:?}"
+    );
+    assert!(
+        stdout_b.iter().any(|line| line == "Claimed"),
+        "driver B stdout must print Claimed: {stdout_b:?}"
+    );
+
+    // Neither driver's own stdout/stderr ever names the other's pane.
+    // Herdr names a pane `run.id.0` (`actor_pane`), so the other Run's
+    // id string is the pane's own name — the exact thing that must
+    // never leak across the per-pane subscription filter.
+    for line in stdout_a.iter().chain(stderr_a.iter()) {
+        assert!(
+            !line.contains(&run_b),
+            "driver A (Run {run_a}) printed a line naming driver B's own pane/Run {run_b}: \
+             {line:?}"
+        );
+    }
+    for line in stdout_b.iter().chain(stderr_b.iter()) {
+        assert!(
+            !line.contains(&run_a),
+            "driver B (Run {run_b}) printed a line naming driver A's own pane/Run {run_a}: \
+             {line:?}"
+        );
+    }
+
+    // Each Work's own journal names only its own Run/Waypoint — no
+    // cross-Work event ever lands in the wrong journal (wirkd's
+    // per-Work journal map, `orient/two-works.md` §1).
+    let journal_a = Journal::open(estate.join("works").join(&work_a)).expect("open journal A");
+    let events_a = journal_a.replay().expect("journal A replays cleanly");
+    let journal_b = Journal::open(estate.join("works").join(&work_b)).expect("open journal B");
+    let events_b = journal_b.replay().expect("journal B replays cleanly");
+
+    fn run_ids_named(events: &[wirk_core::Event]) -> std::collections::BTreeSet<String> {
+        events
+            .iter()
+            .filter_map(|event| event.run.as_ref().map(|run| run.0.clone()))
+            .collect()
+    }
+    let run_ids_a = run_ids_named(&events_a);
+    let run_ids_b = run_ids_named(&events_b);
+    assert_eq!(
+        run_ids_a,
+        std::collections::BTreeSet::from([run_a.clone()]),
+        "Work A's journal must name only its own Run: {events_a:?}"
+    );
+    assert_eq!(
+        run_ids_b,
+        std::collections::BTreeSet::from([run_b.clone()]),
+        "Work B's journal must name only its own Run: {events_b:?}"
+    );
+
+    let claimed_a = events_a.iter().any(|event| {
+        matches!(
+            &event.kind,
+            EventKind::ClaimRecorded {
+                claim_kind: ClaimKind::Done,
+                verdict: wirk_core::ClaimVerdict::Validated,
+                ..
+            }
+        )
+    });
+    assert!(
+        claimed_a,
+        "expected Work A ClaimRecorded{{Done, Validated}}"
+    );
+    let claimed_b = events_b.iter().any(|event| {
+        matches!(
+            &event.kind,
+            EventKind::ClaimRecorded {
+                claim_kind: ClaimKind::Done,
+                verdict: wirk_core::ClaimVerdict::Validated,
+                ..
+            }
+        )
+    });
+    assert!(
+        claimed_b,
+        "expected Work B ClaimRecorded{{Done, Validated}}"
     );
 
     let stop = Command::new(wirk_bin())

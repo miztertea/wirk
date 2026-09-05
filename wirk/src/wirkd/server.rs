@@ -44,7 +44,7 @@
 //! it has no other way to write to the journal (`FailPayload`'s own
 //! doc).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -238,6 +238,11 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
         watchers: Mutex::new(HashMap::new()),
     });
 
+    // W5 (0035 D110): before this listener starts accepting
+    // connections, re-adopt any docker containers a prior, killed
+    // `wirkd` left running (module doc above `recover_docker_runs`).
+    recover_docker_runs(&state);
+
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let state = Arc::clone(&state);
@@ -424,7 +429,7 @@ fn remove_owned_containers(estate_root: &Path) {
 /// '{{.Names}}'`, one name per line — an empty set (no `docker`
 /// binary, no daemon reachable, or genuinely none managed) is not an
 /// error here, just nothing to remove.
-fn managed_container_names() -> std::collections::HashSet<String> {
+fn managed_container_names() -> HashSet<String> {
     let output = std::process::Command::new("docker")
         .arg("ps")
         .arg("-a")
@@ -441,6 +446,267 @@ fn managed_container_names() -> std::collections::HashSet<String> {
             .collect(),
         _ => Default::default(),
     }
+}
+
+// ---- W5: the docker recovery sweep (0035 D110) ------------------------
+//
+// Run once at `run()`'s own startup, before the listener's `.incoming()`
+// loop starts accepting connections (`orient/two-works.md` §2): a
+// `wirkd` that was `SIGKILL`ed with a docker Run still live leaves the
+// container running under `dockerd` regardless (nothing in the docker
+// executor ties the container's life to `wirkd`'s own pid, module doc
+// `executors/docker.rs`) — what breaks is only the path back to the
+// journal. At restart there are exactly two states for an open
+// Deterministic Run's container: still known to the daemon (running,
+// since every container launches with `--rm` and the daemon removes it
+// the instant it exits — module doc `executors/docker.rs`, confirmed by
+// this wave's own probe below), or entirely gone. Re-adopt the first,
+// journal `RunVanished` for the second — nothing between.
+
+/// One open Deterministic Run read from a Work's journal, paired with
+/// the World reserved for its Waypoint. Pure and docker-free (R2: same
+/// journal-walk shape `remove_owned_containers` already uses) so the
+/// unit test can feed it a throwaway `works/` directory with no daemon
+/// at all.
+pub(crate) fn open_deterministic_runs(
+    estate_root: &Path,
+) -> Vec<(WorkId, RunId, DeterministicWorld)> {
+    let works_dir = estate_root.join("works");
+    let Ok(entries) = std::fs::read_dir(&works_dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(journal) = Journal::open(&dir) else {
+            continue;
+        };
+        let Ok(events) = journal.replay() else {
+            continue;
+        };
+        let Some(work_id) = events.first().map(|event| event.work.clone()) else {
+            continue;
+        };
+        for event in &events {
+            let EventKind::RunOpened { run: run_id, .. } = &event.kind else {
+                continue;
+            };
+            let Some(run) = find_run(&events, run_id) else {
+                continue;
+            };
+            if !matches!(run.state, RunState::Open) {
+                continue;
+            }
+            if let Some(World::Deterministic(det)) = world_for_waypoint(&events, &run.waypoint) {
+                found.push((work_id.clone(), run_id.clone(), det));
+            }
+        }
+    }
+    found
+}
+
+/// One matched outcome for an open Deterministic Run against the
+/// daemon's own `io.wirk.managed` listing.
+#[derive(Debug)]
+pub(crate) enum RunMatch {
+    /// `wirk-<run_id>` is still known to the daemon: re-adopt it.
+    Reattach {
+        work_id: WorkId,
+        run_id: RunId,
+        world: DeterministicWorld,
+        container_name: String,
+    },
+    /// `wirk-<run_id>` is gone: removed by its own `--rm` after
+    /// exiting, or never a docker Run at all (indistinguishable from
+    /// the journal alone — both mean the same thing here, and a late
+    /// Claim from a still-alive non-docker executor is honored
+    /// regardless, `Run::apply`'s own Vanished-to-Claimed path, D9#5).
+    Vanished { work_id: WorkId, run_id: RunId },
+}
+
+/// Matches `open_runs` (from `open_deterministic_runs`) against
+/// `managed` (from `managed_container_names`, injected here so the unit
+/// test needs no daemon): one `RunMatch` per open Run, plus the names
+/// in `managed` matched to none of them — a labelled container whose
+/// Run is not open in any journal, left alone by the caller.
+pub(crate) fn match_docker_runs(
+    open_runs: Vec<(WorkId, RunId, DeterministicWorld)>,
+    managed: &HashSet<String>,
+) -> (Vec<RunMatch>, Vec<String>) {
+    let mut matches = Vec::new();
+    let mut named = HashSet::new();
+    for (work_id, run_id, world) in open_runs {
+        let container_name = format!("wirk-{}", run_id.0);
+        named.insert(container_name.clone());
+        if managed.contains(&container_name) {
+            matches.push(RunMatch::Reattach {
+                work_id,
+                run_id,
+                world,
+                container_name,
+            });
+        } else {
+            matches.push(RunMatch::Vanished { work_id, run_id });
+        }
+    }
+    let unmatched = managed
+        .iter()
+        .filter(|name| !named.contains(*name))
+        .cloned()
+        .collect();
+    (matches, unmatched)
+}
+
+/// Called once from `run()`, before the listener starts accepting
+/// connections. Best-effort throughout, same discipline as
+/// `remove_owned_containers`: an empty estate or no `docker` binary
+/// mean nothing to recover, not an error.
+fn recover_docker_runs(state: &Arc<WirkdState>) {
+    let open_runs = open_deterministic_runs(&state.estate_root);
+    if open_runs.is_empty() {
+        return;
+    }
+    let managed = managed_container_names();
+    let (matches, unmatched) = match_docker_runs(open_runs, &managed);
+    for name in unmatched {
+        eprintln!(
+            "wirkd: labelled container {name} matches no open Run in any journal, left alone"
+        );
+    }
+    for m in matches {
+        match m {
+            RunMatch::Vanished { work_id, run_id } => {
+                handle_record(
+                    state,
+                    RecordPayload {
+                        work_id,
+                        run: Some(run_id),
+                        kind: EventKind::RunVanished,
+                    },
+                );
+            }
+            RunMatch::Reattach {
+                work_id,
+                run_id,
+                world,
+                container_name,
+            } => {
+                let state = Arc::clone(state);
+                std::thread::spawn(move || {
+                    reattach_docker_run(&state, work_id, run_id, world, container_name)
+                });
+            }
+        }
+    }
+}
+
+/// Blocks on `docker wait <container_name>` (R4; ruling 0044: no
+/// timer, no poll — the container's own exit is the state waited on)
+/// then files the Run's outcome the way `DockerExecutor::finish_exit`
+/// does for a Run it launched itself: a clean exit's declared artifacts
+/// as a validated Claim, a non-zero exit's code and best-effort log
+/// tail as a `RunFailed` — both through the narrower exit-code-only
+/// path (`orient/two-works.md` §2 J0), reusing `handle_claim`/
+/// `handle_fail` directly since this call already runs inside `wirkd`
+/// and holds the same `state` those handlers take, no socket round
+/// trip needed. Re-checks the Run is still `Open` right before filing:
+/// the original `wirk run-deterministic` process that launched this
+/// container may still be alive, attached via its own `docker start
+/// -a`, and may have already filed the outcome itself once `wirkd`
+/// came back up — filing again would be a harmless but redundant
+/// second `ClaimRecorded`/`RunFailed`, avoided here instead.
+fn reattach_docker_run(
+    state: &Arc<WirkdState>,
+    work_id: WorkId,
+    run_id: RunId,
+    world: DeterministicWorld,
+    container_name: String,
+) {
+    let wait_output = Command::new("docker")
+        .arg("wait")
+        .arg(&container_name)
+        .output();
+    let exit_code = match wait_output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<i32>()
+            .unwrap_or(-1),
+        _ => -1,
+    };
+
+    let still_open = journal_for(state, &work_id).ok().is_some_and(|journal| {
+        let journal = journal.lock().unwrap_or_else(|p| p.into_inner());
+        journal
+            .replay()
+            .ok()
+            .and_then(|events| find_run(&events, &run_id))
+            .is_some_and(|run| matches!(run.state, RunState::Open))
+    });
+    if !still_open {
+        eprintln!(
+            "wirkd: {container_name} exited but Run {} is no longer Open, not re-filing",
+            run_id.0
+        );
+        return;
+    }
+
+    let triple = ExecutionTriple {
+        estate_root: state.estate_root.display().to_string(),
+        work_id: work_id.clone(),
+        run_id: run_id.clone(),
+    };
+
+    if exit_code == 0 {
+        let artifacts: BTreeMap<String, String> = world
+            .expected_artifacts
+            .0
+            .iter()
+            .map(|spec| {
+                (
+                    spec.name.clone(),
+                    world.cwd.join(&spec.name).display().to_string(),
+                )
+            })
+            .collect();
+        handle_claim(
+            state,
+            ClaimPayload {
+                triple,
+                kind: ClaimKind::Done,
+                artifacts,
+            },
+        );
+        return;
+    }
+
+    // Best-effort only: the container may already be gone by the time
+    // this runs (`--rm` races the daemon's own removal, same hazard
+    // `executors/docker.rs`'s own module doc names for a post-hoc
+    // `docker logs`) — an unreadable log is not itself evidence of
+    // anything, so a failed read leaves `detail` empty rather than
+    // failing the whole outcome.
+    let detail = Command::new("docker")
+        .arg("logs")
+        .arg(&container_name)
+        .output()
+        .ok()
+        .map(|out| {
+            let mut combined = out.stdout;
+            combined.extend_from_slice(&out.stderr);
+            let start = combined.len().saturating_sub(4096);
+            String::from_utf8_lossy(&combined[start..]).into_owned()
+        });
+    handle_fail(
+        state,
+        FailPayload {
+            triple,
+            status: Some(exit_code.to_string()),
+            detail,
+        },
+    );
 }
 
 fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {

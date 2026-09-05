@@ -23,8 +23,8 @@ use tempfile::tempdir;
 
 use wirk_core::{
     ActorKind, ActorWorld, ArtifactSpec, Boundary, ClaimId, ClaimKind, ClaimVerdict, Event,
-    EventId, EventKind, ExecutionTriple, OutputContract, RouteId, Run, RunId, RunState, Timestamp,
-    WaypointId, WorkId, World, WorldHash,
+    EventId, EventKind, ExecutionTriple, FailureCause, OutputContract, RouteId, Run, RunId,
+    RunState, Timestamp, WaypointId, WorkId, World, WorldHash,
 };
 use wirk_herdr::fake::FakeHerdrClient;
 use wirk_herdr::run_loop::{FakeWirkdApi, Outcome, RunLoop, RunLoopError};
@@ -135,6 +135,37 @@ fn claim_recorded_done(claim_id: &str) -> EventKind {
         claim: ClaimId(claim_id.to_string()),
         claim_kind: ClaimKind::Done,
         verdict: ClaimVerdict::Validated,
+    }
+}
+
+fn waypoint_reserved(run: &Run, world: World) -> EventKind {
+    EventKind::WaypointReserved {
+        waypoint: run.waypoint.clone(),
+        world_hash: run.world_hash.clone(),
+        world,
+    }
+}
+
+fn run_launched(run: &Run) -> EventKind {
+    EventKind::RunLaunched {
+        run: run.id.clone(),
+        actor_kind: run.kind,
+    }
+}
+
+/// The exact `RunFailed` shape read from the live journal (0050 D151,
+/// `wirkd-watch-a2.ndjson`): `agent_pane_busy`, the cause P2.4's own
+/// tried step actually hit.
+fn run_failed_agent_pane_busy() -> EventKind {
+    EventKind::RunFailed {
+        cause: FailureCause {
+            status: None,
+            request_id: None,
+            at: Timestamp(0),
+            detail: Some(
+                "invalid: agent_pane_busy: agent target pane is not an available shell".to_string(),
+            ),
+        },
     }
 }
 
@@ -411,6 +442,106 @@ fn needs_input_on_the_watch_stream_stops_the_loop() {
     wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_question("c1")));
     let outcome = handle.join().unwrap().expect("drive");
     assert_eq!(outcome, Outcome::NeedsInput);
+}
+
+// ---- (4b) P2.5 W3: the retry race (0050 D151) ------------------------------
+//
+// `wirkd::watch` always replays the *entire* journal before live-tailing
+// (`handle_watch_connection`), so a retry's own driver is handed the
+// previous attempt's `RunOpened`/`RunFailed` before it ever reaches the
+// retry's own `RunOpened` -- the one event whose fold arm clears
+// `NeedsInput` back to `Active`. Before the fix, `observe_watch` decided
+// `NeedsInput` off of every pushed event, including that stale prefix,
+// and returned before the retry's own `RunOpened` (let alone its Claim)
+// was ever read from the channel.
+
+/// (a) The exact P2.4 sequence (`wirkd-watch-a2.ndjson`): attempt 1 opens,
+/// launches, and fails `agent_pane_busy` (the `NeedsInput`-causing
+/// event) -- all *before* the retry's own `RunOpened` for `run-2`, the
+/// Run this `RunLoop` is actually driving. Red before the fix: the loop
+/// folds the stale `RunFailed` before `run-2`'s own `RunOpened` is ever
+/// pushed and returns `Outcome::NeedsInput` right there, so the drive
+/// never reaches `run-2`'s own Claim below and this assertion fails.
+#[test]
+fn retry_does_not_exit_needs_input_on_the_previous_runs_history() {
+    let run1 = open_run("run-1");
+    let run2 = open_run("run-2");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run2, dir.path());
+    let (client, _herdr_tx) = client_for(&run2);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client, wirkd.clone());
+
+    let handle = spawn_drive(loop_, run2.clone(), world.clone());
+
+    wirkd.push_watch_event(watch_event(None, work_submitted()));
+    wirkd.push_watch_event(watch_event(None, waypoint_reserved(&run1, world.clone())));
+    wirkd.push_watch_event(watch_event(Some(&run1.id), run_opened(&run1)));
+    wirkd.push_watch_event(watch_event(Some(&run1.id), run_launched(&run1)));
+    wirkd.push_watch_event(watch_event(Some(&run1.id), run_failed_agent_pane_busy()));
+    // Attempt 1's own `RunFailed` already put the Work in `NeedsInput`
+    // (0050 D151's actual journal has no separate refusal event for
+    // this cause -- `RunFailed` alone is the cause here, per fold.md
+    // §1). `wirk work retry` reserves the same waypoint again and opens
+    // a fresh Run:
+    wirkd.push_watch_event(watch_event(None, waypoint_reserved(&run2, world.clone())));
+    wirkd.push_watch_event(watch_event(Some(&run2.id), run_opened(&run2)));
+    wirkd.push_watch_event(watch_event(Some(&run2.id), run_launched(&run2)));
+    wirkd.push_watch_event(watch_event(Some(&run2.id), claim_recorded_done("c1")));
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(
+        outcome,
+        Outcome::Claimed,
+        "the retry's own RunOpened must clear the previous attempt's \
+         NeedsInput before this Run's own Claim is ever reached -- a \
+         stale replayed prefix must never end the drive early"
+    );
+}
+
+/// (b) No retry at all: this Run's own `RunOpened`, then a `RunFailed`
+/// for the *same* Run. The gate (§7.1) hides only a stale prefix from
+/// *before* this Run's own `RunOpened`, never a real failure of this
+/// Run itself -- `NeedsInput` must still surface exactly as today.
+#[test]
+fn run_failed_for_this_run_after_its_own_run_opened_still_surfaces_needs_input() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client, wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    wirkd.push_watch_event(watch_event(None, work_submitted()));
+    wirkd.push_watch_event(watch_event(Some(&run.id), run_opened(&run)));
+    wirkd.push_watch_event(watch_event(Some(&run.id), run_failed_agent_pane_busy()));
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+}
+
+/// (c) A Claim for this Run arriving after its own `RunOpened`: `Claimed`,
+/// unaffected by the §7.1 gate -- `Claimed` is decided from `Run::apply`
+/// alone, which already ignores any event that does not name this Run.
+#[test]
+fn claim_for_this_run_after_its_own_run_opened_is_claimed() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client, wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    wirkd.push_watch_event(watch_event(None, work_submitted()));
+    wirkd.push_watch_event(watch_event(Some(&run.id), run_opened(&run)));
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
 }
 
 // ---- (5) either stream closing --------------------------------------------

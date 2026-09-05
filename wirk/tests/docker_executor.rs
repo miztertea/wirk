@@ -29,10 +29,12 @@ use std::time::{Duration, Instant};
 
 use executors::docker::{DockerExecutor, DockerExecutorError, create_argv};
 use wirk_core::{
-    DeterministicWorld, ExecutionTriple, Executor, OutputContract, Run, RunId, RunObservation,
-    RunState, WaypointId, WorkId, World, WorldHash,
+    Access, DeterministicWorld, EventId, EventKind, ExecutionTriple, Executor, Journal,
+    OutputContract, RepositoryBinding, RouteId, Run, RunId, RunObservation, RunState, Timestamp,
+    WaypointId, WorkId, World, WorldHash,
 };
 use wirkd::WirkdPointer;
+use wirkd::server::{RunMatch, match_docker_runs, open_deterministic_runs};
 
 // ---- shared fixtures (R2: same shape as `child_executor.rs`'s) --------
 
@@ -446,4 +448,603 @@ fn d5_10_docker_live_nonzero_exit_is_failed_with_status() {
             .any(|name| name == container_name)),
         "container {container_name} was not removed by --rm"
     );
+}
+
+// ---- W5: the docker recovery sweep's matching logic (0035 D110) -------
+//
+// `open_deterministic_runs`/`match_docker_runs` are pure (no `docker`
+// call in either): the docker listing is injected as a `HashSet` here,
+// same as `orient/build-brief.md`'s own "(a) a unit test of the
+// matching (containers listed, journals read, the three cases) with
+// the docker listing injected" (R2: same journal-fixture shape
+// `wirk-core/tests/needs_input.rs` already uses, duplicated per that
+// file's own precedent — `wirk-core`'s tests are out of this wave's
+// allow-list, `wirk`'s own crate has no such helper yet).
+
+fn sweep_event(id: &str, work: &str, run: Option<&str>, kind: EventKind) -> wirk_core::Event {
+    wirk_core::Event {
+        id: EventId(id.to_string()),
+        work: WorkId(work.to_string()),
+        run: run.map(|r| RunId(r.to_string())),
+        at: Timestamp(0),
+        kind,
+    }
+}
+
+fn sweep_work_submitted(waypoints: Vec<&str>) -> EventKind {
+    EventKind::WorkSubmitted {
+        route: RouteId("route-1".to_string()),
+        repositories: vec![RepositoryBinding {
+            name: "wirk".to_string(),
+            access: Access::Write,
+        }],
+        intent: "run the thing".to_string(),
+        waypoints: waypoints
+            .into_iter()
+            .map(|wp| WaypointId(wp.to_string()))
+            .collect(),
+        waypoint_defs: Vec::new(),
+    }
+}
+
+fn sweep_waypoint_reserved(waypoint: &str, cwd: &Path) -> EventKind {
+    EventKind::WaypointReserved {
+        waypoint: WaypointId(waypoint.to_string()),
+        world_hash: WorldHash("deadbeef".to_string()),
+        world: World::Deterministic(DeterministicWorld {
+            command: vec!["true".to_string()],
+            base_sha: "abc123".to_string(),
+            cwd: cwd.to_path_buf(),
+            env: BTreeMap::new(),
+            expected_artifacts: OutputContract(vec![wirk_core::ArtifactSpec {
+                name: "report.md".to_string(),
+                required: true,
+            }]),
+        }),
+    }
+}
+
+fn sweep_run_opened(run: &str, waypoint: &str) -> EventKind {
+    EventKind::RunOpened {
+        run: RunId(run.to_string()),
+        waypoint: WaypointId(waypoint.to_string()),
+        attempt: 1,
+        world_hash: WorldHash("deadbeef".to_string()),
+    }
+}
+
+/// Writes one Work's journal (`<works_dir>/<work_id>/journal.ndjson`)
+/// with `events` appended in order — the on-disk shape
+/// `open_deterministic_runs` reads with `Journal::open`/`replay`, same
+/// as a real `wirkd` ever produces.
+fn write_sweep_journal(works_dir: &Path, work_id: &str, events: &[wirk_core::Event]) {
+    let dir = works_dir.join(work_id);
+    let mut journal = Journal::open(&dir).expect("journal opens");
+    for event in events {
+        journal.append(event).expect("journal appends");
+    }
+}
+
+/// The three cases named in `orient/build-brief.md`'s W5 test (a): an
+/// open Deterministic Run whose container the daemon still lists is
+/// re-adopted; one the daemon has no record of (removed by its own
+/// `--rm`, or never a docker Run at all) is vanished; a Run already
+/// `Claimed` before the sweep ever runs is not an open Run at all and
+/// never appears in either list. A managed container name matching no
+/// open Run in any journal is reported separately, left alone by the
+/// caller (`recover_docker_runs`'s own `eprintln!`, not exercised here
+/// — this test pins the matching, not the stderr line).
+#[test]
+fn d5_11_sweep_matches_open_runs_against_the_injected_docker_listing() {
+    let estate = tempfile::tempdir().expect("estate tempdir");
+    let works_dir = estate.path().join("works");
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+
+    // Work "a": one open Deterministic Run whose container the daemon
+    // still lists -- re-adopted.
+    write_sweep_journal(
+        &works_dir,
+        "work-a",
+        &[
+            sweep_event("ev-a1", "work-a", None, sweep_work_submitted(vec!["wp-1"])),
+            sweep_event(
+                "ev-a2",
+                "work-a",
+                None,
+                sweep_waypoint_reserved("wp-1", cwd.path()),
+            ),
+            sweep_event(
+                "ev-a3",
+                "work-a",
+                Some("run-a"),
+                sweep_run_opened("run-a", "wp-1"),
+            ),
+        ],
+    );
+
+    // Work "b": one open Deterministic Run whose container the daemon
+    // has no record of -- vanished.
+    write_sweep_journal(
+        &works_dir,
+        "work-b",
+        &[
+            sweep_event("ev-b1", "work-b", None, sweep_work_submitted(vec!["wp-1"])),
+            sweep_event(
+                "ev-b2",
+                "work-b",
+                None,
+                sweep_waypoint_reserved("wp-1", cwd.path()),
+            ),
+            sweep_event(
+                "ev-b3",
+                "work-b",
+                Some("run-b"),
+                sweep_run_opened("run-b", "wp-1"),
+            ),
+        ],
+    );
+
+    // Work "c": a Run already Claimed before the sweep runs -- not
+    // open, must not appear in either list even though the daemon
+    // (deliberately) also lists its container name.
+    write_sweep_journal(
+        &works_dir,
+        "work-c",
+        &[
+            sweep_event("ev-c1", "work-c", None, sweep_work_submitted(vec!["wp-1"])),
+            sweep_event(
+                "ev-c2",
+                "work-c",
+                None,
+                sweep_waypoint_reserved("wp-1", cwd.path()),
+            ),
+            sweep_event(
+                "ev-c3",
+                "work-c",
+                Some("run-c"),
+                sweep_run_opened("run-c", "wp-1"),
+            ),
+            sweep_event(
+                "ev-c4",
+                "work-c",
+                Some("run-c"),
+                EventKind::ClaimRecorded {
+                    claim: wirk_core::ClaimId("claim-c".to_string()),
+                    claim_kind: wirk_core::ClaimKind::Done,
+                    verdict: wirk_core::ClaimVerdict::Validated,
+                },
+            ),
+        ],
+    );
+
+    let open_runs = open_deterministic_runs(estate.path());
+    let open_run_ids: std::collections::BTreeSet<String> = open_runs
+        .iter()
+        .map(|(_, run_id, _)| run_id.0.clone())
+        .collect();
+    assert_eq!(
+        open_run_ids,
+        std::collections::BTreeSet::from(["run-a".to_string(), "run-b".to_string()]),
+        "run-c is Claimed, not open, and must be excluded"
+    );
+
+    let managed: std::collections::HashSet<String> = [
+        "wirk-run-a".to_string(),
+        "wirk-run-c".to_string(),
+        "wirk-run-extra".to_string(),
+    ]
+    .into_iter()
+    .collect();
+    let (matches, unmatched) = match_docker_runs(open_runs, &managed);
+
+    assert_eq!(matches.len(), 2, "one match per open Run: {matches:?}");
+    let mut reattached = None;
+    let mut vanished = None;
+    for m in &matches {
+        match m {
+            RunMatch::Reattach {
+                run_id,
+                container_name,
+                ..
+            } => reattached = Some((run_id.0.clone(), container_name.clone())),
+            RunMatch::Vanished { run_id, .. } => vanished = Some(run_id.0.clone()),
+        }
+    }
+    assert_eq!(
+        reattached,
+        Some(("run-a".to_string(), "wirk-run-a".to_string())),
+        "run-a's container is in the managed listing: re-adopt"
+    );
+    assert_eq!(
+        vanished,
+        Some("run-b".to_string()),
+        "run-b's container is not in the managed listing: vanished"
+    );
+
+    // "wirk-run-c" (Claimed, never an open Run) and "wirk-run-extra"
+    // (never journaled at all) both match no open Run -- left alone.
+    let unmatched: std::collections::BTreeSet<String> = unmatched.into_iter().collect();
+    assert_eq!(
+        unmatched,
+        std::collections::BTreeSet::from(["wirk-run-c".to_string(), "wirk-run-extra".to_string()]),
+    );
+}
+
+/// A restart with no open Runs at all must not scan/hang (the build
+/// brief's own probe): an estate with no `works/` directory yet finds
+/// nothing, and one whose only Work is already `Claimed` finds nothing
+/// either.
+#[test]
+fn d5_12_sweep_finds_nothing_when_no_run_is_open() {
+    let estate = tempfile::tempdir().expect("estate tempdir");
+    assert!(
+        open_deterministic_runs(estate.path()).is_empty(),
+        "no works/ directory at all: nothing to recover"
+    );
+
+    let works_dir = estate.path().join("works");
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    write_sweep_journal(
+        &works_dir,
+        "work-done",
+        &[
+            sweep_event(
+                "ev-1",
+                "work-done",
+                None,
+                sweep_work_submitted(vec!["wp-1"]),
+            ),
+            sweep_event(
+                "ev-2",
+                "work-done",
+                None,
+                sweep_waypoint_reserved("wp-1", cwd.path()),
+            ),
+            sweep_event(
+                "ev-3",
+                "work-done",
+                Some("run-done"),
+                sweep_run_opened("run-done", "wp-1"),
+            ),
+            sweep_event(
+                "ev-4",
+                "work-done",
+                Some("run-done"),
+                EventKind::ClaimRecorded {
+                    claim: wirk_core::ClaimId("claim-done".to_string()),
+                    claim_kind: wirk_core::ClaimKind::Done,
+                    verdict: wirk_core::ClaimVerdict::Validated,
+                },
+            ),
+        ],
+    );
+    assert!(
+        open_deterministic_runs(estate.path()).is_empty(),
+        "the only Work is already Claimed: nothing open to recover"
+    );
+}
+
+// ---- W5: the docker recovery sweep, live (0035 D110) -------------------
+//
+// A real workload sized to genuinely outlive a `wirkd` kill (2 GiB
+// through `dd`+`sha256sum`, measured on this box at ~10s under
+// `alpine:3.24` — the size is the workload, not a timer, `orient/
+// build-brief.md` W5's own instruction) — never a `sleep`. Both tests
+// launch the container through a `DockerExecutor` constructed directly
+// in this test process, the same technique `d5_9` already uses for its
+// "the wirkd half is real" live round trip, and deliberately never call
+// `.wait()`/`.poll()` on it: the whole point of `recover_docker_runs`
+// is the case where nothing else is left to file the Run's outcome once
+// `wirkd` dies (`orient/two-works.md` §2: "what breaks is only the path
+// back to the journal, if run-deterministic is also gone or its
+// claim-filing call to the dead wirkd fails") — calling `.wait()` here
+// too would race the sweep's own `docker wait` thread for the same
+// container's exit and could file the outcome twice, an unrelated
+// hazard this pair of tests is built to avoid, not to exercise.
+
+/// Polls `docker ps --filter name=<name> --format {{.Status}}` until it
+/// starts with `Up` (a state read, not a timer) — the workload really
+/// is running before `wirkd` is killed out from under it.
+fn wait_for_container_up(name: &str, deadline: Duration) {
+    let start = Instant::now();
+    loop {
+        let output = Command::new("docker")
+            .arg("ps")
+            .arg("--filter")
+            .arg(format!("name={name}"))
+            .arg("--format")
+            .arg("{{.Status}}")
+            .output()
+            .expect("docker ps");
+        if String::from_utf8_lossy(&output.stdout).starts_with("Up") {
+            return;
+        }
+        assert!(
+            start.elapsed() < deadline,
+            "container {name} never reached Up within the deadline"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Reads `<estate>/.wirk/wirkd.json` until it parses **and** names
+/// `expected_pid` — never the stale pointer a just-restarted wirkd's
+/// predecessor left behind (the file is only overwritten once the new
+/// process's own listener is bound and `write_pointer` runs, `server.rs`
+/// module doc: "before wirkd does anything else observable").
+fn wait_for_pointer_pid(estate: &Path, expected_pid: u32) -> WirkdPointer {
+    let path = estate.join(".wirk").join("wirkd.json");
+    let deadline = Instant::now() + POLL_DEADLINE;
+    loop {
+        if let Ok(bytes) = fs::read(&path)
+            && let Ok(pointer) = serde_json::from_slice::<WirkdPointer>(&bytes)
+            && pointer.pid == expected_pid
+        {
+            return pointer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wirkd pointer never named the restarted pid {expected_pid} at {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `wirk wirkd start --estate <estate>` as a child, `KillWirkdOnDrop`-
+/// guarded (R2, `d5_9`'s own helper shape).
+fn spawn_wirkd(estate: &Path) -> KillWirkdOnDrop {
+    KillWirkdOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_wirk"))
+            .args(["wirkd", "start", "--estate"])
+            .arg(estate)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    )
+}
+
+const REAL_WORKLOAD: &str =
+    "dd if=/dev/urandom bs=1M count=2048 2>/dev/null | sha256sum > report.md";
+
+fn journal_events(estate: &Path, work_id: &str) -> Vec<wirk_core::Event> {
+    let journal_path = estate.join("works").join(work_id);
+    wirk_core::Journal::open(&journal_path)
+        .and_then(|journal| journal.replay())
+        .unwrap_or_default()
+}
+
+/// (b): a docker Run outliving a `wirkd` kill is re-adopted at restart
+/// and reaches `Claimed` with no other process ever filing its outcome.
+#[test]
+#[ignore]
+fn d5_13_docker_live_wirkd_restart_reattaches_a_running_container_to_claimed() {
+    if !docker_live_enabled() {
+        eprintln!("skipped: set WIRK_DOCKER_LIVE=1 to run");
+        return;
+    }
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+
+    let wirkd1 = spawn_wirkd(&estate);
+    wait_for_pointer_live(&estate);
+    let (work_id, run_id, waypoint) =
+        submit_deterministic(&estate, "abc123", &["sh", "-c", REAL_WORKLOAD]);
+
+    let executor = DockerExecutor::new(estate.clone(), WorkId(work_id.clone()));
+    let run = open_run(&run_id);
+    let run = Run {
+        waypoint: WaypointId(waypoint),
+        ..run
+    };
+    let artifacts = OutputContract(vec![wirk_core::ArtifactSpec {
+        name: "report.md".to_string(),
+        required: true,
+    }]);
+    let world = deterministic_world(vec!["sh", "-c", REAL_WORKLOAD], &estate, artifacts);
+    executor.launch(&run, &world).expect("launch");
+    let container_name = executor
+        .container_name(&run.id)
+        .expect("container name recorded after launch");
+    let _guard = RemoveContainerOnDrop(container_name.clone());
+
+    wait_for_container_up(&container_name, POLL_DEADLINE);
+
+    // Ruling 0035 D110's own scenario: SIGKILL, no clean shutdown, no
+    // pointer/socket cleanup left behind.
+    let old_pid = wirkd1.0.id();
+    Command::new("kill")
+        .arg("-9")
+        .arg(old_pid.to_string())
+        .output()
+        .expect("kill -9 runs");
+    // `wirkd1` is intentionally left to drop normally below (its own
+    // Drop's kill/wait on an already-dead pid is a harmless no-op, the
+    // same discipline `RemoveContainerOnDrop` uses for an already-gone
+    // container).
+
+    let mut wirkd2 = spawn_wirkd(&estate);
+    let new_pid = wirkd2.0.id();
+    wait_for_pointer_pid(&estate, new_pid);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let events = loop {
+        let events = journal_events(&estate, &work_id);
+        if events.iter().any(|e| {
+            e.run.as_ref().map(|r| r.0.as_str()) == Some(run_id.as_str())
+                && matches!(
+                    &e.kind,
+                    EventKind::ClaimRecorded {
+                        verdict: wirk_core::ClaimVerdict::Validated,
+                        ..
+                    }
+                )
+        }) {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the restarted wirkd's sweep never re-adopted {container_name} to a validated Claim; \
+             journal so far: {events:?}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+
+    let run_opened_count = events
+        .iter()
+        .filter(|e| matches!(&e.kind, EventKind::RunOpened { run, .. } if run.0 == run_id))
+        .count();
+    let claimed_count = events
+        .iter()
+        .filter(|e| {
+            e.run.as_ref().map(|r| r.0.as_str()) == Some(run_id.as_str())
+                && matches!(
+                    &e.kind,
+                    EventKind::ClaimRecorded {
+                        verdict: wirk_core::ClaimVerdict::Validated,
+                        ..
+                    }
+                )
+        })
+        .count();
+    // A deterministic Run never gets a `RunLaunched` event at all (only
+    // `wirk run`'s actor path journals one, `wirk-core/src/lib.rs`'s own
+    // `RunLaunched` doc) -- `RunOpened` is this Run's one "launched"
+    // fact, and it is journaled exactly once, at submit.
+    assert_eq!(run_opened_count, 1, "exactly one RunOpened: {events:?}");
+    assert_eq!(
+        claimed_count, 1,
+        "exactly one validated ClaimRecorded, no duplicate from a racing second filer: {events:?}"
+    );
+    assert!(
+        estate.join("report.md").exists(),
+        "the container's declared artifact must exist on the host estate root"
+    );
+
+    assert!(
+        poll_until(Duration::from_secs(5), || !docker_managed_containers()
+            .lines()
+            .any(|name| name == container_name)),
+        "container {container_name} was not removed by --rm once the sweep observed its exit"
+    );
+
+    let stop = Command::new(env!("CARGO_BIN_EXE_wirk"))
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let _ = wirkd2.0.wait();
+}
+
+/// (c): the same scenario, but the container is removed by hand (`docker
+/// rm -f`, simulating an operator or a genuinely lost container) before
+/// `wirkd` restarts — the sweep journals `RunVanished`, never a hang.
+#[test]
+#[ignore]
+fn d5_14_docker_live_wirkd_restart_journals_run_vanished_for_a_removed_container() {
+    if !docker_live_enabled() {
+        eprintln!("skipped: set WIRK_DOCKER_LIVE=1 to run");
+        return;
+    }
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+
+    let wirkd1 = spawn_wirkd(&estate);
+    wait_for_pointer_live(&estate);
+    let (work_id, run_id, waypoint) =
+        submit_deterministic(&estate, "abc123", &["sh", "-c", REAL_WORKLOAD]);
+
+    let executor = DockerExecutor::new(estate.clone(), WorkId(work_id.clone()));
+    let run = open_run(&run_id);
+    let run = Run {
+        waypoint: WaypointId(waypoint),
+        ..run
+    };
+    let artifacts = OutputContract(vec![wirk_core::ArtifactSpec {
+        name: "report.md".to_string(),
+        required: true,
+    }]);
+    let world = deterministic_world(vec!["sh", "-c", REAL_WORKLOAD], &estate, artifacts);
+    executor.launch(&run, &world).expect("launch");
+    let container_name = executor
+        .container_name(&run.id)
+        .expect("container name recorded after launch");
+
+    wait_for_container_up(&container_name, POLL_DEADLINE);
+
+    let old_pid = wirkd1.0.id();
+    Command::new("kill")
+        .arg("-9")
+        .arg(old_pid.to_string())
+        .output()
+        .expect("kill -9 runs");
+
+    // Removed by hand, before the restart ever sees it (ruling 0044: a
+    // state fact, not raced against a timer -- `docker rm -f` blocks
+    // until the daemon confirms removal).
+    let rm = Command::new("docker")
+        .arg("rm")
+        .arg("-f")
+        .arg(&container_name)
+        .output()
+        .expect("docker rm -f runs");
+    assert!(
+        rm.status.success(),
+        "docker rm -f failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let mut wirkd2 = spawn_wirkd(&estate);
+    let new_pid = wirkd2.0.id();
+    wait_for_pointer_pid(&estate, new_pid);
+
+    let deadline = Instant::now() + POLL_DEADLINE;
+    let events = loop {
+        let events = journal_events(&estate, &work_id);
+        if events.iter().any(|e| {
+            e.run.as_ref().map(|r| r.0.as_str()) == Some(run_id.as_str())
+                && matches!(&e.kind, EventKind::RunVanished)
+        }) {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the restarted wirkd's sweep never journaled RunVanished for the removed container; \
+             journal so far: {events:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    let vanished_count = events
+        .iter()
+        .filter(|e| {
+            e.run.as_ref().map(|r| r.0.as_str()) == Some(run_id.as_str())
+                && matches!(&e.kind, EventKind::RunVanished)
+        })
+        .count();
+    assert_eq!(vanished_count, 1, "exactly one RunVanished: {events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::ClaimRecorded { .. })),
+        "a removed container must never also be claimed: {events:?}"
+    );
+
+    let stop = Command::new(env!("CARGO_BIN_EXE_wirk"))
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let _ = wirkd2.0.wait();
 }

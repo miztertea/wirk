@@ -42,6 +42,12 @@ pub struct FakeHerdrClient {
     /// assert `kind`/`args` per actor kind, the way `split_pane_calls`
     /// already does for `split_pane`.
     pub start_agent_calls: Mutex<Vec<StartAgent>>,
+    /// P2.5 W2: one reply per call, popped in order, `Ok(())` once the
+    /// queue is empty (every test predating this wave leaves it unset
+    /// and keeps today's always-`Ok` behaviour) — lets a test script
+    /// Herdr's `agent_pane_busy` refusal on the first N attempts and
+    /// `Ok` after, the way `with_subscribe_channel` scripts events.
+    pub start_agent_responses: Mutex<VecDeque<Result<(), HerdrError>>>,
     /// Fix 2 (item C, D133): records every `agent.prompt` call so a
     /// `RunLoop` test can assert how many prompts were sent and what
     /// they said.
@@ -78,6 +84,13 @@ impl FakeHerdrClient {
 
     pub fn with_subscribe_events(self, events: Vec<HerdrEvent>) -> Self {
         *self.subscribe_events.lock().unwrap() = events;
+        self
+    }
+
+    /// Scripts `start_agent`'s replies in call order (P2.5 W2) — e.g.
+    /// `[Err(agent_pane_busy), Ok(())]` for "busy once then accepts".
+    pub fn with_start_agent_responses(self, responses: Vec<Result<(), HerdrError>>) -> Self {
+        *self.start_agent_responses.lock().unwrap() = responses.into();
         self
     }
 
@@ -129,7 +142,11 @@ impl HerdrClient for FakeHerdrClient {
 
     fn start_agent(&self, req: StartAgent) -> Result<(), HerdrError> {
         self.start_agent_calls.lock().unwrap().push(req);
-        Ok(())
+        self.start_agent_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(()))
     }
 
     fn prompt_agent(&self, req: PromptAgent) -> Result<(), HerdrError> {

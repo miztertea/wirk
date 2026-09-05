@@ -694,6 +694,21 @@ impl std::fmt::Debug for LaunchedRun {
     }
 }
 
+/// True when `err` is Herdr's pane-busy refusal on `agent.start`, wire
+/// code `agent_pane_busy` (`refs/herdr/src/app/agents.rs:254-255`).
+/// `HerdrError` has no dedicated variant for it: `SocketClient::
+/// map_error`'s only named business code is `agent_not_ready` (to
+/// `Blocked`, D52); every other code, `agent_pane_busy` included, falls
+/// to its catch-all `HerdrError::Invalid(format!("{other}: {message}"))`
+/// (`socket.rs:564-572`) — so the check is the message's own prefix,
+/// not a variant match.
+fn is_agent_pane_busy(err: &HerdrExecutorError) -> bool {
+    matches!(
+        err,
+        HerdrExecutorError::Herdr(HerdrError::Invalid(msg)) if msg.starts_with("agent_pane_busy")
+    )
+}
+
 impl<C: HerdrClient> HerdrExecutor<C> {
     pub fn new(client: C) -> Self {
         Self { client }
@@ -732,7 +747,7 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // structured pane id and nothing else
         // (`src/app/api/panes.rs:159-168`, `parse_pane_id`) — an agent
         // name such as `run.id` fails it `pane_not_found`.
-        let events = self.client.subscribe(vec![
+        let mut events = self.client.subscribe(vec![
             EventSubscription::PaneAgentStatusChanged {
                 pane_id: pane.pane_id.clone(),
             },
@@ -741,9 +756,53 @@ impl<C: HerdrClient> HerdrExecutor<C> {
             },
         ])?;
 
-        self.start_actor_agent(run, &pane.pane_id)?;
+        self.start_actor_agent_when_ready(run, &pane.pane_id, &mut events)?;
 
         Ok(LaunchedRun { pane, events })
+    }
+
+    /// Retries `start_actor_agent` on Herdr's pane-busy refusal (P2.5
+    /// W2, 0050 D151, `orient/launch.md` §1-§2, amended by the build
+    /// brief's §7.2): a freshly split pane's shell is still finishing
+    /// startup, and `agent.start` refuses `agent_pane_busy`
+    /// (`refs/herdr/src/app/agents.rs:186-193`, `available_pane_shell`)
+    /// until it settles. There is no separate readiness field to poll
+    /// (§1's own finding), so the only signal is the refusal itself:
+    /// on it, print the pane and that the launch is waiting, then block
+    /// on the **already-open** subscription (D51 order — `events` was
+    /// opened before the first attempt, by `launch_actor` above) for
+    /// its next event addressed to this pane, and retry. No count, no
+    /// timer (0044 D134): the loop ends only because reality — the
+    /// pane's own activity — settles, never because an attempt budget
+    /// ran out. Any other error propagates unchanged, as today.
+    fn start_actor_agent_when_ready(
+        &self,
+        run: &wirk_core::Run,
+        pane_id: &str,
+        events: &mut Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>,
+    ) -> Result<(), HerdrExecutorError> {
+        loop {
+            match self.start_actor_agent(run, pane_id) {
+                Ok(()) => return Ok(()),
+                Err(err) if is_agent_pane_busy(&err) => {
+                    println!(
+                        "wirk: pane {pane_id} is busy, waiting for its next event before \
+                         retrying agent.start"
+                    );
+                    match events.next() {
+                        Some(Ok(_)) => continue,
+                        Some(Err(err)) => return Err(err.into()),
+                        None => {
+                            return Err(HerdrExecutorError::Herdr(HerdrError::Transport(format!(
+                                "subscription for pane {pane_id} closed while waiting for \
+                                     it to become ready"
+                            ))));
+                        }
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+        }
     }
 
     /// The actor's pane: reuse-and-split when one exists for this Run,
@@ -769,6 +828,27 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         );
         env.insert("WIRK_WORK_ID".to_string(), actor.triple.work_id.0.clone());
         env.insert("WIRK_RUN_ID".to_string(), actor.triple.run_id.0.clone());
+
+        // 0050 D151: an actor's `wirk claim` is `command not found`
+        // unless the running `wirk` binary's own directory is on the
+        // pane's PATH — the session it inherits from was not
+        // necessarily started with the build directory prepended.
+        // `current_exe` (R3, stdlib) follows the launching binary
+        // wherever it runs from, ahead of the pane's inherited PATH;
+        // scoped to this actor pane's own env map, not the session's
+        // (`orient/launch.md` §3, J1).
+        let mut path_entries = Vec::new();
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            path_entries.push(dir.to_path_buf());
+        }
+        path_entries.extend(std::env::split_paths(
+            &std::env::var("PATH").unwrap_or_default(),
+        ));
+        if let Ok(path) = std::env::join_paths(path_entries) {
+            env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+        }
 
         // Workspace-vs-pane branching (item 4, W2; loop.md §2, build
         // brief §2.2 row 4: "CreateWorkspace{cwd,env} (no open
