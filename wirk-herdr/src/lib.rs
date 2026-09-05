@@ -23,6 +23,7 @@ use thiserror::Error;
 
 pub mod fake;
 pub mod git;
+pub mod opencode_hook;
 pub mod run_loop;
 pub mod socket;
 
@@ -876,6 +877,27 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // none either, same as today).
         if let Ok(cache) = std::env::var("CARGO_TARGET_DIR") {
             env.insert("CARGO_TARGET_DIR".to_string(), cache);
+        }
+
+        // P2.7 Wave 2 (`orient/reorient.md` §6 item 1): an opencode
+        // Run gets wirk's own claim-filing plugin delivered with no
+        // write into the worktree and no write under `~/` —
+        // `w2-probe.md`'s Mechanism 2, measured live. The directory is
+        // wirk-owned, under the estate root (`opencode_hook::run_dir`,
+        // the same `.wirk` convention `wirkd::client::locate` already
+        // uses), never `actor.worktree_path`. A write failure here
+        // does not fail the launch: the actor still starts, just
+        // without the hook, the same "degrade, don't block" posture
+        // `CARGO_TARGET_DIR` above already has (best-effort, passed
+        // through only when it can be).
+        if run.kind.0 == "opencode"
+            && let Ok(config_path) =
+                opencode_hook::write_wirk_claim_hook(&actor.triple.estate_root, &run.id.0)
+        {
+            env.insert(
+                opencode_hook::OPENCODE_CONFIG_ENV.to_string(),
+                config_path.to_string_lossy().into_owned(),
+            );
         }
 
         // Workspace-vs-pane branching (item 4, W2; loop.md §2, build
