@@ -890,7 +890,7 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // without the hook, the same "degrade, don't block" posture
         // `CARGO_TARGET_DIR` above already has (best-effort, passed
         // through only when it can be).
-        if run.kind.0 == "opencode"
+        if opencode_hook::hook_installed_for(&run.kind)
             && let Ok(config_path) =
                 opencode_hook::write_wirk_claim_hook(&actor.triple.estate_root, &run.id.0)
         {

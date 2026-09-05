@@ -26,8 +26,10 @@
 //! is unclaimed (learned from the watch stream, never a status poll)
 //! and the Work is not `NeedsInput` and the pane is not `Blocked`, it
 //! is prompted to continue — the Waypoint's intent, the required
-//! artifacts, and the literal claim instruction (`compose_first_prompt`,
-//! reused for every prompt, not only the first). Prompting stops on a
+//! artifacts, and how the claim gets filed for this Run's actor kind
+//! (`compose_first_prompt`, P2.7 W2b: by hand, or by the hook already
+//! installed for it — reused for every prompt, not only the first).
+//! Prompting stops on a
 //! `ClaimRecorded` for this Run (`Claimed`), the Work moving to
 //! `NeedsInput`, Herdr saying the pane is gone, or **no progress**: a
 //! prompt's own baseline (one worktree fingerprint,
@@ -111,8 +113,8 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use wirk_core::{
-    ActorWorld, Event, EventKind, FailureCause, Run, RunId, RunState, Timestamp, WorkId, WorkState,
-    World, fold,
+    ActorKind, ActorWorld, Event, EventKind, FailureCause, Run, RunId, RunState, Timestamp, WorkId,
+    WorkState, World, fold,
 };
 
 use crate::{
@@ -894,7 +896,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         if !self.prompt_gate.try_acquire() {
             return Ok(());
         }
-        let text = compose_first_prompt(actor);
+        let text = compose_first_prompt(actor, &run.kind);
         self.executor
             .client()
             .prompt_agent(PromptAgent {
@@ -1063,12 +1065,32 @@ fn spawn_watch_reader<E: std::error::Error + Send + 'static>(
 }
 
 /// The prompt sent every time an Idle pane is eligible (D133): the
-/// Waypoint's intent, its required artifacts by name, and the literal
-/// instruction to file `wirk claim` — reused for every prompt, not only
-/// the first (fix 2: 0044 struck the one-nudge budget along with every
-/// other count/timer). A formatting function, no new type (build-
-/// brief.md §2.2, R6).
-pub fn compose_first_prompt(actor: &ActorWorld) -> String {
+/// Waypoint's intent, its required artifacts by name, and how the claim
+/// gets filed — reused for every prompt, not only the first (fix 2: 0044
+/// struck the one-nudge budget along with every other count/timer). A
+/// formatting function, no new type (build-brief.md §2.2, R6).
+///
+/// P2.7 W2b (`tried/RESULT-w2.md`): this text used to name a `wirk
+/// claim` flag (`--artifact <name>=<path> ... --done`) that has never
+/// existed (`wirk/src/main.rs`'s `claim` verb takes only `--artifact
+/// NAME=PATH` repeated and `--question`, no `--done`), and told every
+/// actor to file the claim by hand even for a kind whose hook already
+/// files it at turn end — the actor followed that instruction over its
+/// own Waypoint's contrary intent. Two corrections, one predicate
+/// (`opencode_hook::hook_installed_for`, R2 — the same condition
+/// `actor_pane` already uses to decide whether to write the hook at
+/// all, never a second list of kinds):
+///
+/// - a kind with the hook installed is told the required outputs by
+///   name and that its claim is filed for it at turn end, so it should
+///   end its turn once they exist;
+/// - a kind without the hook keeps a by-hand instruction, corrected to
+///   the real, flagless form W1 built (`wirk claim` alone asks wirkd
+///   for the Waypoint's declared outputs and claims each by name).
+///
+/// Both forms keep the same "ask for input" escape: `wirk claim
+/// --question "..."`, a real flag today and unchanged by this wave.
+pub fn compose_first_prompt(actor: &ActorWorld, kind: &ActorKind) -> String {
     let required: Vec<&str> = actor
         .output_contract
         .0
@@ -1081,10 +1103,15 @@ pub fn compose_first_prompt(actor: &ActorWorld) -> String {
     } else {
         format!("\n\nRequired artifacts (by name): {}", required.join(", "))
     };
+    let claim_line = if crate::opencode_hook::hook_installed_for(kind) {
+        "When the required outputs above exist, end your turn: the claim is filed for you. \
+         If you need input before you can finish, file `wirk claim --question \"...\"` instead."
+    } else {
+        "When you are done, file the claim from this pane: `wirk claim`. If you need input \
+         before you can finish, file `wirk claim --question \"...\"` instead."
+    };
     format!(
-        "{intent}{artifacts_line}\n\nWhen you are done, file the claim from this pane: `wirk claim \
-         --artifact <name>=<path> ... --done`. If you need input before you can finish, file \
-         `wirk claim --question \"...\"` instead.",
+        "{intent}{artifacts_line}\n\n{claim_line}",
         intent = actor.intent,
     )
 }

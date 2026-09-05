@@ -73,3 +73,14 @@ pub fn write_wirk_claim_hook(estate_root: &str, run_id: &str) -> io::Result<Path
 
     Ok(config_path)
 }
+
+/// The one predicate for "does this Run's actor kind have wirk's own
+/// Claim-filing hook installed" (P2.7 W2b, `tried/RESULT-w2.md`): today,
+/// exactly `actor_pane`'s own condition for writing this module's hook
+/// (`wirk-herdr/src/lib.rs`). Shared so the standing prompt
+/// (`run_loop::compose_first_prompt`) and the hook delivery it describes
+/// can never drift onto two different lists of kinds — R2, no new
+/// configuration.
+pub fn hook_installed_for(kind: &wirk_core::ActorKind) -> bool {
+    kind.0 == "opencode"
+}

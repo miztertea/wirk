@@ -1722,6 +1722,102 @@ fn actor_pane_env_carries_cargo_target_dir_from_the_driver_when_set() {
     }
 }
 
+// ---- p2-plugin-surface W2b: the standing prompt names a real flag, and
+// says nothing about filing by hand for a hooked actor kind -------------
+//
+// `tried/RESULT-w2.md`: wirkd's own nudge told an opencode actor "file
+// the claim from this pane: `wirk claim --artifact <name>=<path> ...
+// --done`" — a flag `wirk claim` (`wirk/src/main.rs`) has never had, and
+// advice that contradicted the Waypoint's own intent for a kind whose
+// Claim is already filed by W2's hook at turn end (`actor_pane`'s own
+// `run.kind.0 == "opencode"` check, `wirk-herdr/src/lib.rs`). Both tests
+// below render `compose_first_prompt` through the same
+// `client.prompt_agent_calls` seam every other prompt test in this file
+// reads, rather than calling it directly, so a regression in the
+// `RunLoop` wiring (the wrong `ActorKind` reaching the call) would fail
+// them too.
+
+#[test]
+fn opencode_run_is_never_told_to_claim_by_hand() {
+    let run = open_run("run-1");
+    assert_eq!(
+        run.kind,
+        wirk_core::ActorKind::opencode(),
+        "this test's premise: open_run's default kind is opencode"
+    );
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+
+    let calls = client.prompt_agent_calls.lock().unwrap();
+    let text = &calls[0].text;
+    assert!(
+        !text.contains("wirk claim --artifact"),
+        "an opencode Run's hook already files the claim; the prompt must \
+         not tell the actor to claim by hand with a flag: {text:?}"
+    );
+    assert!(
+        !text.contains("--done"),
+        "wirk claim has no --done flag (wirk/src/main.rs): {text:?}"
+    );
+    assert!(
+        text.contains("report.md"),
+        "the required output must still be named so the actor knows what \
+         to produce: {text:?}"
+    );
+}
+
+#[test]
+fn claude_run_keeps_the_by_hand_instruction_with_the_real_flags() {
+    let mut run = open_run("run-1");
+    run.kind = wirk_core::ActorKind::claude();
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+
+    let calls = client.prompt_agent_calls.lock().unwrap();
+    let text = &calls[0].text;
+    assert!(
+        text.contains("wirk claim"),
+        "a claude Run has no hook (W2 built opencode only); the by-hand \
+         instruction must stay: {text:?}"
+    );
+    assert!(
+        !text.contains("--done"),
+        "wirk claim has no --done flag (wirk/src/main.rs): {text:?}"
+    );
+}
+
 fn git_init_repo(dir: &std::path::Path) {
     git(dir, &["init", "-q", "-b", "main"]);
     git(dir, &["config", "user.email", "test@example.com"]);
