@@ -11,7 +11,7 @@
 //!    `-b` (W6b's own fix; **red today**: the pre-W6b helper always ran
 //!    `git worktree add -b`, which fails with "branch already exists").
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use wirk_herdr::git::worktree_add;
@@ -32,11 +32,17 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// One commit on `main`, returning the repo dir (kept alive by the
-/// caller) and the base SHA.
-fn init_repo() -> (tempfile::TempDir, String) {
+/// One commit on `main`, returning the tempdir (kept alive by the
+/// caller), the repo dir inside it, and the base SHA. Every path a
+/// test creates lives inside this tempdir — never at its parent, which
+/// on this box is `/tmp`, a fixed, quota'd, shared location where a
+/// hardcoded name would collide across runs (box facts,
+/// `knowledge/evidence/hosts/cerberus-2026-09-03.md`).
+fn init_repo() -> (tempfile::TempDir, PathBuf, String) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let repo = dir.path();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir(&repo).expect("mkdir repo");
+    let repo = repo.as_path();
     git(repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join("f.txt"), b"one\n").expect("write f.txt");
     git(repo, &["add", "-A"]);
@@ -54,14 +60,15 @@ fn init_repo() -> (tempfile::TempDir, String) {
         ],
     );
     let base_sha = git(repo, &["rev-parse", "HEAD"]);
-    (dir, base_sha)
+    let repo = repo.to_path_buf();
+    (dir, repo, base_sha)
 }
 
 #[test]
 fn worktree_add_creates_branch_and_worktree_when_neither_exists() {
-    let (dir, base_sha) = init_repo();
-    let repo = dir.path();
-    let path = repo.parent().unwrap().join("fresh-worktree");
+    let (dir, repo, base_sha) = init_repo();
+    let repo = repo.as_path();
+    let path = dir.path().join("fresh-worktree");
     let branch = "wirk/fresh";
 
     let head = worktree_add(repo, &path, branch, &base_sha).expect("worktree_add succeeds");
@@ -81,9 +88,9 @@ fn worktree_add_creates_branch_and_worktree_when_neither_exists() {
 
 #[test]
 fn worktree_add_reuses_the_path_when_it_already_exists() {
-    let (dir, base_sha) = init_repo();
-    let repo = dir.path();
-    let path = repo.parent().unwrap().join("reused-worktree");
+    let (dir, repo, base_sha) = init_repo();
+    let repo = repo.as_path();
+    let path = dir.path().join("reused-worktree");
     let branch = "wirk/reused";
 
     let head1 = worktree_add(repo, &path, branch, &base_sha).expect("first add succeeds");
@@ -117,9 +124,9 @@ fn worktree_add_reuses_the_path_when_it_already_exists() {
 /// runs plain `git worktree add <path> <branch>` (no `-b`) instead.
 #[test]
 fn worktree_add_checks_out_the_existing_branch_when_only_the_path_is_gone() {
-    let (dir, base_sha) = init_repo();
-    let repo = dir.path();
-    let path = repo.parent().unwrap().join("gone-worktree");
+    let (dir, repo, base_sha) = init_repo();
+    let repo = repo.as_path();
+    let path = dir.path().join("gone-worktree");
     let branch = "wirk/gone";
 
     let head1 = worktree_add(repo, &path, branch, &base_sha).expect("first add succeeds");
