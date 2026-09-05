@@ -1,0 +1,19 @@
+{
+  "id": "actor-then-actor",
+  "waypoints": [
+    {
+      "id": "actor-then-actor/wp-1",
+      "kind": "Actor",
+      "intent": "write report.md with one line",
+      "declared_outputs": [{"name": "report.md", "required": true}],
+      "boundary": ["**"]
+    },
+    {
+      "id": "actor-then-actor/wp-2",
+      "kind": "Actor",
+      "intent": "read report.md, write verdict.md naming what it found",
+      "declared_outputs": [{"name": "verdict.md", "required": true}],
+      "boundary": ["**"]
+    }
+  ]
+}

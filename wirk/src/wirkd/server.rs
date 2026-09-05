@@ -1420,14 +1420,23 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             && let Some(next_id) = waypoints.get(pos + 1)
             && let Some(next_def) = journaled_defs.iter().find(|def| &def.id == next_id)
         {
+            let prior_world = world_for_waypoint(&events, &run.waypoint);
             let cwd = worktree_path_for_run(&events, &run_id)
                 .unwrap_or_else(|| state.estate_root.clone());
-            let base_sha = world_for_waypoint(&events, &run.waypoint)
+            let base_sha = prior_world
+                .as_ref()
                 .map(|world| match world {
-                    World::Actor(actor) => actor.base_sha,
-                    World::Deterministic(deterministic) => deterministic.base_sha,
+                    World::Actor(actor) => actor.base_sha.clone(),
+                    World::Deterministic(deterministic) => deterministic.base_sha.clone(),
                 })
                 .unwrap_or_default();
+            // Wave 1 (P2.6, orient/route.md §3): minted before the match,
+            // not after — an Actor World's `triple` needs the new Run's
+            // own id (`ExecutionTriple` names the Run it belongs to); a
+            // Deterministic World carries no triple and never hit this
+            // ordering requirement, which is presumably why it was built
+            // first.
+            let next_run_id = RunId(mint_id("run"));
             let next_world = match next_def.kind {
                 // p2-route-files W2 (build-brief.md §7.1): the next
                 // Waypoint's own journaled definition carries its
@@ -1449,15 +1458,51 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                     )]),
                     expected_artifacts: OutputContract(next_def.declared_outputs.clone()),
                 })),
-                // No Route this item's dogfood needs advances
-                // Actor-to-Actor (R1: nothing needs it) — left
-                // unadvanced rather than guessing an intent/repo_path
-                // for a second pane.
-                WaypointKind::Actor => None,
+                // Wave 1 (P2.6, orient/route.md §3): the same treatment
+                // as the `Deterministic` arm above — a World reserved for
+                // the next Waypoint, on the *same* worktree the Work's
+                // prior Run already carries (`cwd` above, read back via
+                // `worktree_path_for_run` regardless of the prior
+                // Waypoint's own kind, so this covers both Actor→Actor
+                // and Deterministic→Actor). `repository`/`branch` come
+                // from the prior World when it was itself an Actor (the
+                // common case); when the prior Waypoint was Deterministic
+                // (a World shape that carries neither field) they fall
+                // back to the Work's own repository binding and the one
+                // branch this whole Work shares, the same
+                // `format!("wirk/{}", ...)` `handle_submit` cuts once for
+                // every Waypoint (one worktree per Work, never a second).
+                WaypointKind::Actor => {
+                    let (repository, branch) = match &prior_world {
+                        Some(World::Actor(actor)) => {
+                            (actor.repository.clone(), actor.branch.clone())
+                        }
+                        _ => (
+                            work.repositories
+                                .first()
+                                .map(|binding| binding.name.clone())
+                                .unwrap_or_default(),
+                            format!("wirk/{}", work_id.0),
+                        ),
+                    };
+                    Some(World::Actor(ActorWorld {
+                        repository,
+                        worktree_path: cwd,
+                        branch,
+                        base_sha,
+                        triple: ExecutionTriple {
+                            estate_root: state.estate_root.display().to_string(),
+                            work_id: work_id.clone(),
+                            run_id: next_run_id.clone(),
+                        },
+                        intent: next_def.intent.clone().unwrap_or_default(),
+                        output_contract: OutputContract(next_def.declared_outputs.clone()),
+                        boundary: next_def.boundary.clone(),
+                    }))
+                }
             };
             if let Some(next_world) = next_world {
                 let world_hash = WorldHash::of(&next_world);
-                let next_run_id = RunId(mint_id("run"));
                 let reserved = new_event(
                     &work_id,
                     None,

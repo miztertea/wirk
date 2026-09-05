@@ -1,0 +1,18 @@
+{
+  "id": "deterministic-then-actor",
+  "waypoints": [
+    {
+      "id": "deterministic-then-actor/wp-1",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "echo prepared > prepared.md"],
+      "declared_outputs": [{"name": "prepared.md", "required": true}]
+    },
+    {
+      "id": "deterministic-then-actor/wp-2",
+      "kind": "Actor",
+      "intent": "read prepared.md, write verdict.md naming what it found",
+      "declared_outputs": [{"name": "verdict.md", "required": true}],
+      "boundary": ["**"]
+    }
+  ]
+}
