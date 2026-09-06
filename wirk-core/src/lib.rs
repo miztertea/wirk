@@ -242,6 +242,132 @@ pub struct Work {
     /// round-tripped, which it is not today.
     #[serde(default)]
     pub needs_input: Option<NeedsInputCause>,
+    /// W-A (§3.3): set when this Work was submitted as a child, from
+    /// `WorkSubmitted.parent`. `#[serde(default)]`: `Work` is never
+    /// itself journaled (`needs_input`'s own doc), so this only matters
+    /// on the in-memory value, which never predates this field.
+    #[serde(default)]
+    pub parent: Option<ParentBinding>,
+    /// W-A (§3.2): why the Work is (or last was) `Waiting` — the
+    /// container `StageHeld` named and what it is missing. Cleared by a
+    /// later `StageClosed` on the same container (fold's own rule,
+    /// mirroring `needs_input`'s "set on the transition, left as
+    /// history once the Work moves on").
+    #[serde(default)]
+    pub held: Option<HeldInfo>,
+    /// W-A correction (F1/F2): every container's current activation, in
+    /// first-activation order — folded from `ContainerActivated` so a
+    /// reader (and every closure decision) can tell one generation of a
+    /// container from the next without re-deriving it.
+    #[serde(default)]
+    pub activations: Vec<ContainerActivation>,
+}
+
+impl Work {
+    /// The current activation of `waypoint`, or the implicit first
+    /// generation for a container no `ContainerActivated` named (a
+    /// pre-correction journal).
+    pub fn activation(&self, waypoint: &WaypointId) -> u32 {
+        self.activations
+            .iter()
+            .find(|entry| &entry.waypoint == waypoint)
+            .map(|entry| entry.attempt)
+            .unwrap_or(1)
+    }
+}
+
+/// W-A (§3.2): a held container's own reason, surfaced by `wirk work
+/// status` (module doc on `Work.held`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldInfo {
+    pub waypoint: WaypointId,
+    /// W-A correction (F1/F2): the container *activation* this hold
+    /// belongs to. A hold from a superseded generation is history, not
+    /// the current requirement — `fold` only clears `held` on a
+    /// `StageClosed` for this same attempt.
+    #[serde(default = "first_attempt")]
+    pub attempt: u32,
+    pub missing: Vec<String>,
+}
+
+/// The attempt every pre-correction record implies (W-A correction,
+/// F1/F2): journals written before container activations carried an
+/// identity name exactly one generation.
+pub fn first_attempt() -> u32 {
+    1
+}
+
+/// W-A correction (F1/F2): one container's current activation, folded
+/// from `ContainerActivated` — the generation every closure receipt,
+/// hold and served-child binding is scoped to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerActivation {
+    pub waypoint: WaypointId,
+    pub attempt: u32,
+}
+
+/// W-A (§3.3): names the parent Work/container/Run/role a child Work
+/// was submitted under. Carried on `WorkSubmitted.parent` and echoed
+/// onto `Work.parent`; grants (repository bindings) are checked at
+/// submit time against the parent's own — never re-derived from this
+/// binding after the fact (§3.3: "the child's own `WorkSubmitted.parent`
+/// names this parent Work, this waypoint, that same Run and role").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentBinding {
+    pub work: WorkId,
+    pub waypoint: WaypointId,
+    /// W-A correction (F4): the container activation this child serves.
+    /// A client may leave it `None` ("whichever generation is current"),
+    /// which wirkd resolves to the concrete attempt before journaling —
+    /// every *recorded* binding names one exact generation, so a child
+    /// that served a superseded activation can never credit the next
+    /// one. `None` on a replayed record is a pre-correction journal and
+    /// reads as the first generation (`attempt_or_first`).
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    pub run: RunId,
+    pub role: String,
+}
+
+impl ParentBinding {
+    /// The activation this binding names, with a pre-correction record's
+    /// implicit first generation.
+    pub fn attempt_or_first(&self) -> u32 {
+        self.attempt.unwrap_or(1)
+    }
+}
+
+/// W-A (§3.2-3.3): one piece of exact evidence a container's closure
+/// relied on — never a bare file path or a `WorkState` alone.
+/// `Container` (this crate's own addition, beyond BUILD-BRIEF's
+/// one-level shape): a nested sub-container's own `StageClosed`
+/// receipts, so an outer container's declared_outputs can be satisfied
+/// by a leaf several levels down without re-deriving it from raw Claims
+/// each time (W-A-BUILD.md: "Required latest receipts aggregate
+/// recursively, never by last flattened leaf alone").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutcomeReceipt {
+    Leaf {
+        waypoint: WaypointId,
+        run: RunId,
+        claim: ClaimId,
+        /// W-A correction (F3): the exact artifacts that validated,
+        /// each with the content identity recorded at validation —
+        /// never a re-derivation of the Route's declared names against
+        /// a mutable path.
+        artifacts: Vec<ArtifactReceipt>,
+    },
+    Child {
+        role: String,
+        child: WorkId,
+        parent_run: RunId,
+        claim: ClaimId,
+        world_hash: WorldHash,
+    },
+    Container {
+        waypoint: WaypointId,
+        receipts: Vec<OutcomeReceipt>,
+    },
 }
 
 /// P2.3 W1 (states.md §1): one three-field struct rather than a
@@ -356,6 +482,26 @@ pub struct WaypointDefinition {
     pub command: Option<Vec<String>>,
     #[serde(default)]
     pub boundary: Boundary,
+    /// `Container` only (W-A, BUILD-BRIEF.md §3.1): the nested mechanism,
+    /// in execution order. A leaf here may itself be a `Container`
+    /// (BUILD-AMENDMENTS.md: recursive, not bounded to one level).
+    /// Empty for an Actor/Deterministic Waypoint (`load_route` refuses
+    /// the reverse).
+    #[serde(default)]
+    pub leaves: Vec<WaypointDefinition>,
+    /// `Container` only: the child-Work roles this container's closure
+    /// requires a valid receipt for (§3.3). Empty for an
+    /// Actor/Deterministic Waypoint.
+    #[serde(default)]
+    pub required_child_outcomes: Vec<ChildOutcomeSpec>,
+}
+
+/// One child-Work role a container's outcome contract requires (§3.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildOutcomeSpec {
+    pub role: String,
+    pub required: bool,
 }
 
 /// From sergeant's `StageKind` (Actor). `Container` (backend concept)
@@ -363,10 +509,20 @@ pub struct WaypointDefinition {
 /// instead of sergeant's backend taxonomy — which `Executor` impl runs
 /// a Waypoint is a bin-crate binding decision (0022 D78), not a field
 /// (orient/core.md line 63-68).
+///
+/// `Container` (W-A, p3-world-loop BUILD-BRIEF.md §3.1): a nested-stage
+/// node. A container carries no intent, no command, no boundary and no
+/// Run of its own — its `leaves` are the mechanism, its
+/// `declared_outputs`/`required_child_outcomes` are the outcome
+/// contract (`load_route`'s own refusals enforce the split). Leaves may
+/// themselves be containers: BUILD-AMENDMENTS.md supersedes the
+/// original draft's one-level bound — "preserve the recursive schema
+/// and implement/test at least a grandchild nested stage."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WaypointKind {
     Actor,
     Deterministic,
+    Container,
 }
 
 /// Per orient/core.md line 70.
@@ -423,6 +579,14 @@ pub enum RouteError {
     DeterministicMissingCommand { id: WaypointId },
     #[error("waypoint {} declares an output with an empty name", waypoint.0)]
     EmptyArtifactName { waypoint: WaypointId },
+    /// W-A (§3.1): a `Container` carries no intent, command, or
+    /// boundary of its own — those belong to its `leaves`.
+    #[error("container waypoint {} carries an intent, command, or boundary", id.0)]
+    ContainerWithMechanism { id: WaypointId },
+    /// W-A (§3.1): a `Container` with no `leaves` has no mechanism at
+    /// all — refused rather than silently vacuous.
+    #[error("container waypoint {} has no leaves", id.0)]
+    ContainerWithoutLeaves { id: WaypointId },
 }
 
 /// Reads and validates a Route file (format.md §3, R2 co-located with
@@ -443,9 +607,26 @@ pub fn load_route(path: &Path) -> Result<Route, RouteError> {
         return Err(RouteError::NoWaypoints);
     }
 
-    let mut seen: std::collections::HashSet<&WaypointId> = std::collections::HashSet::new();
-    for waypoint in &route.waypoints {
-        if !seen.insert(&waypoint.id) {
+    let mut seen: std::collections::HashSet<WaypointId> = std::collections::HashSet::new();
+    validate_tree(&route.waypoints, path, &mut seen)?;
+
+    Ok(route)
+}
+
+/// Recursive validation over a (possibly nested) `WaypointDefinition`
+/// tree (W-A, §3.1): `DuplicateWaypoint`/`EmptyArtifactName` are
+/// checked across the *whole* tree, not just one level, and a
+/// `Container` node is checked against the outcome/mechanism split
+/// while every other node keeps the original flat checks. Recursion has
+/// no depth bound (BUILD-AMENDMENTS.md: nesting is not limited to one
+/// level).
+fn validate_tree(
+    nodes: &[WaypointDefinition],
+    path: &Path,
+    seen: &mut std::collections::HashSet<WaypointId>,
+) -> Result<(), RouteError> {
+    for waypoint in nodes {
+        if !seen.insert(waypoint.id.clone()) {
             return Err(RouteError::DuplicateWaypoint {
                 id: waypoint.id.clone(),
             });
@@ -466,6 +647,15 @@ pub fn load_route(path: &Path) -> Result<Route, RouteError> {
                         ),
                     });
                 }
+                if !waypoint.leaves.is_empty() || !waypoint.required_child_outcomes.is_empty() {
+                    return Err(RouteError::Malformed {
+                        path: path.to_path_buf(),
+                        reason: format!(
+                            "waypoint {} is not a container but declares leaves or required_child_outcomes",
+                            waypoint.id.0
+                        ),
+                    });
+                }
             }
             WaypointKind::Deterministic => {
                 if waypoint.command.is_none() {
@@ -473,6 +663,31 @@ pub fn load_route(path: &Path) -> Result<Route, RouteError> {
                         id: waypoint.id.clone(),
                     });
                 }
+                if !waypoint.leaves.is_empty() || !waypoint.required_child_outcomes.is_empty() {
+                    return Err(RouteError::Malformed {
+                        path: path.to_path_buf(),
+                        reason: format!(
+                            "waypoint {} is not a container but declares leaves or required_child_outcomes",
+                            waypoint.id.0
+                        ),
+                    });
+                }
+            }
+            WaypointKind::Container => {
+                if waypoint.intent.is_some()
+                    || waypoint.command.is_some()
+                    || !waypoint.boundary.0.is_empty()
+                {
+                    return Err(RouteError::ContainerWithMechanism {
+                        id: waypoint.id.clone(),
+                    });
+                }
+                if waypoint.leaves.is_empty() {
+                    return Err(RouteError::ContainerWithoutLeaves {
+                        id: waypoint.id.clone(),
+                    });
+                }
+                validate_tree(&waypoint.leaves, path, seen)?;
             }
         }
         for output in &waypoint.declared_outputs {
@@ -486,8 +701,90 @@ pub fn load_route(path: &Path) -> Result<Route, RouteError> {
         // loads clean — authoring is this item's, enforcement is
         // P2.4's.
     }
+    Ok(())
+}
 
-    Ok(route)
+// ---- Nested-stage tree helpers (W-A, §3.1-3.2) -------------------------
+//
+// Pure functions over a journaled `waypoint_defs` tree, shared by
+// `fold` (this crate) and `wirkd::server` (closure evaluation,
+// container-activation bookkeeping) so both read the same recursive
+// structure the same way (R2).
+
+/// Finds a `WaypointDefinition` by id anywhere in `tree`, at any depth.
+pub fn find_definition<'a>(
+    tree: &'a [WaypointDefinition],
+    id: &WaypointId,
+) -> Option<&'a WaypointDefinition> {
+    for def in tree {
+        if &def.id == id {
+            return Some(def);
+        }
+        if let Some(found) = find_definition(&def.leaves, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The ancestor container ids of `id` in `tree`, immediate parent
+/// first. Empty when `id` is a top-level entry or is not found.
+pub fn ancestor_chain(tree: &[WaypointDefinition], id: &WaypointId) -> Vec<WaypointId> {
+    fn walk(nodes: &[WaypointDefinition], id: &WaypointId, path: &mut Vec<WaypointId>) -> bool {
+        for def in nodes {
+            if &def.id == id {
+                return true;
+            }
+            path.push(def.id.clone());
+            if walk(&def.leaves, id, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    walk(tree, id, &mut path);
+    path.reverse();
+    path
+}
+
+/// `true` when `id` names `container`'s last direct child, by
+/// declaration order (the DFS-order sibling boundary closure evaluation
+/// walks outward from).
+pub fn is_last_direct_child(container: &WaypointDefinition, id: &WaypointId) -> bool {
+    container.leaves.last().map(|d| &d.id) == Some(id)
+}
+
+/// The first executable (non-`Container`) leaf reached by always
+/// descending into a node's own first child — the DFS-first leaf of
+/// `def`'s subtree. `None` for an empty `leaves` (refused at load) or a
+/// non-container `def`.
+pub fn first_dfs_leaf(def: &WaypointDefinition) -> Option<&WaypointId> {
+    let first = def.leaves.first()?;
+    match first.kind {
+        WaypointKind::Container => first_dfs_leaf(first),
+        _ => Some(&first.id),
+    }
+}
+
+/// Every executable (`Actor`/`Deterministic`) leaf under `tree`, in DFS
+/// order — the flattened execution sequence `WorkSubmitted.waypoints`
+/// carries, unchanged in shape whether or not any `Container` nodes are
+/// present (fold.md's own "old journal with no containers folds
+/// exactly as today").
+pub fn flatten_leaves(tree: &[WaypointDefinition]) -> Vec<WaypointId> {
+    let mut out = Vec::new();
+    fn walk(nodes: &[WaypointDefinition], out: &mut Vec<WaypointId>) {
+        for def in nodes {
+            match def.kind {
+                WaypointKind::Container => walk(&def.leaves, out),
+                _ => out.push(def.id.clone()),
+            }
+        }
+    }
+    walk(tree, &mut out);
+    out
 }
 
 // ---- ExecutionTriple ------------------------------------------------------
@@ -751,6 +1048,7 @@ impl Run {
                 claim,
                 claim_kind,
                 verdict,
+                ..
             } => match (verdict, claim_kind) {
                 // A validated Done claim is the sole completion path
                 // (0001 D3). A late but valid claim is still honored,
@@ -788,7 +1086,11 @@ impl Run {
             | EventKind::WorkSubmitted { .. }
             | EventKind::WaypointReserved { .. }
             | EventKind::WorkFailed { .. }
-            | EventKind::WorkCanceled { .. } => {}
+            | EventKind::WorkCanceled { .. }
+            | EventKind::ContainerActivated { .. }
+            | EventKind::StageHeld { .. }
+            | EventKind::StageClosed { .. }
+            | EventKind::ChildWorkSpawned { .. } => {}
         }
     }
 }
@@ -814,6 +1116,73 @@ pub struct Claim {
 pub struct ArtifactRef {
     pub name: String,
     pub path: String,
+}
+
+/// W-A correction (F3): one artifact as it actually validated —
+/// the declared name, the path resolved against the Run's own checkout
+/// at validation time, and the sha256 of the bytes that were inspected.
+/// Journaled on `ClaimRecorded` and carried verbatim into
+/// `OutcomeReceipt::Leaf`, so a later rewrite of that path can be
+/// *detected* (the digest no longer matches) instead of being silently
+/// attributed to the earlier Claim (BUILD-AMENDMENTS.md: "never
+/// silently attribute later file bytes to an earlier Claim").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactReceipt {
+    pub name: String,
+    /// Worktree-relative where the join resolved inside the Run's
+    /// checkout, otherwise the claimed path verbatim.
+    pub path: String,
+    /// Lowercase hex sha256 of the file's bytes at validation.
+    pub digest: String,
+}
+
+/// A pre-correction record carried the artifact *name* alone
+/// (`OutcomeReceipt::Leaf.artifacts` was a `Vec<String>`). Those
+/// journals must stay replayable and inspectable — the W-A wave that
+/// wrote them is not landed, but a reviewer's own probe estates carry
+/// them, and refusing the whole journal over one field shape would
+/// destroy exactly the historical inspectability this correction is
+/// supposed to protect. A bare string reads as a receipt with no
+/// recorded content identity, which every reader then reports as
+/// unavailable (`"unrecorded"`) rather than as evidence that still
+/// holds.
+impl<'de> Deserialize<'de> for ArtifactReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Recorded {
+                name: String,
+                path: String,
+                digest: String,
+            },
+            NameOnly(String),
+        }
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Recorded { name, path, digest } => ArtifactReceipt { name, path, digest },
+            Wire::NameOnly(name) => ArtifactReceipt {
+                name,
+                path: String::new(),
+                digest: String::new(),
+            },
+        })
+    }
+}
+
+impl ArtifactReceipt {
+    /// The sha256 of `path`'s bytes, or `None` when the file cannot be
+    /// read at all (removed, replaced by a directory, unreadable) —
+    /// which is the "explicit unavailable" answer, never a silent pass.
+    /// R3: `sha2` is already this crate's hash dependency (`WorldHash`).
+    pub fn digest_of(path: &std::path::Path) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        Some(hex_lower(&hasher.finalize()))
+    }
 }
 
 /// D9#3, D9#4 (orient/core.md line 105).
@@ -922,6 +1291,15 @@ pub enum EventKind {
         claim: ClaimId,
         claim_kind: ClaimKind,
         verdict: ClaimVerdict,
+        /// W-A correction (F3): the exact artifacts this Claim was
+        /// validated against, each with the content identity read at
+        /// validation. Empty for a refused Claim, a Question, or a
+        /// pre-correction journal (`serde(default)`), which is why the
+        /// Claim's own `artifacts` are the receipt's only source — a
+        /// closure never re-derives them from the Route's declared
+        /// names and a mutable path.
+        #[serde(default)]
+        artifacts: Vec<ArtifactReceipt>,
     },
     /// D9#6.
     WorktreeCreated {
@@ -959,6 +1337,12 @@ pub enum EventKind {
         /// wave).
         #[serde(default)]
         waypoint_defs: Vec<WaypointDefinition>,
+        /// W-A (§3.3): present only for a child Work, naming the parent
+        /// Work/container/Run/role it was submitted under.
+        /// `#[serde(default)]` so a `WorkSubmitted` written before this
+        /// field existed still folds.
+        #[serde(default)]
+        parent: Option<ParentBinding>,
     },
     /// Journals the compiled World at reservation (BRIEF.md Intent;
     /// evidence/work/p1-executor-design/orient/world.md §5) so a
@@ -1006,8 +1390,70 @@ pub enum EventKind {
     },
     /// Owner/operator cancellation; no existing event carries this verb
     /// (fold.md §2, R6).
+    ///
+    /// `caused_by` (W-A, §3.4): `Some(parent)` when this cancellation is
+    /// a cascade step fired by canceling `parent` with `--cascade`;
+    /// `None` for the explicitly named target of the verb itself.
+    /// `#[serde(default)]` so a `WorkCanceled` written before this field
+    /// existed still folds.
     WorkCanceled {
         reason: Option<String>,
+        #[serde(default)]
+        caused_by: Option<WorkId>,
+    },
+    /// W-A (§3.1): explicit journaled identity for one container
+    /// occurrence, even though a container has no execution Run
+    /// (BUILD-AMENDMENTS.md: "name it and journal it, rather than
+    /// relying on the phrase 'current attempt set' without a
+    /// reducer"). `attempt` starts at 1; W-A correction (F1/F2):
+    /// reopening a previously closed nested container during
+    /// held-work recovery journals a new attempt here, while a merely
+    /// held ancestor keeps its current activation unchanged. Retrying
+    /// while the Work is `Active` on a later waypoint is refused
+    /// today.
+    ContainerActivated {
+        waypoint: WaypointId,
+        attempt: u32,
+    },
+    /// W-A (§3.2): a container's outcome contract is not yet satisfied
+    /// — `missing` names each unmet declared-output name or
+    /// `"child role <role>"`/`"container <id> not closed"` entry.
+    /// Server-minted only (`handle_record` refuses it like `RunOpened`).
+    StageHeld {
+        waypoint: WaypointId,
+        /// The container activation this hold belongs to (W-A
+        /// correction, F1/F2).
+        #[serde(default = "first_attempt")]
+        attempt: u32,
+        missing: Vec<String>,
+    },
+    /// W-A (§3.2): a container's outcome contract is satisfied, with
+    /// the exact receipts that satisfied it. Server-minted only.
+    StageClosed {
+        waypoint: WaypointId,
+        /// The container activation these receipts close (W-A
+        /// correction, F1/F2): a `StageClosed` from a superseded
+        /// generation never credits the current one.
+        #[serde(default = "first_attempt")]
+        attempt: u32,
+        receipts: Vec<OutcomeReceipt>,
+    },
+    /// W-A (§3.3): journaled on the **parent's** journal when it admits
+    /// a child Work submission for one of its containers' declared
+    /// roles. Server-minted only, written before the child's own
+    /// journal is created (§3.3: "the reverse order was rejected
+    /// because it could produce a creditable child the parent never
+    /// recorded").
+    ChildWorkSpawned {
+        role: String,
+        child: WorkId,
+        waypoint: WaypointId,
+        /// The container activation the child serves (W-A correction,
+        /// F4) — the parent's half of the two-sided binding, checked
+        /// against the child's own recorded `parent` at credit time.
+        #[serde(default = "first_attempt")]
+        attempt: u32,
+        run: RunId,
     },
 }
 
@@ -1031,6 +1477,7 @@ pub enum EventKind {
 pub fn fold(events: &[Event]) -> Work {
     let mut work: Option<Work> = None;
     let mut route_waypoints: Vec<WaypointId> = Vec::new();
+    let mut waypoint_defs: Vec<WaypointDefinition> = Vec::new();
     let mut run_waypoints: BTreeMap<RunId, WaypointId> = BTreeMap::new();
 
     for event in events {
@@ -1051,10 +1498,12 @@ pub fn fold(events: &[Event]) -> Work {
                 repositories,
                 intent,
                 waypoints,
-                waypoint_defs: _,
+                waypoint_defs: defs,
+                parent,
             } = &event.kind
             {
                 route_waypoints = waypoints.clone();
+                waypoint_defs = defs.clone();
                 work = Some(Work {
                     id: event.work.clone(),
                     intent: intent.clone(),
@@ -1064,6 +1513,9 @@ pub fn fold(events: &[Event]) -> Work {
                     current_waypoint: None,
                     last_activity: event.at,
                     needs_input: None,
+                    parent: parent.clone(),
+                    held: None,
+                    activations: Vec::new(),
                 });
             }
             // No `Work` exists yet and this isn't `WorkSubmitted`: there
@@ -1085,6 +1537,12 @@ pub fn fold(events: &[Event]) -> Work {
                     w.current_waypoint = Some(waypoint.clone());
                     if matches!(w.state, WorkState::Pending | WorkState::Waiting) {
                         w.state = WorkState::Active;
+                        // W-A (§3.2 amendment): a fresh reservation for
+                        // a leaf under a held container (the usable
+                        // retry path) clears the stale hold — the
+                        // leaf's own later Claim re-evaluates the
+                        // container from scratch.
+                        w.held = None;
                     }
                 }
             }
@@ -1105,6 +1563,12 @@ pub fn fold(events: &[Event]) -> Work {
                     w.state = WorkState::Active;
                     w.needs_input = None;
                 }
+                // W-A (§3.2 amendment): a retry on a leaf under a held
+                // container always writes a fresh `WaypointReserved`
+                // before this `RunOpened` (`handle_retry`, mirroring
+                // every other writer), so that event's own arm above
+                // already cleared `Waiting`/`held` — nothing left to do
+                // here for that case.
             }
             EventKind::RunLaunched { .. } => {}
             // D9#2: inert at Run level (0001 D9 #2; 0017 D56) and, for
@@ -1161,7 +1625,20 @@ pub fn fold(events: &[Event]) -> Work {
                     (ClaimVerdict::Validated, ClaimKind::Done) => {
                         let is_last_waypoint =
                             claimed_waypoint.is_some_and(|wp| route_waypoints.last() == Some(wp));
-                        if is_last_waypoint {
+                        // W-A (§3.2): a leaf nested under a container
+                        // never completes the Work by itself, however
+                        // last it is in the flattened sequence — the
+                        // Work waits for that container's own
+                        // `StageClosed` (below), which is either
+                        // journaled in the same server call (closure
+                        // succeeded) or preceded by a `StageHeld`
+                        // (closure did not). A top-level leaf (no
+                        // container ancestor — every leaf on an old flat
+                        // Route) keeps the original rule exactly
+                        // (`old_flat_route_journal_folds_identically`).
+                        let has_container_ancestor = claimed_waypoint
+                            .is_some_and(|wp| !ancestor_chain(&waypoint_defs, wp).is_empty());
+                        if is_last_waypoint && !has_container_ancestor {
                             w.state = WorkState::Completed;
                         } else if !w.state.is_terminal() {
                             // current_waypoint unchanged until the next
@@ -1241,6 +1718,79 @@ pub fn fold(events: &[Event]) -> Work {
             EventKind::WorkCanceled { .. } => {
                 w.state = WorkState::Canceled;
             }
+            // W-A (§3.1): no *state* effect, but the activation itself
+            // is folded (W-A correction, F1/F2): `activations` carries
+            // each container's current generation, and a container
+            // reopened while it was held drops the stale hold — the
+            // requirement belongs to the superseded generation, and the
+            // reservation that follows is what moves the Work on.
+            EventKind::ContainerActivated { waypoint, attempt } => {
+                match w
+                    .activations
+                    .iter_mut()
+                    .find(|entry| &entry.waypoint == waypoint)
+                {
+                    Some(entry) => entry.attempt = *attempt,
+                    None => w.activations.push(ContainerActivation {
+                        waypoint: waypoint.clone(),
+                        attempt: *attempt,
+                    }),
+                }
+                if w.held
+                    .as_ref()
+                    .is_some_and(|held| &held.waypoint == waypoint && held.attempt < *attempt)
+                {
+                    w.held = None;
+                }
+            }
+            EventKind::StageHeld {
+                waypoint,
+                attempt,
+                missing,
+            } => {
+                if !w.state.is_terminal() {
+                    w.state = WorkState::Waiting;
+                    w.current_waypoint = Some(waypoint.clone());
+                    w.held = Some(HeldInfo {
+                        waypoint: waypoint.clone(),
+                        attempt: *attempt,
+                        missing: missing.clone(),
+                    });
+                }
+            }
+            EventKind::StageClosed {
+                waypoint, attempt, ..
+            } => {
+                if !w.state.is_terminal() {
+                    // W-A correction (F1/F2): a `StageClosed` clears the
+                    // hold only for the generation it closed — a
+                    // replayed close from a superseded attempt leaves a
+                    // newer hold standing.
+                    if w.held
+                        .as_ref()
+                        .is_some_and(|held| &held.waypoint == waypoint && held.attempt == *attempt)
+                    {
+                        w.held = None;
+                    }
+                    // A closing container completes the Work only when
+                    // it is itself a top-level Route element (no
+                    // container ancestor of its own) and the last one —
+                    // exactly the condition a top-level leaf's own
+                    // "is_last_waypoint" check answers above; a nested
+                    // sub-container's own `StageClosed` (a grandchild
+                    // case) only clears `held` here, the cascade to its
+                    // outer container is the server's own next journal
+                    // line in the same call.
+                    let is_top_level_last = ancestor_chain(&waypoint_defs, waypoint).is_empty()
+                        && waypoint_defs.last().map(|d| &d.id) == Some(waypoint);
+                    if is_top_level_last {
+                        w.state = WorkState::Completed;
+                    } else {
+                        w.state = WorkState::Active;
+                    }
+                }
+            }
+            EventKind::ChildWorkSpawned { .. } => {}
         }
     }
 

@@ -49,7 +49,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use wirk_core::{ClaimKind, EventKind, ExecutionTriple, RepositoryBinding, RunId, WorkId};
+use wirk_core::{
+    ClaimKind, EventKind, ExecutionTriple, ParentBinding, RepositoryBinding, RunId, WorkId,
+};
 
 // P2.3 W2 (decide.md §1): `Verb::Retry`/`Verb::WorkFail` and their
 // payloads land in this module alongside every other verb's — `Fail`
@@ -93,6 +95,11 @@ pub enum Verb {
     /// path, and `client::watch` reads a blocking line iterator instead
     /// of one `Reply`.
     Watch,
+    /// W-A (§3.4): the operator's cancel verb. `--cascade` cancels every
+    /// open (non-terminal) descendant child Work first, attributed via
+    /// `caused_by`, before canceling the named Work itself; without it,
+    /// an open child refuses the whole verb (`OpenChild`).
+    Cancel,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -195,6 +202,14 @@ impl Request {
             payload: serde_json::to_value(payload).expect("WatchPayload always serializes"),
         }
     }
+
+    /// `cancel`'s request (W-A, §3.4).
+    pub fn cancel(payload: CancelPayload) -> Self {
+        Request {
+            verb: Verb::Cancel,
+            payload: serde_json::to_value(payload).expect("CancelPayload always serializes"),
+        }
+    }
 }
 
 /// `submit`'s payload (transport.md §2): the repository bindings the
@@ -240,6 +255,13 @@ pub struct SubmitPayload {
     /// ad hoc `--kind deterministic --command` shape above.
     #[serde(default)]
     pub route: Option<String>,
+    /// W-A (§3.3): present only for a child Work submission, naming the
+    /// parent Work/container/Run/role it is submitted under.
+    /// `handle_submit` checks this against the parent's own journal
+    /// before minting anything (`ChildParentMismatch`/
+    /// `ChildExceedsParentBinding`).
+    #[serde(default)]
+    pub parent: Option<ParentBinding>,
 }
 
 /// `claim`'s payload (transport.md §2): the injected
@@ -314,6 +336,17 @@ pub struct WorkFailPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchPayload {
     pub work_id: WorkId,
+}
+
+/// `cancel`'s payload (W-A, §3.4): the Work to cancel, whether to
+/// cascade into open children, and an optional human-readable reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelPayload {
+    pub work_id: WorkId,
+    #[serde(default)]
+    pub cascade: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 // ---- Reply -------------------------------------------------------------

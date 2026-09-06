@@ -1,0 +1,33 @@
+{
+  "id": "wa-container",
+  "waypoints": [
+    {
+      "id": "outer",
+      "kind": "Container",
+      "declared_outputs": [
+        {"name": "a.md", "required": true},
+        {"name": "b.md", "required": true}
+      ],
+      "leaves": [
+        {
+          "id": "outer/leaf-a",
+          "kind": "Deterministic",
+          "command": ["sh", "-c", "echo a > a.md"],
+          "declared_outputs": [{"name": "a.md", "required": true}]
+        },
+        {
+          "id": "outer/leaf-b",
+          "kind": "Deterministic",
+          "command": ["sh", "-c", "echo b > b.md"],
+          "declared_outputs": [{"name": "b.md", "required": true}]
+        }
+      ]
+    },
+    {
+      "id": "after",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "echo c > c.md"],
+      "declared_outputs": [{"name": "c.md", "required": true}]
+    }
+  ]
+}

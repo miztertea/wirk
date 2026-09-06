@@ -123,6 +123,7 @@ fn work_submitted() -> EventKind {
         intent: "write report.md".to_string(),
         waypoints: vec![WaypointId("route-1/wp-1".to_string())],
         waypoint_defs: Vec::new(),
+        parent: None,
     }
 }
 
@@ -137,6 +138,7 @@ fn run_opened(run: &Run) -> EventKind {
 
 fn claim_recorded_done(claim_id: &str) -> EventKind {
     EventKind::ClaimRecorded {
+        artifacts: Vec::new(),
         claim: ClaimId(claim_id.to_string()),
         claim_kind: ClaimKind::Done,
         verdict: ClaimVerdict::Validated,
@@ -176,6 +178,7 @@ fn run_failed_agent_pane_busy() -> EventKind {
 
 fn claim_recorded_question(claim_id: &str) -> EventKind {
     EventKind::ClaimRecorded {
+        artifacts: Vec::new(),
         claim: ClaimId(claim_id.to_string()),
         claim_kind: ClaimKind::Question("what should I do".to_string()),
         verdict: ClaimVerdict::Validated,

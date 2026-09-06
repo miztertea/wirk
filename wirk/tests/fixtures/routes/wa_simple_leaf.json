@@ -1,0 +1,11 @@
+{
+  "id": "wa-simple-leaf",
+  "waypoints": [
+    {
+      "id": "leaf",
+      "kind": "Deterministic",
+      "command": ["sh", "-c", "echo helper > helper.md"],
+      "declared_outputs": [{"name": "helper.md", "required": true}]
+    }
+  ]
+}

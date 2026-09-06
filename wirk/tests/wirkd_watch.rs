@@ -72,6 +72,7 @@ fn submit(estate: &Path, socket: &Path, intent: &str) -> (WorkId, RunId) {
             command: None,
             repo_path: None,
             route: Some("smoke".to_string()),
+            parent: None,
         }),
     )
     .expect("submit call reaches wirkd");

@@ -1,0 +1,20 @@
+{
+  "id": "wa-container-missing-output",
+  "waypoints": [
+    {
+      "id": "outer",
+      "kind": "Container",
+      "declared_outputs": [
+        {"name": "phantom.md", "required": true}
+      ],
+      "leaves": [
+        {
+          "id": "outer/leaf-a",
+          "kind": "Deterministic",
+          "command": ["sh", "-c", "echo a > a.md"],
+          "declared_outputs": [{"name": "a.md", "required": true}]
+        }
+      ]
+    }
+  ]
+}

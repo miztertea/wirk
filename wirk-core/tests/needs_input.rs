@@ -33,6 +33,7 @@ fn work_submitted(waypoints: Vec<&str>) -> EventKind {
             .map(|wp| WaypointId(wp.to_string()))
             .collect(),
         waypoint_defs: Vec::new(),
+        parent: None,
     }
 }
 
@@ -155,6 +156,7 @@ fn fold_question_claim_populates_needs_input_cause() {
         Some("run-1"),
         1,
         EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
             claim: wirk_core::ClaimId("claim-q".to_string()),
             claim_kind: wirk_core::ClaimKind::Question("which base branch?".to_string()),
             verdict: wirk_core::ClaimVerdict::Validated,
@@ -444,6 +446,7 @@ fn fold_lifecycle_working_does_not_clear_a_non_blocked_needs_input() {
         Some("run-1"),
         1,
         EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
             claim: wirk_core::ClaimId("claim-q".to_string()),
             claim_kind: wirk_core::ClaimKind::Question("which base branch?".to_string()),
             verdict: wirk_core::ClaimVerdict::Validated,

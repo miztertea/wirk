@@ -1,0 +1,36 @@
+{
+  "id": "wa-grandchild",
+  "waypoints": [
+    {
+      "id": "outer",
+      "kind": "Container",
+      "declared_outputs": [
+        {"name": "a.md", "required": true},
+        {"name": "b.md", "required": true}
+      ],
+      "leaves": [
+        {
+          "id": "outer/lead",
+          "kind": "Deterministic",
+          "command": ["sh", "-c", "echo a > a.md"],
+          "declared_outputs": [{"name": "a.md", "required": true}]
+        },
+        {
+          "id": "outer/inner",
+          "kind": "Container",
+          "declared_outputs": [
+            {"name": "b.md", "required": true}
+          ],
+          "leaves": [
+            {
+              "id": "outer/inner/leaf",
+              "kind": "Deterministic",
+              "command": ["sh", "-c", "echo b > b.md"],
+              "declared_outputs": [{"name": "b.md", "required": true}]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

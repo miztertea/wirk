@@ -75,6 +75,7 @@ fn work_submitted(waypoints: Vec<&str>) -> EventKind {
             .map(|wp| WaypointId(wp.to_string()))
             .collect(),
         waypoint_defs: Vec::new(),
+        parent: None,
     }
 }
 
@@ -97,6 +98,7 @@ fn run_opened(run: &str, waypoint: &str) -> EventKind {
 
 fn claim_recorded(claim: &str, kind: ClaimKind, verdict: ClaimVerdict) -> EventKind {
     EventKind::ClaimRecorded {
+        artifacts: Vec::new(),
         claim: ClaimId(claim.to_string()),
         claim_kind: kind,
         verdict,
@@ -233,6 +235,7 @@ fn d9_2_lifecycle_events_never_advance_a_waypoint() {
         "ev-refused",
         Some("run-1"),
         EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
             claim: ClaimId("claim-refused".to_string()),
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Refused(wirk_core::ClaimRefusal::MissingArtifact(
@@ -249,6 +252,7 @@ fn d9_2_lifecycle_events_never_advance_a_waypoint() {
         "ev-question",
         Some("run-1"),
         EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
             claim: ClaimId("claim-question".to_string()),
             claim_kind: ClaimKind::Question("which base branch?".to_string()),
             verdict: ClaimVerdict::Validated,
@@ -260,6 +264,7 @@ fn d9_2_lifecycle_events_never_advance_a_waypoint() {
         "ev-validated",
         Some("run-1"),
         EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
             claim: ClaimId("claim-good".to_string()),
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
@@ -307,6 +312,8 @@ fn d9_3_claim_missing_required_artifact_is_refused() {
         intent: None,
         command: None,
         boundary: Boundary(Vec::new()),
+        leaves: Vec::new(),
+        required_child_outcomes: Vec::new(),
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -343,6 +350,8 @@ fn d9_4_fabricated_triple_is_recorded_not_honored() {
         intent: None,
         command: None,
         boundary: Boundary(Vec::new()),
+        leaves: Vec::new(),
+        required_child_outcomes: Vec::new(),
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -377,6 +386,8 @@ fn claim_against_an_already_claimed_run_is_refused() {
         intent: None,
         command: None,
         boundary: Boundary(Vec::new()),
+        leaves: Vec::new(),
+        required_child_outcomes: Vec::new(),
     };
     let mut run = open_run("run-1");
     run.state = RunState::Claimed(ClaimId("claim-earlier".to_string()));
@@ -411,6 +422,8 @@ fn done_claim_with_required_artifact_present_is_validated() {
         intent: None,
         command: None,
         boundary: Boundary(Vec::new()),
+        leaves: Vec::new(),
+        required_child_outcomes: Vec::new(),
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -445,6 +458,8 @@ fn question_claim_with_missing_artifact_is_validated() {
         intent: None,
         command: None,
         boundary: Boundary(Vec::new()),
+        leaves: Vec::new(),
+        required_child_outcomes: Vec::new(),
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -480,6 +495,7 @@ fn d9_5_vanished_run_ends_unresolved_not_complete() {
         "ev-late-claim",
         Some("run-1"),
         EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
             claim: ClaimId("claim-late".to_string()),
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,

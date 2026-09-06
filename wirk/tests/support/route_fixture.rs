@@ -34,6 +34,19 @@ fn fixture_text(name: &str) -> &'static str {
         }
         "malformed_json" => include_str!("../fixtures/routes/malformed_json.json"),
         "unknown_field" => include_str!("../fixtures/routes/unknown_field.json"),
+        "wa_container" => include_str!("../fixtures/routes/wa_container.json"),
+        "wa_container_missing_output" => {
+            include_str!("../fixtures/routes/wa_container_missing_output.json")
+        }
+        "wa_container_child_role" => {
+            include_str!("../fixtures/routes/wa_container_child_role.json")
+        }
+        "wa_grandchild" => include_str!("../fixtures/routes/wa_grandchild.json"),
+        "wa_simple_leaf" => include_str!("../fixtures/routes/wa_simple_leaf.json"),
+        "wa_reopen" => include_str!("../fixtures/routes/wa_reopen.json"),
+        "wa_reopen_deep" => include_str!("../fixtures/routes/wa_reopen_deep.json"),
+        "wa_reopen_roles" => include_str!("../fixtures/routes/wa_reopen_roles.json"),
+        "wa_mixed_mechanism" => include_str!("../fixtures/routes/wa_mixed_mechanism.json"),
         other => panic!("no route fixture named {other}.json under wirk/tests/fixtures/routes/"),
     }
 }

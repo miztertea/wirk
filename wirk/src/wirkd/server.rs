@@ -44,7 +44,7 @@
 //! it has no other way to write to the journal (`FailPayload`'s own
 //! doc).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -58,17 +58,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use wirk_core::{
-    Access, ActorWorld, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind,
-    ClaimRefusal, ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple,
-    FailureCause, Journal, JournalError, OutputContract, Route, RouteId, Run, RunId, RunState,
-    SourceBasis, Timestamp, WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World,
-    WorldHash, fold, load_route, validate_claim,
+    Access, ActorWorld, ArtifactReceipt, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId,
+    ClaimKind, ClaimRefusal, ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple,
+    FailureCause, Journal, JournalError, OutcomeReceipt, OutputContract, ParentBinding,
+    RepositoryBinding, Route, RouteId, Run, RunId, RunState, SourceBasis, Timestamp,
+    WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash,
+    ancestor_chain, find_definition, first_dfs_leaf, flatten_leaves, fold, load_route,
+    validate_claim,
 };
 
 use super::boundary;
 use super::{
-    ClaimPayload, ErrorDetail, FailPayload, RecordPayload, Reply, Request, RetryPayload,
-    StatusPayload, SubmitPayload, Verb, WirkdPointer, WorkFailPayload,
+    CancelPayload, ClaimPayload, ErrorDetail, FailPayload, RecordPayload, Reply, Request,
+    RetryPayload, StatusPayload, SubmitPayload, Verb, WirkdPointer, WorkFailPayload,
 };
 
 /// Envelope reply plus what the server does after writing it: `stop`
@@ -246,6 +248,12 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
     // connections, re-adopt any docker containers a prior, killed
     // `wirkd` left running (module doc above `recover_docker_runs`).
     recover_docker_runs(&state);
+
+    // W-A (§3.2): before this listener starts accepting connections,
+    // re-evaluate any Work left `Waiting` by a crash between a child's
+    // own completing Claim and this Work's `StageClosed` (module doc,
+    // `reevaluate_waiting_works`).
+    reevaluate_waiting_works(&state);
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -753,6 +761,10 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {
             Ok(payload) => Outcome::Reply(handle_record(state, payload)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
+        Verb::Cancel => match serde_json::from_value::<CancelPayload>(request.payload.clone()) {
+            Ok(payload) => Outcome::Reply(handle_cancel(state, payload)),
+            Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+        },
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
         // `handle_connection` intercepts `watch` before ever calling
         // `dispatch` (its own long-lived, many-lines-out shape does not
@@ -926,6 +938,8 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 intent: None,
                 command: payload.command.clone(),
                 boundary: Boundary(Vec::new()),
+                leaves: Vec::new(),
+                required_child_outcomes: Vec::new(),
             }],
         )
     } else {
@@ -947,9 +961,20 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         .as_ref()
         .map(|r| r.id.clone())
         .unwrap_or_else(|| RouteId("ad-hoc".to_string()));
-    let first_def = waypoint_defs[0].clone();
-    let waypoint_id = first_def.id.clone();
-    let all_waypoints: Vec<WaypointId> = waypoint_defs.iter().map(|w| w.id.clone()).collect();
+    // W-A (§3.1): the flattened DFS-ordered executable leaves, whatever
+    // the tree's own nesting — a flat Route (no `Container` nodes)
+    // flattens to itself unchanged (`old_flat_route_journal_folds_
+    // identically`).
+    let all_waypoints: Vec<WaypointId> = flatten_leaves(&waypoint_defs);
+    let Some(waypoint_id) = all_waypoints.first().cloned() else {
+        return err_reply("RouteError", "route has no executable waypoints");
+    };
+    let Some(first_def) = find_definition(&waypoint_defs, &waypoint_id).cloned() else {
+        return err_reply(
+            "RouteError",
+            "route names no definition for its own first waypoint",
+        );
+    };
 
     let triple = ExecutionTriple {
         estate_root: state.estate_root.display().to_string(),
@@ -1092,14 +1117,46 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 boundary: first_def.boundary.clone(),
             })
         }
+        // `waypoint_id` is `all_waypoints[0]`, drawn from `flatten_leaves`
+        // (§3.1) — it can never resolve to a `Container` definition.
+        WaypointKind::Container => {
+            unreachable!("the flattened waypoint sequence names only executable leaves")
+        }
     };
     let world_hash = WorldHash::of(&world);
+
+    // W-A (§3.3): a child submission is checked and, if admitted,
+    // journaled on the *parent's* journal (`ChildWorkSpawned`) before
+    // this Work's own journal is created at all — "the reverse order
+    // was rejected because it could produce a creditable child the
+    // parent never recorded."
+    // W-A correction (F4): `spawn_child_on_parent` resolves (or checks)
+    // the container activation the child serves and hands it back, so
+    // the child's *own* `WorkSubmitted.parent` records the same exact
+    // generation the parent's `ChildWorkSpawned` does — the two-sided
+    // binding both halves are later checked against.
+    let mut recorded_parent = payload.parent.clone();
+    if let Some(parent) = &payload.parent {
+        match spawn_child_on_parent(state, parent, &work_id, &payload.repositories) {
+            Ok(attempt) => {
+                if let Some(binding) = recorded_parent.as_mut() {
+                    binding.attempt = Some(attempt);
+                }
+            }
+            Err((code, message)) => return err_reply(code, &message),
+        }
+    }
 
     let journal = match create_journal_for(state, &work_id) {
         Ok(journal) => journal,
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
     let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+
+    // W-A (§3.1): explicit journaled identity for every container this
+    // first reservation newly enters (BUILD-AMENDMENTS.md: "name it and
+    // journal it"), outermost first.
+    let entering: Vec<WaypointId> = entering_ancestors(&waypoint_defs, &waypoint_id);
 
     let submitted = new_event(
         &work_id,
@@ -1116,8 +1173,25 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             // whole so `handle_claim`'s validation and auto-advance
             // never re-read the file (or reconstruct a fallback) again.
             waypoint_defs,
+            parent: recorded_parent,
         },
     );
+    if let Err(err) = append_event(state, &mut journal, &work_id, &submitted) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    for waypoint in &entering {
+        let activated = new_event(
+            &work_id,
+            None,
+            EventKind::ContainerActivated {
+                waypoint: waypoint.clone(),
+                attempt: 1,
+            },
+        );
+        if let Err(err) = append_event(state, &mut journal, &work_id, &activated) {
+            return err_reply("JournalError", &err.to_string());
+        }
+    }
     let reserved = new_event(
         &work_id,
         None,
@@ -1137,7 +1211,7 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             world_hash,
         },
     );
-    for event in [submitted, reserved, opened] {
+    for event in [reserved, opened] {
         if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
             return err_reply("JournalError", &err.to_string());
         }
@@ -1148,6 +1222,156 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         "run_id": run_id.0,
         "waypoint": waypoint_id.0,
     }))
+}
+
+/// W-A (§3.3): validates a child submission's `ParentBinding` against
+/// the parent's own journal and, if admitted, appends `ChildWorkSpawned`
+/// there. Checked, in order: the parent exists in this estate and is
+/// not terminal; `waypoint` names a `Container` in the parent's own
+/// `waypoint_defs` that declares `role` in `required_child_outcomes`;
+/// `run` is the current, unsuperseded Run of the leaf that requested it
+/// (found by walking up from that leaf's own ancestor chain to
+/// `waypoint`, so a leaf nested arbitrarily deep under the named
+/// container may request its role — `ChildParentMismatch` otherwise);
+/// every one of `child_repositories` is bound no wider than the
+/// parent's own binding of the same name (`ChildExceedsParentBinding`).
+/// Estate boundary is automatic: a `WorkId` from another estate simply
+/// resolves to no journal here (`journal_for`'s own containment).
+fn spawn_child_on_parent(
+    state: &Arc<WirkdState>,
+    parent: &ParentBinding,
+    child_id: &WorkId,
+    child_repositories: &[RepositoryBinding],
+) -> Result<u32, (&'static str, String)> {
+    let journal = journal_for(state, &parent.work)
+        .map_err(|err| ("JournalError", err.to_string()))?
+        .ok_or_else(|| ("ChildParentMismatch", "no such parent Work".to_string()))?;
+    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let events = journal
+        .replay()
+        .map_err(|err| ("JournalError", err.to_string()))?;
+    if events.is_empty() {
+        return Err(("ChildParentMismatch", "no such parent Work".to_string()));
+    }
+    let parent_work = fold(&events);
+    if parent_work.state.is_terminal() {
+        return Err((
+            "ChildParentMismatch",
+            "the parent Work is already terminal".to_string(),
+        ));
+    }
+    let parent_defs = waypoint_defs_for(&events);
+    let Some(container_def) = find_definition(&parent_defs, &parent.waypoint) else {
+        return Err((
+            "ChildParentMismatch",
+            "the parent names no such Waypoint".to_string(),
+        ));
+    };
+    if !matches!(container_def.kind, WaypointKind::Container)
+        || !container_def
+            .required_child_outcomes
+            .iter()
+            .any(|spec| spec.role == parent.role)
+    {
+        return Err((
+            "ChildParentMismatch",
+            "the named Waypoint is not a container declaring this role".to_string(),
+        ));
+    }
+    let Some(requesting_run) = find_run(&events, &parent.run) else {
+        return Err((
+            "ChildParentMismatch",
+            "the parent names no such Run".to_string(),
+        ));
+    };
+    if !ancestor_chain(&parent_defs, &requesting_run.waypoint).contains(&parent.waypoint) {
+        return Err((
+            "ChildParentMismatch",
+            "the named Run's own Waypoint is not nested under the named container".to_string(),
+        ));
+    }
+    if latest_run_for_waypoint(&events, &requesting_run.waypoint).map(|entry| entry.0)
+        != Some(parent.run.clone())
+    {
+        return Err((
+            "ChildParentMismatch",
+            "the named Run has been superseded by a retry".to_string(),
+        ));
+    }
+    for binding in child_repositories {
+        let Some(parent_binding) = parent_work
+            .repositories
+            .iter()
+            .find(|p| p.name == binding.name)
+        else {
+            return Err((
+                "ChildExceedsParentBinding",
+                format!(
+                    "repository {} is not bound by the parent Work",
+                    binding.name
+                ),
+            ));
+        };
+        let within = match binding.access {
+            Access::Read => matches!(parent_binding.access, Access::Read | Access::Write),
+            Access::Write => matches!(parent_binding.access, Access::Write),
+        };
+        if !within {
+            return Err((
+                "ChildExceedsParentBinding",
+                format!(
+                    "repository {} exceeds the parent's own binding",
+                    binding.name
+                ),
+            ));
+        }
+    }
+
+    // W-A correction (F4): the child serves one *generation* of the
+    // container, not the container in the abstract. A submission may
+    // name it explicitly (and is refused if that generation is not the
+    // current one — a stale request cannot be admitted, let alone
+    // credited), or leave it open and take the current one.
+    let current_attempt = container_attempt(&events, &parent.waypoint);
+    if let Some(named) = parent.attempt
+        && named != current_attempt
+    {
+        return Err((
+            "ChildParentMismatch",
+            format!(
+                "the named container activation {named} is not {}'s current activation {current_attempt}",
+                parent.waypoint.0
+            ),
+        ));
+    }
+
+    let spawned = new_event(
+        &parent.work,
+        Some(parent.run.clone()),
+        EventKind::ChildWorkSpawned {
+            role: parent.role.clone(),
+            child: child_id.clone(),
+            waypoint: parent.waypoint.clone(),
+            attempt: current_attempt,
+            run: parent.run.clone(),
+        },
+    );
+    append_event(state, &mut journal, &parent.work, &spawned)
+        .map_err(|err| ("JournalError", err.to_string()))?;
+    Ok(current_attempt)
+}
+
+/// The container ids `waypoint` newly enters — every ancestor (§3.1)
+/// for which `waypoint` is the DFS-first leaf of that ancestor's own
+/// subtree — outermost first, the order `ContainerActivated` is
+/// journaled in.
+fn entering_ancestors(tree: &[WaypointDefinition], waypoint: &WaypointId) -> Vec<WaypointId> {
+    let mut chain = ancestor_chain(tree, waypoint);
+    chain.retain(|ancestor| {
+        find_definition(tree, ancestor).and_then(first_dfs_leaf) == Some(waypoint)
+    });
+    chain.reverse();
+    chain
 }
 
 /// `git -C <repo_path> rev-parse <base_ref>` (R4: native platform CLI,
@@ -1189,6 +1413,10 @@ fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
             | EventKind::ClaimRecorded { .. }
             | EventKind::WorkFailed { .. }
             | EventKind::WorkCanceled { .. }
+            | EventKind::ContainerActivated { .. }
+            | EventKind::StageHeld { .. }
+            | EventKind::StageClosed { .. }
+            | EventKind::ChildWorkSpawned { .. }
     ) {
         return err_reply(
             "Forbidden",
@@ -1363,7 +1591,11 @@ fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
         | EventKind::ClaimFiled { .. }
         | EventKind::ClaimRecorded { .. }
         | EventKind::WorkFailed { .. }
-        | EventKind::WorkCanceled { .. } => unreachable!(),
+        | EventKind::WorkCanceled { .. }
+        | EventKind::ContainerActivated { .. }
+        | EventKind::StageHeld { .. }
+        | EventKind::StageClosed { .. }
+        | EventKind::ChildWorkSpawned { .. } => unreachable!(),
     };
     let event = new_event(&payload.work_id, Some(run_id.clone()), kind);
     if let Err(err) = append_event(state, &mut journal, &payload.work_id, &event) {
@@ -1513,9 +1745,12 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             &mut journal,
             &work_id,
             &run_id,
-            claim_id,
-            payload.kind,
-            ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
+            ClaimOutcome {
+                claim_id,
+                claim_kind: payload.kind,
+                verdict: ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
+                artifacts: Vec::new(),
+            },
         );
     };
 
@@ -1524,6 +1759,19 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     // first — `fold`'s own precondition), so this never hits the
     // "no WorkSubmitted event" panic.
     let work = fold(&events);
+    // W-A correction (minor finding): a Claim against an already
+    // terminal Work is refused *before* anything is appended. The
+    // pre-correction path journaled `ClaimFiled`/`ClaimRecorded`
+    // against a `Completed`/`Failed`/`Canceled` Work — false progress
+    // on a record that is supposed to be closed. This is not the
+    // "late but valid claim" case d9_5 protects (that is about a Run's
+    // own state on a live Work); the Work itself is over.
+    if work.state.is_terminal() {
+        return err_reply(
+            "WorkTerminal",
+            "the Work is already terminal: no further Claim can be filed against it",
+        );
+    }
     // Defensive: the journal was located by `triple.work_id`, so this
     // can only fail if a caller mismatched estate/journal wiring, never
     // in this wave's own construction (build-brief.md §3 W3: "checks
@@ -1534,9 +1782,12 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             &mut journal,
             &work_id,
             &run_id,
-            claim_id,
-            payload.kind,
-            ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
+            ClaimOutcome {
+                claim_id,
+                claim_kind: payload.kind,
+                verdict: ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
+                artifacts: Vec::new(),
+            },
         );
     }
 
@@ -1551,19 +1802,18 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     // the same way a mismatched triple is (D9#4's own reasoning) rather
     // than guessing at a fallback shape.
     let journaled_defs = waypoint_defs_for(&events);
-    let Some(waypoint) = journaled_defs
-        .iter()
-        .find(|def| def.id == run.waypoint)
-        .cloned()
-    else {
+    let Some(waypoint) = find_definition(&journaled_defs, &run.waypoint).cloned() else {
         return record_and_reply(
             state,
             &mut journal,
             &work_id,
             &run_id,
-            claim_id,
-            payload.kind,
-            ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
+            ClaimOutcome {
+                claim_id,
+                claim_kind: payload.kind,
+                verdict: ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
+                artifacts: Vec::new(),
+            },
         );
     };
     let binding = resolve_run_binding(&events, &state.estate_root, &work_id, &run_id);
@@ -1741,14 +1991,43 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                     // is excluded from `offending`, not from `boundary`'s
                     // own glob check, so a later Waypoint whose own boundary
                     // covers that path can still declare and reclaim it.
+                    // W-A (§3.1): walked via `find_definition` against
+                    // the full (possibly nested) tree, not a top-level
+                    // scan — a nested leaf's own id never appears as a
+                    // top-level `journaled_defs` entry, only its
+                    // ancestor container's does, so a flat iteration
+                    // over `journaled_defs` alone would silently exclude
+                    // nothing for any leaf inside a container.
+                    // W-A correction (F1/F2, reopen): "already left
+                    // behind by another Waypoint of this same Work" is
+                    // not a *route-position* fact once a stage can be
+                    // reopened. Re-running an earlier leaf finds a
+                    // later leaf's already-validated output sitting in
+                    // the shared checkout, and refusing it
+                    // `OutOfBoundary` would make the correction path
+                    // unusable. The honest test is whether some other
+                    // leaf of this Work actually claimed that output:
+                    // every leaf before this one in Route order (which
+                    // can only have been reached through a validated
+                    // Claim) plus every leaf that currently holds one.
                     let route_order = route_waypoints(&events);
+                    let mut settled: Vec<&WaypointId> = Vec::new();
                     if let Some(pos) = route_order.iter().position(|w| w == &waypoint.id) {
-                        for def in journaled_defs.iter().filter(|def| {
-                            route_order
-                                .iter()
-                                .position(|w| w == &def.id)
-                                .is_some_and(|def_pos| def_pos < pos)
-                        }) {
+                        settled.extend(&route_order[..pos]);
+                    }
+                    for leaf_id in &route_order {
+                        if leaf_id == &waypoint.id {
+                            continue;
+                        }
+                        if latest_run_for_waypoint(&events, leaf_id)
+                            .and_then(|(run_id, ..)| find_run(&events, &run_id))
+                            .is_some_and(|run| matches!(run.state, RunState::Claimed(_)))
+                        {
+                            settled.push(leaf_id);
+                        }
+                    }
+                    for leaf_id in settled {
+                        if let Some(def) = find_definition(&journaled_defs, leaf_id) {
                             for output in &def.declared_outputs {
                                 declared.insert(output.name.clone());
                             }
@@ -1794,15 +2073,55 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         }
     }
 
+    // W-A correction (F3): capture the content identity of the exact
+    // artifacts that validated, bound to this Claim/Run and to the
+    // canonical path inside the Run's own checkout. Recorded on
+    // `ClaimRecorded`, which is what every later receipt and every
+    // historical inspection reads — so a rewrite of that path after
+    // validation is *detectable* rather than silently re-attributed.
+    // A file that validated a moment ago but cannot be read now is an
+    // explicit `ValidationUnavailable`, never a receipt with no digest.
+    let mut artifact_receipts: Vec<ArtifactReceipt> = Vec::new();
+    if matches!(verdict, ClaimVerdict::Validated)
+        && let Ok(binding) = &binding
+        && binding.materialized
+    {
+        let worktree_path = match &binding.world {
+            World::Actor(actor) => actor.worktree_path.clone(),
+            World::Deterministic(deterministic) => deterministic.cwd.clone(),
+        };
+        for artifact in &claim.artifacts {
+            let resolved = worktree_path.join(&artifact.path);
+            let Some(digest) = ArtifactReceipt::digest_of(&resolved) else {
+                verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
+                    "the claimed artifact {} could not be read to record its content identity",
+                    artifact.name
+                )));
+                artifact_receipts.clear();
+                break;
+            };
+            artifact_receipts.push(ArtifactReceipt {
+                name: artifact.name.clone(),
+                path: artifact_relative_to_worktree(&worktree_path, &artifact.path)
+                    .map(|relative| relative.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| artifact.path.clone()),
+                digest,
+            });
+        }
+    }
+
     let claim_kind = payload.kind.clone();
     let reply = record_and_reply(
         state,
         &mut journal,
         &work_id,
         &run_id,
-        claim_id,
-        payload.kind,
-        verdict.clone(),
+        ClaimOutcome {
+            claim_id,
+            claim_kind: payload.kind,
+            verdict: verdict.clone(),
+            artifacts: artifact_receipts,
+        },
     );
 
     // Auto-advance (item 8, `orient/route.md` §2, J1 decided in
@@ -1815,200 +2134,320 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     if matches!(verdict, ClaimVerdict::Validated) && matches!(claim_kind, ClaimKind::Done) {
         let waypoints = route_waypoints(&events);
         let is_last = waypoints.last() == Some(&run.waypoint);
-        if !is_last
-            && let Some(pos) = waypoints.iter().position(|w| w == &run.waypoint)
-            && let Some(next_id) = waypoints.get(pos + 1)
-            && let Some(next_def) = journaled_defs.iter().find(|def| &def.id == next_id)
-        {
-            let prior_world = binding.as_ref().ok().map(|binding| binding.world.clone());
-            let cwd = prior_world
-                .as_ref()
-                .map(|world| match world {
-                    World::Actor(actor) => actor.worktree_path.clone(),
-                    World::Deterministic(deterministic) => deterministic.cwd.clone(),
-                })
-                .unwrap_or_else(|| state.estate_root.clone());
-            // W4 (P2.6 run 3, rerun3's `verify`-vs-`build` finding): the
-            // *next* Waypoint's boundary check (above, this function) diffs
-            // the worktree against whatever `base_sha` its own reserved
-            // World carries — carrying the *prior* Waypoint's `base_sha`
-            // forward unchanged (the pre-W4 behaviour) means every
-            // already-Claimed change the prior Waypoint itself just made
-            // reads as out-of-boundary for the one after it. The next
-            // Waypoint's Run has not started yet, so "the worktree as it
-            // stood when its Run started" is the branch tip right now, in
-            // this same worktree — read fresh with git (`resolve_git_sha`,
-            // R2, the same call `handle_submit` already makes to pin a
-            // Work's original base) rather than carried from the prior
-            // World's own field. A worktree git cannot read from (the
-            // no-repo-path test harness's own bare-estate `cwd`) falls back
-            // to the prior World's `base_sha` unchanged — today's behaviour,
-            // never a hard failure of auto-advance itself. The Work's
-            // *original* base stays exactly where `handle_submit` already
-            // put it, on the first Waypoint's own reserved World — nothing
-            // here touches that.
-            let prior_base_sha = || {
-                prior_world
-                    .as_ref()
-                    .map(|world| match world {
-                        World::Actor(actor) => actor.base_sha.clone(),
-                        World::Deterministic(deterministic) => deterministic.base_sha.clone(),
-                    })
-                    .unwrap_or_default()
-            };
-            let prior_basis = prior_world
-                .as_ref()
-                .map(|world| world.source_basis().clone())
-                .unwrap_or_default();
-            let base_sha = match &prior_basis {
-                SourceBasis::Git { .. } => {
-                    match resolve_git_sha(&cwd.display().to_string(), "HEAD") {
-                        Ok(base) => base,
-                        Err(detail) => return err_reply("ValidationUnavailable", &detail),
-                    }
-                }
-                SourceBasis::OutputOnly { reference } => reference.clone(),
-                SourceBasis::Unknown => prior_base_sha(),
-            };
-            // Wave 1 (P2.6, orient/route.md §3): minted before the match,
-            // not after — an Actor World's `triple` needs the new Run's
-            // own id (`ExecutionTriple` names the Run it belongs to); a
-            // Deterministic World carries no triple and never hit this
-            // ordering requirement, which is presumably why it was built
-            // first.
-            let next_run_id = RunId(mint_id("run"));
-            let next_world = match next_def.kind {
-                // p2-route-files W2 (build-brief.md §7.1): the next
-                // Waypoint's own journaled definition carries its
-                // command directly — `load_route` already refused a
-                // Deterministic Waypoint with no command at submit
-                // (`RouteError::DeterministicMissingCommand`), so this
-                // is always `Some` for a Route a Work could ever have
-                // been submitted against.
-                WaypointKind::Deterministic => Some(World::Deterministic(DeterministicWorld {
-                    command: next_def.command.clone().unwrap_or_default(),
-                    base_sha: base_sha.clone(),
-                    source_basis: match &prior_basis {
-                        SourceBasis::Git { .. } => SourceBasis::Git {
-                            base: base_sha.clone(),
-                        },
-                        SourceBasis::OutputOnly { reference } => SourceBasis::OutputOnly {
-                            reference: reference.clone(),
-                        },
-                        SourceBasis::Unknown => SourceBasis::Unknown,
-                    },
-                    cwd,
-                    // Every cargo the child executor runs uses the one
-                    // named-kept warm cache (0030; 0039 D126), not a
-                    // cold build in the worktree (build-brief.md §7.5).
-                    env: BTreeMap::from([(
-                        "CARGO_TARGET_DIR".to_string(),
-                        "/var/tmp/wirk-target".to_string(),
-                    )]),
-                    expected_artifacts: OutputContract(next_def.declared_outputs.clone()),
-                })),
-                // Wave 1 (P2.6, orient/route.md §3): the same treatment
-                // as the `Deterministic` arm above — a World reserved for
-                // the next Waypoint, on the *same* worktree the Work's
-                // prior Run already carries (`cwd` above, read back via
-                // `worktree_path_for_run` regardless of the prior
-                // Waypoint's own kind, so this covers both Actor→Actor
-                // and Deterministic→Actor). `repository`/`branch` come
-                // from the prior World when it was itself an Actor (the
-                // common case); when the prior Waypoint was Deterministic
-                // (a World shape that carries neither field) they fall
-                // back to the Work's own repository binding and the one
-                // branch this whole Work shares, the same
-                // `format!("wirk/{}", ...)` `handle_submit` cuts once for
-                // every Waypoint (one worktree per Work, never a second).
-                WaypointKind::Actor => {
-                    if !matches!(prior_basis, SourceBasis::Git { .. }) {
-                        return err_reply(
-                            "IncompatibleSourceBasis",
-                            "an Actor stage cannot inherit an output-only or unknown source basis",
-                        );
-                    }
-                    let (repository, branch) = match &prior_world {
-                        Some(World::Actor(actor)) => {
-                            (actor.repository.clone(), actor.branch.clone())
-                        }
-                        // A deterministic Git World carries its verified
-                        // checkout in `cwd`. The logical repository binding
-                        // name is not a path and therefore cannot support the
-                        // Actor stage's later Git validation or retry.
-                        Some(World::Deterministic(deterministic)) => (
-                            deterministic.cwd.display().to_string(),
-                            format!("wirk/{}", work_id.0),
-                        ),
-                        None => (String::new(), format!("wirk/{}", work_id.0)),
-                    };
-                    Some(World::Actor(ActorWorld {
-                        repository,
-                        worktree_path: cwd,
-                        branch,
-                        source_basis: SourceBasis::Git {
-                            base: base_sha.clone(),
-                        },
-                        base_sha,
-                        triple: ExecutionTriple {
-                            estate_root: state.estate_root.display().to_string(),
-                            work_id: work_id.clone(),
-                            run_id: next_run_id.clone(),
-                        },
-                        intent: next_def.intent.clone().unwrap_or_default(),
-                        output_contract: OutputContract(next_def.declared_outputs.clone()),
-                        boundary: next_def.boundary.clone(),
-                    }))
-                }
-            };
-            if let Some(next_world) = next_world {
-                // W2b (land finding 2026-09-05, `w2b/BUILD.md`): the
-                // reserved Actor World's triple is read from the Run
-                // this advance actually opens — `next_run_id`, the one
-                // value both the triple (above) and `RunOpened` (below)
-                // are cloned from. Checked here, not merely assumed, so
-                // a future edit that clones the wrong `RunId` (the
-                // *prior* Run's — the exact mistake VERIFY.md's probe
-                // (c) and `actor_then_actor_auto_advance_reserves_a_
-                // world_for_the_second_actor` both pin) fails loudly
-                // here rather than shipping a pane whose `WIRK_RUN_ID`
-                // claims against the wrong Run.
-                if let World::Actor(actor) = &next_world {
-                    debug_assert_eq!(
-                        actor.triple.run_id, next_run_id,
-                        "the reserved Actor World's triple must carry the Run this advance opens, not a prior one"
-                    );
-                }
-                let world_hash = WorldHash::of(&next_world);
-                let reserved = new_event(
-                    &work_id,
-                    None,
-                    EventKind::WaypointReserved {
-                        waypoint: next_id.clone(),
-                        world_hash: world_hash.clone(),
-                        world: next_world,
-                    },
-                );
-                let opened = new_event(
-                    &work_id,
-                    Some(next_run_id.clone()),
-                    EventKind::RunOpened {
-                        run: next_run_id,
-                        waypoint: next_id.clone(),
-                        attempt: 1,
-                        world_hash,
-                    },
-                );
-                for event in [reserved, opened] {
-                    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
-                        return err_reply("JournalError", &err.to_string());
-                    }
-                }
+
+        // W-A (§3.2): before advancing to the next leaf (or letting
+        // `fold`'s own last-waypoint rule complete the Work), close
+        // every container this claim's leaf is the last direct child
+        // of, innermost first, cascading outward through
+        // `close_cascade`. A Held container stops the whole advance —
+        // the Work becomes `Waiting`, nothing further is reserved.
+        if let Some(container_id) = innermost_closing_container(&journaled_defs, &run.waypoint) {
+            match close_cascade(state, &work_id, &mut journal, &journaled_defs, container_id) {
+                Ok(CascadeOutcome::Held) => return reply,
+                Ok(CascadeOutcome::Closed(_)) => {}
+                Err(err) => return err_reply("JournalError", &err.to_string()),
             }
+        }
+
+        // W-A (§3.3): if this Work is itself a child and the cascade
+        // above just completed it, re-evaluate the parent's own held
+        // container now that a fresh, current-Run-bound receipt is
+        // available — never inferred from `WorkState` alone
+        // (`reevaluate_parent`/`evaluate_closure` re-derive it from the
+        // parent's own journal facts). A completed Work has no next
+        // leaf to reserve (`is_last` is necessarily true whenever this
+        // fires), so this returns directly — critically, only *after*
+        // dropping this Work's own journal lock: `reevaluate_parent`'s
+        // own cascade may need to read this same Work's journal again
+        // (as the child being credited), and `Mutex` is not reentrant.
+        let events_now = match journal.replay() {
+            Ok(events) => events,
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        };
+        let this_work = fold(&events_now);
+        if matches!(this_work.state, WorkState::Completed)
+            && let Some(parent) = this_work.parent.clone()
+        {
+            drop(journal);
+            if let Err(err) = reevaluate_parent(state, &parent) {
+                return err_reply("JournalError", &err.to_string());
+            }
+            return reply;
+        }
+
+        if !is_last
+            && let Err((code, message)) = reserve_next_leaf(
+                state,
+                &work_id,
+                &mut journal,
+                &journaled_defs,
+                &run.waypoint,
+            )
+        {
+            return err_reply(code, &message);
         }
     }
 
     reply
+}
+
+/// Reserves the next leaf after `after_leaf` in this Work's own
+/// flattened Route order — the World, its hash, and the fresh `RunOpened`
+/// — journaling the `ContainerActivated` identity for every container
+/// the reservation newly enters first.
+///
+/// Extracted from `handle_claim`'s own auto-advance (W-A correction):
+/// a container can now also close *without* a Claim on this journal at
+/// all (a required child Work completing elsewhere, re-evaluated by
+/// `reevaluate_parent`), and a Route that continues past that container
+/// has to advance then too. Before the extraction the Work was left
+/// Active with its closed container as `current_waypoint` and no open
+/// Run at all — nothing to claim, nothing to retry.
+fn reserve_next_leaf(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    journal: &mut Journal,
+    journaled_defs: &[WaypointDefinition],
+    after_leaf: &WaypointId,
+) -> Result<(), (&'static str, String)> {
+    let events = journal
+        .replay()
+        .map_err(|err| ("JournalError", err.to_string()))?;
+    let waypoints = route_waypoints(&events);
+    let prior_binding = match latest_run_for_waypoint(&events, after_leaf) {
+        Some((run_id, ..)) => resolve_run_binding(&events, &state.estate_root, work_id, &run_id),
+        None => Err("the leaf just closed has no Run".to_string()),
+    };
+    if let Some(pos) = waypoints.iter().position(|w| w == after_leaf)
+        && let Some(next_id) = waypoints.get(pos + 1)
+        && let Some(next_def) = find_definition(journaled_defs, next_id)
+    {
+        let prior_world = prior_binding
+            .as_ref()
+            .ok()
+            .map(|binding| binding.world.clone());
+        let cwd = prior_world
+            .as_ref()
+            .map(|world| match world {
+                World::Actor(actor) => actor.worktree_path.clone(),
+                World::Deterministic(deterministic) => deterministic.cwd.clone(),
+            })
+            .unwrap_or_else(|| state.estate_root.clone());
+        // W4 (P2.6 run 3, rerun3's `verify`-vs-`build` finding): the
+        // *next* Waypoint's boundary check (above, this function) diffs
+        // the worktree against whatever `base_sha` its own reserved
+        // World carries — carrying the *prior* Waypoint's `base_sha`
+        // forward unchanged (the pre-W4 behaviour) means every
+        // already-Claimed change the prior Waypoint itself just made
+        // reads as out-of-boundary for the one after it. The next
+        // Waypoint's Run has not started yet, so "the worktree as it
+        // stood when its Run started" is the branch tip right now, in
+        // this same worktree — read fresh with git (`resolve_git_sha`,
+        // R2, the same call `handle_submit` already makes to pin a
+        // Work's original base) rather than carried from the prior
+        // World's own field. A worktree git cannot read from (the
+        // no-repo-path test harness's own bare-estate `cwd`) falls back
+        // to the prior World's `base_sha` unchanged — today's behaviour,
+        // never a hard failure of auto-advance itself. The Work's
+        // *original* base stays exactly where `handle_submit` already
+        // put it, on the first Waypoint's own reserved World — nothing
+        // here touches that.
+        let prior_base_sha = || {
+            prior_world
+                .as_ref()
+                .map(|world| match world {
+                    World::Actor(actor) => actor.base_sha.clone(),
+                    World::Deterministic(deterministic) => deterministic.base_sha.clone(),
+                })
+                .unwrap_or_default()
+        };
+        let prior_basis = prior_world
+            .as_ref()
+            .map(|world| world.source_basis().clone())
+            .unwrap_or_default();
+        let base_sha = match &prior_basis {
+            SourceBasis::Git { .. } => match resolve_git_sha(&cwd.display().to_string(), "HEAD") {
+                Ok(base) => base,
+                Err(detail) => return Err(("ValidationUnavailable", detail)),
+            },
+            SourceBasis::OutputOnly { reference } => reference.clone(),
+            SourceBasis::Unknown => prior_base_sha(),
+        };
+        // Wave 1 (P2.6, orient/route.md §3): minted before the match,
+        // not after — an Actor World's `triple` needs the new Run's
+        // own id (`ExecutionTriple` names the Run it belongs to); a
+        // Deterministic World carries no triple and never hit this
+        // ordering requirement, which is presumably why it was built
+        // first.
+        let next_run_id = RunId(mint_id("run"));
+        let next_world = match next_def.kind {
+            // p2-route-files W2 (build-brief.md §7.1): the next
+            // Waypoint's own journaled definition carries its
+            // command directly — `load_route` already refused a
+            // Deterministic Waypoint with no command at submit
+            // (`RouteError::DeterministicMissingCommand`), so this
+            // is always `Some` for a Route a Work could ever have
+            // been submitted against.
+            WaypointKind::Deterministic => Some(World::Deterministic(DeterministicWorld {
+                command: next_def.command.clone().unwrap_or_default(),
+                base_sha: base_sha.clone(),
+                source_basis: match &prior_basis {
+                    SourceBasis::Git { .. } => SourceBasis::Git {
+                        base: base_sha.clone(),
+                    },
+                    SourceBasis::OutputOnly { reference } => SourceBasis::OutputOnly {
+                        reference: reference.clone(),
+                    },
+                    SourceBasis::Unknown => SourceBasis::Unknown,
+                },
+                cwd,
+                // Every cargo the child executor runs uses the one
+                // named-kept warm cache (0030; 0039 D126), not a
+                // cold build in the worktree (build-brief.md §7.5).
+                env: BTreeMap::from([(
+                    "CARGO_TARGET_DIR".to_string(),
+                    "/var/tmp/wirk-target".to_string(),
+                )]),
+                expected_artifacts: OutputContract(next_def.declared_outputs.clone()),
+            })),
+            // Wave 1 (P2.6, orient/route.md §3): the same treatment
+            // as the `Deterministic` arm above — a World reserved for
+            // the next Waypoint, on the *same* worktree the Work's
+            // prior Run already carries (`cwd` above, read back via
+            // `worktree_path_for_run` regardless of the prior
+            // Waypoint's own kind, so this covers both Actor→Actor
+            // and Deterministic→Actor). `repository`/`branch` come
+            // from the prior World when it was itself an Actor (the
+            // common case); when the prior Waypoint was Deterministic
+            // (a World shape that carries neither field) they fall
+            // back to the Work's own repository binding and the one
+            // branch this whole Work shares, the same
+            // `format!("wirk/{}", ...)` `handle_submit` cuts once for
+            // every Waypoint (one worktree per Work, never a second).
+            WaypointKind::Actor => {
+                if !matches!(prior_basis, SourceBasis::Git { .. }) {
+                    return Err((
+                        "IncompatibleSourceBasis",
+                        "an Actor stage cannot inherit an output-only or unknown source basis"
+                            .to_string(),
+                    ));
+                }
+                let (repository, branch) = match &prior_world {
+                    Some(World::Actor(actor)) => (actor.repository.clone(), actor.branch.clone()),
+                    // A deterministic Git World carries its verified
+                    // checkout in `cwd`. The logical repository binding
+                    // name is not a path and therefore cannot support the
+                    // Actor stage's later Git validation or retry.
+                    Some(World::Deterministic(deterministic)) => (
+                        deterministic.cwd.display().to_string(),
+                        format!("wirk/{}", work_id.0),
+                    ),
+                    None => (String::new(), format!("wirk/{}", work_id.0)),
+                };
+                Some(World::Actor(ActorWorld {
+                    repository,
+                    worktree_path: cwd,
+                    branch,
+                    source_basis: SourceBasis::Git {
+                        base: base_sha.clone(),
+                    },
+                    base_sha,
+                    triple: ExecutionTriple {
+                        estate_root: state.estate_root.display().to_string(),
+                        work_id: work_id.clone(),
+                        run_id: next_run_id.clone(),
+                    },
+                    intent: next_def.intent.clone().unwrap_or_default(),
+                    output_contract: OutputContract(next_def.declared_outputs.clone()),
+                    boundary: next_def.boundary.clone(),
+                }))
+            }
+            // `waypoints` (`route_waypoints`) names only executable
+            // leaves (`flatten_leaves`, §3.1) — `next_id` can never
+            // resolve to a `Container` definition.
+            WaypointKind::Container => {
+                unreachable!("the flattened waypoint sequence names only executable leaves")
+            }
+        };
+        if let Some(next_world) = next_world {
+            // W-A (§3.1): explicit journaled identity for every
+            // container this reservation newly enters, outermost
+            // first, before the reservation itself.
+            // W-A correction (F1/F2): entering a container is a new
+            // *generation* of it — re-entering one that already
+            // closed (after a reopen upstream re-ran the Route
+            // through it) mints the next attempt, which is what
+            // invalidates its earlier `StageClosed` for every
+            // ancestor that would otherwise have credited it.
+            let events_for_attempt = journal
+                .replay()
+                .map_err(|err| ("JournalError", err.to_string()))?;
+            for waypoint in entering_ancestors(journaled_defs, next_id) {
+                let attempt = next_container_attempt(&events_for_attempt, &waypoint);
+                let activated = new_event(
+                    work_id,
+                    None,
+                    EventKind::ContainerActivated { waypoint, attempt },
+                );
+                append_event(state, journal, work_id, &activated)
+                    .map_err(|err| ("JournalError", err.to_string()))?;
+            }
+            // W2b (land finding 2026-09-05, `w2b/BUILD.md`): the
+            // reserved Actor World's triple is read from the Run
+            // this advance actually opens — `next_run_id`, the one
+            // value both the triple (above) and `RunOpened` (below)
+            // are cloned from. Checked here, not merely assumed, so
+            // a future edit that clones the wrong `RunId` (the
+            // *prior* Run's — the exact mistake VERIFY.md's probe
+            // (c) and `actor_then_actor_auto_advance_reserves_a_
+            // world_for_the_second_actor` both pin) fails loudly
+            // here rather than shipping a pane whose `WIRK_RUN_ID`
+            // claims against the wrong Run.
+            if let World::Actor(actor) = &next_world {
+                debug_assert_eq!(
+                    actor.triple.run_id, next_run_id,
+                    "the reserved Actor World's triple must carry the Run this advance opens, not a prior one"
+                );
+            }
+            let world_hash = WorldHash::of(&next_world);
+            let reserved = new_event(
+                work_id,
+                None,
+                EventKind::WaypointReserved {
+                    waypoint: next_id.clone(),
+                    world_hash: world_hash.clone(),
+                    world: next_world,
+                },
+            );
+            let opened = new_event(
+                work_id,
+                Some(next_run_id.clone()),
+                EventKind::RunOpened {
+                    run: next_run_id,
+                    waypoint: next_id.clone(),
+                    attempt: 1,
+                    world_hash,
+                },
+            );
+            for event in [reserved, opened] {
+                append_event(state, journal, work_id, &event)
+                    .map_err(|err| ("JournalError", err.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One Claim's recorded outcome: its minted id, its verb, the verdict
+/// it drew, and (W-A correction, F3) the content identity of the
+/// artifacts it was validated against. One struct rather than four
+/// positional arguments — `record_and_reply` is the only caller shape,
+/// and the four always travel together.
+struct ClaimOutcome {
+    claim_id: ClaimId,
+    claim_kind: ClaimKind,
+    verdict: ClaimVerdict,
+    artifacts: Vec<ArtifactReceipt>,
 }
 
 /// Appends `ClaimFiled` then `ClaimRecorded { verdict }` (validate.md
@@ -2020,10 +2459,14 @@ fn record_and_reply(
     journal: &mut Journal,
     work_id: &WorkId,
     run_id: &RunId,
-    claim_id: ClaimId,
-    claim_kind: ClaimKind,
-    verdict: ClaimVerdict,
+    outcome: ClaimOutcome,
 ) -> Reply {
+    let ClaimOutcome {
+        claim_id,
+        claim_kind,
+        verdict,
+        artifacts,
+    } = outcome;
     let filed = new_event(
         work_id,
         Some(run_id.clone()),
@@ -2041,6 +2484,7 @@ fn record_and_reply(
             claim: claim_id,
             claim_kind,
             verdict: verdict.clone(),
+            artifacts,
         },
     );
     if let Err(err) = append_event(state, journal, work_id, &recorded) {
@@ -2105,6 +2549,42 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
     // P2.3 W1 (states.md §2): why the Work is (or last was) NeedsInput
     // — additive, absent when `needs_input` is `None` so an old caller
     // reading only the fields above is unaffected.
+    // W-A (§3.2, §3.3): additive, same convention — absent when the
+    // Work was never held or is not a child, so an old caller reading
+    // only the original fields is unaffected.
+    if let Some(held) = &work.held {
+        result["held"] = json!({
+            "waypoint": held.waypoint.0,
+            "attempt": held.attempt,
+            "missing": held.missing,
+        });
+    }
+    if let Some(parent) = &work.parent {
+        result["parent"] = json!({
+            "work": parent.work.0,
+            "waypoint": parent.waypoint.0,
+            "attempt": parent.attempt_or_first(),
+            "run": parent.run.0,
+            "role": parent.role,
+        });
+    }
+    // W-A correction (F1/F2): every container's current activation, so
+    // one generation of a nested stage is distinguishable from the next
+    // over the public verb, not only in the raw journal.
+    if !work.activations.is_empty() {
+        result["activations"] = Value::Array(
+            work.activations
+                .iter()
+                .map(|entry| json!({"waypoint": entry.waypoint.0, "attempt": entry.attempt}))
+                .collect(),
+        );
+    }
+    // W-A correction (F3): the artifact evidence this Work's validated
+    // Claims actually rest on, each answered against the content
+    // identity recorded at validation — `available: false` with an
+    // explicit reason when the bytes changed or the file is gone,
+    // rather than a path that silently reads as whatever is there now.
+    result["evidence"] = Value::Array(claim_evidence(&events));
     if let Some(cause) = &work.needs_input {
         result["needs_input"] = json!({
             "run": cause.run.0,
@@ -2113,9 +2593,31 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         });
     }
 
-    if let Some(waypoint) = &work.current_waypoint
-        && let Some((run_id, attempt, world_hash)) = latest_run_for_waypoint(&events, waypoint)
-    {
+    // W-A (§3.2): a held container itself has no Run — `current_waypoint`
+    // names the container, not a leaf, so `latest_run_for_waypoint`
+    // alone finds nothing. Fall back to the most recently opened Run
+    // among the container's own descendant leaves: the run `wirk work
+    // retry`'s CLI (and a human reading `status`) means by "the current
+    // run to retry" for a held container.
+    let effective_run = work.current_waypoint.as_ref().and_then(|waypoint| {
+        latest_run_for_waypoint(&events, waypoint).or_else(|| {
+            let defs = waypoint_defs_for(&events);
+            let container = find_definition(&defs, waypoint)?;
+            let leaves: HashSet<WaypointId> = flatten_leaves(std::slice::from_ref(container))
+                .into_iter()
+                .collect();
+            events.iter().rev().find_map(|event| match &event.kind {
+                EventKind::RunOpened {
+                    run,
+                    waypoint: wp,
+                    attempt,
+                    world_hash,
+                } if leaves.contains(wp) => Some((run.clone(), *attempt, world_hash.clone())),
+                _ => None,
+            })
+        })
+    });
+    if let Some((run_id, attempt, world_hash)) = effective_run {
         result["run_id"] = json!(run_id.0);
         result["attempt"] = json!(attempt);
         result["world_hash"] = json!(world_hash.0);
@@ -2141,6 +2643,76 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
     }
 
     ok_reply(result)
+}
+
+/// W-A correction (F3): one entry per validated Claim that recorded
+/// artifact receipts, each artifact re-checked against its recorded
+/// digest right now. `available` is the whole point: an artifact whose
+/// bytes changed since validation, or that is gone, is reported
+/// explicitly unavailable with the reason — never silently credited,
+/// and never re-hashed into a new "current" digest that would erase
+/// what actually validated. Historical entries stay inspectable
+/// (BUILD-AMENDMENTS.md: "Snapshot needed bytes or resolve against the
+/// recorded digest and return explicit unavailable after change").
+fn claim_evidence(events: &[Event]) -> Vec<Value> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let EventKind::ClaimRecorded {
+                claim,
+                verdict: ClaimVerdict::Validated,
+                artifacts,
+                ..
+            } = &event.kind
+            else {
+                return None;
+            };
+            if artifacts.is_empty() {
+                return None;
+            }
+            let run_id = event.run.clone();
+            let waypoint = run_id
+                .as_ref()
+                .and_then(|run| find_run(events, run))
+                .map(|run| run.waypoint.0);
+            let worktree = run_id
+                .as_ref()
+                .and_then(|run| worktree_path_for_run(events, run));
+            let entries: Vec<Value> = artifacts
+                .iter()
+                .map(|artifact| {
+                    let (available, reason) = match &worktree {
+                        // A pre-correction receipt recorded a name and
+                        // nothing else: inspectable, but never
+                        // reportable as evidence that still holds.
+                        _ if artifact.digest.is_empty() => (false, Some("unrecorded")),
+                        None => (false, Some("unresolved")),
+                        Some(worktree) => {
+                            let path = worktree.join(&artifact.path);
+                            match ArtifactReceipt::digest_of(&path) {
+                                None => (false, Some("absent")),
+                                Some(now) if now == artifact.digest => (true, None),
+                                Some(_) => (false, Some("changed")),
+                            }
+                        }
+                    };
+                    json!({
+                        "name": artifact.name,
+                        "path": artifact.path,
+                        "digest": artifact.digest,
+                        "available": available,
+                        "reason": reason,
+                    })
+                })
+                .collect();
+            Some(json!({
+                "claim": claim.0,
+                "run": run_id.map(|run| run.0),
+                "waypoint": waypoint,
+                "artifacts": entries,
+            }))
+        })
+        .collect()
 }
 
 fn binding_status(binding: Result<RunBinding, String>) -> (Value, Value) {
@@ -2283,26 +2855,55 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
         return err_reply("NotFound", "no such work");
     }
     let work = fold(&events);
-    if !matches!(work.state, WorkState::NeedsInput) {
-        return err_reply("NotNeedsInput", "retry refused: the Work is not NeedsInput");
-    }
-    if work.needs_input.as_ref().map(|cause| &cause.run) != Some(&run_id) {
-        return err_reply(
-            "TripleMismatch",
-            "retry must name the Run that placed this Work in NeedsInput",
-        );
-    }
-
+    let waypoint_defs = waypoint_defs_for(&events);
     let Some(run) = find_run(&events, &run_id) else {
         return err_reply(
             "TripleMismatch",
             "the run id does not match any Run opened for this Work",
         );
     };
-
-    if work.current_waypoint.as_ref() != Some(&run.waypoint)
-        || latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
-            != Some(run_id.clone())
+    match work.state {
+        WorkState::NeedsInput => {
+            if work.needs_input.as_ref().map(|cause| &cause.run) != Some(&run_id) {
+                return err_reply(
+                    "TripleMismatch",
+                    "retry must name the Run that placed this Work in NeedsInput",
+                );
+            }
+            if work.current_waypoint.as_ref() != Some(&run.waypoint) {
+                return err_reply(
+                    "TripleMismatch",
+                    "retry must name the current unsuperseded Run",
+                );
+            }
+        }
+        // W-A (§3.2 amendment, BUILD-AMENDMENTS.md): a held container's
+        // own missing/invalid leaf output needs a usable correction
+        // path even though the Work is `Waiting`, not `NeedsInput` — a
+        // retry naming the *current* Run of any leaf nested under the
+        // held container is accepted; the leaf need not itself have
+        // failed (its own Claim may have validated cleanly while the
+        // *container's* own requirement — a required artifact name, or
+        // a since-superseded child receipt — went unmet).
+        WorkState::Waiting => {
+            let Some(held) = &work.held else {
+                return err_reply("NotNeedsInput", "retry refused: the Work is not held");
+            };
+            if !ancestor_chain(&waypoint_defs, &run.waypoint).contains(&held.waypoint) {
+                return err_reply(
+                    "TripleMismatch",
+                    "retry must name a leaf nested under the held container",
+                );
+            }
+        }
+        _ => {
+            return err_reply(
+                "NotNeedsInput",
+                "retry refused: the Work is neither NeedsInput nor Waiting",
+            );
+        }
+    }
+    if latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0) != Some(run_id.clone())
     {
         return err_reply(
             "TripleMismatch",
@@ -2373,6 +2974,41 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
             })
         }
     };
+    // W-A correction (F1/F2): retrying a leaf *reopens* every ancestor
+    // container whose own current activation had already closed —
+    // outermost first, each with a fresh monotonic attempt, journaled
+    // before the reservation the retry itself makes. This is the usable
+    // reopen path the amendments require ("Reopening invalidates
+    // affected aggregate closure and cannot reuse superseded attempt
+    // evidence"): a closed generation's `StageClosed` no longer answers
+    // for the new one, so every ancestor must see the corrected stage
+    // actually re-executed before it can close again. An ancestor that
+    // is merely *held* is left on its own activation — its closure
+    // never happened, so there is nothing to invalidate, and its own
+    // already-valid child receipts stay valid.
+    let mut reopening = ancestor_chain(&waypoint_defs, &run.waypoint);
+    reopening.reverse();
+    for ancestor in reopening {
+        let attempt = container_attempt(&events, &ancestor);
+        if !matches!(
+            stage_outcome_at(&events, &ancestor, attempt),
+            Some(StageOutcomeRef::Closed(_))
+        ) {
+            continue;
+        }
+        let activated = new_event(
+            &work_id,
+            None,
+            EventKind::ContainerActivated {
+                waypoint: ancestor.clone(),
+                attempt: next_container_attempt(&events, &ancestor),
+            },
+        );
+        if let Err(err) = append_event(state, &mut journal, &work_id, &activated) {
+            return err_reply("JournalError", &err.to_string());
+        }
+    }
+
     let world_hash = WorldHash::of(&fresh_world);
     let reserved = new_event(
         &work_id,
@@ -2934,6 +3570,675 @@ fn refusal_reply(refusal: &ClaimRefusal) -> Reply {
     err_reply(code, &message)
 }
 
+// ---- W-A: nested-stage closure evaluation (§3.2-3.3) -------------------
+
+/// The container `leaf_id` newly completes (as its last direct child),
+/// if any — the entry point `close_cascade` walks outward from.
+/// `close_cascade` itself decides whether to continue past it; this
+/// only answers the *first* step.
+fn innermost_closing_container(
+    tree: &[WaypointDefinition],
+    leaf_id: &WaypointId,
+) -> Option<WaypointId> {
+    let chain = ancestor_chain(tree, leaf_id);
+    let immediate = chain.first()?;
+    let def = find_definition(tree, immediate)?;
+    is_last_direct_child(def, leaf_id).then(|| immediate.clone())
+}
+
+/// `is_last_direct_child`'s cousin for a container's own outward
+/// direction: re-exported locally since `wirk_core::is_last_direct_child`
+/// takes the parent definition, not the tree — kept here rather than in
+/// `wirk-core` since only `close_cascade`'s own cascade needs it walked
+/// this way.
+fn is_last_direct_child(container: &WaypointDefinition, id: &WaypointId) -> bool {
+    container.leaves.last().map(|d| &d.id) == Some(id)
+}
+
+/// What one `close_cascade` walk did (W-A correction): stopped on a
+/// hold, or closed up to and including one outermost container.
+enum CascadeOutcome {
+    Held,
+    Closed(WaypointId),
+}
+
+/// One container's closure outcome (§3.2): closed with exact receipts,
+/// or held with the unmet requirement names.
+enum ClosureOutcome {
+    Closed(Vec<OutcomeReceipt>),
+    Held(Vec<String>),
+}
+
+/// The most recently journaled outcome for container `id` — the *last*
+/// `StageClosed`/`StageHeld` naming it wins (re-evaluation may append a
+/// fresh one after an earlier hold), mirroring `world_for_waypoint`'s
+/// own "last one wins" rule.
+enum StageOutcomeRef {
+    Closed(Vec<OutcomeReceipt>),
+    Held(Vec<String>),
+}
+
+/// The container activation currently in force for `id` — the last
+/// `ContainerActivated` naming it (W-A correction, F1/F2). A container
+/// no activation names at all (a pre-correction journal, or an old flat
+/// Route with no containers) reads as the first generation, so every
+/// comparison below stays total.
+fn container_attempt(events: &[Event], id: &WaypointId) -> u32 {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            EventKind::ContainerActivated { waypoint, attempt } if waypoint == id => Some(*attempt),
+            _ => None,
+        })
+        .unwrap_or(1)
+}
+
+/// The next activation to mint for `id`: strictly monotonic per
+/// container, from the journal alone (W-A correction, F1/F2).
+fn next_container_attempt(events: &[Event], id: &WaypointId) -> u32 {
+    events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ContainerActivated { waypoint, attempt } if waypoint == id => Some(*attempt),
+            _ => None,
+        })
+        .max()
+        .map_or(1, |highest| highest + 1)
+}
+
+/// The most recently journaled outcome for `id` **within one
+/// activation** (W-A correction, F1/F2): a `StageClosed` from a
+/// superseded generation is history, never current credit. This is the
+/// replacement for the pre-correction "latest `StageClosed` wins"
+/// shortcut that let a reopened stage's earlier close still satisfy its
+/// parent.
+fn stage_outcome_at(events: &[Event], id: &WaypointId, attempt: u32) -> Option<StageOutcomeRef> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::StageClosed {
+            waypoint,
+            attempt: at,
+            receipts,
+        } if waypoint == id && *at == attempt => Some(StageOutcomeRef::Closed(receipts.clone())),
+        EventKind::StageHeld {
+            waypoint,
+            attempt: at,
+            missing,
+        } if waypoint == id && *at == attempt => Some(StageOutcomeRef::Held(missing.clone())),
+        _ => None,
+    })
+}
+
+/// `id`'s outcome for the activation currently in force.
+fn current_stage_outcome(events: &[Event], id: &WaypointId) -> Option<StageOutcomeRef> {
+    stage_outcome_at(events, id, container_attempt(events, id))
+}
+
+/// The artifact receipts recorded for `claim` at validation (W-A
+/// correction, F3) — the only source a closure receipt's artifacts come
+/// from. Empty for a pre-correction journal, whose closure then holds
+/// on its declared outputs rather than inventing content identity it
+/// never recorded.
+fn claim_artifact_receipts(events: &[Event], claim_id: &ClaimId) -> Vec<ArtifactReceipt> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            EventKind::ClaimRecorded {
+                claim, artifacts, ..
+            } if claim == claim_id => Some(artifacts.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Recursively gathers every `Leaf` receipt's artifact names out of
+/// `receipts`, descending through nested `Container` receipts — an
+/// outer container's own `declared_outputs` are satisfied by a leaf at
+/// any depth in its subtree, aggregated through each level's own
+/// closure receipt rather than re-derived from raw Claims each time
+/// (W-A-BUILD.md: "aggregate recursively, never by last flattened leaf
+/// alone").
+fn collect_names(receipts: &[OutcomeReceipt], out: &mut BTreeSet<String>) {
+    for receipt in receipts {
+        match receipt {
+            OutcomeReceipt::Leaf { artifacts, .. } => {
+                out.extend(artifacts.iter().map(|artifact| artifact.name.clone()));
+            }
+            OutcomeReceipt::Container { receipts, .. } => collect_names(receipts, out),
+            OutcomeReceipt::Child { .. } => {}
+        }
+    }
+}
+
+/// Evaluates whether container `container_id` (found in `tree`) can
+/// close, from `events` alone — never from `WorkState`. Each direct
+/// child contributes a receipt when it has current, valid evidence: an
+/// executable leaf whose *current* (`latest_run_for_waypoint`) Run is
+/// `Claimed` (which, since `Run::apply` only reaches `Claimed` via a
+/// Validated Done verdict, already proves that leaf's own required
+/// declared outputs were present); a nested container whose own latest
+/// outcome is `StageClosed` (a stale one superseded by a later
+/// `StageHeld` does not count). `declared_outputs{required}` are then
+/// checked against the union of every contributing leaf's own required
+/// output names, recursively aggregated; `required_child_outcomes` are
+/// checked via `valid_child_receipt`, which itself refuses a receipt
+/// bound to a superseded Run (a retried leaf cannot reuse an earlier
+/// attempt's child).
+fn evaluate_closure(
+    state: &Arc<WirkdState>,
+    events: &[Event],
+    tree: &[WaypointDefinition],
+    container_id: &WaypointId,
+) -> ClosureOutcome {
+    let Some(def) = find_definition(tree, container_id) else {
+        return ClosureOutcome::Held(vec![format!("container {} not found", container_id.0)]);
+    };
+
+    let mut receipts = Vec::new();
+    let mut produced: BTreeSet<String> = BTreeSet::new();
+    let mut missing = Vec::new();
+
+    for child in &def.leaves {
+        match child.kind {
+            // W-A correction (F1/F2): a nested container counts only
+            // when *its own current activation* closed. A reopened
+            // sub-container has no `StageClosed` for its new generation
+            // until it is re-executed, so its earlier close can never
+            // be borrowed to satisfy this parent.
+            WaypointKind::Container => match current_stage_outcome(events, &child.id) {
+                Some(StageOutcomeRef::Closed(child_receipts)) => {
+                    collect_names(&child_receipts, &mut produced);
+                    receipts.push(OutcomeReceipt::Container {
+                        waypoint: child.id.clone(),
+                        receipts: child_receipts,
+                    });
+                }
+                _ => missing.push(format!("container {} not closed", child.id.0)),
+            },
+            WaypointKind::Actor | WaypointKind::Deterministic => {
+                match latest_run_for_waypoint(events, &child.id)
+                    .and_then(|(run_id, ..)| find_run(events, &run_id).map(|run| (run_id, run)))
+                {
+                    // W-A correction (F3): the receipt's artifacts are
+                    // the ones this Claim was *validated against*, with
+                    // the content identity recorded then — never the
+                    // Route's declared names re-derived against a
+                    // mutable path.
+                    Some((run_id, run)) => match &run.state {
+                        RunState::Claimed(claim_id) => {
+                            let artifacts = claim_artifact_receipts(events, claim_id);
+                            produced.extend(artifacts.iter().map(|a| a.name.clone()));
+                            receipts.push(OutcomeReceipt::Leaf {
+                                waypoint: child.id.clone(),
+                                run: run_id,
+                                claim: claim_id.clone(),
+                                artifacts,
+                            });
+                        }
+                        // W-A correction (F1): a container never closes
+                        // over a leaf whose current execution is still
+                        // open (or failed) — the pre-correction code
+                        // simply contributed no receipt, which let a
+                        // leaf with no required output of its own pass
+                        // silently while its Run stayed open.
+                        _ => missing.push(format!(
+                            "waypoint {} has no current validated Run",
+                            child.id.0
+                        )),
+                    },
+                    None => missing.push(format!("waypoint {} has not run", child.id.0)),
+                }
+            }
+        }
+    }
+
+    for spec in &def.declared_outputs {
+        if spec.required && !produced.contains(&spec.name) {
+            missing.push(spec.name.clone());
+        }
+    }
+
+    for role in &def.required_child_outcomes {
+        if !role.required {
+            continue;
+        }
+        match valid_child_receipt(state, events, container_id, &role.role) {
+            Some(receipt) => receipts.push(receipt),
+            None => missing.push(format!("child role {}", role.role)),
+        }
+    }
+
+    if missing.is_empty() {
+        ClosureOutcome::Closed(receipts)
+    } else {
+        ClosureOutcome::Held(missing)
+    }
+}
+
+/// A valid `Child` receipt for `role` on `container_id`, from `events`
+/// alone (§3.3): the *most recent* `ChildWorkSpawned` naming this
+/// `(container_id, role)` whose own `run` is still the current,
+/// unsuperseded Run of the leaf that requested it (a retried requesting
+/// leaf mints a fresh Run, so an earlier spawn's `run` no longer
+/// matches `latest_run_for_waypoint` — its receipt is never reused,
+/// `retried_parent_leaf_cannot_reuse_earlier_attempts_child_receipt`),
+/// and whose named child Work has its own journal
+/// (`dangling_spawn_without_child_journal_is_missing_not_credited`
+/// otherwise) and is `Completed` (never `Canceled`, `Failed`, or simply
+/// open).
+fn valid_child_receipt(
+    state: &Arc<WirkdState>,
+    events: &[Event],
+    container_id: &WaypointId,
+    role: &str,
+) -> Option<OutcomeReceipt> {
+    let parent_work_id = events.first().map(|event| event.work.clone())?;
+    let current_attempt = container_attempt(events, container_id);
+    events.iter().rev().find_map(|event| {
+        let EventKind::ChildWorkSpawned {
+            role: spawned_role,
+            child,
+            waypoint,
+            attempt,
+            run,
+        } = &event.kind
+        else {
+            return None;
+        };
+        if spawned_role != role || waypoint != container_id {
+            return None;
+        }
+        // W-A correction (F1/F2): the spawn served one generation of
+        // this container. A reopened container's earlier child outcome
+        // is superseded evidence, not current credit.
+        if *attempt != current_attempt {
+            return None;
+        }
+        let requester = find_run(events, run)?;
+        if latest_run_for_waypoint(events, &requester.waypoint)
+            .map(|entry| entry.0)
+            .as_ref()
+            != Some(run)
+        {
+            return None;
+        }
+        // W-A correction (F4): the binding is checked from both sides —
+        // the parent's own spawn record *and* the child's own recorded
+        // parent. A Work that never named this parent, waypoint,
+        // activation, requesting Run and role cannot be a receipt,
+        // however completed it is.
+        let expected = ParentBinding {
+            work: parent_work_id.clone(),
+            waypoint: container_id.clone(),
+            attempt: Some(*attempt),
+            run: run.clone(),
+            role: role.to_string(),
+        };
+        let (claim, world_hash) = child_work_completed_receipt(state, child, &expected)?;
+        Some(OutcomeReceipt::Child {
+            role: role.to_string(),
+            child: child.clone(),
+            parent_run: run.clone(),
+            claim,
+            world_hash,
+        })
+    })
+}
+
+/// The child Work's own closing `ClaimId`/`WorldHash`, when — and only
+/// when — its journal exists and it folds `Completed` (never inferred
+/// from a partial replay or a dangling spawn with no journal at all).
+fn child_work_completed_receipt(
+    state: &Arc<WirkdState>,
+    child: &WorkId,
+    expected: &ParentBinding,
+) -> Option<(ClaimId, WorldHash)> {
+    let journal = journal_for(state, child).ok().flatten()?;
+    let events = {
+        let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+        journal.replay().ok()?
+    };
+    if events.is_empty() {
+        return None;
+    }
+    let work = fold(&events);
+    if !matches!(work.state, WorkState::Completed) {
+        return None;
+    }
+    // W-A correction (F4): the child's own half of the binding.
+    let bound = work.parent.as_ref().is_some_and(|own| {
+        own.work == expected.work
+            && own.waypoint == expected.waypoint
+            && own.run == expected.run
+            && own.role == expected.role
+            && own.attempt_or_first() == expected.attempt_or_first()
+    });
+    if !bound {
+        return None;
+    }
+    let waypoints = route_waypoints(&events);
+    let last_leaf = waypoints.last()?;
+    let (run_id, ..) = latest_run_for_waypoint(&events, last_leaf)?;
+    let run = find_run(&events, &run_id)?;
+    let RunState::Claimed(claim_id) = run.state else {
+        return None;
+    };
+    let world_hash = world_for_waypoint(&events, last_leaf).map(|world| WorldHash::of(&world))?;
+    Some((claim_id, world_hash))
+}
+
+/// Evaluates `current`'s closure and, on success, walks outward through
+/// its own ancestor chain as far as each successive container is also
+/// its parent's last direct child — journaling one `StageClosed` per
+/// level closed, or one final `StageHeld` where the cascade stops.
+/// Returns `CascadeOutcome::Held` when the cascade stopped on a hold
+/// (the caller must not advance the Work any further), or
+/// `CascadeOutcome::Closed(outermost)` naming the outermost container
+/// it actually closed — which is the container the Route continues
+/// *after*, and so what a caller advancing the Work must ask about.
+fn close_cascade(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    journal: &mut Journal,
+    tree: &[WaypointDefinition],
+    mut current: WaypointId,
+) -> Result<CascadeOutcome, JournalError> {
+    loop {
+        let events = journal.replay()?;
+        let attempt = container_attempt(&events, &current);
+        match evaluate_closure(state, &events, tree, &current) {
+            ClosureOutcome::Closed(receipts) => {
+                let closed = new_event(
+                    work_id,
+                    None,
+                    EventKind::StageClosed {
+                        waypoint: current.clone(),
+                        attempt,
+                        receipts,
+                    },
+                );
+                append_event(state, journal, work_id, &closed)?;
+                let ancestors = ancestor_chain(tree, &current);
+                match ancestors.first() {
+                    Some(parent_id)
+                        if find_definition(tree, parent_id)
+                            .is_some_and(|parent| is_last_direct_child(parent, &current)) =>
+                    {
+                        current = parent_id.clone();
+                    }
+                    _ => return Ok(CascadeOutcome::Closed(current)),
+                }
+            }
+            ClosureOutcome::Held(missing) => {
+                // W-A correction (minor finding): an unchanged hold on
+                // the same activation is already journaled — a restart
+                // sweep or a second re-evaluation re-deriving the same
+                // answer is *idempotent recovery*, not a new fact, and
+                // must not grow the journal by one line per restart.
+                // A hold whose reason changed (or one on a fresh
+                // activation) is a new fact and is appended.
+                let work_now = fold(&events);
+                if matches!(
+                    stage_outcome_at(&events, &current, attempt),
+                    Some(StageOutcomeRef::Held(ref already)) if already == &missing
+                ) && matches!(work_now.state, WorkState::Waiting)
+                    && work_now.held.as_ref().is_some_and(|held| {
+                        held.waypoint == current
+                            && held.attempt == attempt
+                            && held.missing == missing
+                    })
+                {
+                    return Ok(CascadeOutcome::Held);
+                }
+                let held = new_event(
+                    work_id,
+                    None,
+                    EventKind::StageHeld {
+                        waypoint: current.clone(),
+                        attempt,
+                        missing,
+                    },
+                );
+                append_event(state, journal, work_id, &held)?;
+                return Ok(CascadeOutcome::Held);
+            }
+        }
+    }
+}
+
+/// Re-evaluates `parent.work`'s held container (`parent.waypoint`),
+/// triggered by an external event on a *different* Work's journal — a
+/// spawned child validating Done or being canceled (module callers), or
+/// the startup sweep over every `Waiting` Work
+/// (`reevaluate_waiting_works`). A no-op, not an error, when the parent
+/// Work no longer exists, is already terminal, or its named container
+/// is not currently held (idempotent: re-evaluating an already-closed
+/// container must never re-open or duplicate its receipts).
+fn reevaluate_parent(state: &Arc<WirkdState>, parent: &ParentBinding) -> Result<(), JournalError> {
+    let Some(journal) = journal_for(state, &parent.work)? else {
+        return Ok(());
+    };
+    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let events = journal.replay()?;
+    if events.is_empty() || fold(&events).state.is_terminal() {
+        return Ok(());
+    }
+    // W-A correction (F1/F2): "currently held" is asked of the
+    // activation in force, so a container reopened after its close is
+    // never re-closed here from a superseded generation's evidence.
+    if !matches!(
+        current_stage_outcome(&events, &parent.waypoint),
+        Some(StageOutcomeRef::Held(_))
+    ) {
+        return Ok(());
+    }
+    let defs = waypoint_defs_for(&events);
+    let closed = match close_cascade(
+        state,
+        &parent.work,
+        &mut journal,
+        &defs,
+        parent.waypoint.clone(),
+    )? {
+        CascadeOutcome::Held => return Ok(()),
+        CascadeOutcome::Closed(outermost) => outermost,
+    };
+    // W-A correction: the cascade closed this container (and possibly
+    // outer ones) without any Claim on *this* journal — the child that
+    // satisfied it completed elsewhere. `handle_claim`'s auto-advance
+    // never ran, so if the Route continues past the outermost container
+    // just closed, reserve its next leaf here; otherwise the Work sits
+    // `Active` on a closed container with no open Run and nothing to
+    // claim or retry.
+    if let Some(container) = find_definition(&defs, &closed)
+        && let Some(last_leaf) = flatten_leaves(std::slice::from_ref(container))
+            .last()
+            .cloned()
+        && let Err((code, message)) =
+            reserve_next_leaf(state, &parent.work, &mut journal, &defs, &last_leaf)
+    {
+        eprintln!(
+            "wirkd: advancing {} past its closed container failed: {code} {message}",
+            parent.work.0
+        );
+    }
+    let events_now = journal.replay()?;
+    let parent_work = fold(&events_now);
+    let grandparent = parent_work.parent.clone();
+    drop(journal);
+    if matches!(parent_work.state, WorkState::Completed)
+        && let Some(grandparent) = grandparent
+    {
+        reevaluate_parent(state, &grandparent)?;
+    }
+    Ok(())
+}
+
+/// Startup sweep (W-A, §3.2, mirroring `recover_docker_runs`'s own
+/// once-at-startup convention): every Work whose folded state is
+/// currently `Waiting` gets its held container re-evaluated once, so a
+/// crash between a child's own completing Claim and this Work's
+/// `StageClosed` is repaired on restart without any external trigger.
+/// Idempotent: a container already closed (or held for the same reason)
+/// is left alone by `reevaluate_parent`'s own guard.
+fn reevaluate_waiting_works(state: &Arc<WirkdState>) {
+    let works_dir = state.estate_root.join("works");
+    let Ok(entries) = std::fs::read_dir(&works_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(journal) = Journal::open(&dir) else {
+            continue;
+        };
+        let Ok(events) = journal.replay() else {
+            continue;
+        };
+        if events.is_empty() {
+            continue;
+        }
+        let work = fold(&events);
+        if !matches!(work.state, WorkState::Waiting) {
+            continue;
+        }
+        let Some(held) = work.held.clone() else {
+            continue;
+        };
+        let parent = ParentBinding {
+            work: work.id.clone(),
+            waypoint: held.waypoint,
+            // The sweep re-evaluates one *held container*; the Run/role
+            // fields of this binding are only `reevaluate_parent`'s
+            // addressing, never evidence (it re-derives every receipt
+            // from the parent's own journal). The activation likewise
+            // comes from the journal there, not from here.
+            attempt: Some(held.attempt),
+            run: RunId(String::new()),
+            role: String::new(),
+        };
+        if let Err(err) = reevaluate_parent(state, &parent) {
+            eprintln!(
+                "wirkd: startup re-evaluation of held Work {} failed: {err}",
+                work.id.0
+            );
+        }
+    }
+}
+
+// ---- W-A: cancel and cascade (§3.4) ------------------------------------
+
+/// `wirk work cancel`: refuses `OpenChild` when a spawned, non-terminal
+/// child exists and `--cascade` was not given (no journal write on
+/// refusal, same shape as `retry`'s `NotNeedsInput`); with `--cascade`,
+/// cancels every open child first (recursively, attributing each with
+/// `caused_by`), then this Work. A terminal Work is a no-op success
+/// (idempotent: a crash mid-cascade is repaired by re-running the verb).
+fn handle_cancel(state: &Arc<WirkdState>, payload: CancelPayload) -> Reply {
+    match cancel_work(
+        state,
+        &payload.work_id,
+        payload.cascade,
+        payload.reason,
+        None,
+    ) {
+        Ok(()) => ok_reply(json!({})),
+        Err((code, message)) => err_reply(code, &message),
+    }
+}
+
+/// The recursive worker behind `handle_cancel`: `caused_by` is `None`
+/// for the explicitly named target of the verb, `Some(parent)` for a
+/// cascade step.
+fn cancel_work(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    cascade: bool,
+    reason: Option<String>,
+    caused_by: Option<WorkId>,
+) -> Result<(), (&'static str, String)> {
+    let journal = journal_for(state, work_id)
+        .map_err(|err| ("JournalError", err.to_string()))?
+        .ok_or_else(|| ("NotFound", "no such work".to_string()))?;
+    let events = {
+        let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+        journal
+            .replay()
+            .map_err(|err| ("JournalError", err.to_string()))?
+    };
+    if events.is_empty() {
+        return Err(("NotFound", "no such work".to_string()));
+    }
+    let work = fold(&events);
+    if work.state.is_terminal() {
+        return Ok(());
+    }
+
+    let open_children: Vec<WorkId> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::ChildWorkSpawned { child, .. } => Some(child.clone()),
+            _ => None,
+        })
+        .filter(|child| {
+            journal_for(state, child)
+                .ok()
+                .flatten()
+                .and_then(|journal| {
+                    let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+                    journal.replay().ok()
+                })
+                .is_some_and(|events| !events.is_empty() && !fold(&events).state.is_terminal())
+        })
+        .collect();
+
+    if !open_children.is_empty() {
+        if !cascade {
+            return Err((
+                "OpenChild",
+                format!(
+                    "work {} has an open child {} (retry with --cascade)",
+                    work_id.0, open_children[0].0
+                ),
+            ));
+        }
+        for child in &open_children {
+            cancel_work(state, child, true, None, Some(work_id.clone()))?;
+        }
+    }
+
+    let journal = journal_for(state, work_id)
+        .map_err(|err| ("JournalError", err.to_string()))?
+        .ok_or_else(|| ("NotFound", "no such work".to_string()))?;
+    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    // Re-check terminality under this Work's own lock: a concurrent
+    // cancel of the same Work between the read above and this write is
+    // harmless (idempotent no-op), never a double `WorkCanceled`.
+    let events = journal
+        .replay()
+        .map_err(|err| ("JournalError", err.to_string()))?;
+    if fold(&events).state.is_terminal() {
+        return Ok(());
+    }
+    let event = new_event(work_id, None, EventKind::WorkCanceled { reason, caused_by });
+    append_event(state, &mut journal, work_id, &event)
+        .map_err(|err| ("JournalError", err.to_string()))?;
+    drop(journal);
+
+    // A canceled child never satisfies a receipt; the parent's own
+    // container re-evaluates to `StageHeld` for that role, exactly as
+    // it would for any other missing/invalid child completion.
+    if let Some(parent) = work.parent
+        && let Err(err) = reevaluate_parent(state, &parent)
+    {
+        return Err(("JournalError", err.to_string()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2953,6 +4258,7 @@ mod tests {
                     .map(|id| WaypointId(id.to_string()))
                     .collect(),
                 waypoint_defs: Vec::new(),
+                parent: None,
             },
         }
     }

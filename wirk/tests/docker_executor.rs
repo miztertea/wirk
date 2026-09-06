@@ -495,6 +495,7 @@ fn sweep_work_submitted(waypoints: Vec<&str>) -> EventKind {
             .map(|wp| WaypointId(wp.to_string()))
             .collect(),
         waypoint_defs: Vec::new(),
+        parent: None,
     }
 }
 
@@ -628,6 +629,7 @@ fn d5_11_sweep_matches_open_runs_against_the_injected_docker_listing() {
                 "work-c",
                 Some("run-c"),
                 EventKind::ClaimRecorded {
+                    artifacts: Vec::new(),
                     claim: wirk_core::ClaimId("claim-c".to_string()),
                     claim_kind: wirk_core::ClaimKind::Done,
                     verdict: wirk_core::ClaimVerdict::Validated,
@@ -730,6 +732,7 @@ fn d5_12_sweep_finds_nothing_when_no_run_is_open() {
                 "work-done",
                 Some("run-done"),
                 EventKind::ClaimRecorded {
+                    artifacts: Vec::new(),
                     claim: wirk_core::ClaimId("claim-done".to_string()),
                     claim_kind: wirk_core::ClaimKind::Done,
                     verdict: wirk_core::ClaimVerdict::Validated,

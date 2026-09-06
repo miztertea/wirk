@@ -491,6 +491,70 @@ fn wirkd_status_command(estate: &str, work_filter: Option<String>) -> ExitCode {
                     result["current_waypoint"].as_str().unwrap_or("-"),
                     needs_input
                 );
+                // W-A: a held container's own reason, the container
+                // activations in force, and (W-A correction, F3) the
+                // artifact evidence each validated Claim rests on —
+                // answered against the content identity recorded at
+                // validation, so a rewritten or removed artifact reads
+                // `unavailable (changed)` / `unavailable (absent)`
+                // here rather than as a path that silently still
+                // "counts". Printed on the human verb, not only on the
+                // JSON wire result: an operator deciding whether a
+                // closure's evidence still holds is exactly who needs
+                // this, and the pre-correction printer showed neither.
+                if let Some(held) = result.get("held") {
+                    println!(
+                        "  held {} attempt {} missing {}",
+                        held["waypoint"].as_str().unwrap_or("?"),
+                        held["attempt"].as_u64().unwrap_or(1),
+                        held["missing"]
+                            .as_array()
+                            .map(|names| names
+                                .iter()
+                                .filter_map(|name| name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", "))
+                            .unwrap_or_default()
+                    );
+                }
+                if let Some(parent) = result.get("parent") {
+                    println!(
+                        "  parent {} waypoint {} attempt {} run {} role {}",
+                        parent["work"].as_str().unwrap_or("?"),
+                        parent["waypoint"].as_str().unwrap_or("?"),
+                        parent["attempt"].as_u64().unwrap_or(1),
+                        parent["run"].as_str().unwrap_or("?"),
+                        parent["role"].as_str().unwrap_or("?"),
+                    );
+                }
+                for activation in result["activations"].as_array().unwrap_or(&Vec::new()) {
+                    println!(
+                        "  container {} activation {}",
+                        activation["waypoint"].as_str().unwrap_or("?"),
+                        activation["attempt"].as_u64().unwrap_or(1),
+                    );
+                }
+                for entry in result["evidence"].as_array().unwrap_or(&Vec::new()) {
+                    for artifact in entry["artifacts"].as_array().unwrap_or(&Vec::new()) {
+                        let availability = if artifact["available"].as_bool().unwrap_or(false) {
+                            "available".to_string()
+                        } else {
+                            format!(
+                                "unavailable ({})",
+                                artifact["reason"].as_str().unwrap_or("unknown")
+                            )
+                        };
+                        println!(
+                            "  evidence {} {} sha256:{} {} claim {} run {}",
+                            entry["waypoint"].as_str().unwrap_or("?"),
+                            artifact["name"].as_str().unwrap_or("?"),
+                            artifact["digest"].as_str().unwrap_or("?"),
+                            availability,
+                            entry["claim"].as_str().unwrap_or("?"),
+                            entry["run"].as_str().unwrap_or("-"),
+                        );
+                    }
+                }
             }
             Ok(Reply::Err { error, .. }) => {
                 eprintln!(
@@ -594,17 +658,57 @@ fn work_command(rest: &[String]) -> ExitCode {
         // --work <id> --reason <text>` appends `WorkFailed` with the
         // reason; refused when the Work is not `NeedsInput`.
         Some("fail") => work_fail_command(&rest[1..]),
+        // W-A (§3.4): `wirk work cancel --estate <root> --work <id>
+        // [--cascade] [--reason <text>]`.
+        Some("cancel") => work_cancel_command(&rest[1..]),
         _ => work_usage(),
     }
 }
 
-/// `wirk work retry --estate <root> --work <id>`: resolves the failed
-/// `run_id` itself from `wirk work status`'s own `run_id` field (one
-/// extra round trip) rather than asking the human to copy an id
-/// (decide.md §1's own CLI design), then calls wirkd's `retry` verb.
-/// Prints `"Retried <old_run_id> -> <new_run_id>"` on success, or
-/// wirkd's refusal text (`NotNeedsInput` when the Work isn't
-/// `NeedsInput`).
+/// `wirk work cancel --estate <root> --work <id> [--cascade] [--reason
+/// <text>]` (W-A, §3.4): refuses `OpenChild` naming the first open child
+/// found when a spawned child is still non-terminal and `--cascade` was
+/// not given; with `--cascade`, cancels every open descendant first,
+/// attributed to this Work, then this Work itself.
+fn work_cancel_command(rest: &[String]) -> ExitCode {
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return work_usage();
+    };
+    let Some(work_id) = flag_value(rest, "--work") else {
+        return work_usage();
+    };
+    let cascade = rest.iter().any(|arg| arg == "--cascade");
+    let reason = flag_value(rest, "--reason");
+
+    wirkd_client_call(
+        &estate,
+        &Request::cancel(wirkd::CancelPayload {
+            work_id: WorkId(work_id.clone()),
+            cascade,
+            reason,
+        }),
+        |_result| {
+            println!("Canceled {work_id}");
+        },
+    )
+}
+
+/// `wirk work retry --estate <root> --work <id> [--run <run-id>]`:
+/// resolves the failed `run_id` itself from `wirk work status`'s own
+/// `run_id` field (one extra round trip) rather than asking the human
+/// to copy an id (decide.md §1's own CLI design), then calls wirkd's
+/// `retry` verb. Prints `"Retried <old_run_id> -> <new_run_id>"` on
+/// success, or wirkd's refusal text (`NotNeedsInput` when the Work
+/// isn't `NeedsInput` or `Waiting`).
+///
+/// W-A correction (F1/F2): `--run` names one exact leaf Run instead.
+/// That is what reopening an already-closed nested stage needs — the
+/// stage to correct is not the Work's own current one (a held container
+/// resolves to its most recent descendant Run), it is a leaf inside a
+/// container that already closed. Reusing `retry` this way is the
+/// minimal usable public reopen operation: it already mints the fresh
+/// Run/World a correction needs, and wirkd's own `handle_retry` is
+/// where the ancestor invalidation belongs.
 fn work_retry_command(rest: &[String]) -> ExitCode {
     let Some(estate) = flag_value(rest, "--estate") else {
         return work_usage();
@@ -612,6 +716,7 @@ fn work_retry_command(rest: &[String]) -> ExitCode {
     let Some(work_id) = flag_value(rest, "--work") else {
         return work_usage();
     };
+    let named_run = flag_value(rest, "--run");
 
     let pointer = match wirkd::client::locate(Path::new(&estate)) {
         Ok(pointer) => pointer,
@@ -620,6 +725,26 @@ fn work_retry_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if let Some(run_id) = named_run {
+        return wirkd_client_call(
+            &estate,
+            &Request::retry(RetryPayload {
+                triple: ExecutionTriple {
+                    estate_root: estate.clone(),
+                    work_id: WorkId(work_id.clone()),
+                    run_id: RunId(run_id.clone()),
+                },
+            }),
+            |result| {
+                println!(
+                    "Retried {} -> {}",
+                    result["old_run_id"].as_str().unwrap_or(&run_id),
+                    result["new_run_id"].as_str().unwrap_or_default()
+                );
+            },
+        );
+    }
 
     let status_reply = wirkd::client::call(
         &pointer.socket,
@@ -773,6 +898,39 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
     let kind = flag_value(rest, "--kind");
     let repo_path = flag_value(rest, "--repo-path");
     let route = flag_value(rest, "--route");
+    // W-A (§3.3): a child submission names its requesting parent
+    // Work/container/Run and the role it claims — all four or none;
+    // wirkd itself is the one that checks the binding is real
+    // (`ChildParentMismatch`/`ChildExceedsParentBinding`), this is only
+    // parsing.
+    let parent_work = flag_value(rest, "--parent-work");
+    let parent_waypoint = flag_value(rest, "--parent-waypoint");
+    let parent_run = flag_value(rest, "--parent-run");
+    let role = flag_value(rest, "--role");
+    // W-A correction (F4): `--parent-attempt <n>` names the container
+    // *activation* the child serves. Optional: omitted, wirkd binds the
+    // container's current generation and records it on both journals;
+    // given, it must be that same current generation, so a request
+    // built against a superseded activation is refused rather than
+    // admitted and later found stale.
+    let parent_attempt = match flag_value(rest, "--parent-attempt") {
+        None => None,
+        Some(text) => match text.parse::<u32>() {
+            Ok(attempt) => Some(attempt),
+            Err(_) => return work_usage(),
+        },
+    };
+    let parent = match (&parent_work, &parent_waypoint, &parent_run, &role) {
+        (None, None, None, None) => None,
+        (Some(work), Some(waypoint), Some(run), Some(role)) => Some(wirk_core::ParentBinding {
+            work: WorkId(work.clone()),
+            waypoint: WaypointId(waypoint.clone()),
+            attempt: parent_attempt,
+            run: RunId(run.clone()),
+            role: role.clone(),
+        }),
+        _ => return work_usage(),
+    };
     let source_basis = match flag_value(rest, "--source-basis").as_deref() {
         Some("git") => Some(SourceBasis::Git {
             base: base_ref.clone(),
@@ -801,6 +959,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
         command,
         repo_path,
         route,
+        parent,
     };
     wirkd_client_call(&estate, &Request::submit(payload), |result| {
         println!(
@@ -814,7 +973,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) | wirk work status --estate <root> --work <id> | wirk work retry --estate <root> --work <id> | wirk work fail --estate <root> --work <id> --reason <text>"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>]"
     );
     ExitCode::from(1)
 }
@@ -1327,6 +1486,7 @@ fn demo_events() -> Vec<Event> {
                 intent: "demo the journal lifecycle".to_string(),
                 waypoints: vec![waypoint.clone()],
                 waypoint_defs: Vec::new(),
+                parent: None,
             },
         ),
         new_event(
@@ -1370,6 +1530,7 @@ fn demo_events() -> Vec<Event> {
                 claim,
                 claim_kind: ClaimKind::Done,
                 verdict: ClaimVerdict::Validated,
+                artifacts: Vec::new(),
             },
         ),
     ]
@@ -1407,6 +1568,10 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::RunLaunched { .. } => "RunLaunched",
         EventKind::WorkFailed { .. } => "WorkFailed",
         EventKind::WorkCanceled { .. } => "WorkCanceled",
+        EventKind::ContainerActivated { .. } => "ContainerActivated",
+        EventKind::StageHeld { .. } => "StageHeld",
+        EventKind::StageClosed { .. } => "StageClosed",
+        EventKind::ChildWorkSpawned { .. } => "ChildWorkSpawned",
     }
 }
 

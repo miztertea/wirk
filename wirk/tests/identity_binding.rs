@@ -261,7 +261,10 @@ fn raw_work_submitted(waypoint: &str, repositories: Vec<RepositoryBinding>) -> E
             intent: None,
             command: Some(vec!["true".to_string()]),
             boundary: Boundary(Vec::new()),
+            leaves: Vec::new(),
+            required_child_outcomes: Vec::new(),
         }],
+        parent: None,
     }
 }
 
@@ -537,6 +540,7 @@ fn record_refuses_server_and_operator_owned_events() {
         None,
         EventKind::WorkCanceled {
             reason: Some("forged operator cancellation".to_owned()),
+            caused_by: None,
         },
     );
     let after = journal_len(&estate, &work);
@@ -909,7 +913,10 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
                         intent: Some("legacy identity".to_string()),
                         command: None,
                         boundary: Boundary(vec!["**".to_string()]),
+                        leaves: Vec::new(),
+                        required_child_outcomes: Vec::new(),
                     }],
+                    parent: None,
                 },
             ),
             raw_event(

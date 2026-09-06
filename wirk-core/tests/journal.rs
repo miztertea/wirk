@@ -34,6 +34,7 @@ fn claim_recorded_event(id: &str, work: &str, run: &str, claim: &str) -> Event {
         run: Some(RunId(run.to_string())),
         at: Timestamp(1),
         kind: EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
             claim: ClaimId(claim.to_string()),
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
@@ -255,6 +256,7 @@ fn replay_then_fold_equals_folding_the_original_events() {
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
                 waypoint_defs: Vec::new(),
+                parent: None,
             },
         },
         Event {
@@ -305,6 +307,7 @@ fn replay_then_fold_equals_folding_the_original_events() {
             run: Some(RunId("run-1".to_string())),
             at: Timestamp(5),
             kind: EventKind::ClaimRecorded {
+                artifacts: Vec::new(),
                 claim: ClaimId("claim-1".to_string()),
                 claim_kind: ClaimKind::Done,
                 verdict: ClaimVerdict::Validated,
@@ -360,6 +363,7 @@ fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
                 WaypointId("proving/wp-2".to_string()),
             ],
             waypoint_defs: Vec::new(),
+            parent: None,
         },
     };
     let wp1_events = [
@@ -401,6 +405,7 @@ fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
             run: Some(RunId("run-1".to_string())),
             at: Timestamp(4),
             kind: EventKind::ClaimRecorded {
+                artifacts: Vec::new(),
                 claim: ClaimId("claim-1".to_string()),
                 claim_kind: ClaimKind::Done,
                 verdict: ClaimVerdict::Validated,
@@ -446,6 +451,7 @@ fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
             run: Some(RunId("run-2".to_string())),
             at: Timestamp(8),
             kind: EventKind::ClaimRecorded {
+                artifacts: Vec::new(),
                 claim: ClaimId("claim-2".to_string()),
                 claim_kind: ClaimKind::Done,
                 verdict: ClaimVerdict::Validated,
@@ -520,6 +526,7 @@ fn fold_leaves_work_state_unchanged_on_a_refused_question_claim() {
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
                 waypoint_defs: Vec::new(),
+                parent: None,
             },
         },
         Event {
@@ -551,6 +558,7 @@ fn fold_leaves_work_state_unchanged_on_a_refused_question_claim() {
             run: Some(RunId("run-1".to_string())),
             at: Timestamp(3),
             kind: EventKind::ClaimRecorded {
+                artifacts: Vec::new(),
                 claim: ClaimId("claim-1".to_string()),
                 claim_kind: ClaimKind::Question("what next?".to_string()),
                 verdict: ClaimVerdict::Refused(wirk_core::ClaimRefusal::TripleMismatch),
@@ -586,6 +594,7 @@ fn fold_advances_last_activity_across_events_with_increasing_timestamps() {
                 intent: "do the thing".to_string(),
                 waypoints: vec![WaypointId("wp-1".to_string())],
                 waypoint_defs: Vec::new(),
+                parent: None,
             },
         },
         Event {
@@ -651,6 +660,7 @@ fn old_worksubmitted_without_waypoint_defs_field_still_folds() {
             intent: "do the thing".to_string(),
             waypoints: vec![WaypointId("wp-1".to_string())],
             waypoint_defs: Vec::new(),
+            parent: None,
         },
     };
     let mut value = serde_json::to_value(&event).expect("event serializes");
