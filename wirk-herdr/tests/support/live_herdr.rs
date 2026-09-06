@@ -58,10 +58,21 @@ pub fn require_herdr_or_skip(test_name: &str) -> bool {
     }
 }
 
-fn herdr(args: &[&str]) -> std::process::Output {
-    Command::new("herdr")
-        .args(args)
-        .output()
+/// Runs `herdr <args>`, with `env` applied to the spawned CLI process —
+/// needed the moment a session's server was started with an overridden
+/// `XDG_CONFIG_HOME`/`XDG_STATE_HOME` (`start_with_env`'s isolation
+/// case, P2.7 W4): the CLI resolves the session's socket the same way
+/// the server resolved it, by reading those variables from its own
+/// environment, so every command addressing an isolated session must
+/// carry the same overrides or it silently falls back to the caller's
+/// ambient `$HOME/.config/herdr` and finds a different (or no) session.
+fn run_herdr(args: &[&str], env: &[(String, String)]) -> std::process::Output {
+    let mut cmd = Command::new("herdr");
+    cmd.args(args);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output()
         .unwrap_or_else(|e| panic!("herdr {args:?}: spawn failed: {e}"))
 }
 
@@ -77,14 +88,23 @@ fn fnv1a(s: &str) -> u32 {
     hash
 }
 
-fn session_socket_path(name: &str) -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME must be set to locate the Herdr config dir");
-    PathBuf::from(home)
-        .join(".config")
-        .join("herdr")
-        .join("sessions")
-        .join(name)
-        .join("herdr.sock")
+/// Mirrors Herdr's own `config_dir()` (`refs/herdr/src/config/io.rs`):
+/// `XDG_CONFIG_HOME`, when set in the *server's* environment, relocates
+/// the whole config root (and with it every session's socket and the
+/// plugin registry) out from under `$HOME/.config`; `env` is the same
+/// slice a session was started with, so the CLI looks in the same place
+/// the server actually used.
+fn session_socket_path(name: &str, env: &[(String, String)]) -> PathBuf {
+    let config_root = env
+        .iter()
+        .find(|(key, _)| key == "XDG_CONFIG_HOME")
+        .map(|(_, value)| PathBuf::from(value).join("herdr"))
+        .unwrap_or_else(|| {
+            let home =
+                std::env::var("HOME").expect("HOME must be set to locate the Herdr config dir");
+            PathBuf::from(home).join(".config").join("herdr")
+        });
+    config_root.join("sessions").join(name).join("herdr.sock")
 }
 
 /// A throwaway named Herdr session (0040 D127), and — when a test needs
@@ -95,6 +115,7 @@ pub struct LiveHerdrSession {
     name: String,
     socket: PathBuf,
     scratch: PathBuf,
+    env: Vec<(String, String)>,
 }
 
 impl LiveHerdrSession {
@@ -142,12 +163,17 @@ impl LiveHerdrSession {
         std::fs::create_dir_all(&scratch)
             .unwrap_or_else(|e| panic!("creating scratch dir {}: {e}", scratch.display()));
 
+        let env: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+
         let sh = format!(
             "setsid herdr --session {name} server >/var/tmp/{name}-server.log 2>&1 & disown"
         );
         let mut spawn = Command::new("bash");
         spawn.arg("-c").arg(&sh);
-        for (key, value) in extra_env {
+        for (key, value) in &env {
             spawn.env(key, value);
         }
         let status = spawn
@@ -155,7 +181,7 @@ impl LiveHerdrSession {
             .unwrap_or_else(|e| panic!("spawning session {name}: {e}"));
         assert!(status.success(), "spawning session {name} failed");
 
-        let socket = session_socket_path(&name);
+        let socket = session_socket_path(&name, &env);
         let deadline = Instant::now() + SESSION_START_TIMEOUT;
         while !socket.exists() {
             assert!(
@@ -166,7 +192,7 @@ impl LiveHerdrSession {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let snapshot = herdr(&["--session", &name, "api", "snapshot"]);
+        let snapshot = run_herdr(&["--session", &name, "api", "snapshot"], &env);
         assert!(
             snapshot.status.success(),
             "session {name} did not answer api snapshot: {}",
@@ -177,7 +203,17 @@ impl LiveHerdrSession {
             name,
             socket,
             scratch,
+            env,
         })
+    }
+
+    /// Runs `herdr <args>` with this session's own environment overrides
+    /// applied (empty for an ordinary session) — the only correct way to
+    /// address a session started via `start_with_env` with an isolated
+    /// `XDG_CONFIG_HOME`/`XDG_STATE_HOME`, since the CLI must read the
+    /// same variables the server did to find its socket and config root.
+    pub fn herdr(&self, args: &[&str]) -> std::process::Output {
+        run_herdr(args, &self.env)
     }
 
     /// A fresh `SocketClient` dialed at this session's socket, with the
@@ -243,10 +279,10 @@ impl Drop for LiveHerdrSession {
             }
         }
 
-        let _ = herdr(&["session", "stop", &self.name]);
-        let _ = herdr(&["session", "delete", &self.name]);
+        let _ = run_herdr(&["session", "stop", &self.name], &self.env);
+        let _ = run_herdr(&["session", "delete", &self.name], &self.env);
 
-        let list = herdr(&["session", "list"]);
+        let list = run_herdr(&["session", "list"], &self.env);
         let listing = String::from_utf8_lossy(&list.stdout);
         assert!(
             !listing.contains(&self.name),
