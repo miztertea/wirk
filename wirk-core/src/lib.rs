@@ -19,7 +19,7 @@
 //! `FailureCause.detail` — type-level answers to inherited defects 280,
 //! 288, 283, 275; validator bodies stay item 3's.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -539,8 +539,23 @@ pub enum World {
 /// already know about nameable by call site instead of by string
 /// literal. `Default` is `claude()`: every journal on disk before this
 /// field existed only ever ran Claude.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActorKind(pub String);
+
+impl<'de> Deserialize<'de> for ActorKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let kind = String::deserialize(deserializer)?;
+        Ok(ActorKind(match kind.as_str() {
+            // Before 76cc10d these were enum variant names on disk.
+            "Claude" => "claude".to_string(),
+            "Opencode" => "opencode".to_string(),
+            _ => kind,
+        }))
+    }
+}
 
 impl ActorKind {
     pub fn claude() -> Self {

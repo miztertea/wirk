@@ -9,9 +9,9 @@ use std::fs;
 
 use tempfile::tempdir;
 use wirk_core::{
-    Access, ClaimId, ClaimKind, ClaimVerdict, DeterministicWorld, Event, EventId, EventKind,
-    Journal, JournalError, OutputContract, RepositoryBinding, RouteId, RunId, Timestamp,
-    WaypointId, WorkId, World, WorldHash,
+    Access, ActorKind, ClaimId, ClaimKind, ClaimVerdict, DeterministicWorld, Event, EventId,
+    EventKind, Journal, JournalError, OutputContract, RepositoryBinding, RouteId, Run, RunId,
+    RunState, Timestamp, WaypointId, WorkId, World, WorldHash,
 };
 
 fn lifecycle_event(id: &str, work: &str, run: &str, status: &str) -> Event {
@@ -681,4 +681,49 @@ fn old_worksubmitted_without_waypoint_defs_field_still_folds() {
 
     let work = wirk_core::fold(&events);
     assert_eq!(work.id, WorkId("work-1".to_string()));
+}
+
+/// Before 76cc10d, the closed `ActorKind` enum serialized its variants as
+/// `"Claude"` and `"Opencode"`. Replaying this real historical envelope must
+/// normalize a known legacy spelling before the new harness launch mapping
+/// consumes it, while unknown strings remain Herdr's authority.
+#[test]
+fn historical_opencode_actor_kind_replays_to_the_current_launch_spelling() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("journal.ndjson");
+    let event = Event {
+        id: EventId("ev-1".to_string()),
+        work: WorkId("work-1".to_string()),
+        run: Some(RunId("run-1".to_string())),
+        at: Timestamp(0),
+        kind: EventKind::RunLaunched {
+            run: RunId("run-1".to_string()),
+            actor_kind: ActorKind::opencode(),
+        },
+    };
+    let mut value = serde_json::to_value(&event).expect("event serializes");
+    value["kind"]["actor_kind"] = serde_json::Value::String("Opencode".to_string());
+    assert_eq!(
+        value["kind"]["actor_kind"],
+        serde_json::Value::String("Opencode".to_string()),
+        "the fixture must use the historical enum spelling"
+    );
+    let line = serde_json::json!({"seq": 1, "event": value}).to_string();
+    fs::write(&path, format!("{line}\n")).expect("write historical journal line");
+
+    let journal = Journal::open(dir.path()).expect("open historical journal");
+    let replayed = journal.replay().expect("historical journal replays");
+    let mut run = Run {
+        id: RunId("run-1".to_string()),
+        waypoint: WaypointId("wp-1".to_string()),
+        attempt: 1,
+        world_hash: WorldHash("deadbeef".to_string()),
+        state: RunState::Open,
+        kind: ActorKind::default(),
+    };
+    for event in &replayed {
+        run.apply(event);
+    }
+
+    assert_eq!(run.kind, ActorKind::opencode());
 }
