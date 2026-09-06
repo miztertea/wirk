@@ -474,6 +474,186 @@ fn fold_lifecycle_working_does_not_clear_a_non_blocked_needs_input() {
     );
 }
 
+// ---- loop-a-reverify (22-rvF1-legitimate-completion.log; a second,
+// independently reproduced coordinator report) --------------------------
+//
+// A resolved, historical `needs_input` cause must not be read back as
+// the Work's *current* status once `state` has moved off `NeedsInput`
+// for a real, later reason. `fold_run_opened_clears_needs_input_on_retry`
+// above already pins the one arm that got this right; these four pin
+// the arms that didn't.
+
+/// A `RunVanished` NeedsInput resolved by a later, legitimate Claim on
+/// the same Run (D9#5: a late Claim after `RunVanished` is honored, not
+/// stale) must not leave the stale `run_vanished` cause behind once the
+/// Work is `Completed`. Red before this wave: `ClaimRecorded`'s
+/// `(Validated, Done)` arm moved `state` off `NeedsInput` without
+/// touching `needs_input`.
+#[test]
+fn fold_claim_completion_after_run_vanished_clears_needs_input() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::RunVanished,
+    ));
+    let vanished_work = wirk_core::fold(&events);
+    assert!(matches!(vanished_work.state, WorkState::NeedsInput));
+
+    events.push(event(
+        "ev-5",
+        "work-1",
+        Some("run-1"),
+        2,
+        EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
+            claim: wirk_core::ClaimId("claim-late".to_string()),
+            claim_kind: wirk_core::ClaimKind::Done,
+            verdict: wirk_core::ClaimVerdict::Validated,
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::Completed),
+        "a validated Done claim on the last waypoint completes the Work: {:?}",
+        work.state
+    );
+    assert_eq!(
+        work.needs_input, None,
+        "a resolved run_vanished cause must not survive the Work's legitimate completion"
+    );
+}
+
+/// The same contract for `StageClosed`: a Work recovering from
+/// `NeedsInput` through a container's own closure must not keep
+/// reporting the earlier cause once `state` has moved off `NeedsInput`.
+/// Red before this wave: `StageClosed`'s arm moved `state` without
+/// touching `needs_input`.
+#[test]
+fn fold_stage_closed_after_run_vanished_clears_needs_input() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::RunVanished,
+    ));
+    events.push(event(
+        "ev-5",
+        "work-1",
+        None,
+        2,
+        EventKind::StageClosed {
+            waypoint: WaypointId("wp-1".to_string()),
+            attempt: 1,
+            receipts: Vec::new(),
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        !matches!(work.state, WorkState::NeedsInput),
+        "a StageClosed must move the Work off NeedsInput: {:?}",
+        work.state
+    );
+    assert_eq!(
+        work.needs_input, None,
+        "a resolved run_vanished cause must not survive a StageClosed"
+    );
+}
+
+/// The exact second bug report (loop-a-reverify): a Work canceled while
+/// `NeedsInput` for an `out_of_boundary` refusal must not keep
+/// reporting that stale, unrelated cause once it is `Canceled` — a
+/// coordinator reading `wirk work status` after `wirk work cancel` must
+/// not see a resolved refusal as if it were current. Red before this
+/// wave: `WorkCanceled`'s arm set `state` without touching
+/// `needs_input`.
+#[test]
+fn fold_work_canceled_clears_a_stale_out_of_boundary_needs_input() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
+            claim: wirk_core::ClaimId("claim-oob".to_string()),
+            claim_kind: wirk_core::ClaimKind::Done,
+            verdict: wirk_core::ClaimVerdict::Refused(wirk_core::ClaimRefusal::OutOfBoundary(
+                "/etc/passwd".to_string(),
+            )),
+        },
+    ));
+    let needs_input_work = wirk_core::fold(&events);
+    assert!(matches!(needs_input_work.state, WorkState::NeedsInput));
+    assert_eq!(
+        needs_input_work
+            .needs_input
+            .as_ref()
+            .map(|c| c.reason.as_str()),
+        Some("out_of_boundary")
+    );
+
+    events.push(event(
+        "ev-5",
+        "work-1",
+        None,
+        2,
+        EventKind::WorkCanceled {
+            reason: Some("operator canceled".to_string()),
+            caused_by: None,
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(matches!(work.state, WorkState::Canceled));
+    assert_eq!(
+        work.needs_input, None,
+        "a canceled Work must not still report an earlier, unrelated out_of_boundary refusal"
+    );
+}
+
+/// The same contract for `WorkFailed`: a Work explicitly failed while
+/// `NeedsInput` must not keep reporting the earlier, unrelated cause
+/// once it is `Failed`.
+#[test]
+fn fold_work_failed_clears_a_stale_needs_input() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::RunVanished,
+    ));
+    let needs_input_work = wirk_core::fold(&events);
+    assert!(matches!(needs_input_work.state, WorkState::NeedsInput));
+
+    events.push(event(
+        "ev-5",
+        "work-1",
+        None,
+        2,
+        EventKind::WorkFailed {
+            cause: FailureCause {
+                status: None,
+                request_id: None,
+                at: Timestamp(2),
+                detail: Some("operator failed the work".to_string()),
+            },
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(matches!(work.state, WorkState::Failed));
+    assert_eq!(
+        work.needs_input, None,
+        "a failed Work must not still report an earlier, unrelated run_vanished cause"
+    );
+}
+
 /// Guard probe (states.md §4, mirroring `fold_terminal_work_ignores_a_later_run_failed`):
 /// once a Work is terminal, a later `Blocked` observation changes
 /// neither `state` nor `needs_input`.

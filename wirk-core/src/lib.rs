@@ -1792,6 +1792,21 @@ pub fn fold(events: &[Event]) -> Work {
             }
             EventKind::ChildWorkSpawned { .. } => {}
         }
+
+        // Current-vs-historical contract (loop-a-reverify
+        // 22-rvF1-legitimate-completion.log, and a second, independently
+        // reproduced `out_of_boundary`-then-`Canceled` report): every arm
+        // above that sets `w.needs_input` also sets `w.state` to
+        // `NeedsInput` in the same branch, so `state != NeedsInput` is
+        // never true immediately after one of those arms runs. Any other
+        // arm moving `state` away from `NeedsInput` — a late Claim's
+        // completion, a container's `StageClosed`, an explicit
+        // `WorkFailed`/`WorkCanceled` — therefore always means the old
+        // cause is resolved, not current, and clearing it here can never
+        // erase a genuinely still-open one.
+        if w.state != WorkState::NeedsInput {
+            w.needs_input = None;
+        }
     }
 
     work.expect("fold called with no WorkSubmitted event in the slice: no Work to build")
