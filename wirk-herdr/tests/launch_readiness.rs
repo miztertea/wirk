@@ -42,6 +42,9 @@ fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
         worktree_path: worktree_path.to_path_buf(),
         branch: "p2/w2-launch-readiness".to_string(),
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::Git {
+            base: "abc123".to_string(),
+        },
         triple: ExecutionTriple {
             estate_root: "/estate".to_string(),
             work_id: WorkId("work-1".to_string()),

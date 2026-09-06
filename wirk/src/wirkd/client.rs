@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 
 use wirk_core::Event;
 
-use super::{Reply, Request, WatchPayload, WirkdPointer};
+use super::{ErrorDetail, Reply, Request, WatchPayload, WirkdPointer};
 
 /// Everything that can go wrong locating or calling wirkd. Kept as one
 /// flat enum, no `thiserror` (not on `wirk`'s allow-list this wave,
-/// R3 stdlib `impl Display`/`impl std::error::Error` suffices for four
+/// R3 stdlib `impl Display`/`impl std::error::Error` suffices for five
 /// variants).
 #[derive(Debug)]
 pub enum ClientError {
@@ -29,10 +29,15 @@ pub enum ClientError {
     /// A filesystem or socket I/O failure: opening the pointer file,
     /// connecting the socket, writing the request, reading the reply.
     Io(io::Error),
-    /// The reply line was read but is not valid `Reply` JSON — a
-    /// protocol violation, not the application-level refusal
-    /// `Reply::Err` already carries.
+    /// The reply line was read but is not valid `Reply` JSON at all —
+    /// a genuine protocol violation, distinct from `Refused` below.
     MalformedReply(String),
+    /// The reply line parsed fine as `Reply::Err` — wirkd's own
+    /// explicit, well-formed refusal (0069 correction: `watch`'s line
+    /// iterator previously folded this into `MalformedReply`, which
+    /// mislabeled a valid daemon refusal, such as `NotFound`, as a wire
+    /// protocol violation it was not).
+    Refused(ErrorDetail),
 }
 
 impl fmt::Display for ClientError {
@@ -51,6 +56,9 @@ impl fmt::Display for ClientError {
             ClientError::Io(err) => write!(f, "wirkd client I/O error: {err}"),
             ClientError::MalformedReply(reason) => {
                 write!(f, "wirkd reply malformed: {reason}")
+            }
+            ClientError::Refused(detail) => {
+                write!(f, "wirkd refused {}: {}", detail.code, detail.message)
             }
         }
     }
@@ -168,18 +176,21 @@ impl Iterator for WatchLines {
             Ok(0) => None, // EOF: wirkd is gone, or ended this connection
             Ok(_) => {
                 let trimmed = line.trim_end_matches(['\n', '\r']);
-                // A bare `Reply::Err` line (a malformed watch request,
-                // `handle_watch_connection`'s own early-return fast
-                // path) parses as neither `Event` nor anything this
-                // iterator invents a variant for — surfaced as
-                // `MalformedReply` so the caller sees wirkd's own
-                // `code`/`message` rather than a generic decode error.
+                // A bare `Reply::Err` line (`handle_watch_connection`'s
+                // own early-return fast path — an unknown or path-like
+                // Work id, or a malformed watch request) parses as
+                // neither `Event` nor anything this iterator invents a
+                // variant for. 0069 correction: this is a valid,
+                // well-formed refusal wirkd sent on purpose, not a wire
+                // protocol violation — surfaced as `ClientError::
+                // Refused` (carrying wirkd's own `code`/`message`
+                // untouched) so a caller can tell "the daemon explicitly
+                // refused" apart from `MalformedReply`, which is now
+                // reserved for a line that is neither shape at all.
                 match serde_json::from_str::<Event>(trimmed) {
                     Ok(event) => Some(Ok(event)),
                     Err(_) => match serde_json::from_str::<Reply>(trimmed) {
-                        Ok(Reply::Err { error, .. }) => Some(Err(ClientError::MalformedReply(
-                            format!("{}: {}", error.code, error.message),
-                        ))),
+                        Ok(Reply::Err { error, .. }) => Some(Err(ClientError::Refused(error))),
                         _ => Some(Err(ClientError::MalformedReply(format!(
                             "not a watch Event line: {trimmed:?}"
                         )))),

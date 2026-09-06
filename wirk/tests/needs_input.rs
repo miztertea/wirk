@@ -54,10 +54,49 @@ fn wait_for_pointer(estate: &Path) -> WirkdPointer {
 /// `run_id`/`waypoint` off stdout.
 fn submit(estate: &Path, repo: &str) -> (String, String, String) {
     route_fixture::install_route_fixture(estate, "smoke");
+    if !estate.join(".git").exists() {
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(estate)
+                .status()
+                .expect("git init runs")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=needs-input-test",
+                    "-c",
+                    "user.email=needs-input@example.test",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "base",
+                ])
+                .current_dir(estate)
+                .status()
+                .expect("git commit runs")
+                .success()
+        );
+    }
     let output = Command::new(wirk_bin())
         .args(["work", "submit", "--estate"])
         .arg(estate)
-        .args(["--route", "smoke", "--repo", repo, "--base", "main"])
+        .args([
+            "--route",
+            "smoke",
+            "--repo",
+            repo,
+            "--base",
+            "HEAD",
+            "--kind",
+            "actor",
+            "--repo-path",
+        ])
+        .arg(estate)
         .output()
         .expect("work submit runs");
     assert!(
@@ -151,7 +190,78 @@ fn workfail(socket: &Path, work_id: &str, reason: &str) -> Reply {
 /// (`observe_herdr`), so this simulates the loop's own write, not a
 /// dedicated "blocked" verb (there is none — `fold`, not a new wire
 /// endpoint, is what turns this into `NeedsInput`).
-fn blocked(socket: &Path, work_id: &str, run_id: &str, detail: &str) {
+fn blocked(socket: &Path, estate: &Path, work_id: &str, run_id: &str, detail: &str) {
+    let status = match wirkd::client::call(
+        socket,
+        &Request::status(StatusPayload {
+            work_id: WorkId(work_id.to_string()),
+        }),
+    )
+    .expect("status call succeeds")
+    {
+        Reply::Ok { result, .. } => result,
+        reply => panic!("status refused: {reply:?}"),
+    };
+    let waypoint = WaypointId(
+        status["current_waypoint"]
+            .as_str()
+            .expect("current waypoint")
+            .to_string(),
+    );
+    let mut world: World = serde_json::from_value(status["world"].clone()).expect("Actor World");
+    let World::Actor(actor) = &mut world else {
+        panic!("expected Actor World");
+    };
+    let worktree = estate.join("worktrees").join(work_id);
+    let head = wirk_herdr::git::worktree_add(
+        Path::new(&actor.repository),
+        &worktree,
+        &actor.branch,
+        &actor.base_sha,
+    )
+    .expect("materialize actor worktree");
+    let created = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::WorktreeCreated {
+                repo: actor.repository.clone(),
+                base_sha: head,
+            },
+        }),
+    )
+    .expect("worktree record call succeeds");
+    assert!(matches!(created, Reply::Ok { .. }), "{created:?}");
+    actor.worktree_path = worktree;
+    let world_hash = WorldHash::of(&world);
+    let materialized = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::WaypointReserved {
+                waypoint,
+                world_hash,
+                world,
+            },
+        }),
+    )
+    .expect("materialization record call succeeds");
+    assert!(matches!(materialized, Reply::Ok { .. }), "{materialized:?}");
+    let launched = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::RunLaunched {
+                run: RunId(run_id.to_string()),
+                actor_kind: Default::default(),
+            },
+        }),
+    )
+    .expect("launch record call succeeds");
+    assert!(matches!(launched, Reply::Ok { .. }), "{launched:?}");
     let reply = wirkd::client::call(
         socket,
         &Request::record(RecordPayload {
@@ -439,15 +549,12 @@ fn handle_retry_opens_fresh_run_same_world() {
     }
 }
 
-/// Probe (decide.md §5's own named hazard): `retry` reuses
-/// `world_for_waypoint`'s "last `WaypointReserved` wins" lookup, not
-/// the failed Run's own `RunOpened.world_hash` — a Waypoint reserved a
-/// second time (a re-cut base after the failure, the same `record`
-/// verb `wirk run` uses to fill in a worktree path) makes the retry
-/// pick up the **second** World, never a stale one recomputed from the
-/// first.
+/// P3 identity correction: an injected later reservation cannot replace
+/// the exact World consumed by this Run's opening transition. `record`
+/// refuses it without append, and retry resolves the triggering Run rather
+/// than looking up the Waypoint's latest reservation.
 #[test]
-fn handle_retry_reuses_last_waypoint_reserved_not_first() {
+fn handle_retry_uses_triggering_run_exact_reservation_not_injected_latest() {
     let dir = tempfile::tempdir().expect("tempdir");
     let estate = dir.path().to_path_buf();
     let (_wirkd_child, pointer) = start_wirkd(&estate);
@@ -475,23 +582,31 @@ fn handle_retry_reuses_last_waypoint_reserved_not_first() {
             Reply::Err { error, .. } => panic!("status refused: {} {}", error.code, error.message),
         }
     };
-    let mut world: World = serde_json::from_value(status_result(&pointer)["world"].clone())
+    let original: World = serde_json::from_value(status_result(&pointer)["world"].clone())
         .expect("world deserializes");
+    let mut world = original.clone();
     match &mut world {
-        World::Actor(actor) => actor.base_sha = "second-base-sha".to_string(),
-        World::Deterministic(det) => det.base_sha = "second-base-sha".to_string(),
+        World::Actor(actor) => {
+            actor.base_sha = "second-base-sha".to_string();
+            actor.source_basis = wirk_core::SourceBasis::Git {
+                base: actor.base_sha.clone(),
+            };
+        }
+        World::Deterministic(det) => {
+            det.base_sha = "second-base-sha".to_string();
+            det.source_basis = wirk_core::SourceBasis::OutputOnly {
+                reference: det.base_sha.clone(),
+            };
+        }
     }
     let second_hash = WorldHash::of(&world);
 
-    // Re-reserve the same Waypoint a second time (the shape `wirk run`
-    // itself uses to fill in a worktree path, `RecordPayload`'s own
-    // doc) — the second `WaypointReserved` is now the *last* one in the
-    // journal for this Waypoint.
+    let before_forgery = journal_events(&estate, &work_id).len();
     let reply = wirkd::client::call(
         &pointer.socket,
         &Request::record(RecordPayload {
             work_id: WorkId(work_id.clone()),
-            run: None,
+            run: Some(RunId(run_id.clone())),
             kind: EventKind::WaypointReserved {
                 waypoint: WaypointId(waypoint.clone()),
                 world_hash: second_hash.clone(),
@@ -500,7 +615,8 @@ fn handle_retry_reuses_last_waypoint_reserved_not_first() {
         }),
     )
     .expect("record call succeeds");
-    assert!(matches!(reply, Reply::Ok { .. }), "{reply:?}");
+    assert!(matches!(reply, Reply::Err { .. }), "{reply:?}");
+    assert_eq!(journal_events(&estate, &work_id).len(), before_forgery);
 
     let retry_reply = retry(&pointer.socket, &estate, &work_id, &run_id);
     let result = match retry_reply {
@@ -514,11 +630,15 @@ fn handle_retry_reuses_last_waypoint_reserved_not_first() {
 
     let after = status_result(&pointer);
     assert_eq!(after["run_id"].as_str(), Some(new_run_id));
-    assert_eq!(
-        after["world_hash"].as_str(),
-        Some(second_hash.0.as_str()),
-        "retry must open its new Run against the second, most-recently-reserved World"
-    );
+    let retried: World = serde_json::from_value(after["world"].clone()).expect("retried world");
+    match (original, retried) {
+        (World::Actor(original), World::Actor(retried)) => {
+            assert_eq!(retried.base_sha, original.base_sha);
+            assert_ne!(retried.base_sha, "second-base-sha");
+            assert_eq!(retried.triple.run_id.0, new_run_id);
+        }
+        _ => panic!("expected Actor Worlds"),
+    }
 }
 
 /// P2.3 W2 (decide.md §1): `fail` refuses `NotNeedsInput` on an active
@@ -740,6 +860,7 @@ fn wirkd_status_reports_needs_input_cause_for_blocked() {
     let (work_id, run_id, _waypoint) = submit(&estate, "demo:write");
     blocked(
         &pointer.socket,
+        &estate,
         &work_id,
         &run_id,
         "the actor is waiting on its pane w1:p1:\n\
@@ -784,7 +905,13 @@ fn cli_work_retry_succeeds_on_a_blocked_needs_input_work() {
     let (_wirkd_child, pointer) = start_wirkd(&estate);
 
     let (work_id, run_id, _waypoint) = submit(&estate, "demo:write");
-    blocked(&pointer.socket, &work_id, &run_id, "waiting on pane w1:p1");
+    blocked(
+        &pointer.socket,
+        &estate,
+        &work_id,
+        &run_id,
+        "waiting on pane w1:p1",
+    );
 
     let output = Command::new(wirk_bin())
         .args(["work", "retry", "--estate"])
@@ -834,7 +961,13 @@ fn cli_work_fail_succeeds_on_a_blocked_needs_input_work() {
     let (_wirkd_child, pointer) = start_wirkd(&estate);
 
     let (work_id, run_id, _waypoint) = submit(&estate, "demo:write");
-    blocked(&pointer.socket, &work_id, &run_id, "waiting on pane w1:p1");
+    blocked(
+        &pointer.socket,
+        &estate,
+        &work_id,
+        &run_id,
+        "waiting on pane w1:p1",
+    );
 
     let output = Command::new(wirk_bin())
         .args(["work", "fail", "--estate"])

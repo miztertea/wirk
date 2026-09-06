@@ -50,18 +50,27 @@ fn wait_for_pointer(estate: &Path) -> WirkdPointer {
     }
 }
 
-/// Runs `wirk work submit --estate <estate> --route smoke --repo
-/// <repo> --base main` (the estate's own copy of the canonical
-/// `smoke.json` fixture, p2-route-files W2 — `--route` is required now
-/// and no `--intent` exists any more, an Actor Waypoint's intent being
-/// authored in the file) and parses its `work_id <id> run_id <id>
+/// Runs an ad-hoc output-only deterministic submit. This process test
+/// exercises journal/Claim transport rather than Actor worktree inspection,
+/// so it states the non-Git basis it actually uses and parses `work_id <id>
+/// run_id <id>
 /// waypoint <id>` stdout line.
 fn submit(estate: &Path, repo: &str) -> (String, String, String) {
-    route_fixture::install_route_fixture(estate, "smoke");
     let output = Command::new(wirk_bin())
         .args(["work", "submit", "--estate"])
         .arg(estate)
-        .args(["--route", "smoke", "--repo", repo, "--base", "main"])
+        .args([
+            "--kind",
+            "deterministic",
+            "--source-basis",
+            "output-only",
+            "--repo",
+            repo,
+            "--base",
+            "process-fixture",
+            "--command",
+            "true",
+        ])
         .output()
         .expect("work submit runs");
     assert!(

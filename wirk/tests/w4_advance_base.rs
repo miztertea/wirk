@@ -195,7 +195,16 @@ fn submit_deterministic(estate: &Path, base: &str, command: &[&str]) -> (String,
     let mut cmd = Command::new(wirk_bin());
     cmd.args(["work", "submit", "--estate"])
         .arg(estate)
-        .args(["--kind", "deterministic", "--base", base])
+        .args([
+            "--kind",
+            "deterministic",
+            "--source-basis",
+            "git",
+            "--base",
+            base,
+            "--repo-path",
+        ])
+        .arg(estate)
         .args(["--repo", "demo:write", "--command"])
         .args(command);
     let output = cmd.output().expect("work submit runs");
@@ -299,7 +308,7 @@ fn create_worktree_for_run(
     wirkd_record(
         socket,
         work_id,
-        None,
+        Some(run_id),
         EventKind::WaypointReserved {
             waypoint: WaypointId(waypoint.to_string()),
             world_hash,

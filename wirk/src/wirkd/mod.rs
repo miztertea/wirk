@@ -222,6 +222,12 @@ pub struct SubmitPayload {
     pub intent: String,
     pub repositories: Vec<RepositoryBinding>,
     pub base_ref: String,
+    /// Explicit inspection contract for deterministic execution. Actor
+    /// submissions are always verified Git bindings. Missing on legacy
+    /// clients preserves the established ad-hoc output-only meaning of
+    /// `base_ref`; persisted Worlds never default this field implicitly.
+    #[serde(default)]
+    pub source_basis: Option<wirk_core::SourceBasis>,
     #[serde(default)]
     pub kind: Option<String>,
     #[serde(default)]

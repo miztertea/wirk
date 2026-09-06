@@ -350,6 +350,22 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
         "expected WorktreeCreated with the commit's SHA"
     );
 
+    let materialization_is_run_scoped = events.iter().any(|event| {
+        event.run.as_ref().is_some_and(|run| run.0 == run_id)
+            && matches!(
+                &event.kind,
+                EventKind::WaypointReserved {
+                    world: wirk_core::World::Actor(actor),
+                    ..
+                } if !actor.worktree_path.as_os_str().is_empty()
+                    && matches!(&actor.source_basis, wirk_core::SourceBasis::Git { .. })
+            )
+    });
+    assert!(
+        materialization_is_run_scoped,
+        "the ordinary Actor launch must persist a Git materialization scoped to {run_id}"
+    );
+
     let run_launched_opencode = events.iter().any(|event| {
         matches!(
             &event.kind,
@@ -1104,28 +1120,11 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
     );
     drop(session1); // this attempt's pane/session is done with
 
-    // A retry reserves the *same* Waypoint's World again -- same
-    // `branch`, same `worktree_path` (keyed on `work_id`, not `run_id`,
-    // `executor.rs`'s own `run_command`) -- and `worktree_add` always
-    // `git worktree add -b <branch>` fresh (`git.rs`): reattaching to
-    // an existing worktree/branch is 0050 D151's own carried, separate
-    // finding ("relaunch always tries `git worktree add` fresh and
-    // fails on the existing branch"), not this item's fix. This test's
-    // own cleanup -- removing the first attempt's worktree and branch,
-    // exactly what a human operator does today -- isolates the fix
-    // this item *does* make (the retry race in `observe_watch`) from
-    // that separate, unfixed one.
-    let worktree_path = estate.join("worktrees").join(&work_id);
-    let branch = format!("wirk/{work_id}");
-    let _ = Command::new("git")
-        .current_dir(&repo)
-        .args(["worktree", "remove", "--force"])
-        .arg(&worktree_path)
-        .status();
-    let _ = Command::new("git")
-        .current_dir(&repo)
-        .args(["branch", "-D", &branch])
-        .status();
+    // A retry reserves the same verified materialized checkout. Removing
+    // that checkout before asking wirkd to retry would make the recorded
+    // Git basis unavailable and must now fail closed; the executor reuses
+    // and verifies the existing worktree instead of attempting a second
+    // `git worktree add`.
 
     // `wirk work retry`: journals a fresh `RunOpened` for a new run id
     // on the same Waypoint (`handle_retry`, `server.rs`) — the exact

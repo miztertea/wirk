@@ -61,8 +61,8 @@ use wirk_core::{
     Access, ActorWorld, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind,
     ClaimRefusal, ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple,
     FailureCause, Journal, JournalError, OutputContract, Route, RouteId, Run, RunId, RunState,
-    Timestamp, WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash,
-    fold, load_route, validate_claim,
+    SourceBasis, Timestamp, WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World,
+    WorldHash, fold, load_route, validate_claim,
 };
 
 use super::boundary;
@@ -168,8 +168,8 @@ impl From<JournalError> for WirkdError {
     }
 }
 
-/// Per-estate state: one `Arc<Mutex<Journal>>` per Work, keyed by
-/// `WorkId`, opened the first time `submit` or `claim` touches it
+/// Per-estate state: one `Arc<Mutex<Journal>>` per submitted Work, keyed by
+/// `WorkId`, opened by submit or on a later read of its existing journal
 /// (transport.md §5).
 struct WirkdState {
     estate_root: PathBuf,
@@ -202,13 +202,13 @@ fn append_event(
     work_id: &WorkId,
     event: &Event,
 ) -> Result<(), JournalError> {
-    journal.append(event)?;
+    let persisted = journal.append(event)?;
     let mut watchers = state
         .watchers
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
     if let Some(senders) = watchers.get_mut(work_id) {
-        senders.retain(|tx| tx.send(event.clone()).is_ok());
+        senders.retain(|tx| tx.send(persisted.clone()).is_ok());
     }
     Ok(())
 }
@@ -232,6 +232,10 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
     })?;
     write_pointer(&estate_root, &socket_path, std::process::id())?;
 
+    let estate_root = std::fs::canonicalize(&estate_root).map_err(|source| WirkdError::Bind {
+        socket: socket_path.clone(),
+        source,
+    })?;
     let state = Arc::new(WirkdState {
         estate_root,
         journals: Mutex::new(HashMap::new()),
@@ -500,7 +504,11 @@ pub(crate) fn open_deterministic_runs(
             if !matches!(run.state, RunState::Open) {
                 continue;
             }
-            if let Some(World::Deterministic(det)) = world_for_waypoint(&events, &run.waypoint) {
+            if let Ok(RunBinding {
+                world: World::Deterministic(det),
+                ..
+            }) = resolve_run_binding(&events, estate_root, &work_id, run_id)
+            {
                 found.push((work_id.clone(), run_id.clone(), det));
             }
         }
@@ -637,14 +645,17 @@ fn reattach_docker_run(
         _ => -1,
     };
 
-    let still_open = journal_for(state, &work_id).ok().is_some_and(|journal| {
-        let journal = journal.lock().unwrap_or_else(|p| p.into_inner());
-        journal
-            .replay()
-            .ok()
-            .and_then(|events| find_run(&events, &run_id))
-            .is_some_and(|run| matches!(run.state, RunState::Open))
-    });
+    let still_open = journal_for(state, &work_id)
+        .ok()
+        .flatten()
+        .is_some_and(|journal| {
+            let journal = journal.lock().unwrap_or_else(|p| p.into_inner());
+            journal
+                .replay()
+                .ok()
+                .and_then(|events| find_run(&events, &run_id))
+                .is_some_and(|run| matches!(run.state, RunState::Open))
+        });
     if !still_open {
         eprintln!(
             "wirkd: {container_name} exited but Run {} is no longer Open, not re-filing",
@@ -784,7 +795,11 @@ fn handle_watch_connection(
 ) {
     let work_id = payload.work_id;
     let journal = match journal_for(state, &work_id) {
-        Ok(journal) => journal,
+        Ok(Some(journal)) => journal,
+        Ok(None) => {
+            write_one_reply(&stream, &err_reply("NotFound", "no such work"));
+            return;
+        }
         Err(err) => {
             write_one_reply(&stream, &err_reply("JournalError", &err.to_string()));
             return;
@@ -951,14 +966,72 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
     // same rule auto-advance already applies to every later Waypoint,
     // `next_def.kind` below).
     let world = match first_def.kind {
-        WaypointKind::Deterministic => World::Deterministic(DeterministicWorld {
-            command: first_def.command.clone().unwrap_or_default(),
-            base_sha: payload.base_ref.clone(),
-            cwd: state.estate_root.clone(),
-            env: BTreeMap::new(),
-            expected_artifacts: output_contract,
-        }),
+        WaypointKind::Deterministic => {
+            let requested_basis =
+                payload
+                    .source_basis
+                    .clone()
+                    .unwrap_or_else(|| SourceBasis::OutputOnly {
+                        reference: payload.base_ref.clone(),
+                    });
+            if matches!(requested_basis, SourceBasis::OutputOnly { .. })
+                && (payload
+                    .repositories
+                    .iter()
+                    .any(|binding| binding.access == Access::Read)
+                    || !first_def.boundary.0.is_empty())
+            {
+                return err_reply(
+                    "IncompatibleSourceBasis",
+                    "output-only execution cannot satisfy repository Read or Git boundary inspection",
+                );
+            }
+            let (base_sha, source_basis, cwd) = match requested_basis {
+                SourceBasis::Git { base } => {
+                    let Some(repo_path) = payload.repo_path.clone() else {
+                        return err_reply(
+                            "BadRequest",
+                            "deterministic Git inspection requires --repo-path <checkout>",
+                        );
+                    };
+                    let verified = match resolve_git_sha(&repo_path, &base) {
+                        Ok(sha) => sha,
+                        Err(detail) => return err_reply("GitError", &detail),
+                    };
+                    (
+                        verified.clone(),
+                        SourceBasis::Git { base: verified },
+                        PathBuf::from(repo_path),
+                    )
+                }
+                SourceBasis::OutputOnly { reference } => (
+                    reference.clone(),
+                    SourceBasis::OutputOnly { reference },
+                    state.estate_root.clone(),
+                ),
+                SourceBasis::Unknown => {
+                    return err_reply(
+                        "BadRequest",
+                        "new submissions cannot use an unknown source basis",
+                    );
+                }
+            };
+            World::Deterministic(DeterministicWorld {
+                command: first_def.command.clone().unwrap_or_default(),
+                base_sha,
+                source_basis,
+                cwd,
+                env: BTreeMap::new(),
+                expected_artifacts: output_contract,
+            })
+        }
         WaypointKind::Actor if payload.kind.as_deref() == Some("actor") => {
+            if matches!(payload.source_basis, Some(SourceBasis::OutputOnly { .. })) {
+                return err_reply(
+                    "IncompatibleSourceBasis",
+                    "actor execution requires a Git basis",
+                );
+            }
             let Some(repo_path) = payload.repo_path.clone() else {
                 return err_reply("BadRequest", "--repo-path is required for --kind actor");
             };
@@ -979,6 +1052,9 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // worktree exists.
                 worktree_path: PathBuf::new(),
                 branch,
+                source_basis: SourceBasis::Git {
+                    base: base_sha.clone(),
+                },
                 base_sha,
                 triple,
                 // p2-route-files W2 (`--intent` removed, J1): the
@@ -1006,6 +1082,7 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 worktree_path: state.estate_root.clone(),
                 branch,
                 base_sha: payload.base_ref.clone(),
+                source_basis: SourceBasis::Unknown,
                 triple,
                 intent: first_def.intent.clone().unwrap_or_default(),
                 output_contract,
@@ -1018,7 +1095,7 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
     };
     let world_hash = WorldHash::of(&world);
 
-    let journal = match journal_for(state, &work_id) {
+    let journal = match create_journal_for(state, &work_id) {
         Ok(journal) => journal,
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
@@ -1106,20 +1183,189 @@ fn resolve_git_sha(repo_path: &str, base_ref: &str) -> Result<String, String> {
 fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
     if matches!(
         payload.kind,
-        EventKind::ClaimFiled { .. } | EventKind::ClaimRecorded { .. }
+        EventKind::WorkSubmitted { .. }
+            | EventKind::RunOpened { .. }
+            | EventKind::ClaimFiled { .. }
+            | EventKind::ClaimRecorded { .. }
+            | EventKind::WorkFailed { .. }
+            | EventKind::WorkCanceled { .. }
     ) {
         return err_reply(
             "Forbidden",
-            "ClaimFiled/ClaimRecorded are written only by the claim verb, never by record",
+            "this transition is owned by wirkd or the operator, never by record",
         );
     }
 
     let journal = match journal_for(state, &payload.work_id) {
-        Ok(journal) => journal,
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
     let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
-    let event = new_event(&payload.work_id, payload.run, payload.kind);
+    let events = match journal.replay() {
+        Ok(events) => events,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    if events.is_empty() {
+        return err_reply("NotFound", "no such work");
+    }
+    let Some(run_id) = payload.run.as_ref() else {
+        return err_reply(
+            "InvalidTransition",
+            "record observations must name an existing Run",
+        );
+    };
+    let Some(run) = find_run(&events, run_id) else {
+        return err_reply("InvalidTransition", "record names an unknown Run");
+    };
+    if fold(&events).state.is_terminal()
+        || !matches!(run.state, RunState::Open)
+        || latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
+            != Some(run_id.clone())
+    {
+        return err_reply(
+            "InvalidTransition",
+            "record does not target the current open Run",
+        );
+    }
+
+    let kind = match payload.kind {
+        EventKind::WorktreeCreated { repo, base_sha } => {
+            let binding =
+                match resolve_run_binding(&events, &state.estate_root, &payload.work_id, run_id) {
+                    Ok(binding) => binding,
+                    Err(reason) => return err_reply("ValidationUnavailable", &reason),
+                };
+            let World::Actor(actor) = binding.world else {
+                return err_reply("InvalidTransition", "only an Actor Run creates a worktree");
+            };
+            if binding.materialized
+                || events.iter().any(|event| {
+                    event.run.as_ref() == Some(run_id)
+                        && matches!(event.kind, EventKind::WorktreeCreated { .. })
+                })
+                || actor.repository != repo
+                || actor.base_sha != base_sha
+                || resolve_git_sha(&repo, &base_sha).as_deref() != Ok(base_sha.as_str())
+            {
+                return err_reply(
+                    "InvalidTransition",
+                    "WorktreeCreated does not match this Run's unmaterialized Actor binding",
+                );
+            }
+            EventKind::WorktreeCreated { repo, base_sha }
+        }
+        EventKind::WaypointReserved {
+            waypoint,
+            world_hash,
+            world,
+        } => {
+            let Some(previous) = events.last() else {
+                return err_reply(
+                    "InvalidTransition",
+                    "materialization has no preceding event",
+                );
+            };
+            let EventKind::WorktreeCreated { repo, base_sha } = &previous.kind else {
+                return err_reply(
+                    "InvalidTransition",
+                    "Actor materialization must immediately follow WorktreeCreated",
+                );
+            };
+            if previous.run.as_ref() != Some(run_id) || waypoint != run.waypoint {
+                return err_reply("InvalidTransition", "materialization names a different Run");
+            }
+            let binding =
+                match resolve_run_binding(&events, &state.estate_root, &payload.work_id, run_id) {
+                    Ok(binding) => binding,
+                    Err(reason) => return err_reply("ValidationUnavailable", &reason),
+                };
+            let World::Actor(initial) = binding.world else {
+                return err_reply(
+                    "InvalidTransition",
+                    "only an Actor World can be materialized",
+                );
+            };
+            let World::Actor(updated) = &world else {
+                return err_reply("InvalidTransition", "materialization changed World kind");
+            };
+            let mut expected = initial.clone();
+            expected.worktree_path = updated.worktree_path.clone();
+            if binding.materialized
+                || expected != *updated
+                || updated.worktree_path.as_os_str().is_empty()
+                || !paths_equal(
+                    &state.estate_root.join("worktrees").join(&payload.work_id.0),
+                    &updated.worktree_path,
+                )
+                || repo != &updated.repository
+                || base_sha != &updated.base_sha
+                || world_hash != run.world_hash
+                || WorldHash::of(&world) != world_hash
+            {
+                return err_reply(
+                    "InvalidTransition",
+                    "materialized World does not match its Run",
+                );
+            }
+            EventKind::WaypointReserved {
+                waypoint,
+                world_hash,
+                world,
+            }
+        }
+        EventKind::RunLaunched {
+            run: inner,
+            actor_kind,
+        } => {
+            if &inner != run_id
+                || events.iter().any(|event| {
+                    event.run.as_ref() == Some(run_id)
+                        && matches!(event.kind, EventKind::RunLaunched { .. })
+                })
+            {
+                return err_reply(
+                    "InvalidTransition",
+                    "RunLaunched is mismatched or duplicate",
+                );
+            }
+            match resolve_run_binding(&events, &state.estate_root, &payload.work_id, run_id) {
+                Ok(binding) if binding.materialized && matches!(binding.world, World::Actor(_)) => {
+                }
+                Ok(_) => return err_reply("InvalidTransition", "Actor Run is not materialized"),
+                Err(reason) => return err_reply("ValidationUnavailable", &reason),
+            }
+            EventKind::RunLaunched {
+                run: inner,
+                actor_kind,
+            }
+        }
+        EventKind::LifecycleObserved { status, detail } => {
+            let launched = events.iter().any(|event| {
+                event.run.as_ref() == Some(run_id)
+                    && matches!(
+                        &event.kind,
+                        EventKind::RunLaunched { run: inner, .. } if inner == run_id
+                    )
+            });
+            if !launched {
+                return err_reply("InvalidTransition", "lifecycle observation precedes launch");
+            }
+            EventKind::LifecycleObserved { status, detail }
+        }
+        EventKind::RunFailed { mut cause } => {
+            cause.at = now_ts();
+            EventKind::RunFailed { cause }
+        }
+        EventKind::RunVanished => EventKind::RunVanished,
+        EventKind::WorkSubmitted { .. }
+        | EventKind::RunOpened { .. }
+        | EventKind::ClaimFiled { .. }
+        | EventKind::ClaimRecorded { .. }
+        | EventKind::WorkFailed { .. }
+        | EventKind::WorkCanceled { .. } => unreachable!(),
+    };
+    let event = new_event(&payload.work_id, Some(run_id.clone()), kind);
     if let Err(err) = append_event(state, &mut journal, &payload.work_id, &event) {
         return err_reply("JournalError", &err.to_string());
     }
@@ -1188,12 +1434,47 @@ fn artifact_relative_to_worktree(worktree_path: &Path, artifact_path: &str) -> O
         .map(PathBuf::from)
 }
 
+/// Canonical containment after the lexical and existence checks.  A failed
+/// inspection is deliberately distinct from a successful proof that a path
+/// escapes (0067): it cannot be turned into `OutOfBoundary` evidence.
+fn artifact_canonical_containment(
+    worktree_path: &Path,
+    artifact_path: &str,
+) -> Result<bool, String> {
+    let joined = if Path::new(artifact_path).is_absolute() {
+        PathBuf::from(artifact_path)
+    } else {
+        worktree_path.join(artifact_path)
+    };
+    let canonical_root = std::fs::canonicalize(worktree_path).map_err(|err| {
+        format!(
+            "cannot inspect canonical worktree {}: {err}",
+            worktree_path.display()
+        )
+    })?;
+    let canonical_artifact = std::fs::canonicalize(&joined).map_err(|err| {
+        format!(
+            "cannot inspect canonical artifact {}: {err}",
+            joined.display()
+        )
+    })?;
+    Ok(!canonical_artifact.starts_with(&canonical_root))
+}
+
 fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     let work_id = payload.triple.work_id.clone();
     let run_id = payload.triple.run_id.clone();
 
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the claim's estate root does not identify this daemon's estate",
+        );
+    }
+
     let journal = match journal_for(state, &work_id) {
-        Ok(journal) => journal,
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
     let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1285,138 +1566,229 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
         );
     };
-    let mut verdict = validate_claim(&waypoint, &run, &claim);
+    let binding = resolve_run_binding(&events, &state.estate_root, &work_id, &run_id);
+    let mut verdict = match (&payload.kind, &binding) {
+        (_, Err(reason)) => {
+            ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(reason.clone()))
+        }
+        (ClaimKind::Done, Ok(binding))
+            if matches!(binding.world, World::Actor(_)) && !binding.materialized =>
+        {
+            ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(
+                "Actor checkout has not been materialized for this Run".to_string(),
+            ))
+        }
+        _ => validate_claim(&waypoint, &run, &claim),
+    };
 
     if matches!(verdict, ClaimVerdict::Validated)
-        && let Some(worktree_path) = worktree_path_for_run(&events, &run_id)
+        && let Ok(binding) = &binding
     {
-        // P2.4 W1 (build-brief.md §8 amendment 1; `orient/refuse.md`
-        // §4): a declared artifact path escaping the worktree join
-        // just below (`worktree_path.join(&artifact.path)`) is refused
-        // before that join is ever taken — checked first so an
-        // escaping path is never asked whether it "exists" at the
-        // escaped location, which would otherwise read as an unrelated
-        // `MissingArtifact`.
-        //
-        // Not a bare "contains `..` or is absolute" string test
-        // (`refuse.md`'s own first cut, tried and reverted — probed
-        // against `child_executor.rs::d5_1_true_completes_by_claim`,
-        // 0040's real service, not a hypothesis): a Deterministic
-        // Waypoint's own executor (`executors/child.rs`) always claims
-        // an *absolute* artifact path, `cwd.join(&spec.name)`
-        // display()-formatted — legitimate, since `cwd` there equals
-        // `worktree_path` itself. Rejecting every absolute path
-        // refused that real, correct Claim `OutOfBoundary`. The actual
-        // question `server.rs:956`'s join needs answered is narrower:
-        // does the join land inside `worktree_path`, not whether the
-        // string looks suspicious — `artifact_join_escapes` answers
-        // that directly, lexically (no filesystem read, the artifact
-        // need not exist yet).
-        if let Some(escaping) = claim
-            .artifacts
-            .iter()
-            .find(|a| artifact_join_escapes(&worktree_path, &a.path))
-        {
-            verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(escaping.path.clone()));
-        }
+        let worktree_path = match &binding.world {
+            World::Actor(actor) => actor.worktree_path.clone(),
+            World::Deterministic(deterministic) => deterministic.cwd.clone(),
+        };
+        // 0069 correction (REVERIFY-ASSESSMENT.md's named
+        // pre-materialization limit): an Actor Run whose checkout has
+        // not yet materialized has no real worktree to inspect at all
+        // — `worktree_path` above is empty (`ActorWorld`'s own doc). A
+        // Claim naming any artifact refuses `ValidationUnavailable`
+        // with that reason directly, before any of the escape/
+        // existence/canonical checks below ever run: every one of them
+        // joins a (possibly relative) artifact path against
+        // `worktree_path`, and an empty `worktree_path` lets a relative
+        // join resolve, once a real filesystem syscall (`.exists()`,
+        // `canonicalize`) touches it, against the *daemon's own*
+        // current working directory — an unrelated file sitting there
+        // must never be able to change the outcome. A Done claim never
+        // reaches this arm unmaterialized (the earlier verdict match
+        // already refuses it first); an artifact-free Question has
+        // nothing here to inspect and is unaffected.
+        if !binding.materialized && !claim.artifacts.is_empty() {
+            verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(
+                "Actor checkout has not been materialized for this Run; no worktree is available to inspect the claimed artifacts".to_string(),
+            ));
+        } else {
+            // P2.4 W1 (build-brief.md §8 amendment 1; `orient/refuse.md`
+            // §4): a declared artifact path escaping the worktree join
+            // just below (`worktree_path.join(&artifact.path)`) is refused
+            // before that join is ever taken — checked first so an
+            // escaping path is never asked whether it "exists" at the
+            // escaped location, which would otherwise read as an unrelated
+            // `MissingArtifact`.
+            //
+            // Not a bare "contains `..` or is absolute" string test
+            // (`refuse.md`'s own first cut, tried and reverted — probed
+            // against `child_executor.rs::d5_1_true_completes_by_claim`,
+            // 0040's real service, not a hypothesis): a Deterministic
+            // Waypoint's own executor (`executors/child.rs`) always claims
+            // an *absolute* artifact path, `cwd.join(&spec.name)`
+            // display()-formatted — legitimate, since `cwd` there equals
+            // `worktree_path` itself. Rejecting every absolute path
+            // refused that real, correct Claim `OutOfBoundary`. The actual
+            // question `server.rs:956`'s join needs answered is narrower:
+            // does the join land inside `worktree_path`, not whether the
+            // string looks suspicious — `artifact_join_escapes` answers
+            // that directly, lexically (no filesystem read, the artifact
+            // need not exist yet).
+            if let Some(escaping) = claim
+                .artifacts
+                .iter()
+                .find(|a| artifact_join_escapes(&worktree_path, &a.path))
+            {
+                verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(escaping.path.clone()));
+            }
 
-        if matches!(verdict, ClaimVerdict::Validated) {
-            for artifact in &claim.artifacts {
-                if !worktree_path.join(&artifact.path).exists() {
-                    verdict =
-                        ClaimVerdict::Refused(ClaimRefusal::MissingArtifact(artifact.name.clone()));
-                    break;
+            if matches!(verdict, ClaimVerdict::Validated) {
+                for artifact in &claim.artifacts {
+                    if !worktree_path.join(&artifact.path).exists() {
+                        verdict = ClaimVerdict::Refused(ClaimRefusal::MissingArtifact(
+                            artifact.name.clone(),
+                        ));
+                        break;
+                    }
                 }
             }
-        }
 
-        // P2.4 W1: the worktree's own changes since the World's
-        // `base_sha`, outside the Waypoint's Route-authored `boundary`,
-        // refuse the Claim `OutOfBoundary` naming them — `worktree_path`
-        // above already covers a Deterministic Waypoint's `cwd` too
-        // (`worktree_path_for_run`'s own doc), so this one call site
-        // enforces both kinds (`orient/check.md` "Item 5").
-        if matches!(verdict, ClaimVerdict::Validated) {
-            let base_sha = world_for_waypoint(&events, &run.waypoint)
-                .map(|world| match world {
-                    World::Actor(actor) => actor.base_sha,
-                    World::Deterministic(deterministic) => deterministic.base_sha,
-                })
-                .unwrap_or_default();
-            // A worktree the diff cannot read folds to "nothing
-            // observed" rather than a hard failure — same reasoning as
-            // `git.rs::fingerprint`'s own doc comment: unreadable is not
-            // itself evidence of an out-of-boundary write.
-            if let Ok(changed) = wirk_herdr::git::changed_paths(&worktree_path, &base_sha) {
-                // Each declared artifact in its worktree-relative form
-                // (W6 above): an absolute declared path — the
-                // Docker/child executors' own shape — now matches
-                // `changed`'s worktree-relative entries the same way a
-                // relative declared path always has. Every artifact
-                // here already passed the escape guard above (verdict
-                // is still `Validated`), so `strip_prefix` never fails;
-                // `unwrap_or_default` only guards a defensive fallback.
-                let mut declared: std::collections::BTreeSet<String> = claim
-                    .artifacts
-                    .iter()
-                    .map(|a| {
-                        artifact_relative_to_worktree(&worktree_path, &a.path)
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    })
-                    .collect();
-                // W4 (P2.6 run 3, rerun3's `orient.md`-vs-`build`
-                // finding): a Route's own earlier Waypoints (of this
-                // same Work, in the journaled Route order) already left
-                // their own declared outputs sitting untracked in the
-                // shared worktree — `orient.md` for `orient`, before
-                // `build` ever runs. Excluded from `offending` the same
-                // way this Claim's *own* declared artifacts already are
-                // just above (0050): a Waypoint's boundary names what
-                // *it* may write, never a refusal of evidence a prior,
-                // already-Claimed Waypoint of the same Work left behind.
-                // A later Waypoint that legitimately edits an earlier
-                // one's output is unaffected — only the *name itself*
-                // is excluded from `offending`, not from `boundary`'s
-                // own glob check, so a later Waypoint whose own boundary
-                // covers that path can still declare and reclaim it.
-                let route_order = route_waypoints(&events);
-                if let Some(pos) = route_order.iter().position(|w| w == &waypoint.id) {
-                    for def in journaled_defs.iter().filter(|def| {
-                        route_order
-                            .iter()
-                            .position(|w| w == &def.id)
-                            .is_some_and(|def_pos| def_pos < pos)
-                    }) {
-                        for output in &def.declared_outputs {
-                            declared.insert(output.name.clone());
+            if matches!(verdict, ClaimVerdict::Validated) {
+                for artifact in &claim.artifacts {
+                    match artifact_canonical_containment(&worktree_path, &artifact.path) {
+                        Ok(true) => {
+                            verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(
+                                artifact.path.clone(),
+                            ));
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(detail) => {
+                            verdict =
+                                ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(detail));
+                            break;
                         }
                     }
                 }
-                // P2.4 W2 (build-brief.md §3 W2; refuse.md §2): a Work
-                // whose one repository binding is `Access::Read`
-                // refuses any changed path at all, whatever the
-                // Waypoint's globs say — `work.repositories.first()`
-                // per orient's own read (a single-binding case; the
-                // name/path match against `ActorWorld.repository` is
-                // P2.5's question, carried, not answered here).
-                let is_read_binding = work
-                    .repositories
-                    .first()
-                    .is_some_and(|binding| binding.access == Access::Read);
-                let offending: Vec<&String> = changed
-                    .iter()
-                    .filter(|p| !declared.contains(p.as_str()))
-                    .filter(|p| is_read_binding || !boundary::allows(&waypoint.boundary, p))
-                    .collect();
-                if !offending.is_empty() {
-                    let joined = offending
+            }
+
+            // P2.4 W1: the worktree's own changes since the World's
+            // `base_sha`, outside the Waypoint's Route-authored `boundary`,
+            // refuse the Claim `OutOfBoundary` naming them — `worktree_path`
+            // above already covers a Deterministic Waypoint's `cwd` too
+            // (`worktree_path_for_run`'s own doc), so this one call site
+            // enforces both kinds (`orient/check.md` "Item 5"). Gated on
+            // `binding.materialized` (0069 correction): an unmaterialized
+            // Actor's `worktree_path` is empty — nothing exists yet to
+            // diff against — so a Question filed before materialization
+            // (legitimately Validated, no artifacts to check above) must
+            // not be sent through a git diff against an empty path. A Done
+            // claim never reaches this arm unmaterialized: the verdict
+            // match above already refuses it first.
+            if matches!(verdict, ClaimVerdict::Validated) && binding.materialized {
+                let base_sha = match &binding.world {
+                    World::Actor(actor) => actor.base_sha.clone(),
+                    World::Deterministic(deterministic) => deterministic.base_sha.clone(),
+                };
+                let changed = match binding.world.source_basis() {
+                    SourceBasis::Git { .. } => {
+                        match wirk_herdr::git::changed_paths(&worktree_path, &base_sha) {
+                            Ok(changed) => Some(changed),
+                            Err(err) => {
+                                verdict = ClaimVerdict::Refused(
+                                    ClaimRefusal::ValidationUnavailable(err.to_string()),
+                                );
+                                None
+                            }
+                        }
+                    }
+                    SourceBasis::OutputOnly { .. } => None,
+                    SourceBasis::Unknown => {
+                        verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(
+                            "source basis is unknown".to_string(),
+                        ));
+                        None
+                    }
+                };
+                if let Some(changed) = changed {
+                    // Each declared artifact in its worktree-relative form
+                    // (W6 above): an absolute declared path — the
+                    // Docker/child executors' own shape — now matches
+                    // `changed`'s worktree-relative entries the same way a
+                    // relative declared path always has. Every artifact
+                    // here already passed the escape guard above (verdict
+                    // is still `Validated`), so `strip_prefix` never fails;
+                    // `unwrap_or_default` only guards a defensive fallback.
+                    let mut declared: std::collections::BTreeSet<String> = claim
+                        .artifacts
                         .iter()
-                        .map(|p| p.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(joined));
+                        .map(|a| {
+                            artifact_relative_to_worktree(&worktree_path, &a.path)
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect();
+                    // W4 (P2.6 run 3, rerun3's `orient.md`-vs-`build`
+                    // finding): a Route's own earlier Waypoints (of this
+                    // same Work, in the journaled Route order) already left
+                    // their own declared outputs sitting untracked in the
+                    // shared worktree — `orient.md` for `orient`, before
+                    // `build` ever runs. Excluded from `offending` the same
+                    // way this Claim's *own* declared artifacts already are
+                    // just above (0050): a Waypoint's boundary names what
+                    // *it* may write, never a refusal of evidence a prior,
+                    // already-Claimed Waypoint of the same Work left behind.
+                    // A later Waypoint that legitimately edits an earlier
+                    // one's output is unaffected — only the *name itself*
+                    // is excluded from `offending`, not from `boundary`'s
+                    // own glob check, so a later Waypoint whose own boundary
+                    // covers that path can still declare and reclaim it.
+                    let route_order = route_waypoints(&events);
+                    if let Some(pos) = route_order.iter().position(|w| w == &waypoint.id) {
+                        for def in journaled_defs.iter().filter(|def| {
+                            route_order
+                                .iter()
+                                .position(|w| w == &def.id)
+                                .is_some_and(|def_pos| def_pos < pos)
+                        }) {
+                            for output in &def.declared_outputs {
+                                declared.insert(output.name.clone());
+                            }
+                        }
+                    }
+                    // P2.4 W2 (build-brief.md §3 W2; refuse.md §2): a Work
+                    // whose one repository binding is `Access::Read`
+                    // refuses any changed path at all, whatever the
+                    // Waypoint's globs say — `work.repositories.first()`
+                    // per orient's own read (a single-binding case; the
+                    // name/path match against `ActorWorld.repository` is
+                    // P2.5's question, carried, not answered here).
+                    let is_read_binding = work
+                        .repositories
+                        .first()
+                        .is_some_and(|binding| binding.access == Access::Read);
+                    // 0050 D150: "A Read repository binding refuses any
+                    // change at all" — no exception for a declared
+                    // artifact. The declared-artifact exclusion is a
+                    // Write-binding boundary concept (a Waypoint's own
+                    // output does not count against its own boundary); it
+                    // must never let a Read binding's absolute rule get
+                    // bypassed just because the changed path happens to be
+                    // named as this Claim's (or an earlier Waypoint's)
+                    // declared output (`read-artifact-probe/ASSESSMENT.md`,
+                    // an executed defect: a modified or brand-new declared
+                    // artifact both wrongly Validated under Read).
+                    let offending: Vec<&String> = changed
+                        .iter()
+                        .filter(|p| is_read_binding || !declared.contains(p.as_str()))
+                        .filter(|p| is_read_binding || !boundary::allows(&waypoint.boundary, p))
+                        .collect();
+                    if !offending.is_empty() {
+                        let joined = offending
+                            .iter()
+                            .map(|p| p.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(joined));
+                    }
                 }
             }
         }
@@ -1448,8 +1820,13 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             && let Some(next_id) = waypoints.get(pos + 1)
             && let Some(next_def) = journaled_defs.iter().find(|def| &def.id == next_id)
         {
-            let prior_world = world_for_waypoint(&events, &run.waypoint);
-            let cwd = worktree_path_for_run(&events, &run_id)
+            let prior_world = binding.as_ref().ok().map(|binding| binding.world.clone());
+            let cwd = prior_world
+                .as_ref()
+                .map(|world| match world {
+                    World::Actor(actor) => actor.worktree_path.clone(),
+                    World::Deterministic(deterministic) => deterministic.cwd.clone(),
+                })
                 .unwrap_or_else(|| state.estate_root.clone());
             // W4 (P2.6 run 3, rerun3's `verify`-vs-`build` finding): the
             // *next* Waypoint's boundary check (above, this function) diffs
@@ -1479,9 +1856,20 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                     })
                     .unwrap_or_default()
             };
-            let base_sha = resolve_git_sha(&cwd.display().to_string(), "HEAD")
-                .ok()
-                .unwrap_or_else(prior_base_sha);
+            let prior_basis = prior_world
+                .as_ref()
+                .map(|world| world.source_basis().clone())
+                .unwrap_or_default();
+            let base_sha = match &prior_basis {
+                SourceBasis::Git { .. } => {
+                    match resolve_git_sha(&cwd.display().to_string(), "HEAD") {
+                        Ok(base) => base,
+                        Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                    }
+                }
+                SourceBasis::OutputOnly { reference } => reference.clone(),
+                SourceBasis::Unknown => prior_base_sha(),
+            };
             // Wave 1 (P2.6, orient/route.md §3): minted before the match,
             // not after — an Actor World's `triple` needs the new Run's
             // own id (`ExecutionTriple` names the Run it belongs to); a
@@ -1499,7 +1887,16 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 // been submitted against.
                 WaypointKind::Deterministic => Some(World::Deterministic(DeterministicWorld {
                     command: next_def.command.clone().unwrap_or_default(),
-                    base_sha,
+                    base_sha: base_sha.clone(),
+                    source_basis: match &prior_basis {
+                        SourceBasis::Git { .. } => SourceBasis::Git {
+                            base: base_sha.clone(),
+                        },
+                        SourceBasis::OutputOnly { reference } => SourceBasis::OutputOnly {
+                            reference: reference.clone(),
+                        },
+                        SourceBasis::Unknown => SourceBasis::Unknown,
+                    },
                     cwd,
                     // Every cargo the child executor runs uses the one
                     // named-kept warm cache (0030; 0039 D126), not a
@@ -1525,22 +1922,33 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 // `format!("wirk/{}", ...)` `handle_submit` cuts once for
                 // every Waypoint (one worktree per Work, never a second).
                 WaypointKind::Actor => {
+                    if !matches!(prior_basis, SourceBasis::Git { .. }) {
+                        return err_reply(
+                            "IncompatibleSourceBasis",
+                            "an Actor stage cannot inherit an output-only or unknown source basis",
+                        );
+                    }
                     let (repository, branch) = match &prior_world {
                         Some(World::Actor(actor)) => {
                             (actor.repository.clone(), actor.branch.clone())
                         }
-                        _ => (
-                            work.repositories
-                                .first()
-                                .map(|binding| binding.name.clone())
-                                .unwrap_or_default(),
+                        // A deterministic Git World carries its verified
+                        // checkout in `cwd`. The logical repository binding
+                        // name is not a path and therefore cannot support the
+                        // Actor stage's later Git validation or retry.
+                        Some(World::Deterministic(deterministic)) => (
+                            deterministic.cwd.display().to_string(),
                             format!("wirk/{}", work_id.0),
                         ),
+                        None => (String::new(), format!("wirk/{}", work_id.0)),
                     };
                     Some(World::Actor(ActorWorld {
                         repository,
                         worktree_path: cwd,
                         branch,
+                        source_basis: SourceBasis::Git {
+                            base: base_sha.clone(),
+                        },
                         base_sha,
                         triple: ExecutionTriple {
                             estate_root: state.estate_root.display().to_string(),
@@ -1659,7 +2067,8 @@ fn record_and_reply(
 /// three fields is unaffected.
 fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
     let journal = match journal_for(state, &payload.work_id) {
-        Ok(journal) => journal,
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
     let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1676,10 +2085,12 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         .into_iter()
         .filter_map(|run_id| {
             let run = find_run(&events, &run_id)?;
-            let world = world_for_waypoint(&events, &run.waypoint);
+            let binding = resolve_run_binding(&events, &state.estate_root, &work.id, &run_id);
+            let (world, world_binding) = binding_status(binding);
             Some(json!({
                 "run": serde_json::to_value(&run).ok()?,
-                "world": world.and_then(|w| serde_json::to_value(&w).ok()),
+                "world": world,
+                "world_binding": world_binding,
             }))
         })
         .collect();
@@ -1723,12 +2134,31 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
                 result["failure_detail"] = json!(detail);
             }
         }
-        if let Some(world) = world_for_waypoint(&events, waypoint) {
-            result["world"] = serde_json::to_value(&world).expect("World always serializes");
-        }
+        let binding = resolve_run_binding(&events, &state.estate_root, &work.id, &run_id);
+        let (world, world_binding) = binding_status(binding);
+        result["world"] = world;
+        result["world_binding"] = world_binding;
     }
 
     ok_reply(result)
+}
+
+fn binding_status(binding: Result<RunBinding, String>) -> (Value, Value) {
+    match binding {
+        Ok(binding) => (
+            serde_json::to_value(&binding.world).expect("World always serializes"),
+            json!({
+                "state": "resolved",
+                "inspection": binding.inspection_name(),
+                "materialized": binding.materialized,
+                "legacy_basis": binding.legacy_basis,
+            }),
+        ),
+        Err(reason) => (
+            Value::Null,
+            json!({"state": "unavailable", "reason": reason}),
+        ),
+    }
 }
 
 /// `run-deterministic`'s own verb (module doc, `FailPayload`): journals
@@ -1740,8 +2170,16 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
     let work_id = payload.triple.work_id.clone();
     let run_id = payload.triple.run_id.clone();
 
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the failure's estate root does not identify this daemon's estate",
+        );
+    }
+
     let journal = match journal_for(state, &work_id) {
-        Ok(journal) => journal,
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
     let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1749,10 +2187,20 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
         Ok(events) => events,
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
-    if find_run(&events, &run_id).is_none() {
+    let Some(run) = find_run(&events, &run_id) else {
         return err_reply(
             "TripleMismatch",
             "the run id does not match any Run opened for this Work",
+        );
+    };
+    if !matches!(run.state, RunState::Open)
+        || latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
+            != Some(run_id.clone())
+        || fold(&events).state.is_terminal()
+    {
+        return err_reply(
+            "InvalidTransition",
+            "failure does not target the current open Run",
         );
     }
 
@@ -1814,8 +2262,16 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
     let work_id = payload.triple.work_id.clone();
     let run_id = payload.triple.run_id.clone();
 
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the retry's estate root does not identify this daemon's estate",
+        );
+    }
+
     let journal = match journal_for(state, &work_id) {
-        Ok(journal) => journal,
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
     let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1830,6 +2286,12 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
     if !matches!(work.state, WorkState::NeedsInput) {
         return err_reply("NotNeedsInput", "retry refused: the Work is not NeedsInput");
     }
+    if work.needs_input.as_ref().map(|cause| &cause.run) != Some(&run_id) {
+        return err_reply(
+            "TripleMismatch",
+            "retry must name the Run that placed this Work in NeedsInput",
+        );
+    }
 
     let Some(run) = find_run(&events, &run_id) else {
         return err_reply(
@@ -1838,44 +2300,78 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
         );
     };
 
-    let Some(prior_world) = world_for_waypoint(&events, &run.waypoint) else {
+    if work.current_waypoint.as_ref() != Some(&run.waypoint)
+        || latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
+            != Some(run_id.clone())
+    {
         return err_reply(
-            "JournalError",
-            "no World is reserved for this Run's Waypoint",
+            "TripleMismatch",
+            "retry must name the current unsuperseded Run",
         );
+    }
+
+    let binding = match resolve_run_binding(&events, &state.estate_root, &work_id, &run_id) {
+        Ok(binding) => binding,
+        Err(reason) => return err_reply("ValidationUnavailable", &reason),
     };
+    let prior_world = binding.world;
 
     let new_run_id = RunId(mint_id("run"));
 
-    // W4: the worktree this retry's fresh Run is about to start against,
-    // read fresh with git — same reasoning and same call as auto-advance's
-    // `next_world` above (`resolve_git_sha`, R2). Falls back to the prior
-    // World's own `base_sha` when git cannot read it (no worktree yet).
-    let cwd = match &prior_world {
-        World::Actor(actor) => actor.worktree_path.clone(),
-        World::Deterministic(deterministic) => deterministic.cwd.clone(),
-    };
-    let prior_base_sha = || match &prior_world {
-        World::Actor(actor) => actor.base_sha.clone(),
-        World::Deterministic(deterministic) => deterministic.base_sha.clone(),
-    };
-    let fresh_base_sha = resolve_git_sha(&cwd.display().to_string(), "HEAD")
-        .ok()
-        .unwrap_or_else(prior_base_sha);
-
     let fresh_world = match &prior_world {
-        World::Actor(actor) => World::Actor(ActorWorld {
-            base_sha: fresh_base_sha,
-            triple: ExecutionTriple {
-                run_id: new_run_id.clone(),
-                ..actor.triple.clone()
-            },
-            ..actor.clone()
-        }),
-        World::Deterministic(deterministic) => World::Deterministic(DeterministicWorld {
-            base_sha: fresh_base_sha,
-            ..deterministic.clone()
-        }),
+        World::Actor(actor) => {
+            let fresh_base_sha = if binding.materialized {
+                match resolve_git_sha(&actor.worktree_path.display().to_string(), "HEAD") {
+                    Ok(base) => base,
+                    Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                }
+            } else {
+                actor.base_sha.clone()
+            };
+            World::Actor(ActorWorld {
+                worktree_path: if binding.materialized {
+                    actor.worktree_path.clone()
+                } else {
+                    PathBuf::new()
+                },
+                base_sha: fresh_base_sha.clone(),
+                source_basis: SourceBasis::Git {
+                    base: fresh_base_sha,
+                },
+                triple: ExecutionTriple {
+                    estate_root: state.estate_root.display().to_string(),
+                    work_id: work_id.clone(),
+                    run_id: new_run_id.clone(),
+                },
+                ..actor.clone()
+            })
+        }
+        World::Deterministic(deterministic) => {
+            let (fresh_base_sha, source_basis) = match &deterministic.source_basis {
+                SourceBasis::Git { .. } => {
+                    let base =
+                        match resolve_git_sha(&deterministic.cwd.display().to_string(), "HEAD") {
+                            Ok(base) => base,
+                            Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                        };
+                    (base.clone(), SourceBasis::Git { base })
+                }
+                SourceBasis::OutputOnly { reference } => (
+                    reference.clone(),
+                    SourceBasis::OutputOnly {
+                        reference: reference.clone(),
+                    },
+                ),
+                SourceBasis::Unknown => {
+                    return err_reply("ValidationUnavailable", "source basis is unknown");
+                }
+            };
+            World::Deterministic(DeterministicWorld {
+                base_sha: fresh_base_sha,
+                source_basis,
+                ..deterministic.clone()
+            })
+        }
     };
     let world_hash = WorldHash::of(&fresh_world);
     let reserved = new_event(
@@ -1913,7 +2409,7 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
         EventKind::RunOpened {
             run: new_run_id.clone(),
             waypoint: run.waypoint.clone(),
-            attempt: 1,
+            attempt: run.attempt + 1,
             world_hash,
         },
     );
@@ -1934,7 +2430,8 @@ fn handle_workfail(state: &Arc<WirkdState>, payload: WorkFailPayload) -> Reply {
     let work_id = payload.work_id.clone();
 
     let journal = match journal_for(state, &work_id) {
-        Ok(journal) => journal,
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
     let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1976,6 +2473,235 @@ fn all_run_ids(events: &[Event]) -> Vec<RunId> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct RunBinding {
+    world: World,
+    materialized: bool,
+    legacy_basis: bool,
+}
+
+impl RunBinding {
+    fn inspection_name(&self) -> &'static str {
+        match self.world.source_basis() {
+            SourceBasis::Git { .. } => "git",
+            SourceBasis::OutputOnly { .. } => "output_only",
+            SourceBasis::Unknown => "unknown",
+        }
+    }
+}
+
+/// Resolves exactly the reservation consumed by one RunOpened and its only
+/// legal Actor materialization. Journal order and full structured equality
+/// are the authority; matching hashes alone never associate a World to a Run.
+fn resolve_run_binding(
+    events: &[Event],
+    estate_root: &Path,
+    work_id: &WorkId,
+    run_id: &RunId,
+) -> Result<RunBinding, String> {
+    let openings: Vec<(usize, &Event, &WaypointId, &WorldHash)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match &event.kind {
+            EventKind::RunOpened {
+                run,
+                waypoint,
+                world_hash,
+                ..
+            } if run == run_id => Some((index, event, waypoint, world_hash)),
+            _ => None,
+        })
+        .collect();
+    let [(open_index, opened, waypoint, opened_hash)] = openings.as_slice() else {
+        return Err(if openings.is_empty() {
+            "no RunOpened names this Run".to_string()
+        } else {
+            "duplicate RunOpened events name this Run".to_string()
+        });
+    };
+    if opened.work != *work_id || opened.run.as_ref() != Some(run_id) {
+        return Err("RunOpened carries mismatched Work or Event.run identity".to_string());
+    }
+
+    let reservation_index = if *open_index >= 1
+        && matches!(
+            events[*open_index - 1].kind,
+            EventKind::WaypointReserved { .. }
+        ) {
+        *open_index - 1
+    } else if *open_index >= 2
+        && matches!(
+            events[*open_index - 2].kind,
+            EventKind::WaypointReserved { .. }
+        )
+        && matches!(
+            &events[*open_index - 1].kind,
+            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("retried")
+        )
+        && events[*open_index - 1].run.as_ref() != Some(run_id)
+    {
+        *open_index - 2
+    } else {
+        return Err("RunOpened is not adjacent to a legal opening reservation".to_string());
+    };
+    let reservation = &events[reservation_index];
+    let EventKind::WaypointReserved {
+        waypoint: reserved_waypoint,
+        world_hash: reserved_hash,
+        world,
+    } = &reservation.kind
+    else {
+        unreachable!()
+    };
+    if reservation.work != *work_id
+        || reservation.run.is_some()
+        || reserved_waypoint != *waypoint
+        || reserved_hash != *opened_hash
+        || WorldHash::of(world) != *reserved_hash
+    {
+        return Err("opening reservation does not match RunOpened".to_string());
+    }
+
+    let mut resolved = world.clone();
+    let mut legacy_basis = false;
+    match &mut resolved {
+        World::Actor(actor) => {
+            if actor.triple.work_id != *work_id
+                || actor.triple.run_id != *run_id
+                || !estate_roots_equal(estate_root, &actor.triple.estate_root)
+            {
+                return Err(
+                    "Actor World triple does not name this estate, Work, and Run".to_string(),
+                );
+            }
+            match &actor.source_basis {
+                SourceBasis::Git { base } if base == &actor.base_sha => {}
+                SourceBasis::Unknown => {
+                    // The canonical Actor reservation/open writer resolves the
+                    // submitted revision before writing and carries the exact
+                    // triple. Preserve that old writer sequence as Git without
+                    // rewriting its journal or hash.
+                    actor.source_basis = SourceBasis::Git {
+                        base: actor.base_sha.clone(),
+                    };
+                    legacy_basis = true;
+                }
+                _ => return Err("Actor World has an incompatible source basis".to_string()),
+            }
+        }
+        World::Deterministic(det) => match &det.source_basis {
+            SourceBasis::Git { base } if base == &det.base_sha => {}
+            SourceBasis::OutputOnly { reference } if reference == &det.base_sha => {}
+            SourceBasis::Unknown => {
+                return Err("legacy Deterministic World has no provable source basis".to_string());
+            }
+            _ => return Err("Deterministic World source basis disagrees with base_sha".to_string()),
+        },
+    }
+
+    let World::Actor(initial_actor) = &resolved else {
+        return Ok(RunBinding {
+            world: resolved,
+            materialized: true,
+            legacy_basis,
+        });
+    };
+    if !initial_actor.worktree_path.as_os_str().is_empty() {
+        return Ok(RunBinding {
+            world: resolved,
+            materialized: true,
+            legacy_basis,
+        });
+    }
+
+    let expected_path = estate_root.join("worktrees").join(&work_id.0);
+    let mut materialized: Option<World> = None;
+    let launch_index = events.iter().enumerate().find_map(|(index, event)| {
+        matches!(
+            &event.kind,
+            EventKind::RunLaunched { run, .. }
+                if event.run.as_ref() == Some(run_id) && run == run_id
+        )
+        .then_some(index)
+    });
+    for index in (*open_index + 1)..events.len().saturating_sub(1) {
+        if launch_index.is_some_and(|launch| index >= launch) {
+            break;
+        }
+        let created = &events[index];
+        let updated = &events[index + 1];
+        let EventKind::WorktreeCreated { repo, base_sha } = &created.kind else {
+            continue;
+        };
+        let EventKind::WaypointReserved {
+            waypoint: updated_waypoint,
+            world_hash: updated_hash,
+            world: updated_world,
+        } = &updated.kind
+        else {
+            continue;
+        };
+        if created.work != *work_id
+            || created.run.as_ref() != Some(run_id)
+            || updated.work != *work_id
+            || !matches!(updated.run.as_ref(), Some(run) if run == run_id) && updated.run.is_some()
+            || updated_waypoint != *waypoint
+            || updated_hash != *opened_hash
+            || WorldHash::of(updated_world) != *updated_hash
+        {
+            continue;
+        }
+        let World::Actor(updated_actor) = updated_world else {
+            continue;
+        };
+        let mut expected_actor = initial_actor.clone();
+        expected_actor.worktree_path = updated_actor.worktree_path.clone();
+        // Legacy materialization stored Unknown even though the validated
+        // Actor opening sequence proves Git. Compare its historical value,
+        // then expose the effective proven tag in the resolved World.
+        if legacy_basis {
+            expected_actor.source_basis = SourceBasis::Unknown;
+        }
+        if repo != &initial_actor.repository
+            || base_sha != &initial_actor.base_sha
+            || expected_actor != *updated_actor
+            || !paths_equal(&expected_path, &updated_actor.worktree_path)
+        {
+            continue;
+        }
+        if materialized.is_some() {
+            return Err("multiple Actor materializations fit this Run".to_string());
+        }
+        let mut effective = updated_actor.clone();
+        if legacy_basis {
+            effective.source_basis = SourceBasis::Git {
+                base: effective.base_sha.clone(),
+            };
+        }
+        materialized = Some(World::Actor(effective));
+    }
+    let is_materialized = materialized.is_some();
+    Ok(RunBinding {
+        world: materialized.unwrap_or(resolved),
+        materialized: is_materialized,
+        legacy_basis,
+    })
+}
+
+fn paths_equal(expected: &Path, actual: &Path) -> bool {
+    match (
+        std::fs::canonicalize(expected),
+        std::fs::canonicalize(actual),
+    ) {
+        (Ok(expected), Ok(actual)) => expected == actual,
+        _ => expected == actual,
+    }
+}
+
+fn estate_roots_equal(expected: &Path, actual: &str) -> bool {
+    std::fs::canonicalize(actual).is_ok_and(|actual| actual == expected)
+}
+
 /// The `World` most recently reserved for `waypoint` — the *last*
 /// matching `WaypointReserved` wins, not the first (`.rev()`): `wirk
 /// run` (W3) re-emits `WaypointReserved` through `record` once the
@@ -1991,13 +2717,48 @@ fn world_for_waypoint(events: &[Event], waypoint: &WaypointId) -> Option<World> 
     })
 }
 
-/// Fetches (opening on first touch) the `Arc<Mutex<Journal>>` for
-/// `work_id`, journaled at `$estate_root/works/<work_id>/journal.ndjson`
-/// (0033 D101). The outer map lock is held only long enough to
-/// fetch-or-insert; the returned `Arc` lets the caller lock the
-/// per-Work `Mutex<Journal>` without holding the map lock across the
-/// append (transport.md §5).
+/// Returns the only valid directory for a Work id.  External verbs must not
+/// let a path-like id escape the estate's `works/` namespace.
+fn work_journal_dir(state: &Arc<WirkdState>, work_id: &WorkId) -> Option<PathBuf> {
+    let mut components = Path::new(&work_id.0).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => {
+            Some(state.estate_root.join("works").join(&work_id.0))
+        }
+        _ => None,
+    }
+}
+
+/// Fetches an existing submitted Work's journal.  This is intentionally not a
+/// creation path: status, watch, claim, record, failure and retry may observe
+/// a Work, but only submit gives one a journal (0067).
 fn journal_for(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+) -> Result<Option<Arc<Mutex<Journal>>>, JournalError> {
+    let mut journals = state
+        .journals
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if let Some(existing) = journals.get(work_id) {
+        return Ok(Some(Arc::clone(existing)));
+    }
+    let Some(dir) = work_journal_dir(state, work_id) else {
+        return Ok(None);
+    };
+    if !dir.join("journal.ndjson").is_file() {
+        return Ok(None);
+    }
+    let journal = Journal::open(dir)?;
+    let journal = Arc::new(Mutex::new(journal));
+    journals.insert(work_id.clone(), Arc::clone(&journal));
+    Ok(Some(journal))
+}
+
+/// The submit-only journal creation path.  The id is daemon-minted, but it
+/// still goes through the same containment guard so future callers cannot
+/// accidentally bypass it.
+fn create_journal_for(
     state: &Arc<WirkdState>,
     work_id: &WorkId,
 ) -> Result<Arc<Mutex<Journal>>, JournalError> {
@@ -2008,9 +2769,8 @@ fn journal_for(
     if let Some(existing) = journals.get(work_id) {
         return Ok(Arc::clone(existing));
     }
-    let dir = state.estate_root.join("works").join(&work_id.0);
-    let journal = Journal::open(dir)?;
-    let journal = Arc::new(Mutex::new(journal));
+    let dir = work_journal_dir(state, work_id).expect("daemon-minted WorkId is a path component");
+    let journal = Arc::new(Mutex::new(Journal::open(dir)?));
     journals.insert(work_id.clone(), Arc::clone(&journal));
     Ok(journal)
 }
@@ -2166,6 +2926,7 @@ fn refusal_reply(refusal: &ClaimRefusal) -> Reply {
             "the claim's run id does not match any Run opened for this Work".to_string(),
         ),
         ClaimRefusal::OutOfBoundary(what) => ("OutOfBoundary", what.clone()),
+        ClaimRefusal::ValidationUnavailable(detail) => ("ValidationUnavailable", detail.clone()),
         ClaimRefusal::AlreadyClaimed => {
             ("AlreadyClaimed", "the Run is already Claimed".to_string())
         }

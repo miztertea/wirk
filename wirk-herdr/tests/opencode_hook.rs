@@ -44,6 +44,9 @@ fn actor_world(run: &Run, estate_root: &std::path::Path, worktree_path: &std::pa
         worktree_path: worktree_path.to_path_buf(),
         branch: "p2-plugin-surface/w2".to_string(),
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::Git {
+            base: "abc123".to_string(),
+        },
         triple: ExecutionTriple {
             estate_root: estate_root.to_string_lossy().into_owned(),
             work_id: WorkId("work-1".to_string()),

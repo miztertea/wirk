@@ -337,42 +337,45 @@ pub fn run_command(rest: &[String]) -> ExitCode {
     };
     println!("worktree {}", worktree_path.display());
 
-    if let Err(err) = wirkd_record(
-        &pointer.socket,
-        &work_id,
-        Some(run.id.clone()),
-        EventKind::WorktreeCreated {
-            repo: actor.repository.clone(),
-            base_sha: head,
-        },
-    ) {
-        eprintln!("wirk run: {err}");
-        return ExitCode::from(2);
-    }
-    println!("WorktreeCreated");
-
-    // Update the World's worktree_path (R1: re-emit the same
-    // WaypointReserved rather than a new event type — `mod.rs`'s
-    // `RecordPayload` doc comment, `server.rs`'s `world_for_waypoint`).
-    // `worktree_path` is excluded from `WorldHash::of`'s covered fields
-    // (`wirk-core/src/lib.rs`), so the hash is unchanged.
     let mut updated_actor = actor.clone();
-    updated_actor.worktree_path = worktree_path;
-    let updated_world = World::Actor(updated_actor);
-    let world_hash = WorldHash::of(&updated_world);
-    if let Err(err) = wirkd_record(
-        &pointer.socket,
-        &work_id,
-        None,
-        EventKind::WaypointReserved {
-            waypoint: run.waypoint.clone(),
-            world_hash,
-            world: updated_world.clone(),
-        },
-    ) {
-        eprintln!("wirk run: {err}");
+    if actor.worktree_path.as_os_str().is_empty() {
+        if let Err(err) = wirkd_record(
+            &pointer.socket,
+            &work_id,
+            Some(run.id.clone()),
+            EventKind::WorktreeCreated {
+                repo: actor.repository.clone(),
+                base_sha: head.clone(),
+            },
+        ) {
+            eprintln!("wirk run: {err}");
+            return ExitCode::from(2);
+        }
+        println!("WorktreeCreated");
+
+        // The first materialization is a run-scoped legal transition.
+        // Location remains excluded from the content fingerprint.
+        updated_actor.worktree_path = worktree_path;
+        let updated_world = World::Actor(updated_actor.clone());
+        let world_hash = WorldHash::of(&updated_world);
+        if let Err(err) = wirkd_record(
+            &pointer.socket,
+            &work_id,
+            Some(run.id.clone()),
+            EventKind::WaypointReserved {
+                waypoint: run.waypoint.clone(),
+                world_hash,
+                world: updated_world,
+            },
+        ) {
+            eprintln!("wirk run: {err}");
+            return ExitCode::from(2);
+        }
+    } else if actor.worktree_path != worktree_path || head != actor.base_sha {
+        eprintln!("wirk run: the existing Run binding does not match the reusable checkout");
         return ExitCode::from(2);
     }
+    let updated_world = World::Actor(updated_actor);
 
     let client = match SocketClient::connect(herdr_socket) {
         Ok(client) => client,

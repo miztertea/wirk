@@ -57,6 +57,9 @@ fn deterministic_world(
     World::Deterministic(DeterministicWorld {
         command: command.into_iter().map(str::to_string).collect(),
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
         expected_artifacts,
@@ -201,6 +204,9 @@ fn d5_7_docker_create_argv_is_exact_and_ordered() {
             "echo hi > report.md".to_string(),
         ],
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: std::path::PathBuf::from("/var/tmp/wirk-estate/works/work-1/run-run-1/worktree"),
         env,
         expected_artifacts: OutputContract(Vec::new()),
@@ -264,6 +270,9 @@ fn d5_8_a_deterministic_world_without_base_sha_is_refused_docker() {
     let world = World::Deterministic(DeterministicWorld {
         command: vec!["true".to_string()],
         base_sha: String::new(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: String::new(),
+        },
         cwd: cwd.path().to_path_buf(),
         env: BTreeMap::new(),
         expected_artifacts: OutputContract(Vec::new()),
@@ -489,29 +498,37 @@ fn sweep_work_submitted(waypoints: Vec<&str>) -> EventKind {
     }
 }
 
+fn sweep_world(cwd: &Path) -> World {
+    World::Deterministic(DeterministicWorld {
+        command: vec!["true".to_string()],
+        base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
+        cwd: cwd.to_path_buf(),
+        env: BTreeMap::new(),
+        expected_artifacts: OutputContract(vec![wirk_core::ArtifactSpec {
+            name: "report.md".to_string(),
+            required: true,
+        }]),
+    })
+}
+
 fn sweep_waypoint_reserved(waypoint: &str, cwd: &Path) -> EventKind {
+    let world = sweep_world(cwd);
     EventKind::WaypointReserved {
         waypoint: WaypointId(waypoint.to_string()),
-        world_hash: WorldHash("deadbeef".to_string()),
-        world: World::Deterministic(DeterministicWorld {
-            command: vec!["true".to_string()],
-            base_sha: "abc123".to_string(),
-            cwd: cwd.to_path_buf(),
-            env: BTreeMap::new(),
-            expected_artifacts: OutputContract(vec![wirk_core::ArtifactSpec {
-                name: "report.md".to_string(),
-                required: true,
-            }]),
-        }),
+        world_hash: WorldHash::of(&world),
+        world,
     }
 }
 
-fn sweep_run_opened(run: &str, waypoint: &str) -> EventKind {
+fn sweep_run_opened(run: &str, waypoint: &str, cwd: &Path) -> EventKind {
     EventKind::RunOpened {
         run: RunId(run.to_string()),
         waypoint: WaypointId(waypoint.to_string()),
         attempt: 1,
-        world_hash: WorldHash("deadbeef".to_string()),
+        world_hash: WorldHash::of(&sweep_world(cwd)),
     }
 }
 
@@ -559,7 +576,7 @@ fn d5_11_sweep_matches_open_runs_against_the_injected_docker_listing() {
                 "ev-a3",
                 "work-a",
                 Some("run-a"),
-                sweep_run_opened("run-a", "wp-1"),
+                sweep_run_opened("run-a", "wp-1", cwd.path()),
             ),
         ],
     );
@@ -581,7 +598,7 @@ fn d5_11_sweep_matches_open_runs_against_the_injected_docker_listing() {
                 "ev-b3",
                 "work-b",
                 Some("run-b"),
-                sweep_run_opened("run-b", "wp-1"),
+                sweep_run_opened("run-b", "wp-1", cwd.path()),
             ),
         ],
     );
@@ -604,7 +621,7 @@ fn d5_11_sweep_matches_open_runs_against_the_injected_docker_listing() {
                 "ev-c3",
                 "work-c",
                 Some("run-c"),
-                sweep_run_opened("run-c", "wp-1"),
+                sweep_run_opened("run-c", "wp-1", cwd.path()),
             ),
             sweep_event(
                 "ev-c4",
@@ -706,7 +723,7 @@ fn d5_12_sweep_finds_nothing_when_no_run_is_open() {
                 "ev-3",
                 "work-done",
                 Some("run-done"),
-                sweep_run_opened("run-done", "wp-1"),
+                sweep_run_opened("run-done", "wp-1", cwd.path()),
             ),
             sweep_event(
                 "ev-4",

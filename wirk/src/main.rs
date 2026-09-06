@@ -66,8 +66,8 @@ use wirkd::{
 use wirk_core::{
     Access, ClaimId, ClaimKind, ClaimVerdict, DeterministicWorld, Event, EventId, EventKind,
     ExecutionTriple, Executor, FailureCause, Journal, JournalError, OutputContract,
-    RepositoryBinding, RouteId, Run, RunId, RunObservation, WaypointId, WorkId, WorkState, World,
-    WorldHash,
+    RepositoryBinding, RouteId, Run, RunId, RunObservation, SourceBasis, WaypointId, WorkId,
+    WorkState, World, WorldHash,
 };
 
 /// The injected execution triple: ruling 0001 D3 ("the execution
@@ -326,7 +326,12 @@ fn wirkd_usage() -> ExitCode {
 /// the plugin pane's own "the pane program ends; that is the state"
 /// contract (item G). `--estate` naming a wirkd that is not running
 /// prints why and exits 2 immediately, rather than blocking on a
-/// connection that will never come.
+/// connection that will never come. Once every watched connection has
+/// ended, the exit is 0 unless at least one Work's own watch was
+/// explicitly refused by wirkd (0069 correction) — an unrefused
+/// stream's own valid events and clean EOF are printed exactly as
+/// before either way, and that refusal never cuts a sibling Work's
+/// still-live stream short.
 fn wirkd_watch_command(estate: &str, work_filter: Option<String>) -> ExitCode {
     let pointer = match wirkd::client::locate(Path::new(estate)) {
         Ok(pointer) => pointer,
@@ -354,12 +359,17 @@ fn wirkd_watch_command(estate: &str, work_filter: Option<String>) -> ExitCode {
     // thread's lines funnel into — the same "many readers, one channel
     // the caller blocks on" shape item A's `RunLoop` uses for Herdr plus
     // wirkd, applied here to N Work watches instead of two fixed
-    // streams.
+    // streams. `any_refused` is the one piece of state a thread reports
+    // back besides its printed lines: whether *its* Work was refused by
+    // wirkd (0069 correction) — checked only after every stream has
+    // ended on its own, never used to cut a still-live stream short.
     let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let any_refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut handles = Vec::new();
     for work_id in work_ids {
         let socket = pointer.socket.clone();
         let tx = tx.clone();
+        let any_refused = std::sync::Arc::clone(&any_refused);
         handles.push(std::thread::spawn(move || {
             let events = match wirkd::client::watch(
                 &socket,
@@ -382,6 +392,21 @@ fn wirkd_watch_command(estate: &str, work_filter: Option<String>) -> ExitCode {
                             return;
                         }
                     }
+                    // A well-formed daemon refusal (`NotFound` for an
+                    // unknown or path-like id, most commonly): labeled
+                    // `refused`, not folded into `watch_error`'s
+                    // generic-failure line, and recorded so the whole
+                    // command's exit reflects it — while every other
+                    // thread here keeps streaming its own Work
+                    // untouched.
+                    Err(wirkd::client::ClientError::Refused(detail)) => {
+                        any_refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx.send(format!(
+                            "{work_id} refused {}: {}",
+                            detail.code, detail.message
+                        ));
+                        return;
+                    }
                     Err(err) => {
                         let _ = tx.send(format!("{work_id} watch_error {err}"));
                         return;
@@ -401,7 +426,11 @@ fn wirkd_watch_command(estate: &str, work_filter: Option<String>) -> ExitCode {
     for handle in handles {
         let _ = handle.join();
     }
-    ExitCode::SUCCESS
+    if any_refused.load(std::sync::atomic::Ordering::Relaxed) {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// `wirk wirkd status --estate <root> [--work <id>]` and its `wirk work
@@ -726,6 +755,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
                         "--route",
                         "--kind",
                         "--repo-path",
+                        "--source-basis",
                     ]
                     .iter()
                     .any(|flag| remaining.iter().any(|arg| arg == *flag))
@@ -743,6 +773,16 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
     let kind = flag_value(rest, "--kind");
     let repo_path = flag_value(rest, "--repo-path");
     let route = flag_value(rest, "--route");
+    let source_basis = match flag_value(rest, "--source-basis").as_deref() {
+        Some("git") => Some(SourceBasis::Git {
+            base: base_ref.clone(),
+        }),
+        Some("output-only") => Some(SourceBasis::OutputOnly {
+            reference: base_ref.clone(),
+        }),
+        Some(_) => return work_usage(),
+        None => None,
+    };
 
     // p2-route-files W2 (build-brief.md §7.3): `--route` is required
     // for every submit except the ad hoc `--kind deterministic
@@ -756,6 +796,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
         intent: String::new(),
         repositories,
         base_ref,
+        source_basis,
         kind,
         command,
         repo_path,
@@ -773,7 +814,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> | wirk work retry --estate <root> --work <id> | wirk work fail --estate <root> --work <id> --reason <text>"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) | wirk work status --estate <root> --work <id> | wirk work retry --estate <root> --work <id> | wirk work fail --estate <root> --work <id> --reason <text>"
     );
     ExitCode::from(1)
 }
@@ -1266,6 +1307,7 @@ fn demo_events() -> Vec<Event> {
         // to pin, so it names itself rather than leaving the field
         // empty (a `ChildExecutor` refuses an empty `base_sha`).
         base_sha: "journal-demo".to_string(),
+        source_basis: SourceBasis::Unknown,
         cwd: PathBuf::from("."),
         env: BTreeMap::new(),
         expected_artifacts: OutputContract(Vec::new()),

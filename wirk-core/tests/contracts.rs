@@ -49,6 +49,9 @@ fn actor_world(repository: &str, branch: &str, base_sha: &str, worktree: &str) -
         worktree_path: worktree.into(),
         branch: branch.to_string(),
         base_sha: base_sha.to_string(),
+        source_basis: wirk_core::SourceBasis::Git {
+            base: base_sha.to_string(),
+        },
         triple: triple("run-1"),
         intent: "do the thing".to_string(),
         output_contract: OutputContract(vec![ArtifactSpec {
@@ -544,6 +547,9 @@ fn world_hash_covers_content_not_location_or_identity() {
     let det1 = World::Deterministic(DeterministicWorld {
         command: vec!["cargo".to_string(), "test".to_string()],
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
@@ -551,6 +557,9 @@ fn world_hash_covers_content_not_location_or_identity() {
     let det2 = World::Deterministic(DeterministicWorld {
         command: vec!["test".to_string(), "cargo".to_string()],
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
@@ -566,6 +575,9 @@ fn world_hash_covers_content_not_location_or_identity() {
     let det3 = World::Deterministic(DeterministicWorld {
         command: vec!["ab".to_string(), "c".to_string()],
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
@@ -573,6 +585,9 @@ fn world_hash_covers_content_not_location_or_identity() {
     let det4 = World::Deterministic(DeterministicWorld {
         command: vec!["a".to_string(), "bc".to_string()],
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
@@ -623,6 +638,9 @@ fn world_hash_covers_deterministic_base_sha() {
     let det_a = World::Deterministic(DeterministicWorld {
         command: vec!["cargo".to_string(), "test".to_string()],
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
@@ -630,6 +648,9 @@ fn world_hash_covers_deterministic_base_sha() {
     let det_b = World::Deterministic(DeterministicWorld {
         command: vec!["cargo".to_string(), "test".to_string()],
         base_sha: "def456".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "def456".to_string(),
+        },
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
@@ -641,11 +662,74 @@ fn world_hash_covers_deterministic_base_sha() {
     let det_c = World::Deterministic(DeterministicWorld {
         command: vec!["cargo".to_string(), "test".to_string()],
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: "/var/tmp/w2".into(),
         env: Default::default(),
         expected_artifacts: OutputContract(vec![]),
     });
     assert_eq!(WorldHash::of(&det_a), WorldHash::of(&det_c));
+}
+
+#[test]
+fn tagged_world_hash_is_unambiguous_and_covers_source_basis() {
+    let make = |command: Vec<&str>, source_basis| {
+        World::Deterministic(DeterministicWorld {
+            command: command.into_iter().map(str::to_string).collect(),
+            base_sha: "abc123".to_string(),
+            source_basis,
+            cwd: "/var/tmp/w1".into(),
+            env: Default::default(),
+            expected_artifacts: OutputContract(vec![]),
+        })
+    };
+    let joined = make(
+        vec!["a\u{1f}b"],
+        wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
+    );
+    let split = make(
+        vec!["a", "b"],
+        wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
+    );
+    assert_ne!(WorldHash::of(&joined), WorldHash::of(&split));
+
+    let git = make(
+        vec!["a", "b"],
+        wirk_core::SourceBasis::Git {
+            base: "abc123".to_string(),
+        },
+    );
+    assert_ne!(WorldHash::of(&split), WorldHash::of(&git));
+}
+
+#[test]
+fn untagged_legacy_world_keeps_its_known_hash_vector() {
+    let legacy = World::Deterministic(DeterministicWorld {
+        command: vec!["cargo".to_string(), "test".to_string()],
+        base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::Unknown,
+        cwd: "/var/tmp/w1".into(),
+        env: Default::default(),
+        expected_artifacts: OutputContract(vec![]),
+    });
+    assert_eq!(
+        WorldHash::of(&legacy).0,
+        "8f942c918b200550dc43a21ed6ee6ca4bb313608a2178fe9f4fdd458adeb22de"
+    );
+
+    let json = serde_json::to_value(&legacy).expect("serialize legacy fixture");
+    let mut historical = json;
+    historical["Deterministic"]
+        .as_object_mut()
+        .expect("deterministic object")
+        .remove("source_basis");
+    let replayed: World = serde_json::from_value(historical).expect("old World still replays");
+    assert_eq!(WorldHash::of(&replayed), WorldHash::of(&legacy));
 }
 
 /// W1 (0041 D129): a `RunLaunched` written before the `kind` field

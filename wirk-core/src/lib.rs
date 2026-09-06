@@ -92,23 +92,66 @@ impl WorldHash {
     ///
     /// Hex-encoded lowercase.
     pub fn of(world: &World) -> WorldHash {
+        if world.source_basis() == &SourceBasis::Unknown {
+            return Self::legacy(world);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"wirk.world-hash/v2\0");
+        match world {
+            World::Actor(actor) => {
+                hasher.update([0u8]);
+                hash_string(&mut hasher, &actor.repository);
+                hash_string(&mut hasher, &actor.branch);
+                hash_string(&mut hasher, &actor.base_sha);
+                hash_source_basis(&mut hasher, &actor.source_basis);
+                hash_string(&mut hasher, &actor.intent);
+                hash_len(&mut hasher, actor.output_contract.0.len());
+                for spec in &actor.output_contract.0 {
+                    hash_string(&mut hasher, &spec.name);
+                    hasher.update([spec.required as u8]);
+                }
+                hash_len(&mut hasher, actor.boundary.0.len());
+                for glob in &actor.boundary.0 {
+                    hash_string(&mut hasher, glob);
+                }
+            }
+            World::Deterministic(det) => {
+                hasher.update([1u8]);
+                hash_len(&mut hasher, det.command.len());
+                for word in &det.command {
+                    hash_string(&mut hasher, word);
+                }
+                hash_string(&mut hasher, &det.base_sha);
+                hash_source_basis(&mut hasher, &det.source_basis);
+                hash_len(&mut hasher, det.expected_artifacts.0.len());
+                for spec in &det.expected_artifacts.0 {
+                    hash_string(&mut hasher, &spec.name);
+                    hasher.update([spec.required as u8]);
+                }
+            }
+        }
+        let digest = hasher.finalize();
+        WorldHash(hex_lower(&digest))
+    }
+
+    fn legacy(world: &World) -> WorldHash {
         let mut hasher = Sha256::new();
         match world {
             World::Actor(actor) => {
                 hasher.update([0u8]);
-                hasher.update(actor.repository.as_bytes());
-                hasher.update([0x1f]);
-                hasher.update(actor.branch.as_bytes());
-                hasher.update([0x1f]);
-                hasher.update(actor.base_sha.as_bytes());
-                hasher.update([0x1f]);
-                hasher.update(actor.intent.as_bytes());
-                hasher.update([0x1f]);
+                for field in [
+                    &actor.repository,
+                    &actor.branch,
+                    &actor.base_sha,
+                    &actor.intent,
+                ] {
+                    hasher.update(field.as_bytes());
+                    hasher.update([0x1f]);
+                }
                 for spec in &actor.output_contract.0 {
                     hasher.update(spec.name.as_bytes());
-                    hasher.update([0x1f]);
-                    hasher.update([spec.required as u8]);
-                    hasher.update([0x1f]);
+                    hasher.update([0x1f, spec.required as u8, 0x1f]);
                 }
                 for glob in &actor.boundary.0 {
                     hasher.update(glob.as_bytes());
@@ -125,14 +168,34 @@ impl WorldHash {
                 hasher.update([0x1f]);
                 for spec in &det.expected_artifacts.0 {
                     hasher.update(spec.name.as_bytes());
-                    hasher.update([0x1f]);
-                    hasher.update([spec.required as u8]);
-                    hasher.update([0x1f]);
+                    hasher.update([0x1f, spec.required as u8, 0x1f]);
                 }
             }
         }
-        let digest = hasher.finalize();
-        WorldHash(hex_lower(&digest))
+        WorldHash(hex_lower(&hasher.finalize()))
+    }
+}
+
+fn hash_len(hasher: &mut Sha256, len: usize) {
+    hasher.update((len as u64).to_be_bytes());
+}
+
+fn hash_string(hasher: &mut Sha256, value: &str) {
+    hash_len(hasher, value.len());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_source_basis(hasher: &mut Sha256, basis: &SourceBasis) {
+    match basis {
+        SourceBasis::Unknown => hasher.update([0]),
+        SourceBasis::Git { base } => {
+            hasher.update([1]);
+            hash_string(hasher, base);
+        }
+        SourceBasis::OutputOnly { reference } => {
+            hasher.update([2]);
+            hash_string(hasher, reference);
+        }
     }
 }
 
@@ -307,7 +370,7 @@ pub enum WaypointKind {
 }
 
 /// Per orient/core.md line 70.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactSpec {
     pub name: String,
     pub required: bool,
@@ -316,7 +379,7 @@ pub struct ArtifactSpec {
 /// A Waypoint's declared required artifacts, authored on the Route
 /// (build-brief.md §2 "OutputContract/Boundary ... decided now ...
 /// Route-authored fields"; minimal wrapper, R6).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputContract(pub Vec<ArtifactSpec>);
 
 /// The declared mutation surface and authority envelope for a Waypoint
@@ -328,7 +391,7 @@ pub struct OutputContract(pub Vec<ArtifactSpec>);
 /// `#[serde(default)]` has a value to default to, and a Route file
 /// omitting `"boundary"` parses as authoring nothing yet, not a
 /// refusal (refusal 9, out of scope: enforcement is P2.4's).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Boundary(pub Vec<String>);
 
 // ---- Route file loader ------------------------------------------------
@@ -435,11 +498,27 @@ pub fn load_route(path: &Path) -> Result<Route, RouteError> {
 /// per wirk's Run/Waypoint split (orient/core.md line 98-103). Moved
 /// into W1 because `ActorWorld` carries it as `triple: ExecutionTriple`
 /// (build-brief.md §2 amendment), not three separate strings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionTriple {
     pub estate_root: String,
     pub work_id: WorkId,
     pub run_id: RunId,
+}
+
+/// The explicit source inspection contract for a reserved World. Missing
+/// fields in historical journals are unknown; they are never guessed from a
+/// path or a SHA-shaped string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceBasis {
+    #[default]
+    Unknown,
+    Git {
+        base: String,
+    },
+    OutputOnly {
+        reference: String,
+    },
 }
 
 // ---- World ----------------------------------------------------------------
@@ -459,7 +538,7 @@ pub struct ExecutionTriple {
 /// World handed to an actor (Herdr-pane / Claude) Waypoint at launch.
 /// Assembled once, at reservation, from Work + Route + git
 /// (orient/world.md §1, §3).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorWorld {
     /// Work: which repo this Work targets (0001 D6 carve list names "repo").
     pub repository: String,
@@ -472,6 +551,8 @@ pub struct ActorWorld {
     /// git: exact commit the worktree was cut from, pinned at creation
     /// (0001 D9 evidence 6).
     pub base_sha: String,
+    #[serde(default)]
+    pub source_basis: SourceBasis,
     /// env: `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`, the injected
     /// execution triple (claim-contract.md; 0001 D3).
     pub triple: ExecutionTriple,
@@ -488,7 +569,7 @@ pub struct ActorWorld {
 
 /// World handed to a deterministic (child/docker) Waypoint. Same
 /// compilation source; no pane, no Herdr binding (orient/world.md §1).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeterministicWorld {
     /// Route: the Waypoint's own command definition (0001 D4:
     /// "wirk-owned executors").
@@ -501,6 +582,8 @@ pub struct DeterministicWorld {
     /// arm below (J3 on 0029 D95's principle: the code state a
     /// deterministic command runs against is content, not location).
     pub base_sha: String,
+    #[serde(default)]
+    pub source_basis: SourceBasis,
     /// git: same `worktree_path` as `ActorWorld` (0018 D60).
     pub cwd: PathBuf,
     /// env: execution triple (claim-contract.md) plus any Route-declared
@@ -515,10 +598,19 @@ pub struct DeterministicWorld {
 /// `Executor` trait (W2) implemented by both an actor (Herdr-pane)
 /// executor and a deterministic one (0001 D2, D4). No Atlas variant:
 /// orient/world.md §3's R1 answer for P1 is "not now" (0023 D81).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum World {
     Actor(ActorWorld),
     Deterministic(DeterministicWorld),
+}
+
+impl World {
+    pub fn source_basis(&self) -> &SourceBasis {
+        match self {
+            World::Actor(world) => &world.source_basis,
+            World::Deterministic(world) => &world.source_basis,
+        }
+    }
 }
 
 // ---- Run ------------------------------------------------------------------
@@ -743,6 +835,9 @@ pub enum ClaimRefusal {
     MissingArtifact(String),
     TripleMismatch,
     OutOfBoundary(String),
+    /// The declared inspection contract could not be observed. This is
+    /// neither success nor evidence of a boundary violation.
+    ValidationUnavailable(String),
     /// A Claim filed against a `Run` already `RunState::Claimed` (build
     /// brief amendment 1, this item; d9_5's precedent: a valid Claim on
     /// a `Failed` or `Vanished` Run is still honored — late evidence,
@@ -1208,7 +1303,7 @@ impl Journal {
     /// `WorkId`/`RunId`/`ClaimId` already document), serializes it to a
     /// single line, one `write_all`, then `fsync`s before returning —
     /// every acknowledged append is durable (R1: no batching for P1).
-    pub fn append(&mut self, event: &Event) -> Result<(), JournalError> {
+    pub fn append(&mut self, event: &Event) -> Result<Event, JournalError> {
         let mut event = event.clone();
         if event.id.0.is_empty() {
             event.id = EventId(ulid::Ulid::generate().to_string());
@@ -1223,7 +1318,7 @@ impl Journal {
         self.file.write_all(&line)?;
         self.file.sync_all()?;
         self.next_seq = seq + 1;
-        Ok(())
+        Ok(envelope.event)
     }
 
     /// Rebuilds `Vec<Event>` from seq 1; `fold(&journal.replay()?)` is

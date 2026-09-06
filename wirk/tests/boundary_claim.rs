@@ -313,7 +313,7 @@ fn create_worktree_for_run(
     wirkd_record(
         socket,
         work_id,
-        None,
+        Some(run_id),
         EventKind::WaypointReserved {
             waypoint: wirk_core::WaypointId(waypoint.to_string()),
             world_hash,
@@ -1207,6 +1207,421 @@ fn claim_with_no_artifact_flags_validates_once_all_declared_outputs_exist() {
         code,
         Some(0),
         "expected exit 0 (Validated), stdout: {stdout}"
+    );
+    assert_eq!(stdout, "Validated");
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+fn claim_question(
+    estate: &Path,
+    work_id: &str,
+    run_id: &str,
+    question: &str,
+    artifacts: &[(&str, &str)],
+) -> (Option<i32>, String) {
+    let mut args = vec!["claim".to_string()];
+    for (name, path) in artifacts {
+        args.extend(["--artifact".to_string(), format!("{name}={path}")]);
+    }
+    args.extend(["--question".to_string(), question.to_string()]);
+    let output = Command::new(wirk_bin())
+        .args(args)
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", work_id)
+        .env("WIRK_RUN_ID", run_id)
+        .output()
+        .expect("wirk claim runs");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    )
+}
+
+fn containment_run() -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    KillOnDrop,
+    WirkdPointer,
+    String,
+    String,
+    PathBuf,
+) {
+    let (repo_dir, base_sha) = scratch_repo();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let (child, pointer) = start_wirkd(estate_dir.path());
+    let route = boundary_src_only_route(estate_dir.path());
+    let (work, run) = submit_actor(estate_dir.path(), &route, repo_dir.path(), &base_sha);
+    let worktree = create_worktree_for_run(
+        estate_dir.path(),
+        &pointer.socket,
+        &work,
+        &run,
+        "boundary-src-only/wp-1",
+    );
+    (repo_dir, estate_dir, child, pointer, work, run, worktree)
+}
+
+#[test]
+fn claim_refuses_terminal_and_intermediate_canonical_escapes() {
+    for (artifact, intermediate) in [("report.md", false), ("src/link/report.md", true)] {
+        let (_repo, estate, child, _pointer, work, run, worktree) = containment_run();
+        let outside = estate.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside dir");
+        fs::write(outside.join("report.md"), "outside\n").expect("outside file");
+        let link = if intermediate {
+            worktree.join("src/link")
+        } else {
+            worktree.join("report.md")
+        };
+        let target = if intermediate {
+            outside.clone()
+        } else {
+            outside.join("report.md")
+        };
+        std::os::unix::fs::symlink(target, link).expect("escaping link");
+        let (code, stdout) = claim(estate.path(), &work, &run, &[("report.md", artifact)]);
+        assert_eq!(code, Some(3), "{artifact}: {stdout}");
+        assert!(stdout.starts_with("Refused: OutOfBoundary"), "{stdout}");
+        stop_wirkd(estate.path(), child);
+    }
+}
+
+#[test]
+fn claim_accepts_contained_symlink_and_preserves_question_behavior() {
+    let (_repo, estate, child, pointer, work, run, worktree) = containment_run();
+    fs::write(worktree.join("src/target.md"), "inside\n").expect("target");
+    std::os::unix::fs::symlink(
+        worktree.join("src/target.md"),
+        worktree.join("src/report.md"),
+    )
+    .expect("contained link");
+    let (code, stdout) = claim_question(
+        estate.path(),
+        &work,
+        &run,
+        "where is the report?",
+        &[("report.md", "src/report.md")],
+    );
+    assert_eq!(code, Some(0), "{stdout}");
+    assert_eq!(stdout, "Validated");
+    assert!(matches!(
+        run_state(&pointer.socket, &work, &run),
+        RunState::Open
+    ));
+    assert!(work_status_cli(estate.path(), &work).contains("state needs_input"));
+    stop_wirkd(estate.path(), child);
+}
+
+/// P3 foundation correction (0069, `foundation-verify/VERDICT.md`
+/// finding 1): containment is not a Done-only check — a Question claim
+/// carrying a claimed artifact whose symlink target escapes the
+/// worktree is refused the same way a Done claim is, the Run stays
+/// Open, and the Work is surfaced `needs_input` with reason
+/// `out_of_boundary`. Restores the containment candidate's own
+/// `claim_question_with_escaping_symlink_still_refused`, deleted by the
+/// reconciliation that introduced the `ClaimKind::Done` gate.
+#[test]
+fn claim_question_with_escaping_symlink_still_refused() {
+    let (_repo, estate, child, pointer, work, run, worktree) = containment_run();
+    let outside = estate.path().join("outside");
+    fs::create_dir_all(&outside).expect("outside dir");
+    fs::write(outside.join("report.md"), "escaped\n").expect("outside file");
+    std::os::unix::fs::symlink(&outside, worktree.join("src/link")).expect("escaping link");
+
+    let (code, stdout) = claim_question(
+        estate.path(),
+        &work,
+        &run,
+        "containment question probe, escaping twin",
+        &[("report.md", "src/link/report.md")],
+    );
+    assert_eq!(
+        code,
+        Some(3),
+        "a Question claim with an escaping symlink artifact must be refused, stdout: {stdout}"
+    );
+    assert!(
+        stdout.starts_with("Refused: OutOfBoundary"),
+        "expected an OutOfBoundary refusal, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("src/link/report.md"),
+        "refusal must name the escaping artifact path, got: {stdout}"
+    );
+
+    let state = run_state(&pointer.socket, &work, &run);
+    assert!(
+        matches!(state, RunState::Open),
+        "the Run must remain Open after the refusal, got: {state:?}"
+    );
+    let status = work_status_cli(estate.path(), &work);
+    assert!(
+        status.contains("state needs_input"),
+        "an OutOfBoundary refusal must surface the Work as needs_input, got: {status}"
+    );
+    assert!(
+        status.contains("out_of_boundary:"),
+        "needs_input must carry the out_of_boundary reason, got: {status}"
+    );
+
+    stop_wirkd(estate.path(), child);
+}
+
+/// The lexical twin of the symlink escape above: a Question claim
+/// naming a `../`-escaping artifact must be refused before any
+/// filesystem read, exactly like a Done claim
+/// (`claim_refused_on_artifact_path_escape`).
+#[test]
+fn claim_question_with_lexical_escape_is_refused() {
+    let (_repo, estate, child, _pointer, work, run, worktree) = containment_run();
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+
+    let (code, stdout) = claim_question(
+        estate.path(),
+        &work,
+        &run,
+        "lexical escape question probe",
+        &[("report.md", "report.md"), ("evidence", "../escape.txt")],
+    );
+    assert_eq!(
+        code,
+        Some(3),
+        "a Question claim with a lexically escaping artifact must be refused, stdout: {stdout}"
+    );
+    assert!(
+        stdout.starts_with("Refused: OutOfBoundary"),
+        "expected an OutOfBoundary refusal, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("../escape.txt"),
+        "refusal must name the escaping artifact path, got: {stdout}"
+    );
+
+    stop_wirkd(estate.path(), child);
+}
+
+/// A Question claim whose required declared output was never written
+/// is still refused `MissingArtifact`, the same as a Done claim
+/// (`other_refusal_kinds_stay_silent_no_needs_input`) — the
+/// `ClaimKind::Done` gate skipped this check for every Question.
+#[test]
+fn claim_question_with_missing_artifact_is_refused() {
+    let (_repo, estate, child, _pointer, work, run, _worktree) = containment_run();
+
+    let (code, stdout) = claim_question(
+        estate.path(),
+        &work,
+        &run,
+        "missing artifact question probe",
+        &[("report.md", "report.md")],
+    );
+    assert_eq!(
+        code,
+        Some(3),
+        "a Question claim with a missing required artifact must be refused, stdout: {stdout}"
+    );
+    assert!(
+        stdout.starts_with("Refused: MissingArtifact"),
+        "expected a MissingArtifact refusal, got: {stdout}"
+    );
+
+    stop_wirkd(estate.path(), child);
+}
+
+/// A Question claim does not silently drop the Route boundary diff:
+/// an undeclared change outside the Waypoint's boundary is refused
+/// `OutOfBoundary` naming it, the same as a Done claim
+/// (`claim_refused_out_of_boundary_names_the_path`).
+#[test]
+fn claim_question_with_undeclared_git_change_is_refused() {
+    let (_repo, estate, child, _pointer, work, run, worktree) = containment_run();
+    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+    // Outside the boundary, undeclared: the offending change.
+    fs::write(worktree.join("docs/notes.md"), b"notes\nedited\n").expect("edit docs/notes.md");
+
+    let (code, stdout) = claim_question(
+        estate.path(),
+        &work,
+        &run,
+        "undeclared change question probe",
+        &[("report.md", "report.md")],
+    );
+    assert_eq!(
+        code,
+        Some(3),
+        "a Question claim with an undeclared out-of-boundary change must be refused, stdout: {stdout}"
+    );
+    assert!(
+        stdout.starts_with("Refused: OutOfBoundary"),
+        "expected an OutOfBoundary refusal, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("docs/notes.md"),
+        "refusal must name the offending path, got: {stdout}"
+    );
+
+    stop_wirkd(estate.path(), child);
+}
+
+/// P3 (0050 D150, `read-artifact-probe/ASSESSMENT.md`): "A `Read`
+/// repository binding refuses any change at all" — no exception for
+/// the Claim's own declared artifact. Red before this wave: `offending`
+/// filtered out anything named in `declared` *before* checking
+/// `is_read_binding`, so a Read-bound Work could modify its own
+/// already-tracked declared output and still Validate, exactly as
+/// `read-artifact-probe/result.json` reproduced live against the
+/// independently reviewed binary.
+#[test]
+fn claim_refused_when_modified_tracked_declared_artifact_is_claimed_under_read_binding() {
+    let (repo_dir, _initial_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    // A second commit tracks `report.md` too, so it is an ordinary
+    // already-tracked file at `base_sha` — the same shape
+    // `read-artifact-probe/probe.py` used for `tracked.txt`.
+    fs::write(repo.join("report.md"), b"original\n").expect("write report.md");
+    git(repo, &["add", "report.md"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "track report.md",
+        ],
+    );
+    let base_sha = git(repo, &["rev-parse", "HEAD"]);
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = boundary_src_only_route(estate);
+    let (work_id, run_id) = submit_actor_with_repo(estate, &route, repo, &base_sha, "demo:read");
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "boundary-src-only/wp-1",
+    );
+
+    // Modify the already-tracked declared artifact — a Read binding
+    // must refuse this the same as any other change, never exempted
+    // merely because it is the Claim's own declared output.
+    fs::write(worktree.join("report.md"), b"modified despite Read\n").expect("modify report.md");
+
+    let (code, stdout) = claim(estate, &work_id, &run_id, &[("report.md", "report.md")]);
+    assert_eq!(
+        code,
+        Some(3),
+        "a Read binding must refuse a modified declared artifact, stdout: {stdout}"
+    );
+    assert!(
+        stdout.starts_with("Refused: OutOfBoundary"),
+        "expected an OutOfBoundary refusal, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("report.md"),
+        "refusal must name the declared artifact itself, got: {stdout}"
+    );
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// The untracked twin: a declared artifact that never existed in the
+/// repository at all — a brand-new file the Claim writes and then
+/// names as its own required output — is still a source write under a
+/// Read binding (`read-artifact-probe/ASSESSMENT.md`'s second
+/// scenario), refused the same way.
+#[test]
+fn claim_refused_when_new_declared_artifact_is_written_under_read_binding() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = boundary_src_only_route(estate);
+    let (work_id, run_id) = submit_actor_with_repo(estate, &route, repo, &base_sha, "demo:read");
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "boundary-src-only/wp-1",
+    );
+
+    // `report.md` never existed in the repo at `base_sha` — a brand
+    // new, untracked declared output.
+    fs::write(worktree.join("report.md"), b"# new output\n").expect("write report.md");
+
+    let (code, stdout) = claim(estate, &work_id, &run_id, &[("report.md", "report.md")]);
+    assert_eq!(
+        code,
+        Some(3),
+        "a Read binding must refuse a new declared-artifact write, stdout: {stdout}"
+    );
+    assert!(
+        stdout.starts_with("Refused: OutOfBoundary"),
+        "expected an OutOfBoundary refusal, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("report.md"),
+        "refusal must name the new declared artifact, got: {stdout}"
+    );
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// The positive control the fix must not break: a declared artifact
+/// already tracked and left completely unchanged under a Read binding
+/// still Validates — Read refuses *changes*, not the mere existence or
+/// naming of a declared artifact (0050 D150's own wording, "refuses
+/// any change at all").
+#[test]
+fn claim_validated_on_read_binding_when_declared_artifact_is_unchanged() {
+    let (repo_dir, _initial_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    fs::write(repo.join("report.md"), b"original\n").expect("write report.md");
+    git(repo, &["add", "report.md"]);
+    git(
+        repo,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "track report.md",
+        ],
+    );
+    let base_sha = git(repo, &["rev-parse", "HEAD"]);
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = boundary_src_only_route(estate);
+    let (work_id, run_id) = submit_actor_with_repo(estate, &route, repo, &base_sha, "demo:read");
+    create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run_id,
+        "boundary-src-only/wp-1",
+    );
+    // `report.md` is left exactly as committed — nothing changed.
+
+    let (code, stdout) = claim(estate, &work_id, &run_id, &[("report.md", "report.md")]);
+    assert_eq!(
+        code,
+        Some(0),
+        "an unchanged declared artifact under Read must still Validate, stdout: {stdout}"
     );
     assert_eq!(stdout, "Validated");
 

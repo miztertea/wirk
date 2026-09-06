@@ -24,9 +24,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use wirkd::{Reply, Request, StatusPayload, WirkdPointer};
+use wirkd::{RecordPayload, Reply, Request, StatusPayload, WirkdPointer};
 
-use wirk_core::{WorkId, World};
+use wirk_core::{EventKind, RunId, WaypointId, WorkId, World, WorldHash};
 
 fn wirk_bin() -> &'static str {
     env!("CARGO_BIN_EXE_wirk")
@@ -50,15 +50,17 @@ fn wait_for_pointer(estate: &Path) -> WirkdPointer {
     }
 }
 
-/// `wirk work submit --estate <estate> --route proving --repo <repo>
-/// --base main`, parsing its `work_id <id> run_id <id> waypoint <id>`
+/// `wirk work submit --estate <estate> --route proving --kind actor
+/// --repo-path <repo> --base HEAD`, parsing its Run triple
 /// stdout line (wp-1's own triple). No `--intent`: `proving.json`'s
 /// own wp-1 carries its intent text (p2-route-files W2, J1).
-fn submit_proving(estate: &Path, repo: &str) -> (String, String, String) {
+fn submit_proving(estate: &Path, repo: &Path) -> (String, String, String) {
     let output = Command::new(wirk_bin())
         .args(["work", "submit", "--estate"])
         .arg(estate)
-        .args(["--route", "proving", "--repo", repo, "--base", "main"])
+        .args(["--route", "proving", "--kind", "actor", "--repo-path"])
+        .arg(repo)
+        .args(["--repo", "demo:write", "--base", "HEAD"])
         .output()
         .expect("work submit --route proving runs");
     assert!(
@@ -90,6 +92,35 @@ fn submit_proving(estate: &Path, repo: &str) -> (String, String, String) {
         "wp-1 must be the reserved Waypoint"
     );
     (work_id, run_id, waypoint)
+}
+
+fn init_repo(repo: &Path) {
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+            .expect("git init runs")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=proving-route-test",
+                "-c",
+                "user.email=proving-route@example.test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ])
+            .current_dir(repo)
+            .status()
+            .expect("git commit runs")
+            .success()
+    );
 }
 
 fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i32>, String) {
@@ -127,6 +158,59 @@ fn status(socket: &Path, work_id: &str) -> serde_json::Value {
     }
 }
 
+fn materialize_actor(
+    socket: &Path,
+    estate: &Path,
+    work_id: &str,
+    run_id: &str,
+    waypoint: &str,
+) -> std::path::PathBuf {
+    let result = status(socket, work_id);
+    let mut world: World = serde_json::from_value(result["world"].clone()).expect("Actor World");
+    let World::Actor(actor) = &mut world else {
+        panic!("expected an Actor World");
+    };
+    let worktree = estate.join("worktrees").join(work_id);
+    let head = wirk_herdr::git::worktree_add(
+        Path::new(&actor.repository),
+        &worktree,
+        &actor.branch,
+        &actor.base_sha,
+    )
+    .expect("materialize actor worktree");
+    let created = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::WorktreeCreated {
+                repo: actor.repository.clone(),
+                base_sha: head,
+            },
+        }),
+    )
+    .expect("record WorktreeCreated");
+    assert!(matches!(created, Reply::Ok { .. }), "{created:?}");
+
+    actor.worktree_path = worktree.clone();
+    let world_hash = WorldHash::of(&world);
+    let reserved = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::WaypointReserved {
+                waypoint: WaypointId(waypoint.to_string()),
+                world_hash,
+                world,
+            },
+        }),
+    )
+    .expect("record materialized reservation");
+    assert!(matches!(reserved, Reply::Ok { .. }), "{reserved:?}");
+    worktree
+}
+
 struct KillOnDrop(std::process::Child);
 
 impl Drop for KillOnDrop {
@@ -153,6 +237,9 @@ impl Drop for KillOnDrop {
 fn proving_route_advances_and_completes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let estate = dir.path().to_path_buf();
+    let repo = estate.join("repo");
+    fs::create_dir(&repo).expect("create repo");
+    init_repo(&repo);
     route_fixture::install_route_fixture(&estate, "proving");
 
     let mut wirkd_child = KillOnDrop(
@@ -166,13 +253,10 @@ fn proving_route_advances_and_completes() {
     );
     let pointer = wait_for_pointer(&estate);
 
-    let (work_id, run1, waypoint1) = submit_proving(&estate, "demo:write");
+    let (work_id, run1, waypoint1) = submit_proving(&estate, &repo);
 
-    // wp-1's default (no `--kind`) World reserves `worktree_path` at
-    // the estate root itself (`handle_submit`'s bare-submit arm,
-    // `server.rs`) — write `report.md` there, same convention
-    // `wirkd_process.rs`'s own valid-claim case uses.
-    fs::write(estate.join("report.md"), b"the report\n").expect("write report.md");
+    let worktree = materialize_actor(&pointer.socket, &estate, &work_id, &run1, &waypoint1);
+    fs::write(worktree.join("report.md"), b"the report\n").expect("write report.md");
 
     let (code, stdout) = claim(
         &estate,
@@ -204,7 +288,7 @@ fn proving_route_advances_and_completes() {
     };
     assert_eq!(
         deterministic.cwd,
-        estate.clone(),
+        worktree.clone(),
         "wp-2's cwd must equal wp-1's own worktree path"
     );
     assert_eq!(
@@ -232,7 +316,7 @@ fn proving_route_advances_and_completes() {
         Some("completed"),
         "status after wp-2 completes: {result}"
     );
-    let summary = fs::read_to_string(estate.join("summary.md")).expect("summary.md written");
+    let summary = fs::read_to_string(worktree.join("summary.md")).expect("summary.md written");
     assert_eq!(summary.trim(), "1", "wc -l of a one-line report.md");
 
     let stop = Command::new(wirk_bin())

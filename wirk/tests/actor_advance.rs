@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use wirkd::{Reply, Request, StatusPayload, WirkdPointer};
+use wirkd::{RecordPayload, Reply, Request, StatusPayload, WirkdPointer};
 
-use wirk_core::{WorkId, World};
+use wirk_core::{EventKind, RunId, WaypointId, WorkId, World, WorldHash};
 
 fn wirk_bin() -> &'static str {
     env!("CARGO_BIN_EXE_wirk")
@@ -113,20 +113,58 @@ fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
     );
 }
 
-/// `wirk work submit --estate <estate> --route <path> --repo <repo>
-/// --base main`, returning the parsed `work_id run_id waypoint` triple
-/// (no `--kind`: the default World-assembly arm, `worktree_path` at the
-/// estate root itself, the same convention `route_files.rs`'s own
-/// helper uses).
-fn submit_route(estate: &Path, route_path: &Path, repo: &str) -> (String, String, String) {
-    let output = Command::new(wirk_bin())
+fn init_repo(repo: &Path) {
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+            .expect("git init runs")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=actor-advance-test",
+                "-c",
+                "user.email=actor-advance@example.test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ])
+            .current_dir(repo)
+            .status()
+            .expect("git commit runs")
+            .success()
+    );
+}
+
+/// Submit a Route against a real Git checkout. `explicit_actor` selects
+/// the first-Actor assembly path; a Route whose first stage is
+/// deterministic still derives its kind from the Route while explicitly
+/// selecting Git as its inspection basis.
+fn submit_route(
+    estate: &Path,
+    route_path: &Path,
+    repo: &Path,
+    explicit_actor: bool,
+) -> (String, String, String) {
+    let mut command = Command::new(wirk_bin());
+    command
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route"])
         .arg(route_path)
-        .args(["--repo", repo, "--base", "main"])
-        .output()
-        .expect("work submit runs");
+        .args(["--repo", "demo:write", "--base", "HEAD", "--repo-path"])
+        .arg(repo)
+        .args(["--source-basis", "git"]);
+    if explicit_actor {
+        command.args(["--kind", "actor"]);
+    }
+    let output = command.output().expect("work submit runs");
     assert!(
         output.status.success(),
         "work submit failed: {}",
@@ -150,6 +188,59 @@ fn submit_route(estate: &Path, route_path: &Path, repo: &str) -> (String, String
         "unexpected work submit stdout: {stdout:?}"
     );
     (work_id, run_id, waypoint)
+}
+
+fn materialize_actor(
+    socket: &Path,
+    estate: &Path,
+    work_id: &str,
+    run_id: &str,
+    waypoint: &str,
+) -> PathBuf {
+    let result = status(socket, work_id);
+    let mut world: World = serde_json::from_value(result["world"].clone()).expect("Actor World");
+    let World::Actor(actor) = &mut world else {
+        panic!("expected an Actor World");
+    };
+    let worktree = estate.join("worktrees").join(work_id);
+    let head = wirk_herdr::git::worktree_add(
+        Path::new(&actor.repository),
+        &worktree,
+        &actor.branch,
+        &actor.base_sha,
+    )
+    .expect("materialize actor worktree");
+    let created = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::WorktreeCreated {
+                repo: actor.repository.clone(),
+                base_sha: head,
+            },
+        }),
+    )
+    .expect("record WorktreeCreated");
+    assert!(matches!(created, Reply::Ok { .. }), "{created:?}");
+
+    actor.worktree_path = worktree.clone();
+    let world_hash = WorldHash::of(&world);
+    let reserved = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::WaypointReserved {
+                waypoint: WaypointId(waypoint.to_string()),
+                world_hash,
+                world,
+            },
+        }),
+    )
+    .expect("record materialized reservation");
+    assert!(matches!(reserved, Reply::Ok { .. }), "{reserved:?}");
+    worktree
 }
 
 fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i32>, String) {
@@ -193,16 +284,21 @@ fn status(socket: &Path, work_id: &str) -> serde_json::Value {
 fn actor_then_actor_auto_advance_reserves_a_world_for_the_second_actor() {
     let dir = tempfile::tempdir().expect("tempdir");
     let estate = dir.path().to_path_buf();
+    let repo = estate.join("repo");
+    fs::create_dir(&repo).expect("create repo");
+    init_repo(&repo);
     let (wirkd_child, pointer) = start_wirkd(&estate);
 
     let (work_id, run1, waypoint1) = submit_route(
         &estate,
         &fixture(&estate, "actor_then_actor.json"),
-        "demo:write",
+        &repo,
+        true,
     );
     assert_eq!(waypoint1, "actor-then-actor/wp-1");
 
-    fs::write(estate.join("report.md"), b"the report\n").expect("write report.md");
+    let worktree = materialize_actor(&pointer.socket, &estate, &work_id, &run1, &waypoint1);
+    fs::write(worktree.join("report.md"), b"the report\n").expect("write report.md");
     let (code, claim_stdout) = claim(
         &estate,
         &work_id,
@@ -231,8 +327,7 @@ fn actor_then_actor_auto_advance_reserves_a_world_for_the_second_actor() {
         panic!("wp-2's World must be Actor, got: {world:?}");
     };
     assert_eq!(
-        actor.worktree_path,
-        estate.clone(),
+        actor.worktree_path, worktree,
         "wp-2's worktree_path must equal wp-1's own"
     );
     assert_eq!(
@@ -274,12 +369,16 @@ fn actor_then_actor_auto_advance_reserves_a_world_for_the_second_actor() {
 fn deterministic_then_actor_auto_advance_reserves_a_world_for_the_actor() {
     let dir = tempfile::tempdir().expect("tempdir");
     let estate = dir.path().to_path_buf();
+    let repo = estate.join("repo");
+    fs::create_dir(&repo).expect("create repo");
+    init_repo(&repo);
     let (wirkd_child, pointer) = start_wirkd(&estate);
 
     let (work_id, _run1, waypoint1) = submit_route(
         &estate,
         &fixture(&estate, "deterministic_then_actor.json"),
-        "demo:write",
+        &repo,
+        false,
     );
     assert_eq!(waypoint1, "deterministic-then-actor/wp-1");
 
@@ -310,14 +409,14 @@ fn deterministic_then_actor_auto_advance_reserves_a_world_for_the_actor() {
     };
     assert_eq!(
         actor.worktree_path,
-        estate.clone(),
+        repo.clone(),
         "wp-2's worktree_path must equal wp-1's own cwd \
-         (the default submit arm's estate-root convention)"
+         (the verified deterministic Git checkout)"
     );
     assert_eq!(
-        actor.repository, "demo",
-        "falls back to the Work's own repository binding name \
-         when the prior World (Deterministic) carries none"
+        actor.repository,
+        repo.display().to_string(),
+        "the Actor must inherit the deterministic Git checkout path"
     );
     assert!(
         actor.branch.starts_with("wirk/"),

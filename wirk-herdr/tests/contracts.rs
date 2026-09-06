@@ -117,6 +117,9 @@ fn actor_world(run: &Run) -> wirk_core::World {
         worktree_path: "/var/tmp/w1".into(),
         branch: "p1/executor-design".to_string(),
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::Git {
+            base: "abc123".to_string(),
+        },
         triple: wirk_core::ExecutionTriple {
             estate_root: "/estate".to_string(),
             work_id: wirk_core::WorkId("work-1".to_string()),
@@ -379,6 +382,9 @@ fn launch_refuses_a_deterministic_world() {
     let world = wirk_core::World::Deterministic(wirk_core::DeterministicWorld {
         command: vec!["cargo".to_string(), "test".to_string()],
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: "/var/tmp/w1".into(),
         env: Default::default(),
         expected_artifacts: wirk_core::OutputContract(vec![]),

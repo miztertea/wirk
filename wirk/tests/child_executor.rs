@@ -138,6 +138,9 @@ fn deterministic_world(
     World::Deterministic(DeterministicWorld {
         command: command.into_iter().map(str::to_string).collect(),
         base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
         cwd: cwd.to_path_buf(),
         env: BTreeMap::new(),
         expected_artifacts,
@@ -395,6 +398,9 @@ fn d5_6_a_deterministic_world_without_base_sha_is_refused() {
     let world = World::Deterministic(DeterministicWorld {
         command: vec!["true".to_string()],
         base_sha: String::new(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: String::new(),
+        },
         cwd: cwd.path().to_path_buf(),
         env: BTreeMap::new(),
         expected_artifacts: OutputContract(Vec::new()),

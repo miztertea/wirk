@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use wirkd::{Reply, Request, StatusPayload, WirkdPointer};
+use wirkd::{RecordPayload, Reply, Request, StatusPayload, WirkdPointer};
 
-use wirk_core::{EventKind, Journal, WorkId, World};
+use wirk_core::{EventKind, Journal, RunId, WaypointId, WorkId, World, WorldHash};
 
 fn wirk_bin() -> &'static str {
     env!("CARGO_BIN_EXE_wirk")
@@ -126,6 +126,49 @@ fn submit_route(estate: &Path, route_path: &Path, repo: &str) -> std::process::O
         .expect("work submit runs")
 }
 
+fn init_repo(repo: &Path) {
+    fs::create_dir(repo).expect("create repo");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo)
+            .status()
+            .expect("git init runs")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=route-files-test",
+                "-c",
+                "user.email=route-files@example.test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ])
+            .current_dir(repo)
+            .status()
+            .expect("git commit runs")
+            .success()
+    );
+}
+
+fn submit_actor_route(estate: &Path, route_path: &Path, repo: &Path) -> std::process::Output {
+    Command::new(wirk_bin())
+        .args(["work", "submit", "--estate"])
+        .arg(estate)
+        .args(["--route"])
+        .arg(route_path)
+        .args(["--kind", "actor", "--repo-path"])
+        .arg(repo)
+        .args(["--repo", "demo:write", "--base", "HEAD"])
+        .output()
+        .expect("work submit runs")
+}
+
 fn parse_submit_stdout(stdout: &str) -> (String, String, String) {
     let words: Vec<&str> = stdout.split_whitespace().collect();
     let (mut work_id, mut run_id, mut waypoint) = (String::new(), String::new(), String::new());
@@ -176,6 +219,58 @@ fn status(socket: &Path, work_id: &str) -> serde_json::Value {
             error.code, error.message
         ),
     }
+}
+
+fn materialize_actor(
+    socket: &Path,
+    estate: &Path,
+    work_id: &str,
+    run_id: &str,
+    waypoint: &str,
+) -> PathBuf {
+    let result = status(socket, work_id);
+    let mut world: World = serde_json::from_value(result["world"].clone()).expect("Actor World");
+    let World::Actor(actor) = &mut world else {
+        panic!("expected an Actor World");
+    };
+    let worktree = estate.join("worktrees").join(work_id);
+    let head = wirk_herdr::git::worktree_add(
+        Path::new(&actor.repository),
+        &worktree,
+        &actor.branch,
+        &actor.base_sha,
+    )
+    .expect("materialize actor worktree");
+    let created = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::WorktreeCreated {
+                repo: actor.repository.clone(),
+                base_sha: head,
+            },
+        }),
+    )
+    .expect("record WorktreeCreated");
+    assert!(matches!(created, Reply::Ok { .. }), "{created:?}");
+    actor.worktree_path = worktree.clone();
+    let world_hash = WorldHash::of(&world);
+    let reserved = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::WaypointReserved {
+                waypoint: WaypointId(waypoint.to_string()),
+                world_hash,
+                world,
+            },
+        }),
+    )
+    .expect("record materialized reservation");
+    assert!(matches!(reserved, Reply::Ok { .. }), "{reserved:?}");
+    worktree
 }
 
 /// A missing Route file is refused (exit 2), and no journal is written
@@ -424,12 +519,14 @@ fn three_waypoint_route_from_file_journals_three_ids() {
 fn auto_advance_reads_journaled_waypoint_def_not_hardcoded() {
     let dir = tempfile::tempdir().expect("tempdir");
     let estate = dir.path().to_path_buf();
+    let repo = estate.join("repo");
+    init_repo(&repo);
     let (wirkd_child, pointer) = start_wirkd(&estate);
 
-    let output = submit_route(
+    let output = submit_actor_route(
         &estate,
         &fixture(&estate, "two_waypoint_distinctive.json"),
-        "demo:write",
+        &repo,
     );
     assert!(
         output.status.success(),
@@ -439,9 +536,8 @@ fn auto_advance_reads_journaled_waypoint_def_not_hardcoded() {
     let (work_id, run1, waypoint1) = parse_submit_stdout(&String::from_utf8_lossy(&output.stdout));
     assert_eq!(waypoint1, "two-wp-distinctive/wp-1");
 
-    // wp-1's default (no `--kind`) World reserves `worktree_path` at the
-    // estate root itself (same convention `proving_route.rs` uses).
-    fs::write(estate.join("report.md"), b"the report\n").expect("write report.md");
+    let worktree = materialize_actor(&pointer.socket, &estate, &work_id, &run1, &waypoint1);
+    fs::write(worktree.join("report.md"), b"the report\n").expect("write report.md");
     let (code, claim_stdout) = claim(
         &estate,
         &work_id,
@@ -479,6 +575,8 @@ fn auto_advance_reads_journaled_waypoint_def_not_hardcoded() {
 fn editing_the_route_file_after_submit_does_not_change_the_reserved_command() {
     let dir = tempfile::tempdir().expect("tempdir");
     let estate = dir.path().to_path_buf();
+    let repo = estate.join("repo");
+    init_repo(&repo);
     let route_path = dir.path().join("mutable-route.json");
     fs::copy(
         fixture(&estate, "two_waypoint_distinctive.json"),
@@ -488,13 +586,13 @@ fn editing_the_route_file_after_submit_does_not_change_the_reserved_command() {
 
     let (wirkd_child, pointer) = start_wirkd(&estate);
 
-    let output = submit_route(&estate, &route_path, "demo:write");
+    let output = submit_actor_route(&estate, &route_path, &repo);
     assert!(
         output.status.success(),
         "submit failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let (work_id, run1, _waypoint1) = parse_submit_stdout(&String::from_utf8_lossy(&output.stdout));
+    let (work_id, run1, waypoint1) = parse_submit_stdout(&String::from_utf8_lossy(&output.stdout));
 
     // Edit the file on disk after submit, before the Claim that
     // triggers auto-advance: wp-2's command changes to something the
@@ -507,7 +605,8 @@ fn editing_the_route_file_after_submit_does_not_change_the_reserved_command() {
         );
     fs::write(&route_path, edited).expect("edit route file after submit");
 
-    fs::write(estate.join("report.md"), b"the report\n").expect("write report.md");
+    let worktree = materialize_actor(&pointer.socket, &estate, &work_id, &run1, &waypoint1);
+    fs::write(worktree.join("report.md"), b"the report\n").expect("write report.md");
     let (code, claim_stdout) = claim(
         &estate,
         &work_id,

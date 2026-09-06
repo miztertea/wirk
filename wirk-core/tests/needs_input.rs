@@ -43,6 +43,9 @@ fn waypoint_reserved(waypoint: &str) -> EventKind {
         world: World::Deterministic(wirk_core::DeterministicWorld {
             command: vec!["true".to_string()],
             base_sha: "abc123".to_string(),
+            source_basis: wirk_core::SourceBasis::OutputOnly {
+                reference: "abc123".to_string(),
+            },
             cwd: std::path::PathBuf::from("/var/tmp/w1"),
             env: std::collections::BTreeMap::new(),
             expected_artifacts: wirk_core::OutputContract(Vec::new()),
