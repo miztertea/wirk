@@ -12,7 +12,8 @@ use std::process::ExitCode;
 
 use crate::wirkd::{
     AtlasAcquirePayload, AtlasPublishPayload, AtlasRefreshPayload, AtlasRelatePayload,
-    AtlasResolvePayload, AtlasSearchPayload, AtlasStatusPayload, Reply, Request,
+    AtlasResolvePayload, AtlasSearchPayload, AtlasSemanticBuildPayload, AtlasSemanticSelectPayload,
+    AtlasStatusPayload, Reply, Request,
 };
 use crate::{flag_value, wirkd_client_call};
 use wirk_core::WorkId;
@@ -26,6 +27,7 @@ pub fn atlas_command(rest: &[String]) -> ExitCode {
         Some("search") => search_command(&rest[1..]),
         Some("resolve") => resolve_command(&rest[1..]),
         Some("relate") => relate_command(&rest[1..]),
+        Some("semantic") => semantic_command(&rest[1..]),
         _ => atlas_usage(),
     }
 }
@@ -38,6 +40,8 @@ fn atlas_usage() -> ExitCode {
          | wirk atlas status --estate <root> [--source <name>] [--work <id>] [--json] \
          | wirk atlas resolve --estate <root> [--work <id>] --coordinate <encoded> [--json] \
          | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--family code|knowledge|config]... [--limit <n>] [--continue <token>] [--json] \
+         | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--json] \
+         | wirk atlas semantic select --estate <root> --source <name> --edition <id> [--json] \
          | wirk atlas relate --estate <root> --work <id> --kind governed_by --from <coordinate> --to <coordinate> --evidence <coordinate> [--evidence <coordinate>...] [--run <id>] [--world <hash>] [--json]"
     );
     ExitCode::from(1)
@@ -293,6 +297,78 @@ fn status_command(rest: &[String]) -> ExitCode {
                             .as_str()
                             .unwrap_or("none")
                     );
+                    // P3 W4 A: staged/selected and each edition's actual
+                    // verification state, in plain text as well as
+                    // `--json` — the same honesty rule W3 applied to
+                    // admission and coverage.
+                    //
+                    // W4-LIFECYCLE-CORRECTION.md item 1: the plain-text
+                    // summary is what a caller actually reads, so the
+                    // availability *state* and its reason are printed
+                    // here and not only in `--json`. `available` is the
+                    // derived answer, identical to the one `--json` and
+                    // `search --semantic requested` give.
+                    let semantic = &source["semantic"];
+                    println!(
+                        "    semantic selected {} available {} state {} editions {}",
+                        semantic["selected"].as_str().unwrap_or("none"),
+                        semantic["selected_available"]
+                            .as_bool()
+                            .map(|available| available.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        semantic["availability"]["state"].as_str().unwrap_or("?"),
+                        semantic["editions_total"].as_u64().unwrap_or(0)
+                    );
+                    if let Some(detail) = semantic["availability"]["detail"].as_str() {
+                        println!("      reason {detail}");
+                    }
+                    for edition in semantic["editions"].as_array().cloned().unwrap_or_default() {
+                        println!(
+                            "      {} {} {} {} rows {} model {} provenance {}",
+                            edition["edition"].as_str().unwrap_or("?"),
+                            edition["state"].as_str().unwrap_or("?"),
+                            edition["verification"]["state"].as_str().unwrap_or("?"),
+                            // Over the generation this source publishes
+                            // now, or retained evidence of one it no
+                            // longer does.
+                            if edition["current"].as_bool().unwrap_or(false) {
+                                "current"
+                            } else {
+                                "superseded"
+                            },
+                            edition["vectors"]["rows"].as_u64().unwrap_or(0),
+                            edition["model"]["consumed"]["digest"]
+                                .as_str()
+                                .unwrap_or("-"),
+                            // `unreported` is the honest answer for a
+                            // backend that enumerated no environment, and
+                            // for every edition built before this record
+                            // existed. Among the ones that did report,
+                            // the word is the *coverage* of what they
+                            // measured — `complete`, `partial`, or
+                            // `unmeasured` for a record written before
+                            // loaded modules were measured at all — so
+                            // that a 15-of-16 report and a 15-of-15 one
+                            // stop rendering identically
+                            // (`W4-PRODUCER-PROVENANCE-CORRECTION.md`
+                            // item 2).
+                            match edition["backend"]["environment"]["state"].as_str() {
+                                Some("reported") =>
+                                    edition["backend"]["environment"]["coverage"]["state"]
+                                        .as_str()
+                                        .unwrap_or("unmeasured"),
+                                other => other.unwrap_or("unreported"),
+                            }
+                        );
+                        // The reason a coverage is partial is the whole
+                        // point of saying it is partial, so it prints
+                        // here rather than only in `--json`.
+                        if let Some(detail) =
+                            edition["backend"]["environment"]["coverage"]["detail"].as_str()
+                        {
+                            println!("        provenance gap {detail}");
+                        }
+                    }
                 }
             });
         },
@@ -367,6 +443,120 @@ fn search_command(rest: &[String]) -> ExitCode {
                 }
                 if let Some(token) = result["continuation"].as_str() {
                     println!("continuation {token}");
+                }
+            });
+        },
+    )
+}
+
+/// `wirk atlas semantic build|select` (P3 W4 A,
+/// `W4-PUBLIC-LIFECYCLE-BUILD.md`). Two verbs, deliberately not one:
+/// building stages an immutable edition nothing reads, selecting is the
+/// separate atomic publication. `--backend`/`--model` are the whole
+/// portability boundary — the product ships no model name, no cache path
+/// and no interpreter, and records exactly what it was handed.
+fn semantic_command(rest: &[String]) -> ExitCode {
+    match rest.first().map(String::as_str) {
+        Some("build") => semantic_build_command(&rest[1..]),
+        Some("select") => semantic_select_command(&rest[1..]),
+        _ => atlas_usage(),
+    }
+}
+
+fn semantic_build_command(rest: &[String]) -> ExitCode {
+    if let Err(code) = check_flags(
+        "semantic build",
+        rest,
+        &[
+            ESTATE,
+            JSON,
+            ("--source", true),
+            ("--generation", true),
+            ("--backend", true),
+            ("--backend-arg", true),
+            ("--model", true),
+        ],
+    ) {
+        return code;
+    }
+    let (Some(estate), Some(source), Some(generation), Some(backend), Some(model)) = (
+        flag_value(rest, "--estate"),
+        flag_value(rest, "--source"),
+        flag_value(rest, "--generation"),
+        flag_value(rest, "--backend"),
+        flag_value(rest, "--model"),
+    ) else {
+        return atlas_usage();
+    };
+    let json = is_json(rest);
+    call_expecting_outcome(
+        &estate,
+        &Request::atlas_semantic_build(AtlasSemanticBuildPayload {
+            source,
+            generation,
+            backend,
+            backend_args: flag_values(rest, "--backend-arg"),
+            model,
+        }),
+        &["staged"],
+        |result| {
+            print_result(json, result, |result| {
+                println!(
+                    "outcome {} edition {} rows {} dimensions {} model {}",
+                    result["outcome"].as_str().unwrap_or("?"),
+                    result["edition"]["edition"].as_str().unwrap_or("-"),
+                    result["edition"]["vectors"]["rows"].as_u64().unwrap_or(0),
+                    result["edition"]["vectors"]["dimensions"]
+                        .as_u64()
+                        .unwrap_or(0),
+                    result["edition"]["model"]["consumed"]["digest"]
+                        .as_str()
+                        .unwrap_or("-"),
+                );
+                if let Some(detail) = result["detail"].as_str() {
+                    println!("detail {detail}");
+                }
+            });
+        },
+    )
+}
+
+fn semantic_select_command(rest: &[String]) -> ExitCode {
+    if let Err(code) = check_flags(
+        "semantic select",
+        rest,
+        &[ESTATE, JSON, ("--source", true), ("--edition", true)],
+    ) {
+        return code;
+    }
+    let (Some(estate), Some(source), Some(edition)) = (
+        flag_value(rest, "--estate"),
+        flag_value(rest, "--source"),
+        flag_value(rest, "--edition"),
+    ) else {
+        return atlas_usage();
+    };
+    let json = is_json(rest);
+    call_expecting_outcome(
+        &estate,
+        &Request::atlas_semantic_select(AtlasSemanticSelectPayload { source, edition }),
+        &["selected"],
+        |result| {
+            print_result(json, result, |result| {
+                println!(
+                    "outcome {} edition {} publication_revision {}",
+                    result["outcome"].as_str().unwrap_or("?"),
+                    result["edition"]["edition"]
+                        .as_str()
+                        .unwrap_or(result["edition"].as_str().unwrap_or("-")),
+                    result["publication_revision"].as_u64().unwrap_or(0),
+                );
+                if let Some(detail) = result["detail"].as_str() {
+                    // A refused replacement must say what still stands.
+                    println!(
+                        "detail {detail}\nstill selected {}",
+                        result["selected"].as_str().unwrap_or("none")
+                    );
                 }
             });
         },

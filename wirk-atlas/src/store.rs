@@ -35,6 +35,15 @@ struct Catalog {
     memberships: BTreeMap<String, Membership>,
     published: BTreeMap<String, GenerationId>,
     attempts: Vec<AcquisitionAttempt>,
+    /// P3 W4 A: membership id -> the semantic edition it currently
+    /// selects. Additive and `default`ed, deliberately without a
+    /// `FORMAT_VERSION` bump: a W3 catalog written before this field
+    /// existed still opens, still passes every estate check, and still
+    /// resolves every generation reference it already held — the
+    /// migration the brief requires is "an old catalog keeps working",
+    /// not "an old catalog is rewritten".
+    #[serde(default)]
+    semantic_selected: BTreeMap<String, crate::EditionId>,
 }
 
 /// A single-writer, estate-local catalog.  Opening cleans only abandoned
@@ -51,16 +60,26 @@ impl AtlasStore {
     ) -> Result<Self, AtlasError> {
         let root = estate_root.as_ref().join("atlas");
         fs::create_dir_all(root.join("generations"))?;
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with(".tmp-") {
-                let kind = entry.file_type()?;
-                if kind.is_dir() {
-                    fs::remove_dir_all(entry.path())?;
-                } else {
-                    // A catalog write's temporary is a file. Removing the
-                    // entry itself also avoids following a hostile symlink.
-                    fs::remove_file(entry.path())?;
+        // P3 W4 A: `atlas/semantic/` holds edition directories and is
+        // staged through the same private-temporary discipline, so
+        // reopening cleans its abandoned temporaries too — a build
+        // interrupted before its rename leaves nothing behind.
+        for directory in [root.clone(), root.join("semantic")] {
+            if !directory.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(&directory)? {
+                let entry = entry?;
+                if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                    let kind = entry.file_type()?;
+                    if kind.is_dir() {
+                        fs::remove_dir_all(entry.path())?;
+                    } else {
+                        // A catalog write's temporary is a file. Removing
+                        // the entry itself also avoids following a
+                        // hostile symlink.
+                        fs::remove_file(entry.path())?;
+                    }
                 }
             }
         }
@@ -85,6 +104,7 @@ impl AtlasStore {
                 memberships: BTreeMap::new(),
                 published: BTreeMap::new(),
                 attempts: vec![],
+                semantic_selected: BTreeMap::new(),
             }
         };
         Ok(Self { root, catalog })
@@ -592,6 +612,46 @@ impl AtlasStore {
         }
         Ok(())
     }
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// `check_membership` under a name `semantic.rs` can call across the
+    /// module boundary; the rule itself is unchanged.
+    pub(crate) fn check_membership_public(&self, member: &Membership) -> Result<(), AtlasError> {
+        self.check_membership(member)
+    }
+
+    /// The edition this membership currently selects, or `None`.
+    /// Reads the same private in-memory catalog snapshot every other
+    /// query reads, so a selection is visible to this handle exactly when
+    /// its catalog write committed.
+    pub fn selected_semantic(&self, membership: &Membership) -> Option<crate::EditionId> {
+        self.catalog
+            .semantic_selected
+            .get(&membership.id.0)
+            .cloned()
+    }
+
+    /// One atomic catalog advance, through the same
+    /// temp/fsync/rename/directory-fsync discipline every other
+    /// publication uses. `publication_revision` advances with it: a
+    /// semantic selection changes what the estate publicly asserts.
+    pub(crate) fn commit_semantic_selection(
+        &mut self,
+        membership: &Membership,
+        edition: crate::EditionId,
+    ) -> Result<(), AtlasError> {
+        if self.catalog.semantic_selected.get(&membership.id.0) == Some(&edition) {
+            return Ok(());
+        }
+        let mut next = self.catalog.clone();
+        next.semantic_selected
+            .insert(membership.id.0.clone(), edition);
+        next.publication_revision += 1;
+        self.commit_catalog(next)
+    }
+
     pub fn attempts(&self) -> &[AcquisitionAttempt] {
         &self.catalog.attempts
     }
@@ -717,6 +777,10 @@ fn valid_path(path: &[u8]) -> bool {
 
 /// Deliberately process-level so a verifier can exercise real crash windows
 /// from a child process, rather than substituting a fake store failure.
+pub(crate) fn checkpoint_public(name: &str) {
+    checkpoint(name)
+}
+
 fn checkpoint(name: &str) {
     if std::env::var("WIRK_ATLAS_FAILPOINT").ok().as_deref() == Some(name) {
         std::process::exit(86);

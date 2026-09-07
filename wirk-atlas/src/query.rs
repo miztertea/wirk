@@ -142,6 +142,106 @@ struct Candidate {
     generation_identity: HitGenerationIdentity,
 }
 
+/// What `--semantic requested` can honestly be told, given what this
+/// estate has actually built and selected.
+///
+/// It is never `Applied` in this increment, and that is a contract, not
+/// an omission: W4 A builds and selects semantic editions; W4 B is the
+/// increment that ranks through them. Reporting `Applied` because a
+/// verified edition exists would assert that a search consulted vectors
+/// it did not consult — the exact "asserting search happened" failure
+/// `W4-PUBLIC-LIFECYCLE-BUILD.md` forbids. The reason text distinguishes
+/// the two genuinely different states so a caller can tell "nothing is
+/// built" from "something is built and this answer still did not use it".
+fn semantic_status(
+    store: &AtlasStore,
+    request: &SearchRequest,
+    admitted: &[crate::AdmittedSource],
+) -> SemanticStatus {
+    if request.semantic == SemanticRequest::Disabled {
+        return SemanticStatus::Disabled;
+    }
+    // The same derived answer `atlas status` gives, over the same
+    // selected editions (`W4-LIFECYCLE-CORRECTION.md` item 1: the human
+    // status, the JSON status and this fallback must agree). A selection
+    // that is superseded, corrupt or unreadable is counted as what it
+    // is, never as a usable edition. Only admitted sources are consulted,
+    // so nothing here reaches past a denial.
+    let mut usable = 0usize;
+    let mut unusable = 0usize;
+    // The reason classes actually present, kept apart rather than summed.
+    // `W4-PRODUCER-PROVENANCE-CORRECTION.md` item 4: a selection whose own
+    // record has gone is not a selection whose source generation moved on,
+    // and this sentence used to assert the second for both.
+    let mut superseded = 0usize;
+    let mut unverified = 0usize;
+    let mut unreadable = 0usize;
+    for source in admitted {
+        match store.semantic_availability(&source.membership) {
+            Ok(crate::SemanticAvailability::None) => {}
+            Ok(availability) if availability.is_available() => usable += 1,
+            // A selection this product cannot presently evaluate is
+            // reported with the ones it evaluated and rejected, never
+            // silently as usable.
+            Ok(other) => {
+                unusable += 1;
+                match other {
+                    crate::SemanticAvailability::Superseded(_) => superseded += 1,
+                    crate::SemanticAvailability::Unusable(_) => unverified += 1,
+                    _ => unreadable += 1,
+                }
+            }
+            Err(_) => {
+                unusable += 1;
+                unreadable += 1;
+            }
+        }
+    }
+    // Only the classes that actually occurred, so the sentence never
+    // names a condition this estate is not in.
+    let mut classes: Vec<String> = Vec::new();
+    if superseded > 0 {
+        classes.push(format!(
+            "{superseded} built over a source generation this source no longer publishes"
+        ));
+    }
+    if unverified > 0 {
+        classes.push(format!("{unverified} whose bytes no longer verify"));
+    }
+    if unreadable > 0 {
+        classes.push(format!(
+            "{unreadable} whose own edition record is absent or unreadable"
+        ));
+    }
+    let classes = classes.join(", ");
+    let total = admitted.len();
+    if usable == 0 && unusable == 0 {
+        return SemanticStatus::Unavailable(
+            "no admitted source has a selected semantic edition; \
+             build and select one explicitly before requesting semantic retrieval"
+                .into(),
+        );
+    }
+    if usable == 0 {
+        return SemanticStatus::Unavailable(format!(
+            "no admitted source has a usable selected semantic edition: {unusable} of {total} \
+             have a selection that is not currently usable — {classes}. `atlas status` names the \
+             condition per source."
+        ));
+    }
+    let mut reason = format!(
+        "{usable} of {total} admitted sources have a usable selected semantic edition, but \
+         semantic retrieval is not implemented in this increment: these hits are lexical"
+    );
+    if unusable > 0 {
+        reason.push_str(&format!(
+            "; a further {unusable} of {total} have a selection that is not currently usable — \
+             {classes}; see `atlas status`"
+        ));
+    }
+    SemanticStatus::Unavailable(reason)
+}
+
 /// Coherence does not come from the `&AtlasStore` borrow (source-verify-w2
 /// `probe_b1`: a *second*, independent `AtlasStore` handle on the same
 /// estate root is outside this borrow entirely, and can `acquire`/`publish`
@@ -171,8 +271,17 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
             hits: Vec::new(),
             semantic: match request.semantic {
                 SemanticRequest::Disabled => SemanticStatus::Disabled,
+                // Scoped to the request, not to the estate
+                // (`W4-LIFECYCLE-CORRECTION.md` item 2): this branch is
+                // reached both by a fresh estate and by a `--source` no
+                // membership answers to, and asserting the second case is
+                // the first would be a plain falsehood on a surface whose
+                // whole value is that it says nothing untrue. It still
+                // discloses no more than the old sentence did.
                 SemanticRequest::Requested => SemanticStatus::Unavailable(
-                    "no semantic backend is implemented in this increment".into(),
+                    "no registered source matched this request, so no semantic edition can be \
+                     selected for one"
+                        .into(),
                 ),
             },
             coverage: AnswerCoverage {
@@ -204,9 +313,12 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
             hits: Vec::new(),
             semantic: match request.semantic {
                 SemanticRequest::Disabled => SemanticStatus::Disabled,
-                SemanticRequest::Requested => SemanticStatus::Unavailable(
-                    "no semantic backend is implemented in this increment".into(),
-                ),
+                // Deliberately says nothing about which editions exist:
+                // this scope admitted nothing, so disclosing the estate's
+                // semantic state here would leak past the denial.
+                SemanticRequest::Requested => {
+                    SemanticStatus::Unavailable("this scope admitted no source to search".into())
+                }
             },
             coverage: AnswerCoverage {
                 denied: true,
@@ -386,12 +498,7 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
     }
     coverage.partial = truncated || coverage.source_unavailable || coverage.generation_unavailable;
 
-    let semantic = match request.semantic {
-        SemanticRequest::Disabled => SemanticStatus::Disabled,
-        SemanticRequest::Requested => SemanticStatus::Unavailable(
-            "no semantic backend is implemented in this increment".into(),
-        ),
-    };
+    let semantic = semantic_status(store, request, &admitted);
 
     Ok(SearchAnswer {
         publication_revision,

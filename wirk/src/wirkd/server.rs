@@ -1070,6 +1070,22 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>, peer: Option<&AttemptHol
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
+        Verb::AtlasSemanticBuild => {
+            match serde_json::from_value::<super::AtlasSemanticBuildPayload>(
+                request.payload.clone(),
+            ) {
+                Ok(payload) => Outcome::Reply(handle_atlas_semantic_build(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasSemanticSelect => {
+            match serde_json::from_value::<super::AtlasSemanticSelectPayload>(
+                request.payload.clone(),
+            ) {
+                Ok(payload) => Outcome::Reply(handle_atlas_semantic_select(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::AtlasStatus => {
             match serde_json::from_value::<super::AtlasStatusPayload>(request.payload.clone()) {
                 Ok(payload) => Outcome::Reply(handle_atlas_status(state, payload)),
@@ -5189,10 +5205,15 @@ fn handle_atlas_status(state: &Arc<WirkdState>, payload: super::AtlasStatusPaylo
                 })
             })
             .collect();
+        let semantic = match semantic_status_record(&atlas, membership) {
+            Ok(semantic) => semantic,
+            Err(reply) => return reply,
+        };
         sources.push(json!({
             "membership": membership_json(membership),
             "published_generation": current.as_ref().map(generation_json),
             "recent_attempts": attempts,
+            "semantic": semantic,
         }));
     }
     let mut result = json!({
@@ -5213,6 +5234,325 @@ fn handle_atlas_status(state: &Arc<WirkdState>, payload: super::AtlasStatusPaylo
         result["source"] = json!(wanted);
     }
     ok_reply(result)
+}
+
+// ---- Atlas semantic editions (P3 W4 A, W4-PUBLIC-LIFECYCLE-BUILD.md) -----
+
+fn configured_path_json(path: &wirk_atlas::ConfiguredPath) -> Value {
+    json!({
+        "configured": path.configured,
+        "canonical": path.canonical,
+        "digest": path.digest,
+        "byte_len": path.byte_len,
+        "file_count": path.file_count,
+    })
+}
+
+/// The complete public identity of one edition. Every field is what was
+/// actually measured — recipe equality is not output identity (0078), so
+/// the vector and mapping digests are first-class here, not a footnote.
+fn edition_json(edition: &wirk_atlas::SemanticEdition) -> Value {
+    json!({
+        "edition": edition.id.0,
+        // Which identity scheme this record's id was computed under. A
+        // `v1` edition predates the complete-argv and backend-environment
+        // bindings and says so rather than implying them.
+        "identity": edition.identity,
+        "estate": edition.estate.0,
+        "membership": edition.membership.0,
+        "source": edition.source.0,
+        "generation": edition.generation.0,
+        "revision": edition.generation_revision,
+        "content": edition.generation_content,
+        "acquisition_policy": edition.acquisition_policy,
+        "chunker": {
+            "extractor_set": edition.chunker.extractor_set,
+            "unitizer": edition.chunker.unitizer,
+        },
+        "model": {
+            "consumed": configured_path_json(&edition.model.consumed),
+            "reported_path": edition.model.reported_path,
+            "reported_digest": edition.model.reported_digest,
+        },
+        "backend": {
+            "protocol": edition.backend.protocol,
+            "program": configured_path_json(&edition.backend.program),
+            "arguments": edition.backend.arguments.iter().map(configured_path_json).collect::<Vec<_>>(),
+            "argv": edition.backend.argv.iter().map(backend_argument_json).collect::<Vec<_>>(),
+            "reported": edition.backend.reported,
+            "environment": backend_environment_json(&edition.backend.environment),
+        },
+        "vectors": {
+            "format": edition.vectors.format,
+            "file": edition.vectors.file,
+            "rows": edition.vectors.rows,
+            "dimensions": edition.vectors.dimensions,
+            "byte_len": edition.vectors.byte_len,
+            "digest": edition.vectors.digest,
+        },
+        "mapping": {
+            "file": edition.mapping.file,
+            "rows": edition.mapping.rows,
+            "byte_len": edition.mapping.byte_len,
+            "digest": edition.mapping.digest,
+        },
+        "producer": {
+            "producer": edition.producer.producer,
+            "built_at_unix_millis": edition.producer.built_at_unix_millis,
+        },
+    })
+}
+
+fn backend_argument_json(argument: &wirk_atlas::BackendArgument) -> Value {
+    match argument {
+        wirk_atlas::BackendArgument::Literal { value } => {
+            json!({"kind": "literal", "value": value})
+        }
+        wirk_atlas::BackendArgument::File { value, file } => {
+            json!({"kind": "file", "value": value, "file": configured_path_json(file)})
+        }
+    }
+}
+
+fn unavailable_entries_json(entries: &[wirk_atlas::UnavailableEntry]) -> Value {
+    Value::Array(
+        entries
+            .iter()
+            .map(|entry| json!({"name": entry.name, "reason": entry.reason}))
+            .collect(),
+    )
+}
+
+/// `unmeasured` is the honest reading of every record written before
+/// loaded modules were measured. It is deliberately not `complete`: those
+/// builds never looked, and saying otherwise would mint coverage they
+/// never had.
+fn environment_coverage_json(coverage: &wirk_atlas::EnvironmentCoverage) -> Value {
+    match coverage {
+        wirk_atlas::EnvironmentCoverage::Unmeasured => json!({"state": "unmeasured"}),
+        wirk_atlas::EnvironmentCoverage::Complete => json!({"state": "complete"}),
+        wirk_atlas::EnvironmentCoverage::Partial(detail) => {
+            json!({"state": "partial", "detail": detail})
+        }
+    }
+}
+
+/// `unreported` is a first-class answer, not a missing field: a backend
+/// that cannot enumerate its own environment produces an edition whose
+/// implementation provenance is honestly absent, which a reader must be
+/// able to tell apart from one that was measured
+/// (`W4-LIFECYCLE-CORRECTION.md` item 3).
+///
+/// `W4-PRODUCER-PROVENANCE-CORRECTION.md` item 2 adds a second axis to the
+/// same rule: among the editions that *did* report, one that measured
+/// every loaded module and one that could not must not render alike. The
+/// state a reader sees is therefore the coverage — `complete`, `partial`
+/// with the reason, `unmeasured` for a record written before loaded
+/// modules were measured at all — and never a bare "reported".
+fn backend_environment_json(environment: &wirk_atlas::BackendEnvironment) -> Value {
+    match environment {
+        wirk_atlas::BackendEnvironment::Unreported => json!({"state": "unreported"}),
+        wirk_atlas::BackendEnvironment::Reported(identity) => json!({
+            "state": "reported",
+            "coverage": environment_coverage_json(&identity.coverage),
+            "scope": identity.scope,
+            "kind": identity.kind,
+            "root": identity.root,
+            "runtime": identity.runtime,
+            "executable": identity.executable,
+            "digest": identity.digest,
+            "modules_total": identity.modules.len(),
+            "modules": identity.modules.iter().map(|module| json!({
+                "name": module.name,
+                "origin": module.origin,
+                "path": module.path,
+                "digest": module.digest,
+                "byte_len": module.byte_len,
+                "attribution": match &module.attribution {
+                    wirk_atlas::ModuleAttribution::Declared(name) =>
+                        json!({"state": "declared", "distribution": name}),
+                    wirk_atlas::ModuleAttribution::Undeclared(detail) =>
+                        json!({"state": "undeclared", "detail": detail}),
+                },
+            })).collect::<Vec<_>>(),
+            "undescribed_distributions": unavailable_entries_json(
+                &identity.undescribed_distributions),
+            "unmeasured_modules": unavailable_entries_json(&identity.unmeasured_modules),
+            "distributions": identity.distributions.iter().map(|distribution| json!({
+                "name": distribution.name,
+                "version": distribution.version,
+                "metadata_path": distribution.metadata_path,
+                "record_digest": distribution.record_digest,
+                "metadata_digest": distribution.metadata_digest,
+                "declared_files": distribution.declared_files,
+                "declared_byte_len": distribution.declared_byte_len,
+                "files_checked": distribution.files_checked,
+                "files_missing": distribution.files_missing,
+                "files_mismatched": distribution.files_mismatched,
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+/// `verified` here means "these bytes are the bytes this record commits
+/// to", and nothing else. It deliberately says nothing about retrieval:
+/// W4 A builds and selects editions, and no query reads them yet.
+fn verification_json(verification: &wirk_atlas::SemanticVerification) -> Value {
+    match verification {
+        wirk_atlas::SemanticVerification::Verified => json!({"state": "verified"}),
+        wirk_atlas::SemanticVerification::Missing(detail) => {
+            json!({"state": "missing", "detail": detail})
+        }
+        wirk_atlas::SemanticVerification::Corrupt(detail) => {
+            json!({"state": "corrupt", "detail": detail})
+        }
+        wirk_atlas::SemanticVerification::Unavailable(detail) => {
+            json!({"state": "unavailable", "detail": detail})
+        }
+    }
+}
+
+fn membership_by_alias(
+    atlas: &wirk_atlas::AtlasStore,
+    alias: &str,
+) -> Option<wirk_atlas::Membership> {
+    atlas
+        .memberships()
+        .find(|membership| membership.alias == alias)
+        .cloned()
+}
+
+/// `handle_atlas_semantic_build`: stage one immutable semantic edition.
+/// Creation only — never a query's side effect, never implicit, and never
+/// a publication: the reply's `outcome` is `staged`, and no reader
+/// consults the result until `atlas semantic select` names it.
+fn handle_atlas_semantic_build(
+    state: &Arc<WirkdState>,
+    payload: super::AtlasSemanticBuildPayload,
+) -> Reply {
+    let mut atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(membership) = membership_by_alias(&atlas, &payload.source) else {
+        return err_reply(
+            "UnknownSource",
+            &format!("no registered source named {}", payload.source),
+        );
+    };
+    let config = wirk_atlas::SemanticBuildConfig {
+        backend: std::path::PathBuf::from(&payload.backend),
+        backend_args: payload.backend_args.clone(),
+        model: std::path::PathBuf::from(&payload.model),
+        // The producer of a product build is this daemon's own verb, at
+        // this protocol version. 0089 forbids minting producer proof for
+        // vectors this product did not create; it always knows its own.
+        producer: format!("wirkd/atlas-semantic-build/{PROTOCOL_VERSION}"),
+    };
+    let generation = wirk_atlas::GenerationId(payload.generation.clone());
+    match atlas.build_semantic(&membership, &generation, &config) {
+        Ok(wirk_atlas::SemanticBuildOutcome::Staged(edition)) => ok_reply(json!({
+            "membership": membership_json(&membership),
+            "outcome": "staged",
+            "edition": edition_json(&edition),
+        })),
+        Ok(wirk_atlas::SemanticBuildOutcome::Refused(reason)) => ok_reply(json!({
+            "membership": membership_json(&membership),
+            "outcome": "refused",
+            "detail": reason,
+        })),
+        Err(err) => err_reply("AtlasError", &err.to_string()),
+    }
+}
+
+/// `handle_atlas_semantic_select`: the separate, atomic publication step.
+/// The store re-verifies the edition's own bytes and its exact committed
+/// coordinates before any catalog write, so a refused selection leaves
+/// the previously selected edition exactly as it was.
+fn handle_atlas_semantic_select(
+    state: &Arc<WirkdState>,
+    payload: super::AtlasSemanticSelectPayload,
+) -> Reply {
+    let mut atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(membership) = membership_by_alias(&atlas, &payload.source) else {
+        return err_reply(
+            "UnknownSource",
+            &format!("no registered source named {}", payload.source),
+        );
+    };
+    let previous = atlas.selected_semantic(&membership);
+    let edition = wirk_atlas::EditionId(payload.edition.clone());
+    match atlas.select_semantic(&membership, &edition) {
+        Ok(Ok(edition)) => ok_reply(json!({
+            "membership": membership_json(&membership),
+            "outcome": "selected",
+            "edition": edition_json(&edition),
+            "publication_revision": atlas.publication_revision(),
+        })),
+        Ok(Err(reason)) => ok_reply(json!({
+            "membership": membership_json(&membership),
+            "outcome": "refused",
+            "detail": reason,
+            // Named explicitly so a failed replacement is legible as
+            // "the old one still stands", not as an unknown state.
+            "selected": previous.map(|id| id.0),
+            "publication_revision": atlas.publication_revision(),
+        })),
+        Err(err) => err_reply("AtlasError", &err.to_string()),
+    }
+}
+
+/// This source's semantic record for `atlas status`: every edition on
+/// disk, which one is selected, and what each one's bytes actually verify
+/// as right now. Under a `--work` scope this is only ever reached for a
+/// membership that scope already admits, so it discloses nothing the
+/// caller could not already see.
+fn semantic_status_record(
+    atlas: &wirk_atlas::AtlasStore,
+    membership: &wirk_atlas::Membership,
+) -> Result<Value, Reply> {
+    let editions = match atlas.semantic_editions(membership) {
+        Ok(editions) => editions,
+        Err(err) => return Err(err_reply("AtlasError", &err.to_string())),
+    };
+    let selected = atlas.selected_semantic(membership);
+    let rendered: Vec<Value> = editions
+        .iter()
+        .map(|state| {
+            let mut value = edition_json(&state.edition);
+            value["state"] = json!(if state.selected { "selected" } else { "staged" });
+            value["verification"] = verification_json(&state.verification);
+            // Retained-and-intact is not the same as
+            // describes-what-this-source-publishes
+            // (`W4-LIFECYCLE-CORRECTION.md` item 1). Both are reported,
+            // per edition, and neither is inferred from the other.
+            value["current"] = json!(state.current);
+            value
+        })
+        .collect();
+    // `selected_available` now means what a caller reading only the
+    // summary would take it to mean: this selection is usable right now.
+    // A selection whose generation is superseded, whose bytes do not
+    // verify, or whose record cannot be read, is `false` with the reason
+    // beside it — never `true` because a record with that id exists.
+    let availability = match atlas.semantic_availability(membership) {
+        Ok(availability) => availability,
+        Err(err) => return Err(err_reply("AtlasError", &err.to_string())),
+    };
+    let mut availability_json = json!({"state": availability.label()});
+    if let Some(detail) = availability.detail() {
+        availability_json["detail"] = json!(detail);
+    }
+    Ok(json!({
+        "selected": selected.as_ref().map(|id| id.0.clone()),
+        "selected_available": availability.selected_available(),
+        "availability": availability_json,
+        "editions_total": rendered.len(),
+        "editions": rendered,
+    }))
 }
 
 /// Estate-wide orientation (`payload.work` absent) or a real Work's own

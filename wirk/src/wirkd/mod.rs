@@ -111,6 +111,14 @@ pub enum Verb {
     /// P3 W3: atomically advances a registered source's published
     /// generation to an already-staged one.
     AtlasPublish,
+    /// P3 W4 A: builds one immutable semantic edition over an
+    /// already-staged generation with an explicitly configured backend
+    /// and model, and stages it. No query ever triggers this.
+    AtlasSemanticBuild,
+    /// P3 W4 A: atomically selects an already-built, fully verified
+    /// semantic edition as a source's published one — the separate,
+    /// explicit publication step for vectors.
+    AtlasSemanticSelect,
     /// P3 W3: reports registered sources, their published generation
     /// and coverage summary, and recent acquisition attempts.
     AtlasStatus,
@@ -250,6 +258,22 @@ impl Request {
         Request {
             verb: Verb::AtlasPublish,
             payload: serde_json::to_value(payload).expect("AtlasPublishPayload always serializes"),
+        }
+    }
+
+    pub fn atlas_semantic_build(payload: AtlasSemanticBuildPayload) -> Self {
+        Request {
+            verb: Verb::AtlasSemanticBuild,
+            payload: serde_json::to_value(payload)
+                .expect("AtlasSemanticBuildPayload always serializes"),
+        }
+    }
+
+    pub fn atlas_semantic_select(payload: AtlasSemanticSelectPayload) -> Self {
+        Request {
+            verb: Verb::AtlasSemanticSelect,
+            payload: serde_json::to_value(payload)
+                .expect("AtlasSemanticSelectPayload always serializes"),
         }
     }
 
@@ -459,6 +483,27 @@ pub struct AtlasRefreshPayload {
 pub struct AtlasPublishPayload {
     pub source: String,
     pub generation: String,
+}
+
+/// `atlas semantic build`'s payload (P3 W4 A). Backend and model are
+/// caller configuration travelling as data on an argv boundary — the
+/// product holds no model name, cache path or interpreter of its own,
+/// and records what it was actually given as build provenance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasSemanticBuildPayload {
+    pub source: String,
+    pub generation: String,
+    pub backend: String,
+    #[serde(default)]
+    pub backend_args: Vec<String>,
+    pub model: String,
+}
+
+/// `atlas semantic select`'s payload (P3 W4 A).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasSemanticSelectPayload {
+    pub source: String,
+    pub edition: String,
 }
 
 /// `atlas status`'s payload: every registered source, or one named

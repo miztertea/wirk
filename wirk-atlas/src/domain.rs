@@ -149,6 +149,13 @@ pub enum AtlasError {
     Catalog(String),
     #[error("generation is incomplete or absent: {0}")]
     Generation(String),
+    /// A *semantic edition* record, which is not a generation. Split out
+    /// because the reason text is read by a human deciding what is wrong
+    /// with their estate, and `Generation` made a removed `edition.json`
+    /// report a missing source generation — a different condition with a
+    /// different repair (`W4-PRODUCER-PROVENANCE-CORRECTION.md` item 4).
+    #[error("semantic edition record is absent or unreadable: {0}")]
+    Edition(String),
     #[error("catalog is visible but its directory entry durability is uncertain: {0}")]
     DurabilityUncertain(String),
     #[error("I/O: {0}")]

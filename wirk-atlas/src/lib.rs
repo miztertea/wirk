@@ -8,6 +8,7 @@ mod extract;
 mod git;
 mod query;
 mod relationship;
+mod semantic;
 mod store;
 
 pub use admission::{AdmissionSummary, AdmittedSource, QueryScope};
@@ -20,5 +21,14 @@ pub use query::{
 };
 pub use relationship::{
     RelationshipError, RelationshipView, admit_relationship, relationships_for,
+};
+pub use semantic::{
+    BackendArgument, BackendEnvironment, BackendIdentity, ChunkerIdentity, ConfiguredPath,
+    DistributionIdentity, EDITION_RECORD, EMBED_PROTOCOL, ENVIRONMENT_SCOPE_V2, EditionId,
+    EditionState, EnvironmentCoverage, EnvironmentIdentity, IDENTITY_V1, IDENTITY_V2, IDENTITY_V3,
+    MAPPING_FILE, MappingManifest, MappingRow, ModelIdentity, ModuleAttribution, ModuleIdentity,
+    ProducerIdentity, SemanticAvailability, SemanticBuildConfig, SemanticBuildOutcome,
+    SemanticEdition, SemanticVerification, UnavailableEntry, VECTOR_FORMAT, VECTORS_FILE,
+    VectorManifest,
 };
 pub use store::{AcquireOutcome, AtlasStore};
