@@ -263,6 +263,7 @@ fn raw_work_submitted(waypoint: &str, repositories: Vec<RepositoryBinding>) -> E
             boundary: Boundary(Vec::new()),
             leaves: Vec::new(),
             required_child_outcomes: Vec::new(),
+            selection: None,
         }],
         parent: None,
         execution_repo: None,
@@ -645,6 +646,8 @@ fn record_refuses_unknown_mismatched_duplicate_and_terminal_run_transitions() {
         EventKind::RunLaunched {
             run: RunId("run-other".to_string()),
             actor_kind: Default::default(),
+            selection: Default::default(),
+            launch_argv: Vec::new(),
         },
     );
     assert!(matches!(unknown, Reply::Err { .. }));
@@ -917,6 +920,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
                         boundary: Boundary(vec!["**".to_string()]),
                         leaves: Vec::new(),
                         required_child_outcomes: Vec::new(),
+                        selection: None,
                     }],
                     parent: None,
                     execution_repo: None,

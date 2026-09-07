@@ -30,6 +30,11 @@ fn open_run(run_id: &str) -> Run {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind: Default::default(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     }
 }
 
@@ -127,6 +132,8 @@ fn d9_1_journal_replay_rebuilds_work_state() {
             EventKind::RunLaunched {
                 run: RunId("run-1".to_string()),
                 actor_kind: Default::default(),
+                selection: Default::default(),
+                launch_argv: Vec::new(),
             },
         ),
         event(
@@ -316,6 +323,7 @@ fn d9_3_claim_missing_required_artifact_is_refused() {
         boundary: Boundary(Vec::new()),
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
+        selection: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -354,6 +362,7 @@ fn d9_4_fabricated_triple_is_recorded_not_honored() {
         boundary: Boundary(Vec::new()),
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
+        selection: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -390,6 +399,7 @@ fn claim_against_an_already_claimed_run_is_refused() {
         boundary: Boundary(Vec::new()),
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
+        selection: None,
     };
     let mut run = open_run("run-1");
     run.state = RunState::Claimed(ClaimId("claim-earlier".to_string()));
@@ -426,6 +436,7 @@ fn done_claim_with_required_artifact_present_is_validated() {
         boundary: Boundary(Vec::new()),
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
+        selection: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -462,6 +473,7 @@ fn question_claim_with_missing_artifact_is_validated() {
         boundary: Boundary(Vec::new()),
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
+        selection: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -783,6 +795,8 @@ fn run_launched_with_opencode_kind_updates_run() {
         EventKind::RunLaunched {
             run: RunId("run-1".to_string()),
             actor_kind: wirk_core::ActorKind::opencode(),
+            selection: Default::default(),
+            launch_argv: Vec::new(),
         },
     );
     run.apply(&event);
@@ -804,6 +818,8 @@ fn run_launched_with_an_unlisted_kind_updates_run_and_round_trips() {
         EventKind::RunLaunched {
             run: RunId("run-1".to_string()),
             actor_kind: wirk_core::ActorKind("codex".to_string()),
+            selection: Default::default(),
+            launch_argv: Vec::new(),
         },
     );
     run.apply(&event);
@@ -812,7 +828,9 @@ fn run_launched_with_an_unlisted_kind_updates_run_and_round_trips() {
     let json = serde_json::to_string(&event).expect("event serializes");
     let parsed: Event = serde_json::from_str(&json).expect("event round-trips through JSON");
     match parsed.kind {
-        EventKind::RunLaunched { run, actor_kind } => {
+        EventKind::RunLaunched {
+            run, actor_kind, ..
+        } => {
             assert_eq!(run, RunId("run-1".to_string()));
             assert_eq!(actor_kind, wirk_core::ActorKind("codex".to_string()));
         }
@@ -922,4 +940,139 @@ fn out_of_boundary_refusal_on_a_terminal_work_leaves_state_and_needs_input_untou
         "an OutOfBoundary refusal must leave a Failed Work's needs_input untouched, got {:?}",
         work.needs_input
     );
+}
+
+// ---- P3 native launch selection, D1: the pre-launch binding ---------
+
+/// `RunLaunchRequested` is the durable record of the resolved request,
+/// written before Herdr is called. Folding it fixes `kind`/`selection`
+/// and raises `launch_requested` — while `launched` stays false,
+/// because nothing has launched yet. That pair is the honest
+/// "admitted, outcome unknown" state a lost reply leaves behind.
+#[test]
+fn run_launch_requested_binds_the_request_without_claiming_a_launch() {
+    let mut run = open_run("run-1");
+    assert!(!run.launch_requested);
+    assert!(!run.launched);
+    let requested = event(
+        "e-1",
+        Some("run-1"),
+        EventKind::RunLaunchRequested {
+            run: RunId("run-1".to_string()),
+            actor_kind: wirk_core::ActorKind::opencode(),
+            selection: wirk_core::ActorSelection {
+                model: Some("prov/m".to_string()),
+                effort: None,
+                args: vec!["--raw".to_string()],
+            },
+        },
+    );
+    run.apply(&requested);
+    assert_eq!(run.kind, wirk_core::ActorKind::opencode());
+    assert_eq!(run.selection.model.as_deref(), Some("prov/m"));
+    assert_eq!(run.selection.args, vec!["--raw".to_string()]);
+    assert!(run.launch_requested, "the request is durably bound");
+    assert!(
+        !run.launched,
+        "an admitted request is not a launch: nothing here says Herdr ever answered"
+    );
+    assert!(
+        run.launch_argv.is_empty(),
+        "no argv is invented for a launch that has not returned"
+    );
+
+    // The launch itself then adds Herdr's own argv, and only then is
+    // the Run launched.
+    run.apply(&event(
+        "e-2",
+        Some("run-1"),
+        EventKind::RunLaunched {
+            run: RunId("run-1".to_string()),
+            actor_kind: wirk_core::ActorKind::opencode(),
+            selection: wirk_core::ActorSelection {
+                model: Some("prov/m".to_string()),
+                effort: None,
+                args: vec!["--raw".to_string()],
+            },
+            launch_argv: vec!["opencode".to_string(), "--model".to_string()],
+        },
+    ));
+    assert!(run.launched);
+    assert_eq!(run.launch_argv.len(), 2);
+}
+
+/// A journal written before this event existed still folds, and gains
+/// no invented facts from it: a Run whose only launch record is an old
+/// `RunLaunched` is `launched` with no `launch_requested`, which is
+/// exactly what happened.
+#[test]
+fn an_old_journal_with_no_launch_request_still_folds_unchanged() {
+    let raw = r#"{"id":"e-1","work":"w-1","run":"run-1","at":0,
+        "kind":{"kind":"RunLaunched","run":"run-1","actor_kind":"Opencode"}}"#;
+    let parsed: Event = serde_json::from_str(raw).expect("an old RunLaunched still parses");
+    let mut run = open_run("run-1");
+    run.apply(&parsed);
+    assert!(run.launched);
+    assert!(
+        !run.launch_requested,
+        "no request event exists for this Run, and none is invented"
+    );
+    assert_eq!(run.selection, wirk_core::ActorSelection::default());
+    assert!(run.launch_argv.is_empty());
+}
+
+/// P3 native launch attempt admission: the attempt folds onto the Run
+/// as who holds it and where its launch is bound, so every later
+/// invocation — and wirkd's own admission decision — reads it from the
+/// journal rather than from any live state.
+#[test]
+fn run_launch_attempted_folds_the_holder_and_the_destination() {
+    let mut run = open_run("run-1");
+    assert!(run.launch_attempt.is_none());
+    run.apply(&event(
+        "e-1",
+        Some("run-1"),
+        EventKind::RunLaunchAttempted {
+            run: RunId("run-1".to_string()),
+            destination: "/run/herdr-one.sock".to_string(),
+            holder: wirk_core::AttemptHolder {
+                pid: 4242,
+                start_token: Some("991".to_string()),
+            },
+        },
+    ));
+    let attempt = run.launch_attempt.clone().expect("the attempt folded");
+    assert_eq!(attempt.holder.pid, 4242);
+    assert_eq!(attempt.destination, "/run/herdr-one.sock");
+
+    // A superseding attempt replaces it: wirkd only ever admits one
+    // while the previous holder is gone, so the latest is the current.
+    run.apply(&event(
+        "e-2",
+        Some("run-1"),
+        EventKind::RunLaunchAttempted {
+            run: RunId("run-1".to_string()),
+            destination: "/run/herdr-one.sock".to_string(),
+            holder: wirk_core::AttemptHolder {
+                pid: 4343,
+                start_token: Some("1200".to_string()),
+            },
+        },
+    ));
+    assert_eq!(run.launch_attempt.expect("still there").holder.pid, 4343);
+}
+
+/// And an event written before attempts existed still folds, with the
+/// fact absent rather than invented: `None` is "no attempt admission
+/// was ever taken", which is exactly true of every old journal.
+#[test]
+fn a_run_launch_attempted_without_its_fields_folds_to_an_empty_holder() {
+    let parsed: EventKind = serde_json::from_str(r#"{"kind":"RunLaunchAttempted","run":"run-1"}"#)
+        .expect("the additive fields default");
+    let mut run = open_run("run-1");
+    run.apply(&event("e-1", Some("run-1"), parsed));
+    let attempt = run.launch_attempt.expect("folded");
+    assert_eq!(attempt.holder.pid, 0);
+    assert_eq!(attempt.holder.start_token, None);
+    assert_eq!(attempt.destination, "");
 }

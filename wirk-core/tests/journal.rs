@@ -292,6 +292,8 @@ fn replay_then_fold_equals_folding_the_original_events() {
             kind: EventKind::RunLaunched {
                 run: RunId("run-1".to_string()),
                 actor_kind: Default::default(),
+                selection: Default::default(),
+                launch_argv: Vec::new(),
             },
         },
         Event {
@@ -722,6 +724,8 @@ fn historical_opencode_actor_kind_replays_to_the_current_launch_spelling() {
         kind: EventKind::RunLaunched {
             run: RunId("run-1".to_string()),
             actor_kind: ActorKind::opencode(),
+            selection: Default::default(),
+            launch_argv: Vec::new(),
         },
     };
     let mut value = serde_json::to_value(&event).expect("event serializes");
@@ -743,6 +747,11 @@ fn historical_opencode_actor_kind_replays_to_the_current_launch_spelling() {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind: ActorKind::default(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     };
     for event in &replayed {
         run.apply(event);

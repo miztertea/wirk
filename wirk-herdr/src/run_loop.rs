@@ -113,13 +113,13 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use wirk_core::{
-    ActorKind, ActorWorld, Event, EventKind, FailureCause, Run, RunId, RunState, Timestamp, WorkId,
-    WorkState, World, fold,
+    ActorKind, ActorWorld, AttemptHolder, Event, EventKind, FailureCause, Run, RunId, RunState,
+    Timestamp, WorkId, WorkState, World, fold,
 };
 
 use crate::{
-    AgentStatus, HerdrClient, HerdrError, HerdrEvent, HerdrExecutor, HerdrExecutorError, Notify,
-    PromptAgent, PromptGate,
+    AgentStatus, EventSubscription, HerdrClient, HerdrError, HerdrEvent, HerdrExecutor,
+    HerdrExecutorError, Notify, PromptAgent, PromptGate, validate_selection,
 };
 
 // ---- WirkdApi -------------------------------------------------------------
@@ -220,6 +220,39 @@ pub enum RunLoopError<W: WirkdApi> {
     /// reader thread had one.
     #[error("wirkd watch stream ended: wirkd is gone{}", detail.as_ref().map(|d| format!(" ({d})")).unwrap_or_default())]
     WirkdGone { detail: Option<String> },
+    /// P3 native launch attempt admission: this Run's admitted launch
+    /// could be neither confirmed nor ruled out from here, so this
+    /// invocation stops instead of launching. Never a claim that
+    /// nothing ran and never a claim that something did — the two
+    /// cases it covers are "Herdr would not say" (a transport or
+    /// protocol error from `agent.get`, which is not an absence) and
+    /// "this Run already launched and its agent is gone", where
+    /// launching again would be a second external execution rather
+    /// than a recovery.
+    #[error("{0}")]
+    LaunchUnresolved(String),
+}
+
+/// One live Herdr subscription, as `launch`/`launch_actor` hand it back
+/// (named once so the reconciliation row's own signature stays
+/// readable).
+pub type HerdrEventStream = Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>;
+
+/// What `observe_admitted_launch` found, once it has asked the one
+/// system that can answer.
+///
+/// There is deliberately no "unknown" variant: an unknown outcome
+/// is not a value this caller may act on, so it leaves as
+/// `RunLoopError::LaunchUnresolved` instead of as a case the
+/// launch path could fall through.
+enum AdmittedLaunch {
+    /// Herdr reports the agent live: it launched. Attached to,
+    /// under the same bound request, with no second agent.
+    Reconciled(HerdrEventStream),
+    /// Herdr says, definitely, that no agent of this name exists —
+    /// `agent_not_found`, its own answer, not an error standing in
+    /// for one. The admitted request may be launched now.
+    Absent,
 }
 
 /// One item off the loop's single merged channel (module doc): either
@@ -460,6 +493,81 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         world: &World,
     ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>, RunLoopError<W>>
     {
+        // Step 0 (D1, "validate before unnecessary execution-side
+        // effects"): everything about the resolved request that can be
+        // judged without Herdr is judged here — before the binding
+        // write and before any pane exists. An unmappable or
+        // self-contradicting request costs nothing and journals
+        // nothing.
+        validate_selection(run.kind.0.as_str(), &run.selection)
+            .map_err(|err| RunLoopError::Herdr(HerdrExecutorError::Selection(err)))?;
+
+        // Step 1 (D1): durably bind the resolved request *before* the
+        // irreversible `agent.start`, atomically against this Run's own
+        // journal under wirkd's authority (`handle_record`, which
+        // admits at most one `RunLaunchRequested` per Run). A refusal
+        // here means someone else already bound this Run's launch: this
+        // invocation stops without touching Herdr and without
+        // journaling anything of its own, so it can neither start a
+        // second differently-configured agent nor append a competing
+        // `RunFailed` to the admitted owner's Run.
+        let already_bound = run.launch_requested;
+        if !already_bound {
+            self.wirkd
+                .record(
+                    work_id,
+                    &run.id,
+                    EventKind::RunLaunchRequested {
+                        run: run.id.clone(),
+                        actor_kind: run.kind.clone(),
+                        selection: run.selection.clone(),
+                    },
+                )
+                .map_err(RunLoopError::Wirkd)?;
+        }
+
+        // Step 2 (the independent review's N1): admitting the *request*
+        // is not admitting the *attempt*. Binding the request stops a
+        // second invocation from launching a differently-configured
+        // agent, but once it is bound, a duplicate invocation and a
+        // recovery invocation both used to walk straight into
+        // `agent.start` under it, with only Herdr's own agent-name
+        // uniqueness between them — an incidental guard that does not
+        // exist at all across two Herdr sessions. So the attempt is
+        // admitted the same way and in the same place: under wirkd's
+        // journal lock, against this Run's own journal, to exactly one
+        // live process at a time, bound to the Herdr this process is
+        // actually connected to. A refusal here means someone else owns
+        // this Run's launch right now: this invocation stops without
+        // touching Herdr.
+        //
+        // `holder` is left default deliberately: wirkd mints it from
+        // this connection's own kernel-reported peer credentials and
+        // discards whatever a client sends.
+        self.wirkd
+            .record(
+                work_id,
+                &run.id,
+                EventKind::RunLaunchAttempted {
+                    run: run.id.clone(),
+                    destination: self.executor.client().destination(),
+                    holder: AttemptHolder::default(),
+                },
+            )
+            .map_err(RunLoopError::Wirkd)?;
+
+        if already_bound {
+            // An earlier invocation's request was admitted. Whether it
+            // reached Herdr, and what Herdr did with it, is the one
+            // question this invocation must answer before it can
+            // launch anything — and the only place the answer can come
+            // from is Herdr.
+            match self.observe_admitted_launch(work_id, run)? {
+                AdmittedLaunch::Reconciled(events) => return Ok(events),
+                AdmittedLaunch::Absent => {}
+            }
+        }
+
         self.release_earlier_panes(work_id, run);
         match self.executor.launch_actor(run, world) {
             Ok(launched) => {
@@ -471,6 +579,8 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                         EventKind::RunLaunched {
                             run: run.id.clone(),
                             actor_kind: run.kind.clone(),
+                            selection: run.selection.clone(),
+                            launch_argv: launched.argv.clone(),
                         },
                     )
                     .map_err(RunLoopError::Wirkd)?;
@@ -478,23 +588,186 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             }
             Err(err) => {
                 let detail = err.to_string();
-                self.wirkd
-                    .record(
-                        work_id,
-                        &run.id,
-                        EventKind::RunFailed {
-                            cause: FailureCause {
-                                status: None,
-                                request_id: None,
-                                at: Timestamp(0),
-                                detail: Some(detail),
+                // D1: `agent.start` failing is not by itself evidence
+                // that nothing started — a lost reply looks exactly
+                // like a refusal from here. Ask Herdr before claiming
+                // either. Only when Herdr has no agent under this Run's
+                // name is `RunFailed` the truth; when it does, the
+                // honest record is that the outcome of an admitted
+                // request is uncertain, which is a state the next
+                // invocation can reconcile (above) instead of a failure
+                // that discards a live agent.
+                // Corrected for the review's transport-error finding:
+                // only Herdr's own `agent_not_found` is an absence.
+                // Every other error is Herdr declining to answer, which
+                // is exactly the case where claiming `RunFailed` would
+                // discard a live agent.
+                match self.executor.client().get_agent(&run.id.0) {
+                    Ok(pane) => {
+                        let _ = self.wirkd.record(
+                            work_id,
+                            &run.id,
+                            EventKind::LifecycleObserved {
+                                status: "launch-outcome-uncertain".to_string(),
+                                detail: Some(format!(
+                                    "agent.start for the admitted request returned an error \
+                                     ({detail}), but Herdr reports an agent named {} live in \
+                                     pane {} — this launch is neither confirmed nor failed",
+                                    run.id.0, pane.pane_id
+                                )),
                             },
-                        },
-                    )
-                    .map_err(RunLoopError::Wirkd)?;
+                        );
+                    }
+                    Err(err) if !matches!(err, HerdrError::NotFound(_)) => {
+                        // Herdr declined to answer at all. Two
+                        // unknowns compounded — what `agent.start`
+                        // did, and what exists now — is still not
+                        // "nothing ran".
+                        let _ = self.wirkd.record(
+                            work_id,
+                            &run.id,
+                            EventKind::LifecycleObserved {
+                                status: "launch-outcome-uncertain".to_string(),
+                                detail: Some(format!(
+                                    "agent.start for the admitted request returned an error \
+                                     ({detail}), and Herdr would not say whether an agent named \
+                                     {} exists either ({err}) — this launch is neither \
+                                     confirmed nor failed",
+                                    run.id.0
+                                )),
+                            },
+                        );
+                    }
+                    Err(_) => {
+                        self.wirkd
+                            .record(
+                                work_id,
+                                &run.id,
+                                EventKind::RunFailed {
+                                    cause: FailureCause {
+                                        status: None,
+                                        request_id: None,
+                                        at: Timestamp(0),
+                                        detail: Some(detail),
+                                    },
+                                },
+                            )
+                            .map_err(RunLoopError::Wirkd)?;
+                    }
+                }
                 Err(RunLoopError::Herdr(err))
             }
         }
+    }
+
+    /// D1 recovery, corrected for the review's N1 and for its
+    /// "a timeout, transport error or unobservable Herdr state is not
+    /// proof of absence": this Run already has an admitted
+    /// `RunLaunchRequested`, so an earlier invocation (or this Run's
+    /// own earlier life) got at least as far as being allowed to call
+    /// Herdr. Ask Herdr by the agent name the launch uses (`run.id`).
+    ///
+    /// Three answers, kept apart rather than collapsed:
+    ///
+    /// * the agent is live — the launch really happened, so reconcile
+    ///   onto the pane rather than start a second one. Herdr's argv for
+    ///   the original start is not recoverable this way, so no
+    ///   `RunLaunched` is written and no argv is invented: the
+    ///   reconciliation is recorded as what it is, an observation.
+    /// * `NotFound` — Herdr's own `agent_not_found`, a definite
+    ///   absence. If no `RunLaunched` ever folded, the admitted request
+    ///   may now be launched, unchanged. If one *did* fold, this Run
+    ///   already launched and its agent is gone: launching again would
+    ///   be a second external execution of a Run that already ran, so
+    ///   it is refused and the operator's own `wirk work retry`, which
+    ///   opens a new Run, is named.
+    /// * any other error — a transport failure, a Herdr that will not
+    ///   answer, a protocol error. Previously this whole class was
+    ///   `Ok(None)`, read as "no agent", and fell through to a second
+    ///   `agent.start`. It is not absence: it is the absence of an
+    ///   answer, and it is recorded as an observation and refused.
+    fn observe_admitted_launch(
+        &mut self,
+        work_id: &WorkId,
+        run: &Run,
+    ) -> Result<AdmittedLaunch, RunLoopError<W>> {
+        let pane = match self.executor.client().get_agent(&run.id.0) {
+            Ok(pane) => pane,
+            Err(HerdrError::NotFound(detail)) => {
+                if run.launched {
+                    let detail = format!(
+                        "this Run's launch is already recorded (RunLaunched) and Herdr reports \
+                         no agent named {} ({detail}); it will not be launched a second time \
+                         under the same Run — `wirk work retry` opens a new one",
+                        run.id.0
+                    );
+                    self.log_line(&detail);
+                    let _ = self.wirkd.record(
+                        work_id,
+                        &run.id,
+                        EventKind::LifecycleObserved {
+                            status: "launch-agent-gone".to_string(),
+                            detail: Some(detail.clone()),
+                        },
+                    );
+                    return Err(RunLoopError::LaunchUnresolved(detail));
+                }
+                return Ok(AdmittedLaunch::Absent);
+            }
+            Err(err) => {
+                let detail = format!(
+                    "this Run's launch request was admitted and Herdr will not say whether its \
+                     agent {} exists ({err}); a transport or protocol error is not proof that \
+                     nothing launched, so this invocation records the uncertainty and stops \
+                     rather than starting a second agent",
+                    run.id.0
+                );
+                self.log_line(&detail);
+                let _ = self.wirkd.record(
+                    work_id,
+                    &run.id,
+                    EventKind::LifecycleObserved {
+                        status: "launch-outcome-unobservable".to_string(),
+                        detail: Some(detail.clone()),
+                    },
+                );
+                return Err(RunLoopError::LaunchUnresolved(detail));
+            }
+        };
+        let events = self
+            .executor
+            .client()
+            .subscribe(vec![
+                EventSubscription::PaneAgentStatusChanged {
+                    pane_id: pane.pane_id.clone(),
+                },
+                EventSubscription::PaneUpdated {
+                    pane_id: pane.pane_id.clone(),
+                },
+            ])
+            .map_err(|err| RunLoopError::Herdr(HerdrExecutorError::Herdr(err)))?;
+        self.launched_pane = Some(pane.pane_id.clone());
+        self.log_line(&format!(
+            "launch reconciled: this Run's request was already admitted and Herdr reports its \
+             agent live in pane {}; attaching to it rather than launching again",
+            pane.pane_id
+        ));
+        self.wirkd
+            .record(
+                work_id,
+                &run.id,
+                EventKind::LifecycleObserved {
+                    status: "launch-reconciled".to_string(),
+                    detail: Some(format!(
+                        "an admitted launch request with no RunLaunched was reconciled onto the \
+                         live agent {} in pane {}; Herdr's own argv for that start was never \
+                         returned to wirk and is not recorded",
+                        run.id.0, pane.pane_id
+                    )),
+                },
+            )
+            .map_err(RunLoopError::Wirkd)?;
+        Ok(AdmittedLaunch::Reconciled(events))
     }
 
     /// P2.6 W3 (rerun findings, `03-orient.log`; ruling 0052): before
@@ -1082,8 +1355,13 @@ fn spawn_watch_reader<E: std::error::Error + Send + 'static>(
 /// all, never a second list of kinds):
 ///
 /// - a kind with the hook installed is told the required outputs by
-///   name and that its claim is filed for it at turn end, so it should
-///   end its turn once they exist;
+///   name, and truthfully: a claim is *attempted* at every turn end and
+///   *refused* until they exist (`native-progress-contract-use/
+///   HANDOFF.md` §1.4/§3 Rule 4, defect E — the old text promised "the
+///   claim is filed for you", which is only true from the turn a
+///   refusal stops happening; a refusal before then is state wirkd
+///   already journals and the run loop already acts on, not a failure
+///   for the actor to react to);
 /// - a kind without the hook keeps a by-hand instruction, corrected to
 ///   the real, flagless form W1 built (`wirk claim` alone asks wirkd
 ///   for the Waypoint's declared outputs and claims each by name).
@@ -1104,8 +1382,10 @@ pub fn compose_first_prompt(actor: &ActorWorld, kind: &ActorKind) -> String {
         format!("\n\nRequired artifacts (by name): {}", required.join(", "))
     };
     let claim_line = if crate::claim_hook::hook_installed_for(kind) {
-        "When the required outputs above exist, end your turn: the claim is filed for you. \
-         If you need input before you can finish, file `wirk claim --question \"...\"` instead."
+        "A claim is attempted automatically at the end of every turn and is refused until \
+         the required outputs above exist, so end your turn once they do — a refusal before \
+         then is a normal record, not a failure. If you need input before you can finish, \
+         file `wirk claim --question \"...\"` instead."
     } else {
         "When you are done, file the claim from this pane: `wirk claim`. If you need input \
          before you can finish, file `wirk claim --question \"...\"` instead."

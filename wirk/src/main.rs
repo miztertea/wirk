@@ -97,7 +97,7 @@ fn main() -> ExitCode {
         Some("atlas") => atlas::atlas_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind claude|opencode] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate --estate <root> ..."
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate --estate <root> ..."
             );
             ExitCode::FAILURE
         }
@@ -1161,8 +1161,17 @@ fn reserved_deterministic(status: &serde_json::Value) -> Result<(Run, World), St
         world_hash: WorldHash(world_hash),
         state: wirk_core::RunState::Open,
         // Deterministic runs carry no actor kind (0041 D129 is
-        // actor-only); default is inert here.
+        // actor-only); default is inert here. Same for P3 native launch
+        // selection: actor-only (`selection` is refused at Route load
+        // for a non-Actor Waypoint), inert on a Deterministic Run.
         kind: wirk_core::ActorKind::default(),
+        selection: wirk_core::ActorSelection::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        // Attempt admission is the Actor launch path's own
+        // (`RunLaunchAttempted`); a Deterministic Run never takes one.
+        launch_attempt: None,
     };
     Ok((run, world))
 }
@@ -1529,6 +1538,8 @@ fn demo_events() -> Vec<Event> {
             EventKind::RunLaunched {
                 run: run.clone(),
                 actor_kind: wirk_core::ActorKind::default(),
+                selection: wirk_core::ActorSelection::default(),
+                launch_argv: Vec::new(),
             },
         ),
         new_event(
@@ -1580,6 +1591,8 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::WorkSubmitted { .. } => "WorkSubmitted",
         EventKind::WaypointReserved { .. } => "WaypointReserved",
         EventKind::RunOpened { .. } => "RunOpened",
+        EventKind::RunLaunchRequested { .. } => "RunLaunchRequested",
+        EventKind::RunLaunchAttempted { .. } => "RunLaunchAttempted",
         EventKind::RunLaunched { .. } => "RunLaunched",
         EventKind::WorkFailed { .. } => "WorkFailed",
         EventKind::WorkCanceled { .. } => "WorkCanceled",

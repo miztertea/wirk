@@ -222,6 +222,122 @@ fn route_file_output_with_empty_name_is_refused() {
     }
 }
 
+/// P3 native launch selection (BUILD-BRIEF.md item 1): an Actor
+/// Waypoint's own `selection` (harness/model/effort/args) loads and
+/// parses, the workflow-authored half of the contract this wave adds.
+#[test]
+fn route_file_actor_selection_loads() {
+    let dir = tempdir().expect("tempdir");
+    let content = r#"{
+      "id": "with-selection",
+      "waypoints": [
+        {
+          "id": "with-selection/wp-1",
+          "kind": "Actor",
+          "intent": "do it",
+          "declared_outputs": [],
+          "selection": {
+            "harness": "codex",
+            "model": "gpt-6-astra",
+            "effort": "high",
+            "args": ["--sandbox", "workspace-write"]
+          }
+        }
+      ]
+    }"#;
+    let path = write(dir.path(), "route.json", content);
+    let route = load_route(&path).expect("an Actor Waypoint's selection loads");
+    let selection = route.waypoints[0]
+        .selection
+        .as_ref()
+        .expect("selection is present");
+    assert_eq!(
+        selection.harness,
+        Some(wirk_core::ActorKind("codex".to_string()))
+    );
+    assert_eq!(selection.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(selection.effort.as_deref(), Some("high"));
+    assert_eq!(
+        selection.args,
+        vec!["--sandbox".to_string(), "workspace-write".to_string()]
+    );
+}
+
+/// A Waypoint with no `selection` at all still loads clean —
+/// `selection` is additive, same posture as `boundary`'s own empty
+/// case just above.
+#[test]
+fn route_file_no_selection_is_allowed() {
+    let dir = tempdir().expect("tempdir");
+    let content = r#"{
+      "id": "no-selection",
+      "waypoints": [
+        {"id": "no-selection/wp-1", "kind": "Actor", "intent": "do it", "declared_outputs": []}
+      ]
+    }"#;
+    let path = write(dir.path(), "route.json", content);
+    let route = load_route(&path).expect("no selection loads clean");
+    assert_eq!(route.waypoints[0].selection, None);
+}
+
+/// P3 native launch selection (BUILD-BRIEF.md item 1: "Reject
+/// actor-only configuration on non-Actor stages where it would
+/// otherwise be silently unused"): a Deterministic Waypoint carries no
+/// Run to launch, so an authored `selection` there would never be
+/// read by anything — refused at load, not silently accepted and
+/// dropped.
+#[test]
+fn route_file_deterministic_with_selection_is_refused() {
+    let dir = tempdir().expect("tempdir");
+    let content = r#"{
+      "id": "det-selection",
+      "waypoints": [
+        {
+          "id": "det-selection/wp-1",
+          "kind": "Deterministic",
+          "command": ["true"],
+          "declared_outputs": [],
+          "selection": {"model": "gpt-6-astra"}
+        }
+      ]
+    }"#;
+    let path = write(dir.path(), "route.json", content);
+    let err =
+        load_route(&path).expect_err("a Deterministic Waypoint carrying selection is refused");
+    match err {
+        RouteError::ActorSelectionOnNonActor { id } => assert_eq!(id.0, "det-selection/wp-1"),
+        other => panic!("expected ActorSelectionOnNonActor, got {other:?}"),
+    }
+}
+
+/// Same refusal, `Container` side: a container has no Run of its own
+/// either (`ContainerWithMechanism` already refuses `intent`/`command`/
+/// `boundary` there for the same reason).
+#[test]
+fn route_file_container_with_selection_is_refused() {
+    let dir = tempdir().expect("tempdir");
+    let content = r#"{
+      "id": "container-selection",
+      "waypoints": [
+        {
+          "id": "container-selection/wp-1",
+          "kind": "Container",
+          "declared_outputs": [],
+          "selection": {"model": "gpt-6-astra"},
+          "leaves": [
+            {"id": "container-selection/wp-1/leaf", "kind": "Deterministic", "command": ["true"], "declared_outputs": []}
+          ]
+        }
+      ]
+    }"#;
+    let path = write(dir.path(), "route.json", content);
+    let err = load_route(&path).expect_err("a Container carrying selection is refused");
+    match err {
+        RouteError::ActorSelectionOnNonActor { id } => assert_eq!(id.0, "container-selection/wp-1"),
+        other => panic!("expected ActorSelectionOnNonActor, got {other:?}"),
+    }
+}
+
 #[test]
 fn route_file_empty_boundary_is_allowed() {
     let dir = tempdir().expect("tempdir");

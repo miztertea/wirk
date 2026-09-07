@@ -67,12 +67,29 @@ fn open_run(run_id: &str) -> Run {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind: Default::default(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     }
 }
 
 fn open_run_with_kind(run_id: &str, kind: wirk_core::ActorKind) -> Run {
     Run {
         kind,
+        ..open_run(run_id)
+    }
+}
+
+fn open_run_with_selection(
+    run_id: &str,
+    kind: wirk_core::ActorKind,
+    selection: wirk_core::ActorSelection,
+) -> Run {
+    Run {
+        kind,
+        selection,
         ..open_run(run_id)
     }
 }
@@ -288,12 +305,14 @@ fn d9_4_launch_carries_the_runs_triple_in_split_pane_env() {
     );
 }
 
-/// W1 (0041 D129): `start_actor_agent` sends `StartAgent{kind:"claude",
-/// args:["--model","sonnet"]}` for `ActorKind::claude()` — the
-/// pre-existing behavior, now driven by `run.kind` rather than
-/// hardcoded (`orient/actor.md` §1).
+/// P3 native launch selection (PREPARATION-ADJUDICATION.md point 4:
+/// "eliminate machine-specific model literals as product
+/// restrictions"), superseding W1's 0041 D129 hardcoded
+/// `["--model","sonnet"]`: a claude Run with no requested model/effort
+/// launches with **no** model/effort flag at all — the harness's own
+/// native default engages, never a wirk-invented exact model identity.
 #[test]
-fn start_actor_agent_sends_claude_kind_and_model() {
+fn claude_with_no_selection_launches_with_no_model_or_effort_flag() {
     let run = open_run_with_kind("run-1", wirk_core::ActorKind::claude());
     let world = actor_world(&run);
 
@@ -312,17 +331,15 @@ fn start_actor_agent_sends_claude_kind_and_model() {
     assert_eq!(calls[0].kind, "claude");
     assert_eq!(
         calls[0].args,
-        vec!["--model".to_string(), "sonnet".to_string()]
+        Vec::<String>::new(),
+        "no selection requested: no --model, no --effort, no invented default"
     );
 }
 
-/// W1 (0041 D129): `start_actor_agent` sends
-/// `StartAgent{kind:"opencode", args:["--model",
-/// "hecate/qwen3.8-27b-udiq3s-mtp"]}` for `ActorKind::opencode()`
-/// (`orient/actor.md` §1, §5 — the model passed explicitly the first
-/// live run).
+/// Same absence-of-forced-default, opencode side (previously hardcoded
+/// to `hecate/qwen3.8-27b-udiq3s-mtp`, orient/actor.md §5).
 #[test]
-fn start_actor_agent_sends_opencode_kind_and_model() {
+fn opencode_with_no_selection_launches_with_no_model_flag() {
     let run = open_run_with_kind("run-1", wirk_core::ActorKind::opencode());
     let world = actor_world(&run);
 
@@ -333,18 +350,252 @@ fn start_actor_agent_sends_opencode_kind_and_model() {
     executor.launch(&run, &world).expect("launch");
 
     let calls = executor.client().start_agent_calls.lock().unwrap();
-    assert_eq!(
-        calls.len(),
-        1,
-        "launch should call start_agent exactly once"
-    );
+    assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].kind, "opencode");
+    assert_eq!(calls[0].args, Vec::<String>::new());
+}
+
+/// A requested model translates to claude's own real, installed,
+/// interactive `--model <model>` flag (verified by hand against
+/// `claude --help` on this box — PREPARATION-ADJUDICATION.md point 2).
+#[test]
+fn claude_with_requested_model_sends_the_real_model_flag() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind::claude(),
+        wirk_core::ActorSelection {
+            model: Some("opus".to_string()),
+            effort: None,
+            args: Vec::new(),
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+
+    executor.launch(&run, &world).expect("launch");
+
+    let calls = executor.client().start_agent_calls.lock().unwrap();
+    assert_eq!(
+        calls[0].args,
+        vec!["--model".to_string(), "opus".to_string()]
+    );
+}
+
+/// Claude also has a real, direct interactive `--effort <level>` flag
+/// (`claude --help`, distinct from `opencode`'s total absence of one
+/// below) — both requested together produce both real flags, model
+/// first (matching the order `build_selection_args` builds them in).
+#[test]
+fn claude_with_requested_model_and_effort_sends_both_real_flags() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind::claude(),
+        wirk_core::ActorSelection {
+            model: Some("sonnet".to_string()),
+            effort: Some("high".to_string()),
+            args: Vec::new(),
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+
+    executor.launch(&run, &world).expect("launch");
+
+    let calls = executor.client().start_agent_calls.lock().unwrap();
+    assert_eq!(
+        calls[0].args,
+        vec![
+            "--model".to_string(),
+            "sonnet".to_string(),
+            "--effort".to_string(),
+            "high".to_string(),
+        ]
+    );
+}
+
+/// Opencode's own real interactive `-m`/`--model` flag (`opencode
+/// --help` on this box), verified distinct from claude's spelling only
+/// by coincidence — both happen to be `--model`.
+#[test]
+fn opencode_with_requested_model_sends_the_real_model_flag() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind::opencode(),
+        wirk_core::ActorSelection {
+            model: Some("hecate/qwen3.8-27b-udiq3s-mtp".to_string()),
+            effort: None,
+            args: Vec::new(),
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+
+    executor.launch(&run, &world).expect("launch");
+
+    let calls = executor.client().start_agent_calls.lock().unwrap();
     assert_eq!(
         calls[0].args,
         vec![
             "--model".to_string(),
             "hecate/qwen3.8-27b-udiq3s-mtp".to_string()
         ]
+    );
+}
+
+/// PREPARATION-ADJUDICATION.md point 2: "An explicitly requested
+/// option must not silently degrade into a different execution ...
+/// fail visibly before actor launch." `opencode --help`'s full option
+/// list carries no effort/reasoning-effort control at all (verified by
+/// hand on this box) — an explicit effort request for it is refused
+/// before `agent.start` is ever called, not silently dropped.
+#[test]
+fn opencode_with_requested_effort_is_refused_before_launch() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind::opencode(),
+        wirk_core::ActorSelection {
+            model: None,
+            effort: Some("high".to_string()),
+            args: Vec::new(),
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+
+    let err = executor
+        .launch(&run, &world)
+        .expect_err("opencode has no native effort control");
+    assert!(
+        matches!(
+            err,
+            wirk_herdr::HerdrExecutorError::Selection(
+                wirk_herdr::SelectionError::UnsupportedEffort { .. }
+            )
+        ),
+        "expected Selection(UnsupportedEffort), got {err:?}"
+    );
+    assert_eq!(
+        executor.client().start_agent_calls.lock().unwrap().len(),
+        0,
+        "agent.start must never be called for a refused selection"
+    );
+}
+
+/// Codex's own real interactive `-m`/`--model` flag, plus its real
+/// **config** control for effort — `model_reasoning_effort`, set the
+/// same way any other Codex config override is (`-c key=value`,
+/// confirmed against this box's own installed `~/.codex/config.toml`),
+/// never a codex-specific CLI flag wirk invents.
+#[test]
+fn codex_with_requested_model_and_effort_maps_to_its_real_controls() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind("codex".to_string()),
+        wirk_core::ActorSelection {
+            model: Some("gpt-6-astra".to_string()),
+            effort: Some("high".to_string()),
+            args: Vec::new(),
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+
+    executor.launch(&run, &world).expect("launch");
+
+    let calls = executor.client().start_agent_calls.lock().unwrap();
+    assert_eq!(calls[0].kind, "codex");
+    assert_eq!(
+        calls[0].args,
+        vec![
+            "--model".to_string(),
+            "gpt-6-astra".to_string(),
+            "-c".to_string(),
+            "model_reasoning_effort=high".to_string(),
+        ]
+    );
+}
+
+/// PREPARATION-ADJUDICATION.md point 2/5: a kind outside wirk's three
+/// verified harnesses gets no invented flag syntax — an explicit model
+/// request for it is refused rather than guessed, distinct from
+/// `start_actor_agent_sends_an_unlisted_kind_bare` below (no
+/// model/effort requested at all, which still launches bare — 0056
+/// D164 unchanged).
+#[test]
+fn unmapped_kind_with_requested_model_is_refused_before_launch() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind("somekind".to_string()),
+        wirk_core::ActorSelection {
+            model: Some("whatever".to_string()),
+            effort: None,
+            args: Vec::new(),
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+
+    let err = executor
+        .launch(&run, &world)
+        .expect_err("wirk has never inspected somekind's own CLI");
+    assert!(
+        matches!(
+            err,
+            wirk_herdr::HerdrExecutorError::Selection(
+                wirk_herdr::SelectionError::UnmappedKind { .. }
+            )
+        ),
+        "expected Selection(UnmappedKind), got {err:?}"
+    );
+    assert_eq!(executor.client().start_agent_calls.lock().unwrap().len(), 0);
+}
+
+/// Raw pass-through (`selection.args`) is preserved verbatim, exact
+/// token boundaries kept, appended after whatever convenience mapping
+/// ran — for any kind, including one wirk has never heard of (the
+/// escape hatch `UnmappedKind`'s own error message points an author
+/// at).
+#[test]
+fn raw_pass_through_args_preserve_exact_token_boundaries() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind("somekind".to_string()),
+        wirk_core::ActorSelection {
+            model: None,
+            effort: None,
+            args: vec![
+                "--flag with spaces".to_string(),
+                "--another=value".to_string(),
+            ],
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+
+    executor.launch(&run, &world).expect("launch");
+
+    let calls = executor.client().start_agent_calls.lock().unwrap();
+    assert_eq!(
+        calls[0].args,
+        vec![
+            "--flag with spaces".to_string(),
+            "--another=value".to_string(),
+        ],
+        "each element is one argv token, not split or rejoined on whitespace"
     );
 }
 
@@ -552,3 +803,225 @@ fn live_agent_start_with_an_unknown_kind_surfaces_herdrs_own_error_not_wirks() {
 // pane's second, content-identical Idle as a "replay" of the first,
 // which is the run 2 bug `run_loop.rs`'s own tests now pin the fix for
 // (`the_run2_bug_a_second_identical_idle_is_still_prompted`).
+
+// ---- P3 native launch selection, D2: raw arguments may not restate a
+// structured field ---------------------------------------------------
+
+/// The review's D2 counterexample, executed: a Route authoring
+/// `model: "model-A"` **and** `args: ["--model","raw-B"]` submitted
+/// **two** `--model` tokens while the recorded request and the printed
+/// provenance both named only the first. Whichever token claude's own
+/// parser honors, one of the two records is then false.
+///
+/// The rule chosen is the narrowest one that cannot lie: no implicit
+/// precedence — the overlap is refused, before launch, naming both
+/// sides. Raw args stay the escape hatch for everything the convenience
+/// fields do not cover (`raw_pass_through_args_preserve_exact_token_boundaries`,
+/// `raw_args_that_do_not_restate_a_structured_field_still_pass_through`);
+/// they simply may not restate one that was also given.
+#[test]
+fn a_raw_model_flag_alongside_a_requested_model_is_refused_before_launch() {
+    for raw in [
+        vec!["--model".to_string(), "raw-B".to_string()],
+        vec!["--model=raw-B".to_string()],
+    ] {
+        let run = open_run_with_selection(
+            "run-1",
+            wirk_core::ActorKind::claude(),
+            wirk_core::ActorSelection {
+                model: Some("model-A".to_string()),
+                effort: None,
+                args: raw.clone(),
+            },
+        );
+        let world = actor_world(&run);
+        let fake = FakeHerdrClient::default().with_split_pane_response(pane_info(
+            "p1",
+            AgentStatus::Idle,
+            1,
+        ));
+        let executor = HerdrExecutor::new(fake);
+
+        let err = executor.launch(&run, &world).expect_err(&format!(
+            "two --model tokens must be refused, not submitted: {raw:?}"
+        ));
+        match &err {
+            wirk_herdr::HerdrExecutorError::Selection(
+                wirk_herdr::SelectionError::RawArgConflict {
+                    field, raw: named, ..
+                },
+            ) => {
+                assert_eq!(field, "model");
+                assert!(
+                    named.contains("raw-B"),
+                    "the error names the offending raw token, got {named:?}"
+                );
+            }
+            other => panic!("expected Selection(RawArgConflict), got {other:?}"),
+        }
+        assert_eq!(
+            executor.client().start_agent_calls.lock().unwrap().len(),
+            0,
+            "agent.start must never be called for a refused selection"
+        );
+    }
+}
+
+/// Every verified harness, in the real spellings its own installed CLI
+/// accepts: claude `--model`/`--effort` (no short alias exists),
+/// opencode `-m`/`--model`, codex `-m`/`--model` and its
+/// `-c model_reasoning_effort=` config override — separate-token and
+/// `=`-joined forms alike.
+#[test]
+fn every_verified_harnesss_own_raw_spelling_of_a_structured_field_is_refused() {
+    let cases: Vec<(&str, wirk_core::ActorSelection, &str, &str)> = vec![
+        (
+            "claude",
+            wirk_core::ActorSelection {
+                model: Some("model-A".to_string()),
+                effort: None,
+                args: vec!["--model".to_string(), "raw-B".to_string()],
+            },
+            "model",
+            "--model raw-B",
+        ),
+        (
+            "claude",
+            wirk_core::ActorSelection {
+                model: None,
+                effort: Some("high".to_string()),
+                args: vec!["--effort=low".to_string()],
+            },
+            "effort",
+            "--effort=low",
+        ),
+        (
+            "opencode",
+            wirk_core::ActorSelection {
+                model: Some("prov/m".to_string()),
+                effort: None,
+                args: vec!["-m".to_string(), "prov/other".to_string()],
+            },
+            "model",
+            "-m prov/other",
+        ),
+        (
+            "codex",
+            wirk_core::ActorSelection {
+                model: Some("m-1".to_string()),
+                effort: None,
+                args: vec!["-c".to_string(), "model=m-2".to_string()],
+            },
+            "model",
+            "-c model=m-2",
+        ),
+        (
+            "codex",
+            wirk_core::ActorSelection {
+                model: None,
+                effort: Some("high".to_string()),
+                args: vec!["-c".to_string(), "model_reasoning_effort=low".to_string()],
+            },
+            "effort",
+            "-c model_reasoning_effort=low",
+        ),
+        (
+            "codex",
+            wirk_core::ActorSelection {
+                model: None,
+                effort: Some("high".to_string()),
+                args: vec!["--config=model_reasoning_effort=low".to_string()],
+            },
+            "effort",
+            "--config=model_reasoning_effort=low",
+        ),
+    ];
+    for (kind, selection, field, raw) in cases {
+        let err = wirk_herdr::validate_selection(kind, &selection)
+            .expect_err(&format!("{kind}/{field} must be refused"));
+        match err {
+            wirk_herdr::SelectionError::RawArgConflict {
+                kind: err_kind,
+                field: err_field,
+                raw: err_raw,
+                ..
+            } => {
+                assert_eq!(err_kind, kind);
+                assert_eq!(err_field, field);
+                assert_eq!(err_raw, raw, "the error names the offending raw token");
+            }
+            other => panic!("expected RawArgConflict for {kind}/{field}, got {other:?}"),
+        }
+    }
+}
+
+/// The escape hatch is untouched: a raw flag the convenience fields do
+/// not cover, and even a raw `--model` when **no** structured model was
+/// requested, both pass through exactly as before. This is the control
+/// for the rule above — it refuses overlap, not raw arguments.
+#[test]
+fn raw_args_that_do_not_restate_a_structured_field_still_pass_through() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind::claude(),
+        wirk_core::ActorSelection {
+            model: None,
+            effort: None,
+            args: vec!["--model".to_string(), "raw-only".to_string()],
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+    executor.launch(&run, &world).expect("launch");
+    let calls = executor.client().start_agent_calls.lock().unwrap();
+    assert_eq!(calls[0].args[0], "--model");
+    assert_eq!(calls[0].args[1], "raw-only");
+
+    let unrelated = wirk_core::ActorSelection {
+        model: Some("model-A".to_string()),
+        effort: Some("high".to_string()),
+        args: vec![
+            "--fallback-model".to_string(),
+            "other".to_string(),
+            "--raw-tail".to_string(),
+        ],
+    };
+    wirk_herdr::validate_selection("claude", &unrelated)
+        .expect("--fallback-model is a different setting, not a restatement of --model");
+}
+
+/// D1's "validate before unnecessary execution-side effects": a request
+/// that cannot be honored costs no pane, no agent and no journal entry.
+#[test]
+fn a_conflicting_selection_never_reaches_agent_start_or_creates_a_pane() {
+    let run = open_run_with_selection(
+        "run-1",
+        wirk_core::ActorKind::claude(),
+        wirk_core::ActorSelection {
+            model: Some("model-A".to_string()),
+            effort: None,
+            args: vec!["--model".to_string(), "raw-B".to_string()],
+        },
+    );
+    let world = actor_world(&run);
+    let fake =
+        FakeHerdrClient::default().with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1));
+    let executor = HerdrExecutor::new(fake);
+    let err = executor.launch(&run, &world).expect_err("refused");
+    assert!(
+        matches!(
+            err,
+            wirk_herdr::HerdrExecutorError::Selection(
+                wirk_herdr::SelectionError::RawArgConflict { .. }
+            )
+        ),
+        "expected Selection(RawArgConflict), got {err:?}"
+    );
+    assert_eq!(
+        executor.client().start_agent_calls.lock().unwrap().len(),
+        0,
+        "agent.start must never be called for a refused selection"
+    );
+}

@@ -28,6 +28,7 @@ fn actor(id: &str, outputs: &[&str]) -> WaypointDefinition {
         boundary: Boundary(vec!["**".to_string()]),
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
+        selection: None,
     }
 }
 
@@ -58,6 +59,7 @@ fn container(
                 required: true,
             })
             .collect(),
+        selection: None,
     }
 }
 
@@ -218,6 +220,93 @@ fn grandchild_nested_route_loads_and_flattens_in_dfs_order() {
             WaypointId("outer".to_string()),
         ],
         "immediate parent first"
+    );
+}
+
+/// P3 native launch selection (BUILD-BRIEF.md item 1: "No invented
+/// cross-Work inheritance; actual nested executable leaves can
+/// independently select their mechanism"). Two Actor leaves nested
+/// under the same Container, one two levels deep, each authoring its
+/// own distinct `selection` — `find_definition` returns each leaf's
+/// own value, never a parent's or a sibling's; the Container itself
+/// carries none (`selection: None` is refused for a Container by
+/// `route_file_container_with_selection_is_refused`, so there is
+/// nothing here for a leaf to inherit even by accident).
+#[test]
+fn nested_actor_leaves_select_their_own_mechanism_independently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let content = r#"{
+      "id": "independent-selection",
+      "waypoints": [
+        {
+          "id": "outer",
+          "kind": "Container",
+          "declared_outputs": [],
+          "leaves": [
+            {
+              "id": "outer/claude-leaf",
+              "kind": "Actor",
+              "intent": "review",
+              "declared_outputs": [],
+              "selection": {"harness": "claude", "model": "opus", "effort": "high"}
+            },
+            {
+              "id": "outer/inner",
+              "kind": "Container",
+              "declared_outputs": [],
+              "leaves": [
+                {
+                  "id": "outer/inner/codex-leaf",
+                  "kind": "Actor",
+                  "intent": "repair",
+                  "declared_outputs": [],
+                  "selection": {"harness": "codex", "model": "gpt-6-astra"}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }"#;
+    let path = write(dir.path(), "route.json", content);
+    let route = load_route(&path).expect("nested route with per-leaf selection loads");
+
+    let claude_leaf = wirk_core::find_definition(
+        &route.waypoints,
+        &WaypointId("outer/claude-leaf".to_string()),
+    )
+    .expect("claude-leaf found");
+    let claude_selection = claude_leaf
+        .selection
+        .as_ref()
+        .expect("claude-leaf selection");
+    assert_eq!(
+        claude_selection.harness,
+        Some(wirk_core::ActorKind::claude())
+    );
+    assert_eq!(claude_selection.model.as_deref(), Some("opus"));
+
+    let codex_leaf = wirk_core::find_definition(
+        &route.waypoints,
+        &WaypointId("outer/inner/codex-leaf".to_string()),
+    )
+    .expect("codex-leaf found");
+    let codex_selection = codex_leaf.selection.as_ref().expect("codex-leaf selection");
+    assert_eq!(
+        codex_selection.harness,
+        Some(wirk_core::ActorKind("codex".to_string()))
+    );
+    assert_eq!(codex_selection.model.as_deref(), Some("gpt-6-astra"));
+    assert_eq!(
+        codex_selection.effort, None,
+        "codex-leaf never authored an effort; nothing carries claude-leaf's 'high' across"
+    );
+
+    let outer = wirk_core::find_definition(&route.waypoints, &WaypointId("outer".to_string()))
+        .expect("outer container found");
+    assert_eq!(
+        outer.selection, None,
+        "the container itself has no selection for a leaf to inherit"
     );
 }
 

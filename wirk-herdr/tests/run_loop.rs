@@ -44,6 +44,11 @@ fn open_run(run_id: &str) -> Run {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind: ActorKind::opencode(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     }
 }
 
@@ -159,6 +164,8 @@ fn run_launched(run: &Run) -> EventKind {
     EventKind::RunLaunched {
         run: run.id.clone(),
         actor_kind: run.kind.clone(),
+        selection: run.selection.clone(),
+        launch_argv: Vec::new(),
     }
 }
 
@@ -1831,7 +1838,7 @@ fn claude_run_is_never_told_to_claim_by_hand() {
         "wirk claim has no --done flag (wirk/src/main.rs): {text:?}"
     );
     assert!(
-        text.contains("end your turn: the claim is filed for you"),
+        text.contains("A claim is attempted automatically at the end of every turn"),
         "a claude Run now gets the hooked prompt form, same as opencode: {text:?}"
     );
     assert!(
@@ -1862,4 +1869,430 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+// ---- P3 native launch selection D1: bind before the launch, and be
+// honest about a launch whose outcome is unknown ----------------------
+
+/// The request is bound before `agent.start`, not after it: when the
+/// start call itself fails, the resolved selection is **already** in
+/// the journal. On the code this corrects, `RunLaunched` was the only
+/// record of the selection and was written on the success arm alone, so
+/// this same failure left no record of what was asked for at all.
+#[test]
+fn a_failed_agent_start_still_leaves_the_resolved_request_recorded() {
+    let mut run = open_run("run-1");
+    run.selection = wirk_core::ActorSelection {
+        model: Some("prov/bound".to_string()),
+        effort: None,
+        args: Vec::new(),
+    };
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = FakeHerdrClient::default()
+        .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+        .with_start_agent_responses(vec![Err(HerdrError::Invalid(
+            "some_refusal: herdr refused this start".to_string(),
+        ))]);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let mut loop_ = RunLoop::new(client, wirkd.clone());
+
+    assert!(
+        loop_.launch(&work_id(), &run, &world).is_err(),
+        "the start really failed"
+    );
+
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    let requested = recorded
+        .iter()
+        .find_map(|kind| match kind {
+            EventKind::RunLaunchRequested { selection, .. } => Some(selection.clone()),
+            _ => None,
+        })
+        .expect("the resolved request is bound before the launch is attempted");
+    assert_eq!(requested.model.as_deref(), Some("prov/bound"));
+    assert!(
+        !recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunLaunched { .. })),
+        "nothing launched, so nothing claims a launch: {recorded:?}"
+    );
+    assert!(
+        recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunFailed { .. })),
+        "Herdr knows no agent under this Run's name, so the failure is the truth: {recorded:?}"
+    );
+}
+
+/// The other side of the same window: `agent.start` returned an error,
+/// but Herdr *does* have a live agent under this Run's name — a lost
+/// reply looks exactly like a refusal from wirk's side. Claiming
+/// `RunFailed` there would discard a running agent; the honest record
+/// is that the outcome of an admitted request is not known.
+#[test]
+fn a_start_error_with_a_live_agent_records_uncertainty_not_failure() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = FakeHerdrClient::default()
+        .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+        .with_start_agent_responses(vec![Err(HerdrError::Transport(
+            "connection reset before the reply".to_string(),
+        ))])
+        .with_get_pane_response(&run.id.0, Ok(pane_info("p9", AgentStatus::Working, 3)));
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let mut loop_ = RunLoop::new(client, wirkd.clone());
+
+    assert!(
+        loop_.launch(&work_id(), &run, &world).is_err(),
+        "the call itself errored"
+    );
+
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    assert!(
+        !recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunFailed { .. })),
+        "a live agent is not a failed launch: {recorded:?}"
+    );
+    let detail = recorded
+        .iter()
+        .find_map(|kind| match kind {
+            EventKind::LifecycleObserved { status, detail }
+                if status == "launch-outcome-uncertain" =>
+            {
+                detail.clone()
+            }
+            _ => None,
+        })
+        .expect("the uncertainty is recorded, not guessed either way");
+    assert!(detail.contains("neither confirmed nor failed"), "{detail}");
+}
+
+/// Recovery: a Run whose request was admitted and whose launch never
+/// came back is reinvoked. Herdr still has the agent, so wirk
+/// reconciles onto it — the same bound request, no second agent, and no
+/// invented argv for a start whose reply was never seen.
+#[test]
+fn a_reinvocation_reconciles_onto_the_agent_an_admitted_launch_really_started() {
+    let mut run = open_run("run-1");
+    run.launch_requested = true;
+    run.selection = wirk_core::ActorSelection {
+        model: Some("prov/bound".to_string()),
+        effort: None,
+        args: Vec::new(),
+    };
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = FakeHerdrClient::default()
+        .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+        .with_get_pane_response(&run.id.0, Ok(pane_info("p9", AgentStatus::Working, 3)));
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let client = Arc::new(client);
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    assert!(
+        loop_.launch(&work_id(), &run, &world).is_ok(),
+        "reconciliation attaches rather than failing"
+    );
+
+    assert_eq!(
+        client.start_agent_calls.lock().unwrap().len(),
+        0,
+        "no second agent is started for a launch that already happened"
+    );
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    assert!(
+        !recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunLaunchRequested { .. })),
+        "the request was already bound; it is reused, never rebound: {recorded:?}"
+    );
+    assert!(
+        !recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunLaunched { .. })),
+        "no RunLaunched is invented for a start whose argv wirk never received: {recorded:?}"
+    );
+    let detail = recorded
+        .iter()
+        .find_map(|kind| match kind {
+            EventKind::LifecycleObserved { status, detail } if status == "launch-reconciled" => {
+                detail.clone()
+            }
+            _ => None,
+        })
+        .expect("the reconciliation is recorded as the observation it is");
+    assert!(detail.contains("p9"), "{detail}");
+}
+
+/// And when Herdr has nothing under this Run's name, the reinvocation
+/// launches once — under the request already bound, never a freshly
+/// resolved one.
+#[test]
+fn a_reinvocation_with_no_live_agent_launches_under_the_already_bound_request() {
+    let mut run = open_run("run-1");
+    run.launch_requested = true;
+    run.selection = wirk_core::ActorSelection {
+        model: Some("prov/bound".to_string()),
+        effort: None,
+        args: Vec::new(),
+    };
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = FakeHerdrClient::default()
+        .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+        .with_start_agent_responses(vec![Ok(vec![
+            "opencode".to_string(),
+            "--model".to_string(),
+            "prov/bound".to_string(),
+        ])]);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let client = Arc::new(client);
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    assert!(loop_.launch(&work_id(), &run, &world).is_ok(), "launch");
+
+    assert_eq!(
+        client.start_agent_calls.lock().unwrap()[0].args,
+        vec!["--model".to_string(), "prov/bound".to_string()],
+        "the bound request is what launches, unchanged"
+    );
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    assert!(
+        !recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunLaunchRequested { .. })),
+        "an already-bound request is never rebound: {recorded:?}"
+    );
+    match recorded
+        .iter()
+        .find(|kind| matches!(kind, EventKind::RunLaunched { .. }))
+        .expect("the launch that did return is recorded")
+    {
+        EventKind::RunLaunched {
+            selection,
+            launch_argv,
+            ..
+        } => {
+            assert_eq!(selection.model.as_deref(), Some("prov/bound"));
+            assert_eq!(launch_argv.len(), 3);
+        }
+        other => panic!("expected RunLaunched, got {other:?}"),
+    }
+}
+
+// ---- P3 native launch attempt admission (the review's N1) -----------
+//
+// wirkd owns the admission itself (`server.rs`, its own tests). These
+// pin the client half: that the attempt is taken before Herdr is
+// touched, and that "Herdr did not answer" is never read as "no agent
+// exists".
+
+/// The attempt is admitted *before* `agent.start`, not after it: a
+/// launch that dies at the irreversible call has already recorded who
+/// owned it and where it was launching.
+#[test]
+fn the_launch_attempt_is_admitted_before_agent_start() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = FakeHerdrClient::default()
+        .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+        .with_start_agent_responses(vec![Err(HerdrError::Invalid(
+            "some_refusal: herdr refused this start".to_string(),
+        ))]);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let mut loop_ = RunLoop::new(client, wirkd.clone());
+
+    assert!(loop_.launch(&work_id(), &run, &world).is_err());
+
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    let requested = recorded
+        .iter()
+        .position(|kind| matches!(kind, EventKind::RunLaunchRequested { .. }))
+        .expect("the request is bound");
+    let attempted = recorded
+        .iter()
+        .position(|kind| matches!(kind, EventKind::RunLaunchAttempted { .. }))
+        .expect("the attempt is admitted too, not only the request");
+    assert!(
+        requested < attempted,
+        "the request is bound first, then the attempt under it: {recorded:?}"
+    );
+    match &recorded[attempted] {
+        EventKind::RunLaunchAttempted {
+            destination,
+            holder,
+            ..
+        } => {
+            assert_eq!(
+                destination, "fake-herdr",
+                "the attempt names the Herdr this client actually talks to"
+            );
+            assert_eq!(
+                holder,
+                &wirk_core::AttemptHolder::default(),
+                "the holder is wirkd's to mint from the connection, never the client's to claim"
+            );
+        }
+        other => panic!("expected RunLaunchAttempted, got {other:?}"),
+    }
+}
+
+/// The transport-error half of the review's finding. `agent.get`
+/// erroring is not Herdr saying "no such agent" — it is Herdr not
+/// saying anything. The old code read every error as absence and fell
+/// through to a second `agent.start`.
+#[test]
+fn an_unanswerable_herdr_is_not_an_absent_agent_and_never_relaunches() {
+    let mut run = open_run("run-1");
+    run.launch_requested = true;
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = Arc::new(
+        FakeHerdrClient::default()
+            .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+            .with_start_agent_responses(vec![Ok(vec!["opencode".to_string()])])
+            .with_get_pane_response(
+                &run.id.0,
+                Err(HerdrError::Transport(
+                    "connecting to /run/herdr.sock: No such file or directory".to_string(),
+                )),
+            ),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let err = loop_
+        .launch(&work_id(), &run, &world)
+        .err()
+        .expect("an unanswerable Herdr resolves nothing");
+    assert!(
+        matches!(err, RunLoopError::LaunchUnresolved(_)),
+        "{err:?} should be an unresolved launch, not a failure claim"
+    );
+    assert_eq!(
+        client.start_agent_calls.lock().unwrap().len(),
+        0,
+        "no second agent is started on the strength of an error"
+    );
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    assert!(
+        !recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunFailed { .. })),
+        "not answering is not failing: {recorded:?}"
+    );
+    let detail = recorded
+        .iter()
+        .find_map(|kind| match kind {
+            EventKind::LifecycleObserved { status, detail }
+                if status == "launch-outcome-unobservable" =>
+            {
+                detail.clone()
+            }
+            _ => None,
+        })
+        .expect("the unobservable state is recorded as itself");
+    assert!(
+        detail.contains("not proof that nothing launched"),
+        "{detail}"
+    );
+}
+
+/// A Run that already launched, reinvoked while its agent is still
+/// live, reconciles onto it. This is the review's part B — the plain
+/// duplicate invocation that used to walk into `agent.start` and be
+/// stopped only by Herdr's `agent_name_taken`.
+#[test]
+fn a_duplicate_invocation_of_a_launched_run_reconciles_rather_than_relaunching() {
+    let mut run = open_run("run-1");
+    run.launch_requested = true;
+    run.launched = true;
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = Arc::new(
+        FakeHerdrClient::default()
+            .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+            .with_start_agent_responses(vec![Ok(vec!["opencode".to_string()])])
+            .with_get_pane_response(&run.id.0, Ok(pane_info("p9", AgentStatus::Working, 3))),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    assert!(loop_.launch(&work_id(), &run, &world).is_ok(), "reconciles");
+    assert_eq!(
+        client.start_agent_calls.lock().unwrap().len(),
+        0,
+        "an already-launched Run with a live agent is never launched again"
+    );
+}
+
+/// And when that Run's agent is definitely gone — Herdr's own
+/// `agent_not_found`, not an error standing in for it — the honest
+/// answer is that this Run already ran, not a second launch under a
+/// launch record that already exists.
+#[test]
+fn a_launched_run_whose_agent_is_gone_is_not_launched_a_second_time() {
+    let mut run = open_run("run-1");
+    run.launch_requested = true;
+    run.launched = true;
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = Arc::new(
+        FakeHerdrClient::default()
+            .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+            .with_start_agent_responses(vec![Ok(vec!["opencode".to_string()])]),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let err = loop_
+        .launch(&work_id(), &run, &world)
+        .err()
+        .expect("this Run already ran");
+    assert!(matches!(err, RunLoopError::LaunchUnresolved(_)), "{err:?}");
+    assert!(err.to_string().contains("wirk work retry"), "{err}");
+    assert_eq!(client.start_agent_calls.lock().unwrap().len(), 0);
+}
+
+/// A start error compounded with a Herdr that will not answer: two
+/// unknowns are still not "nothing ran". Previously the `Err(_)` arm
+/// journaled `RunFailed` here, which would discard an agent that may
+/// well be running.
+#[test]
+fn a_start_error_and_an_unanswerable_herdr_is_uncertain_not_failed() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = FakeHerdrClient::default()
+        .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+        .with_start_agent_responses(vec![Err(HerdrError::Transport(
+            "connection reset before the reply".to_string(),
+        ))])
+        .with_get_pane_response(
+            &run.id.0,
+            Err(HerdrError::Transport("herdr is gone".to_string())),
+        );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let mut loop_ = RunLoop::new(client, wirkd.clone());
+
+    assert!(loop_.launch(&work_id(), &run, &world).is_err());
+
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    assert!(
+        !recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunFailed { .. })),
+        "an unanswerable Herdr is not evidence the launch failed: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().any(|kind| matches!(
+            kind,
+            EventKind::LifecycleObserved { status, .. } if status == "launch-outcome-uncertain"
+        )),
+        "{recorded:?}"
+    );
 }

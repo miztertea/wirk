@@ -23,7 +23,7 @@ use wirk_core::{
     ActorKind, ActorWorld, ArtifactSpec, Boundary, ExecutionTriple, Executor, OutputContract, Run,
     RunId, RunState, WaypointId, WorkId, World, WorldHash,
 };
-use wirk_herdr::claim_hook::{OPENCODE_CONFIG_ENV, WIRK_CLAIM_PLUGIN_JS};
+use wirk_herdr::claim_hook::{OPENCODE_CONFIG_ENV, wirk_claim_plugin_js};
 use wirk_herdr::fake::FakeHerdrClient;
 use wirk_herdr::{AgentStatus, HerdrExecutor, PaneInfo};
 
@@ -35,6 +35,11 @@ fn run_with_kind(kind: ActorKind) -> Run {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind,
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     }
 }
 
@@ -152,9 +157,27 @@ fn opencode_run_gets_a_wirk_owned_claim_plugin_with_no_worktree_or_home_write() 
     assert!(plugin_path.starts_with(estate.path()));
 
     let plugin_contents = std::fs::read_to_string(plugin_path).expect("plugin file exists");
+    // Rule 4 (`native-progress-contract-use/HANDOFF.md` §1.4): the
+    // written plugin invokes this very test binary's own
+    // `current_exe()` by absolute path — the same value `actor_pane`
+    // reads, since this test runs in the same process — never the bare
+    // name `wirk`, which breaks the moment the driver binary is
+    // preserved or renamed under a different name.
+    let exe = std::env::current_exe().expect("current_exe");
     assert_eq!(
-        plugin_contents, WIRK_CLAIM_PLUGIN_JS,
-        "the written plugin file is exactly the crate's shipped plugin, unmodified"
+        plugin_contents,
+        wirk_claim_plugin_js(&exe),
+        "the written plugin file matches the template with this driver's own exe path spliced in"
+    );
+    assert!(
+        plugin_contents.contains("execFile(WIRK_CLAIM_BIN"),
+        "the plugin must invoke WIRK_CLAIM_BIN, not the bare name `wirk`, which is \
+         `command not found` whenever the driver binary is preserved or renamed: \
+         {plugin_contents}"
+    );
+    assert!(
+        plugin_contents.contains(&exe.to_string_lossy().into_owned()),
+        "the plugin must name the driver's own absolute binary path: {plugin_contents}"
     );
 }
 

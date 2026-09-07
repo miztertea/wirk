@@ -31,6 +31,11 @@ fn run_with_kind(kind: ActorKind) -> Run {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind,
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     }
 }
 
@@ -154,10 +159,28 @@ fn claude_run_gets_a_settings_flag_naming_a_wirk_owned_stop_hook_under_the_estat
     let inner = stop[0]["hooks"].as_array().expect("hooks array");
     assert_eq!(inner.len(), 1, "exactly one hook command: {settings}");
     assert_eq!(inner[0]["type"], "command");
-    assert_eq!(
-        inner[0]["command"], "wirk claim",
-        "the Stop hook's command must be bare `wirk claim` (W1's flagless \
-         form self-populates from wirkd's own declared-output contract)"
+    // Rule 4 (`native-progress-contract-use/HANDOFF.md` §1.4): the
+    // command names this test binary's own `current_exe()` by absolute
+    // path (the same value `start_actor_agent` reads, since this test
+    // runs in the same process), shell-quoted, followed by bare
+    // `claim` (W1's flagless form self-populates from wirkd's own
+    // declared-output contract) — never the bare name `wirk`, which is
+    // `command not found` whenever the driver binary is preserved or
+    // renamed.
+    let exe = std::env::current_exe().expect("current_exe");
+    let command = inner[0]["command"].as_str().expect("command is a string");
+    assert!(
+        command.ends_with(" claim"),
+        "the Stop hook's command must end with bare `claim`: {command:?}"
+    );
+    assert_ne!(
+        command, "wirk claim",
+        "the Stop hook must not name the bare, PATH-resolved binary `wirk`: {command:?}"
+    );
+    assert!(
+        command.contains(&exe.to_string_lossy().into_owned()),
+        "the Stop hook's command must name the driver's own absolute binary \
+         path: {command:?}"
     );
     assert!(
         inner[0].get("permissions").is_none(),

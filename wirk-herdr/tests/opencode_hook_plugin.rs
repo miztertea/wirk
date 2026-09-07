@@ -1,6 +1,6 @@
 //! P2.7 Wave 2: the wirk-owned opencode plugin's own *runtime logic*,
 //! pinned by running its exported handler under a real Node against a
-//! fake opencode `event` and a fake `wirk` on `PATH` that records its
+//! fake opencode `event` and a fake driver binary that records its
 //! argv and env (`BUILD.md`'s stated fallback — neither `FakeHerdrClient`
 //! nor `scripted_actor.sh` runs a real opencode process or loads a JS
 //! plugin, so this is the ceiling of "deterministic" available for the
@@ -11,6 +11,12 @@
 //! *delivery* mechanism (the file lands where `OPENCODE_CONFIG` says);
 //! this file pins the delivered file's own dispatch.
 //!
+//! The fake driver is deliberately **not** named `wirk` and its
+//! directory is **not** put on `PATH` — the shape
+//! `native-progress-contract-use/HANDOFF.md` §1.4 proved live breaks
+//! bare `execFile("wirk", …)` (Rule 4). The plugin must still reach it,
+//! by the absolute path `wirk_claim_plugin_js` splices in.
+//!
 //! Skips (prints why, exit success — same posture as this suite's
 //! other environment-gated live checks) when `node` is not on `PATH`;
 //! every box this item was built and run on has it (opencode itself
@@ -20,7 +26,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::Command;
 
-use wirk_herdr::claim_hook::WIRK_CLAIM_PLUGIN_JS;
+use wirk_herdr::claim_hook::wirk_claim_plugin_js;
 
 const FAKE_WIRK_SH: &str = include_str!("support/fake_wirk.sh");
 
@@ -69,33 +75,34 @@ fn node_available() -> bool {
 }
 
 /// Runs one scenario against the real plugin file under `node`, with a
-/// fake `wirk` ahead of it on `PATH`. Returns the fake `wirk`'s record
-/// file's contents if it ran, `None` if it did not (the file was never
+/// fake driver binary named `wirk-renamed-probe` (never `wirk`) whose
+/// directory is deliberately kept off `PATH` — the plugin must reach it
+/// only through the absolute path baked into `plugin.mjs` by
+/// `wirk_claim_plugin_js`. Returns the fake driver's record file's
+/// contents if it ran, `None` if it did not (the file was never
 /// written).
 fn run_scenario(scenario: &str) -> Option<String> {
     let dir = tempfile::tempdir().expect("scenario tempdir");
 
-    std::fs::write(dir.path().join("plugin.mjs"), WIRK_CLAIM_PLUGIN_JS).expect("write plugin.mjs");
-    std::fs::write(dir.path().join("harness.mjs"), HARNESS_MJS).expect("write harness.mjs");
-
     let bin_dir = dir.path().join("bin");
     std::fs::create_dir_all(&bin_dir).expect("bin dir");
-    let fake_wirk = bin_dir.join("wirk");
+    let fake_wirk = bin_dir.join("wirk-renamed-probe");
     std::fs::write(&fake_wirk, FAKE_WIRK_SH).expect("write fake wirk");
     set_executable(&fake_wirk);
 
+    std::fs::write(
+        dir.path().join("plugin.mjs"),
+        wirk_claim_plugin_js(&fake_wirk),
+    )
+    .expect("write plugin.mjs");
+    std::fs::write(dir.path().join("harness.mjs"), HARNESS_MJS).expect("write harness.mjs");
+
     let record = dir.path().join("record.txt");
-    let path = format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
 
     let status = Command::new("node")
         .arg("harness.mjs")
         .arg(scenario)
         .current_dir(dir.path())
-        .env("PATH", path)
         .env("WIRK_FAKE_RECORD", &record)
         .env("WIRK_ESTATE_ROOT", "/estate/sentinel")
         .env("WIRK_WORK_ID", "work-sentinel")
@@ -123,10 +130,11 @@ fn set_executable(path: &Path) {
 #[cfg(not(unix))]
 fn set_executable(_path: &Path) {}
 
-/// Red on `main` (`BUILD.md`'s pasted output): `wirk-herdr/src/
-/// wirk-claim-plugin.js` does not exist and `opencode_hook::
-/// WIRK_CLAIM_PLUGIN_JS` does not compile — this whole test file fails
-/// to build.
+/// Red before Rule 4 (`native-progress-contract-use/HANDOFF.md` §1.4):
+/// with the fake driver renamed and off `PATH`, the old
+/// `execFile("wirk", …)` body left the plugin unable to run it at all —
+/// `record` was always `None`. Green: the absolute-path invocation
+/// runs it regardless of its name or `PATH`.
 #[test]
 fn root_session_idle_runs_wirk_claim_with_the_panes_env() {
     if !node_available() {

@@ -249,6 +249,24 @@ fn blocked(socket: &Path, estate: &Path, work_id: &str, run_id: &str, detail: &s
     )
     .expect("materialization record call succeeds");
     assert!(matches!(materialized, Reply::Ok { .. }), "{materialized:?}");
+    // P3 native launch selection D1: the resolved request is admitted
+    // before the launch, and wirkd refuses a `RunLaunched` that no
+    // `RunLaunchRequested` preceded — this fixture drives the same two
+    // writes `RunLoop::launch` makes, in the same order.
+    let requested = wirkd::client::call(
+        socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.to_string()),
+            run: Some(RunId(run_id.to_string())),
+            kind: EventKind::RunLaunchRequested {
+                run: RunId(run_id.to_string()),
+                actor_kind: Default::default(),
+                selection: Default::default(),
+            },
+        }),
+    )
+    .expect("launch request record call succeeds");
+    assert!(matches!(requested, Reply::Ok { .. }), "{requested:?}");
     let launched = wirkd::client::call(
         socket,
         &Request::record(RecordPayload {
@@ -257,6 +275,8 @@ fn blocked(socket: &Path, estate: &Path, work_id: &str, run_id: &str, detail: &s
             kind: EventKind::RunLaunched {
                 run: RunId(run_id.to_string()),
                 actor_kind: Default::default(),
+                selection: Default::default(),
+                launch_argv: Vec::new(),
             },
         }),
     )

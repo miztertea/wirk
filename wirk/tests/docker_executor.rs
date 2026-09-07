@@ -46,6 +46,11 @@ fn open_run(run_id: &str) -> Run {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind: Default::default(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     }
 }
 
@@ -325,6 +330,11 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind: Default::default(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     };
     let artifacts = OutputContract(vec![wirk_core::ArtifactSpec {
         name: "report.md".to_string(),

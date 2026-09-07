@@ -33,6 +33,11 @@ fn run_id() -> Run {
         world_hash: WorldHash("deadbeef".to_string()),
         state: RunState::Open,
         kind: ActorKind::opencode(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
     }
 }
 
@@ -116,7 +121,7 @@ fn launch_waits_on_one_pane_busy_refusal_then_succeeds() {
         FakeHerdrClient::default()
             .with_split_pane_response(pane_info(&run.id.0))
             .with_subscribe_channel(rx)
-            .with_start_agent_responses(vec![Err(agent_pane_busy()), Ok(())]),
+            .with_start_agent_responses(vec![Err(agent_pane_busy()), Ok(vec![])]),
     );
     let executor = HerdrExecutor::new(client.clone());
 
@@ -160,7 +165,7 @@ fn launch_waits_on_two_pane_busy_refusals_then_succeeds() {
             .with_start_agent_responses(vec![
                 Err(agent_pane_busy()),
                 Err(agent_pane_busy()),
-                Ok(()),
+                Ok(vec![]),
             ]),
     );
     let executor = HerdrExecutor::new(client.clone());

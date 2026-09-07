@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod claim_hook;
@@ -504,7 +504,16 @@ pub trait HerdrClient: Send + Sync {
     fn open_worktree(&self, req: OpenWorktree) -> Result<WorktreeInfo, HerdrError>;
     fn remove_worktree(&self, req: RemoveWorktree) -> Result<(), HerdrError>;
     fn send_input(&self, pane_id: &str, text: &str) -> Result<(), HerdrError>;
-    fn start_agent(&self, req: StartAgent) -> Result<(), HerdrError>;
+    /// P3 native launch selection (PREPARATION-ADJUDICATION.md point 3):
+    /// returns Herdr's own `agent_started.argv` — what Herdr says it
+    /// submitted to the shell (`refs/herdr` `0f8ad12`
+    /// `src/app/agents.rs::start_agent`: `argv = [executable] + args`),
+    /// launch **submission** evidence, never proof a provider actually
+    /// served the requested model. Previously discarded
+    /// (`Result<(), HerdrError>`) — the preparation report's own named
+    /// finding ("Herdr already accepts opaque argv and returns launch
+    /// argv, which Wirk discards").
+    fn start_agent(&self, req: StartAgent) -> Result<Vec<String>, HerdrError>;
     fn prompt_agent(&self, req: PromptAgent) -> Result<(), HerdrError>;
     /// `timeout_ms` (here and on `StartAgent`) is a transport bound
     /// only: never treated as completion (0017 D56) and never treated
@@ -549,6 +558,16 @@ pub trait HerdrClient: Send + Sync {
         &self,
         subs: Vec<EventSubscription>,
     ) -> Result<Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>, HerdrError>;
+    /// P3 native launch attempt admission: *which Herdr* this client
+    /// talks to, as one stable string wirkd can bind a Run's launch to
+    /// (`EventKind::RunLaunchAttempted.destination`). Not a wire verb —
+    /// it asks the client about itself, which is why it has no row in
+    /// the protocol map. A Run's launch is bound to the first
+    /// destination that attempted it, so a recovery invocation pointed
+    /// at a *different* Herdr is refused rather than allowed to turn an
+    /// uncertain launch into a second real one somewhere the first
+    /// agent is neither visible nor name-colliding.
+    fn destination(&self) -> String;
 }
 
 /// So a test can hold an `Arc<FakeHerdrClient>` (mutating its recorded
@@ -571,7 +590,7 @@ impl<T: HerdrClient + ?Sized> HerdrClient for std::sync::Arc<T> {
     fn send_input(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
         (**self).send_input(pane_id, text)
     }
-    fn start_agent(&self, req: StartAgent) -> Result<(), HerdrError> {
+    fn start_agent(&self, req: StartAgent) -> Result<Vec<String>, HerdrError> {
         (**self).start_agent(req)
     }
     fn prompt_agent(&self, req: PromptAgent) -> Result<(), HerdrError> {
@@ -587,6 +606,9 @@ impl<T: HerdrClient + ?Sized> HerdrClient for std::sync::Arc<T> {
     }
     fn get_pane(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
         (**self).get_pane(pane_id)
+    }
+    fn destination(&self) -> String {
+        (**self).destination()
     }
     fn get_agent(&self, target: &str) -> Result<PaneInfo, HerdrError> {
         (**self).get_agent(target)
@@ -700,6 +722,11 @@ pub struct HerdrExecutor<C: HerdrClient> {
 pub struct LaunchedRun {
     pub pane: PaneInfo,
     pub events: Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>,
+    /// P3 native launch selection: Herdr's own `agent_started.argv` for
+    /// this launch (`HerdrClient::start_agent`'s own doc) — carried out
+    /// here so `RunLoop::launch` can journal it distinctly from
+    /// `run.selection` (what was requested).
+    pub argv: Vec<String>,
 }
 
 impl std::fmt::Debug for LaunchedRun {
@@ -750,6 +777,12 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         run: &wirk_core::Run,
         world: &wirk_core::World,
     ) -> Result<LaunchedRun, HerdrExecutorError> {
+        // D1, "validate before unnecessary execution-side effects": a
+        // request no mapping can honor, or one that contradicts itself
+        // (`validate_selection`), is refused before a pane is created
+        // — not after, as it was when the only check lived inside
+        // `start_actor_agent`.
+        validate_selection(run.kind.0.as_str(), &run.selection)?;
         let pane = self.actor_pane(run, world)?;
 
         // Subscribe to this pane's status changes and revision bumps
@@ -772,9 +805,9 @@ impl<C: HerdrClient> HerdrExecutor<C> {
             },
         ])?;
 
-        self.start_actor_agent_when_ready(run, &pane.pane_id, world, &mut events)?;
+        let argv = self.start_actor_agent_when_ready(run, &pane.pane_id, world, &mut events)?;
 
-        Ok(LaunchedRun { pane, events })
+        Ok(LaunchedRun { pane, events, argv })
     }
 
     /// Retries `start_actor_agent` on Herdr's pane-busy refusal (P2.5
@@ -797,10 +830,10 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         pane_id: &str,
         world: &wirk_core::World,
         events: &mut Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>,
-    ) -> Result<(), HerdrExecutorError> {
+    ) -> Result<Vec<String>, HerdrExecutorError> {
         loop {
             match self.start_actor_agent(run, pane_id, world) {
-                Ok(()) => return Ok(()),
+                Ok(argv) => return Ok(argv),
                 Err(err) if is_agent_pane_busy(&err) => {
                     println!(
                         "wirk: pane {pane_id} is busy, waiting for its next event before \
@@ -846,18 +879,24 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         env.insert("WIRK_WORK_ID".to_string(), actor.triple.work_id.0.clone());
         env.insert("WIRK_RUN_ID".to_string(), actor.triple.run_id.0.clone());
 
-        // 0050 D151: an actor's `wirk claim` is `command not found`
-        // unless the running `wirk` binary's own directory is on the
+        // `current_exe` (R3, stdlib), read once here and reused below
+        // for the Claim hook's own invocation (native-progress-
+        // contract-use/HANDOFF.md §1.4, Rule 4): the one value both
+        // uses thread from, rather than two separate lookups.
+        let exe = std::env::current_exe().ok();
+
+        // 0050 D151: an actor's by-hand `wirk claim` is `command not
+        // found` unless the running binary's own directory is on the
         // pane's PATH — the session it inherits from was not
         // necessarily started with the build directory prepended.
-        // `current_exe` (R3, stdlib) follows the launching binary
-        // wherever it runs from, ahead of the pane's inherited PATH;
-        // scoped to this actor pane's own env map, not the session's
-        // (`orient/launch.md` §3, J1).
+        // `current_exe` follows the launching binary wherever it runs
+        // from, ahead of the pane's inherited PATH; scoped to this
+        // actor pane's own env map, not the session's (`orient/
+        // launch.md` §3, J1). This does not make the *hook's own*
+        // invocation resolvable when the binary is renamed — see the
+        // absolute-path hook delivery below.
         let mut path_entries = Vec::new();
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
+        if let Some(dir) = exe.as_deref().and_then(Path::parent) {
             path_entries.push(dir.to_path_buf());
         }
         path_entries.extend(std::env::split_paths(
@@ -896,10 +935,16 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // env var, claude's is an argv element built in
         // `start_actor_agent` below — the two kinds share the "is a
         // hook installed" predicate for the standing prompt, never the
-        // delivery mechanism itself.
+        // delivery mechanism itself. The plugin invokes `exe` (this
+        // driver's own absolute binary) directly, not the bare name
+        // `wirk` — HANDOFF.md §1.4, Rule 4 — so a write is skipped
+        // (same degrade posture) when `current_exe` could not be read,
+        // exactly as a `PATH`-prepend write above would have nothing
+        // to add.
         if run.kind == wirk_core::ActorKind::opencode()
+            && let Some(exe) = exe.as_deref()
             && let Ok(config_path) =
-                claim_hook::write_wirk_claim_hook(&actor.triple.estate_root, &run.id.0)
+                claim_hook::write_wirk_claim_hook(&actor.triple.estate_root, &run.id.0, exe)
         {
             env.insert(
                 claim_hook::OPENCODE_CONFIG_ENV.to_string(),
@@ -970,35 +1015,38 @@ impl<C: HerdrClient> HerdrExecutor<C> {
     /// `agent.start` on the actor's pane, named by `run.id` — the name
     /// every later `agent.*` call targets (`agent.prompt`,
     /// `agent.send_keys`: confirmed live, `tried/RESULT.md` run 3,
-    /// 04-blocked).
+    /// 04-blocked). Returns Herdr's own `agent_started.argv`
+    /// (`HerdrClient::start_agent`'s own doc).
     fn start_actor_agent(
         &self,
         run: &wirk_core::Run,
         pane_id: &str,
         world: &wirk_core::World,
-    ) -> Result<(), HerdrExecutorError> {
-        // W1 (0041 D129): `run.kind`, not a hardcoded `"claude"` — the
-        // opencode row starts with its own configured default model
-        // (`hecate/qwen3.8-27b-udiq3s-mtp`, orient/actor.md §5, passed
-        // explicitly the first live run rather than relying on
-        // opencode's own bare-args default).
+    ) -> Result<Vec<String>, HerdrExecutorError> {
+        // P3 native launch selection (BUILD-BRIEF.md, superseding W1's
+        // 0041 D129 hardcoded per-kind defaults): `run.selection`, not a
+        // machine-specific model literal baked into the product
+        // (PREPARATION-ADJUDICATION.md point 4 — "the product must not
+        // require edits when our local Qwen endpoint/model changes").
+        // `build_selection_args` maps a *requested* model/effort onto
+        // the harness's own real, installed, interactive CLI flags
+        // (verified by hand against `claude --help`/`opencode --help`/
+        // `codex --help`, not the headless/`exec` examples the
+        // preparation report's own illustrative code copied instead —
+        // adjudication point 2) and refuses, before `agent.start` is
+        // ever called, a request no mapping can honor without guessing
+        // syntax (`SelectionError`) rather than silently dropping or
+        // downgrading it. Omitted model/effort adds no flag at all: the
+        // harness's own native default runs, honestly unrepresented as
+        // any particular model identity.
         //
-        // 0056 D164: per-kind launch defaults stay exactly as main has
-        // them for claude and opencode and are not extended to any other
-        // kind — a kind with no row here launches bare (no args), passed
-        // through to `agent.start` verbatim; Herdr's own answer to that
-        // call is the validation, not a match arm added here.
-        let (kind_str, mut args) = match run.kind.0.as_str() {
-            "claude" => ("claude", vec!["--model".to_string(), "sonnet".to_string()]),
-            "opencode" => (
-                "opencode",
-                vec![
-                    "--model".to_string(),
-                    "hecate/qwen3.8-27b-udiq3s-mtp".to_string(),
-                ],
-            ),
-            other => (other, Vec::new()),
-        };
+        // 0056 D164 stands unchanged for the *kind* itself: a kind with
+        // no row here launches bare when no model/effort was requested,
+        // passed through to `agent.start` verbatim; Herdr's own answer
+        // to that call is the kind's own validation, not a match arm
+        // added here.
+        let kind_str = run.kind.0.as_str();
+        let mut args = build_selection_args(kind_str, &run.selection)?;
 
         // P2.7 Wave 3 (`build-brief.md` §6 item 1, `reorient.md` §C): a
         // claude Run gets wirk's own Claim-filing hook via one
@@ -1008,25 +1056,31 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // coexists with whatever `~/.claude/settings.json` or the
         // worktree's own `.claude/settings.json` already declare. Same
         // "degrade, don't block" posture as opencode's env-var delivery
-        // above: a write failure leaves the launch unaffected, just
-        // without the hook.
+        // above: a write failure (including `current_exe` itself being
+        // unreadable) leaves the launch unaffected, just without the
+        // hook. The hook's own command invokes this same `current_exe`
+        // by absolute path, not the bare name `wirk` — HANDOFF.md §1.4,
+        // Rule 4 — resolved fresh here rather than threaded from
+        // `actor_pane`, a separate call with no shared state (0001 D9's
+        // own boundary between the two methods).
         if run.kind == wirk_core::ActorKind::claude()
             && let wirk_core::World::Actor(actor) = world
+            && let Ok(exe) = std::env::current_exe()
             && let Ok(settings_path) =
-                claim_hook::write_claude_claim_hook(&actor.triple.estate_root, &run.id.0)
+                claim_hook::write_claude_claim_hook(&actor.triple.estate_root, &run.id.0, &exe)
         {
             args.push("--settings".to_string());
             args.push(settings_path.to_string_lossy().into_owned());
         }
 
-        self.client.start_agent(StartAgent {
+        let argv = self.client.start_agent(StartAgent {
             pane_id: pane_id.to_string(),
             kind: kind_str.to_string(),
             name: run.id.0.clone(),
             args,
             timeout_ms: None,
         })?;
-        Ok(())
+        Ok(argv)
     }
 
     /// `Executor::poll`'s body against an explicit pane id. `pane.get`
@@ -1067,6 +1121,275 @@ pub enum HerdrExecutorError {
         "HerdrExecutor cannot launch a Deterministic world: not this executor's kind (0022 D78)"
     )]
     NotDeterministicKind,
+    /// P3 native launch selection: a requested model/effort this
+    /// harness has no real, verified argv mapping for
+    /// (`build_selection_args`'s own doc) — surfaced before
+    /// `agent.start` is ever called, so no pane launches with a
+    /// guessed or silently-dropped setting.
+    #[error(transparent)]
+    Selection(#[from] SelectionError),
+}
+
+/// Every way `build_selection_args` refuses a requested model/effort
+/// (PREPARATION-ADJUDICATION.md point 2: "An explicitly requested
+/// option must not silently degrade into a different execution ...
+/// fail visibly before actor launch"). Never fired for an *absent*
+/// model/effort — omitting one always launches bare of it, the
+/// harness's own native default engaging unrepresented as any
+/// particular value (adjudication point 4).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SelectionError {
+    /// The harness has an installed, interactive `--model`/`-m`-shaped
+    /// control (claude/opencode/codex all do) but no verified native
+    /// way to set reasoning effort for it — requesting one anyway is
+    /// refused rather than silently dropped or guessed at.
+    #[error(
+        "{kind} has no verified native effort control wirk can map to (requested {effort:?}); \
+         pass a raw flag via the Route's own `selection.args` if {kind} actually supports one"
+    )]
+    UnsupportedEffort { kind: String, effort: String },
+    /// A kind outside wirk's three verified harnesses (claude, opencode,
+    /// codex — 0056 D164 still accepts any kind string Herdr does, this
+    /// is not a kind allowlist): wirk has never inspected its
+    /// interactive CLI, so guessing a flag for a requested model/effort
+    /// would be exactly the silent-invention this contract forbids.
+    /// `selection.args` remains the escape hatch — an author who knows
+    /// the kind's real flag can pass it there directly.
+    #[error(
+        "{kind} is not one of wirk's verified harnesses (claude, opencode, codex); an explicit \
+         model/effort request for it cannot be mapped without guessing its syntax — pass it via \
+         the Route's own `selection.args` instead"
+    )]
+    UnmappedKind { kind: String },
+    /// P3 native launch selection, D2: the same setting was requested
+    /// twice, once structurally (`selection.model`/`selection.effort`)
+    /// and once raw (`selection.args`), for the same harness. Both
+    /// tokens would be submitted; which one the harness's own parser
+    /// honors is its business, and wirk's recorded request would then
+    /// describe only one of them.
+    ///
+    /// The rule is deliberately the narrowest one that cannot lie:
+    /// **no implicit precedence — an overlap is refused, before
+    /// launch.** Raw args remain the escape hatch for everything the
+    /// convenience fields do not cover; they simply may not restate a
+    /// field that was also given structurally. Removing either side
+    /// resolves it, and the author says which one they meant.
+    #[error(
+        "{kind}: `selection.{field}` and the raw argument {raw:?} both set {kind}'s own \
+         {flag} — wirk will not submit both and then record only one as the request; \
+         drop `selection.{field}` or drop the raw argument"
+    )]
+    RawArgConflict {
+        kind: String,
+        field: String,
+        flag: String,
+        raw: String,
+    },
+}
+
+/// The real, installed, interactive CLI controls for the three
+/// harnesses wirk has actually inspected — verified by hand this wave
+/// (`claude --help`, `opencode --help`, `codex --help` against the
+/// binaries on this box), not copied from a headless/`exec` example
+/// (PREPARATION-ADJUDICATION.md point 2, naming exactly that failure
+/// mode in the preparation report's own illustrative code):
+///
+/// * **claude**: `--model <model>` and `--effort <level>` are both
+///   real, direct interactive flags.
+/// * **opencode**: `-m`/`--model <provider/model>` is a real
+///   interactive flag; there is no effort/reasoning-effort control of
+///   any kind on the interactive command (`opencode --help`'s full
+///   option list carries none) — an explicit effort request for
+///   opencode is `SelectionError::UnsupportedEffort`, not a silently
+///   dropped flag.
+/// * **codex**: `-m`/`--model <MODEL>` is a real interactive flag;
+///   effort has no dedicated flag but a real, documented config
+///   control, `model_reasoning_effort` (`~/.codex/config.toml`'s own
+///   key, confirmed installed on this box), set the same way any other
+///   Codex config override is — `-c model_reasoning_effort=<level>` —
+///   never a codex-specific flag wirk would otherwise have to invent.
+///
+/// Any kind outside this verified set launches bare when no
+/// model/effort is requested (0056 D164, unchanged); an explicit
+/// request for one is `SelectionError::UnmappedKind`. `selection.args`
+/// (raw pass-through, exact token boundaries preserved) is appended
+/// after whatever this function maps, for every kind — the escape
+/// hatch for anything neither convenience field covers.
+/// The native spellings by which a raw `selection.args` token would set
+/// the same thing a structured field sets, per verified harness — the
+/// real syntax variants of the installed CLIs, checked by hand this
+/// wave against `claude --help` (2.1.263), `opencode --help` (1.18.29)
+/// and `codex --help` (0.153.4):
+///
+/// * claude: `--model <v>` / `--model=<v>`, `--effort <v>` /
+///   `--effort=<v>`. There is no short alias for either.
+///   `--fallback-model` is a different setting and is not a conflict.
+/// * opencode: `-m <v>` / `--model <v>` / `--model=<v>` / `-m=<v>`.
+///   opencode has no effort control at all, so no effort row exists.
+/// * codex: `-m <v>` / `--model <v>` / `--model=<v>` / `-m=<v>`, plus
+///   the config-override forms wirk itself uses for effort —
+///   `-c`/`--config` followed by `model_reasoning_effort=<v>` for
+///   effort, and by `model=<v>` for model, in both the separate-token
+///   and `=`-joined spellings.
+///
+/// Returns the offending raw token when `args` restates `field`.
+/// Nothing here parses the harness's whole command line: it recognizes
+/// only the handful of spellings of the flags wirk itself emits, which
+/// is exactly the overlap it has to be honest about.
+fn conflicting_raw_arg(kind: &str, field: SelectionField, args: &[String]) -> Option<String> {
+    let (flags, config_keys): (&[&str], &[&str]) = match (kind, field) {
+        ("claude", SelectionField::Model) => (&["--model"], &[]),
+        ("claude", SelectionField::Effort) => (&["--effort"], &[]),
+        ("opencode", SelectionField::Model) => (&["-m", "--model"], &[]),
+        ("codex", SelectionField::Model) => (&["-m", "--model"], &["model"]),
+        ("codex", SelectionField::Effort) => (&[], &["model_reasoning_effort"]),
+        _ => (&[], &[]),
+    };
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        for flag in flags {
+            if arg.starts_with(&format!("{flag}=")) {
+                return Some(arg.clone());
+            }
+            if arg == flag {
+                // Report the value with the flag, so the error names
+                // the whole offending pair the author actually wrote.
+                return Some(match iter.peek() {
+                    Some(value) => format!("{arg} {value}"),
+                    None => arg.clone(),
+                });
+            }
+        }
+        if config_keys.is_empty() {
+            continue;
+        }
+        // `-c key=value` / `--config key=value`, and their `=`-joined
+        // spellings `-c=key=value` / `--config=key=value`.
+        let joined = ["-c=", "--config="]
+            .iter()
+            .find_map(|prefix| arg.strip_prefix(prefix));
+        let separate = if arg == "-c" || arg == "--config" {
+            iter.peek().map(|next| next.as_str())
+        } else {
+            None
+        };
+        for key in config_keys {
+            let prefix = format!("{key}=");
+            if joined.is_some_and(|rest| rest.starts_with(&prefix))
+                || separate.is_some_and(|next| next.starts_with(&prefix))
+            {
+                return Some(match separate {
+                    Some(next) => format!("{arg} {next}"),
+                    None => arg.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Which structured field a conflict is about (`conflicting_raw_arg`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionField {
+    Model,
+    Effort,
+}
+
+impl SelectionField {
+    fn name(self) -> &'static str {
+        match self {
+            SelectionField::Model => "model",
+            SelectionField::Effort => "effort",
+        }
+    }
+}
+
+/// P3 native launch selection D1/D2: everything about a resolved
+/// request that can be judged without touching Herdr — the harness
+/// mapping (`build_selection_args`) and the raw/structured overlap
+/// (`conflicting_raw_arg`). Called by `RunLoop::launch` *before* it
+/// binds the request or creates a pane, so an unmappable or
+/// self-contradicting request costs no execution-side effect at all:
+/// no pane, no journal entry, no agent.
+pub fn validate_selection(
+    kind: &str,
+    selection: &wirk_core::ActorSelection,
+) -> Result<(), SelectionError> {
+    build_selection_args(kind, selection).map(|_| ())
+}
+
+fn build_selection_args(
+    kind: &str,
+    selection: &wirk_core::ActorSelection,
+) -> Result<Vec<String>, SelectionError> {
+    // D2: refuse before mapping anything. A structured field and a raw
+    // restatement of the same harness flag are a conflict, never a
+    // silent precedence — the recorded request would otherwise name one
+    // token while two were submitted.
+    for (field, requested) in [
+        (SelectionField::Model, selection.model.is_some()),
+        (SelectionField::Effort, selection.effort.is_some()),
+    ] {
+        if !requested {
+            continue;
+        }
+        if let Some(raw) = conflicting_raw_arg(kind, field, &selection.args) {
+            return Err(SelectionError::RawArgConflict {
+                kind: kind.to_string(),
+                field: field.name().to_string(),
+                flag: match field {
+                    SelectionField::Model => "model",
+                    SelectionField::Effort => "reasoning effort",
+                }
+                .to_string(),
+                raw,
+            });
+        }
+    }
+    let mut args = Vec::new();
+    match kind {
+        "claude" => {
+            if let Some(model) = &selection.model {
+                args.push("--model".to_string());
+                args.push(model.clone());
+            }
+            if let Some(effort) = &selection.effort {
+                args.push("--effort".to_string());
+                args.push(effort.clone());
+            }
+        }
+        "opencode" => {
+            if let Some(model) = &selection.model {
+                args.push("--model".to_string());
+                args.push(model.clone());
+            }
+            if let Some(effort) = &selection.effort {
+                return Err(SelectionError::UnsupportedEffort {
+                    kind: kind.to_string(),
+                    effort: effort.clone(),
+                });
+            }
+        }
+        "codex" => {
+            if let Some(model) = &selection.model {
+                args.push("--model".to_string());
+                args.push(model.clone());
+            }
+            if let Some(effort) = &selection.effort {
+                args.push("-c".to_string());
+                args.push(format!("model_reasoning_effort={effort}"));
+            }
+        }
+        other => {
+            if selection.model.is_some() || selection.effort.is_some() {
+                return Err(SelectionError::UnmappedKind {
+                    kind: other.to_string(),
+                });
+            }
+        }
+    }
+    args.extend(selection.args.iter().cloned());
+    Ok(args)
 }
 
 impl<C: HerdrClient> wirk_core::Executor for HerdrExecutor<C> {
@@ -1081,8 +1404,10 @@ impl<C: HerdrClient> wirk_core::Executor for HerdrExecutor<C> {
     /// `HerdrExecutor::launch_actor`, which opens one subscription
     /// before `agent.start` per D51 and returns it.
     fn launch(&self, run: &wirk_core::Run, world: &wirk_core::World) -> Result<(), Self::Error> {
+        validate_selection(run.kind.0.as_str(), &run.selection)?;
         let pane = self.actor_pane(run, world)?;
-        self.start_actor_agent(run, &pane.pane_id, world)
+        self.start_actor_agent(run, &pane.pane_id, world)?;
+        Ok(())
     }
 
     fn poll(&self, run: &wirk_core::Run) -> Result<wirk_core::RunObservation, Self::Error> {

@@ -47,6 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -58,13 +59,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use wirk_core::{
-    Access, ActorWorld, ArtifactReceipt, ArtifactRef, ArtifactSpec, Boundary, Claim, ClaimId,
-    ClaimKind, ClaimRefusal, ClaimVerdict, DeterministicWorld, Event, EventKind, ExecutionTriple,
-    FailureCause, Journal, JournalError, OutcomeReceipt, OutputContract, ParentBinding,
-    RepositoryBinding, Route, RouteId, Run, RunId, RunState, SourceBasis, Timestamp,
-    WaypointDefinition, WaypointId, WaypointKind, WorkId, WorkState, World, WorldHash,
-    ancestor_chain, find_definition, first_dfs_leaf, flatten_leaves, fold, load_route,
-    validate_claim,
+    Access, ActorWorld, ArtifactReceipt, ArtifactRef, ArtifactSpec, AttemptHolder,
+    AuthoredSelection, Boundary, Claim, ClaimId, ClaimKind, ClaimRefusal, ClaimVerdict,
+    DeterministicWorld, Event, EventKind, ExecutionTriple, FailureCause, Journal, JournalError,
+    LaunchAttempt, OutcomeReceipt, OutputContract, ParentBinding, RepositoryBinding, Route,
+    RouteId, Run, RunId, RunState, SourceBasis, Timestamp, WaypointDefinition, WaypointId,
+    WaypointKind, WorkId, WorkState, World, WorldHash, ancestor_chain, find_definition,
+    first_dfs_leaf, flatten_leaves, fold, load_route, validate_claim,
 };
 
 use super::boundary;
@@ -371,6 +372,243 @@ fn remove_pointer_and_socket(estate_root: &Path, socket_path: &Path) {
 /// rather than dropping the connection silently. `stop` writes its
 /// reply, flushes, then removes the pointer/socket and exits the whole
 /// process (transport.md §2).
+/// P3 native launch attempt admission: the connected client's own
+/// process, as the kernel reports it for this socket's peer
+/// (`SO_PEERCRED`). No client-declared pid is involved anywhere: a
+/// client never sends its identity, so it cannot misstate it. This is
+/// exclusion between cooperating invocations, not authentication —
+/// anything that can write this estate's journal directly bypasses
+/// wirkd entirely, and always could.
+///
+/// R3 fails here: `std::os::unix::net::UnixStream::peer_cred` is still
+/// unstable (`peer_credentials_unix_socket`, rust-lang#42839) on this
+/// workspace's pinned toolchain. R5 takes it instead — `libc`, already
+/// this crate's direct dependency for `ChildExecutor`'s own `prctl`,
+/// used the ordinary way rather than adopting a new crate for one
+/// `getsockopt`.
+///
+/// `start_token` pins *which* process that pid is (`process_start_token`),
+/// read here at admission time rather than trusted later, so a
+/// recycled pid never reads as the original holder still running.
+/// `None` when the kernel gives no pid for this peer: the caller then
+/// refuses to admit an attempt rather than admitting one it cannot
+/// name.
+fn peer_holder(stream: &UnixStream) -> Option<AttemptHolder> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: a plain `getsockopt(2)` on a socket this thread owns and
+    // keeps alive across the call. `optval` points at a live, correctly
+    // sized `ucred`, `optlen` at a `socklen_t` holding that size, and
+    // the kernel writes at most that many bytes; the result is read
+    // only after checking both the return code and the length the
+    // kernel wrote back.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut cred).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || len as usize != std::mem::size_of::<libc::ucred>() {
+        return None;
+    }
+    let pid = u32::try_from(cred.pid).ok().filter(|pid| *pid != 0)?;
+    Some(AttemptHolder {
+        pid,
+        start_token: process_start_token(pid),
+    })
+}
+
+/// The two fields of `/proc/<pid>/stat` an admitted holder is judged
+/// by, read in one go from one read of one file so they always
+/// describe the same instant:
+///
+/// * `state` (field 3) — the kernel's own answer to "is this process
+///   still a running process at all". `Z` is the one that matters
+///   here: dead, but not yet reaped by its parent, so still in `/proc`.
+/// * `starttime` (field 22, clock ticks since boot) — the kernel's own
+///   tiebreaker for pid reuse, read as an opaque token and never
+///   interpreted as a time.
+///
+/// Parsed from after the **last** `)` because field 2 (`comm`) may
+/// itself contain spaces and parentheses; the first field after it is
+/// `state`, and `starttime` is the 19th after that. `None` on any
+/// platform or condition where it cannot be read, which `holder_state`
+/// treats as unverifiable rather than as either alive or gone.
+fn process_stat(pid: u32) -> Option<(char, String)> {
+    process_stat_at(&PathBuf::from(format!("/proc/{pid}/stat")))
+}
+
+/// `process_stat`'s parse, taking the stat file's path rather than a
+/// pid — the seam a test drives with a real, injectable read failure
+/// (L2: the outer `None` arm below `holder_state` treats as
+/// unverifiable) instead of a live `/proc/<pid>` race. R3/R4: the same
+/// `std::fs::read_to_string` call, only its path is now a parameter.
+fn process_stat_at(path: &Path) -> Option<(char, String)> {
+    let stat = std::fs::read_to_string(path).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start_token = fields.nth(18)?.to_string();
+    Some((state, start_token))
+}
+
+fn process_start_token(pid: u32) -> Option<String> {
+    process_stat(pid).map(|(_, start_token)| start_token)
+}
+
+/// What the kernel says about a previously admitted attempt's holder.
+/// Nothing here is a lease, a timeout or a heartbeat: the holder's own
+/// process *is* the marker, so a holder that dies releases its attempt
+/// by dying, and nothing a crashed holder leaves behind can trap a
+/// Run — including its own corpse, which is what `state` is read for
+/// (the review's Z1).
+enum HolderState {
+    /// That pid is a live process and is the same process wirkd
+    /// admitted. *Live*, not *runnable*: a stopped holder (`T`) is
+    /// alive, can be continued, and keeps what it holds.
+    Live,
+    /// No such process; or that pid is now a different process; or the
+    /// process is there but dead — a zombie (`Z`) its parent has not
+    /// reaped, which is exactly what a crashed `wirk run` leaves
+    /// behind under a supervisor that does not `wait()`. A dead
+    /// process cannot drive an agent, answer Herdr or write a journal,
+    /// so it holds nothing.
+    Gone,
+    /// The kernel would not say (no `/proc`, or the holder was
+    /// admitted without a start token and its pid is in use now).
+    /// Refused like `Live` — wirkd will not replace an owner it cannot
+    /// establish is gone — and reported as exactly that, so the
+    /// operator sees a pid to check rather than an unexplained
+    /// refusal. `wirk work retry`, which opens a *new* Run, remains
+    /// available and takes no attempt from this one.
+    Unverifiable,
+}
+
+fn holder_state(holder: &AttemptHolder) -> HolderState {
+    if holder.pid == 0 {
+        return HolderState::Gone;
+    }
+    holder_state_at(&PathBuf::from(format!("/proc/{}", holder.pid)), holder)
+}
+
+/// `holder_state`'s two syscalls, taking the `/proc/<pid>` directory as
+/// a parameter — the seam L2's test drives with a real directory that
+/// is not `/proc/<pid>` at all, so "the directory exists but its
+/// `stat` entry cannot be read" is a real, constructed filesystem
+/// failure rather than a live race against a pid's exit-and-reap
+/// window. `holder_state` is the only caller in the running server; a
+/// test calling this directly reaches the exact same two syscalls
+/// (`metadata`, then `process_stat_at`) it would reach through a pid.
+fn holder_state_at(proc_dir: &Path, holder: &AttemptHolder) -> HolderState {
+    match std::fs::metadata(proc_dir) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => HolderState::Gone,
+        Err(_) => HolderState::Unverifiable,
+        // The pid is in `/proc`. That alone does not make it a running
+        // process, so ask the kernel what it *is* before asking
+        // whether it is the one that was admitted.
+        Ok(_) => match process_stat_at(&proc_dir.join("stat")) {
+            // Dead: a zombie waiting on its parent, or (`X`/`x`) on
+            // its way out of the table. A pid names one process at a
+            // time, so whether this corpse is the admitted holder or a
+            // later occupant of its pid, the holder is not running —
+            // the start token cannot change that answer, and there is
+            // no uncertainty left for it to resolve.
+            Some(('Z' | 'X' | 'x', _)) => HolderState::Gone,
+            Some((_, current)) => match &holder.start_token {
+                Some(admitted) if admitted == &current => HolderState::Live,
+                Some(_) => HolderState::Gone,
+                None => HolderState::Unverifiable,
+            },
+            // In `/proc` a moment ago, unreadable now: it may have
+            // exited between the two reads, or this may be a platform
+            // that does not answer. Not shown to be gone.
+            None => HolderState::Unverifiable,
+        },
+    }
+}
+
+/// The whole of the attempt-admission rule, as one decision over
+/// values: what this Run already has (`current`), who is asking
+/// (`peer`), and where they would launch (`destination`). `Ok(())`
+/// admits and supersedes; `Err` is the refusal text, which names both
+/// sides so the client's own printed error explains itself.
+///
+/// Pure and kernel-backed: the only outside fact it reads is whether
+/// the previous holder's process is still running (`holder_state`),
+/// which is what makes it testable against real processes rather than
+/// against a fake of one.
+fn admit_launch_attempt(
+    current: Option<&LaunchAttempt>,
+    peer: &AttemptHolder,
+    destination: &str,
+) -> Result<(), String> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    if current.destination != destination {
+        return Err(format!(
+            "this Run's launch is bound to Herdr destination {}; this invocation is connected \
+             to {destination} — an agent this Run may already have started is neither visible \
+             nor name-colliding there, so launching from here could start a second one",
+            current.destination
+        ));
+    }
+    if current.holder.pid == peer.pid {
+        return Ok(());
+    }
+    match holder_state(&current.holder) {
+        HolderState::Gone => Ok(()),
+        HolderState::Live => Err(format!(
+            "this Run's launch attempt is held by process {}, which is still running",
+            current.holder.pid
+        )),
+        HolderState::Unverifiable => Err(format!(
+            "this Run's launch attempt is held by process {}, and wirkd cannot establish from \
+             the kernel whether it is still running; it will not replace an owner it cannot \
+             show is gone",
+            current.holder.pid
+        )),
+    }
+}
+
+/// The other half of the same ownership: who may state what happened to
+/// a Run whose attempt is held. `Ok(())` for the holder itself, for a
+/// Run no attempt governs, and for wirkd's own internal recovery path
+/// (`peer` is `None` there, since no client is on the other end).
+fn admit_outcome_record(
+    current: Option<&LaunchAttempt>,
+    peer: Option<&AttemptHolder>,
+    kind: &EventKind,
+) -> Result<(), String> {
+    if !matches!(
+        kind,
+        EventKind::RunLaunched { .. }
+            | EventKind::RunFailed { .. }
+            | EventKind::RunVanished
+            | EventKind::LifecycleObserved { .. }
+    ) {
+        return Ok(());
+    }
+    let (Some(current), Some(peer)) = (current, peer) else {
+        return Ok(());
+    };
+    if current.holder.pid == peer.pid {
+        return Ok(());
+    }
+    Err(format!(
+        "this Run's launch attempt is held by process {}; this process ({}) no longer owns it \
+         and may not record its outcome",
+        current.holder.pid, peer.pid
+    ))
+}
+
 fn handle_connection(stream: UnixStream, state: &Arc<WirkdState>, socket_path: &Path) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(clone) => clone,
@@ -401,7 +639,11 @@ fn handle_connection(stream: UnixStream, state: &Arc<WirkdState>, socket_path: &
         return;
     }
 
-    let outcome = dispatch(&request, state);
+    // P3 native launch attempt admission: who is on the other end of
+    // this connection, as the kernel reports it — read once, here,
+    // where the socket still exists (`peer_holder`).
+    let peer = peer_holder(&stream);
+    let outcome = dispatch(&request, state, peer.as_ref());
 
     let reply = match &outcome {
         Outcome::Reply(reply) | Outcome::Stop(reply) => reply,
@@ -643,6 +885,10 @@ fn recover_docker_runs(state: &Arc<WirkdState>) {
                         run: Some(run_id),
                         kind: EventKind::RunVanished,
                     },
+                    // wirkd's own startup recovery, not a client: no
+                    // peer process exists to name, and no Actor launch
+                    // attempt governs a Deterministic Run.
+                    None,
                 );
             }
             RunMatch::Reattach {
@@ -769,7 +1015,7 @@ fn reattach_docker_run(
     );
 }
 
-fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {
+fn dispatch(request: &Request, state: &Arc<WirkdState>, peer: Option<&AttemptHolder>) -> Outcome {
     match request.verb {
         Verb::Ping => Outcome::Reply(handle_ping()),
         Verb::Submit => match serde_json::from_value::<SubmitPayload>(request.payload.clone()) {
@@ -799,7 +1045,7 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {
             }
         }
         Verb::Record => match serde_json::from_value::<RecordPayload>(request.payload.clone()) {
-            Ok(payload) => Outcome::Reply(handle_record(state, payload)),
+            Ok(payload) => Outcome::Reply(handle_record(state, payload, peer)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
         Verb::Cancel => match serde_json::from_value::<CancelPayload>(request.payload.clone()) {
@@ -1023,6 +1269,7 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 boundary: Boundary(Vec::new()),
                 leaves: Vec::new(),
                 required_child_outcomes: Vec::new(),
+                selection: None,
             }],
         )
     } else {
@@ -1663,7 +1910,11 @@ fn canonical_repository_identity(repo_path: &str) -> Result<String, String> {
 /// refused: those two travel only through `claim`'s own validated path
 /// (build-brief.md's own "Implement wirkd's record verb... refuse
 /// ClaimRecorded and ClaimFiled through it").
-fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
+fn handle_record(
+    state: &Arc<WirkdState>,
+    payload: RecordPayload,
+    peer: Option<&AttemptHolder>,
+) -> Reply {
     if matches!(
         payload.kind,
         EventKind::WorkSubmitted { .. }
@@ -1714,6 +1965,18 @@ fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
             "InvalidTransition",
             "record does not target the current open Run",
         );
+    }
+
+    // P3 native launch attempt admission: a replaced owner goes quiet.
+    // Once some invocation holds this Run's launch attempt, only that
+    // process may state what happened to the launch or what the pane
+    // is doing — a superseded one cannot publish a competing
+    // `RunFailed`, cannot append lifecycle observations to the Run it
+    // no longer drives, and learns it was replaced from this refusal
+    // (`RunLoop` stops driving on it rather than keeping a pane it no
+    // longer owns prompted).
+    if let Err(refusal) = admit_outcome_record(run.launch_attempt.as_ref(), peer, &payload.kind) {
+        return err_reply("InvalidTransition", &refusal);
     }
 
     let kind = match payload.kind {
@@ -1801,10 +2064,111 @@ fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
                 world,
             }
         }
+        // P3 native launch selection D1: the pre-launch admission
+        // itself. At most one per Run, checked against the Run's own
+        // replayed journal while this handler holds the journal lock —
+        // that lock, not a git worktree lock and not Herdr's agent-name
+        // uniqueness, is what makes two concurrent `wirk run`
+        // invocations for one Run resolve to exactly one admitted
+        // request. The loser is refused here, before it has called
+        // Herdr at all, so it has nothing to relaunch and nothing to
+        // journal against the winner's Run.
+        EventKind::RunLaunchRequested {
+            run: inner,
+            actor_kind,
+            selection,
+        } => {
+            if &inner != run_id
+                || events.iter().any(|event| {
+                    event.run.as_ref() == Some(run_id)
+                        && matches!(event.kind, EventKind::RunLaunchRequested { .. })
+                })
+            {
+                return err_reply(
+                    "InvalidTransition",
+                    "this Run's launch request is already bound",
+                );
+            }
+            match resolve_run_binding(&events, &state.estate_root, &payload.work_id, run_id) {
+                Ok(binding) if binding.materialized && matches!(binding.world, World::Actor(_)) => {
+                }
+                Ok(_) => return err_reply("InvalidTransition", "Actor Run is not materialized"),
+                Err(reason) => return err_reply("ValidationUnavailable", &reason),
+            }
+            EventKind::RunLaunchRequested {
+                run: inner,
+                actor_kind,
+                selection,
+            }
+        }
+        // P3 native launch attempt admission (the independent review's
+        // N1): the *attempt*, admitted the same way and in the same
+        // place the request is. Admitting the request once is not
+        // enough — once it is bound, a duplicate invocation and a
+        // recovery invocation both used to fall straight through to
+        // `agent.start`, with only Herdr's own agent-name uniqueness
+        // between them, which is exactly the incidental guard this
+        // contract may not lean on (and which does not exist at all
+        // across two Herdr sessions).
+        //
+        // Three refusals, all under this handler's journal lock:
+        // the destination this Run's launch is bound to; a holder the
+        // kernel still reports running; and a client wirkd cannot
+        // name. Everything else is admitted and supersedes — a holder
+        // that died releases its attempt by dying, so there is no
+        // marker to leak and no valid Run to trap.
+        EventKind::RunLaunchAttempted {
+            run: inner,
+            destination,
+            ..
+        } => {
+            if &inner != run_id {
+                return err_reply("InvalidTransition", "launch attempt names a different Run");
+            }
+            let Some(peer) = peer else {
+                return err_reply(
+                    "Forbidden",
+                    "wirkd could not identify this client's process; a launch attempt is \
+                     admitted only to a process it can name",
+                );
+            };
+            if !events.iter().any(|event| {
+                event.run.as_ref() == Some(run_id)
+                    && matches!(event.kind, EventKind::RunLaunchRequested { .. })
+            }) {
+                return err_reply(
+                    "InvalidTransition",
+                    "a launch attempt precedes this Run's admitted launch request",
+                );
+            }
+            if let Err(refusal) =
+                admit_launch_attempt(run.launch_attempt.as_ref(), peer, &destination)
+            {
+                return err_reply("InvalidTransition", &refusal);
+            }
+            EventKind::RunLaunchAttempted {
+                run: inner,
+                destination,
+                holder: peer.clone(),
+            }
+        }
         EventKind::RunLaunched {
             run: inner,
             actor_kind,
+            selection,
+            launch_argv,
         } => {
+            // P3 native launch selection: this duplicate check is
+            // already the server-side half of "a repeated invocation
+            // must not silently alter an already fixed Run launch"
+            // (PREPARATION-ADJUDICATION.md point 3) — at most one
+            // `RunLaunched` is ever accepted per Run, whatever
+            // `selection`/`launch_argv` it carries, so a second
+            // resolved request (even one identical to the first) is
+            // refused here exactly as a second `actor_kind` always was.
+            // `wirk run`'s own client-side check (`executor.rs`) is what
+            // stops the *live relaunch* from ever happening in the first
+            // place; this is the durable record's own backstop.
             if &inner != run_id
                 || events.iter().any(|event| {
                     event.run.as_ref() == Some(run_id)
@@ -1822,17 +2186,56 @@ fn handle_record(state: &Arc<WirkdState>, payload: RecordPayload) -> Reply {
                 Ok(_) => return err_reply("InvalidTransition", "Actor Run is not materialized"),
                 Err(reason) => return err_reply("ValidationUnavailable", &reason),
             }
+            // D1's other half: a launch result may only ever state the
+            // request that was already admitted for this Run. Without
+            // this, the pre-launch binding would be advisory — a caller
+            // could bind one selection and then report another.
+            let bound = events.iter().find_map(|event| match &event.kind {
+                EventKind::RunLaunchRequested {
+                    run: bound_run,
+                    actor_kind,
+                    selection,
+                } if bound_run == run_id && event.run.as_ref() == Some(run_id) => {
+                    Some((actor_kind.clone(), selection.clone()))
+                }
+                _ => None,
+            });
+            match bound {
+                None => {
+                    return err_reply(
+                        "InvalidTransition",
+                        "RunLaunched without an admitted RunLaunchRequested",
+                    );
+                }
+                Some((bound_kind, bound_selection))
+                    if bound_kind != actor_kind || bound_selection != selection =>
+                {
+                    return err_reply(
+                        "InvalidTransition",
+                        "RunLaunched does not match this Run's admitted launch request",
+                    );
+                }
+                Some(_) => {}
+            }
             EventKind::RunLaunched {
                 run: inner,
                 actor_kind,
+                selection,
+                launch_argv,
             }
         }
         EventKind::LifecycleObserved { status, detail } => {
+            // D1: an admitted launch request is enough. A launch whose
+            // reply was lost still really started an agent, and the
+            // reconciliation that discovers it (`RunLoop::launch`) has
+            // to be able to say so.
             let launched = events.iter().any(|event| {
                 event.run.as_ref() == Some(run_id)
                     && matches!(
                         &event.kind,
-                        EventKind::RunLaunched { run: inner, .. } if inner == run_id
+                        EventKind::RunLaunched { run: inner, .. }
+                            | EventKind::RunLaunchRequested { run: inner, .. }
+                            if inner == run_id
                     )
             });
             if !launched {
@@ -2803,6 +3206,7 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         return err_reply("NotFound", "no such work");
     }
     let work = fold(&events);
+    let waypoint_defs = waypoint_defs_for(&events);
 
     let runs: Vec<Value> = all_run_ids(&events)
         .into_iter()
@@ -2810,10 +3214,22 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
             let run = find_run(&events, &run_id)?;
             let binding = resolve_run_binding(&events, &state.estate_root, &work.id, &run_id);
             let (world, world_binding) = binding_status(binding);
+            // P3 native launch selection (BUILD-BRIEF.md item 1): the
+            // Route-authored default for this Run's own Waypoint —
+            // `wirk run`'s own precedence layer (CLI-explicit > this >
+            // the harness's native default), read from the same
+            // `WorkSubmitted.waypoint_defs` every other reader of a
+            // Waypoint's authored shape already uses (R2), never
+            // re-read from a Route file that may have changed since
+            // submit.
+            let selection: Option<AuthoredSelection> =
+                find_definition(&waypoint_defs, &run.waypoint)
+                    .and_then(|def| def.selection.clone());
             Some(json!({
                 "run": serde_json::to_value(&run).ok()?,
                 "world": world,
                 "world_binding": world_binding,
+                "selection": selection,
             }))
         })
         .collect();
@@ -3720,6 +4136,13 @@ fn find_run(events: &[Event], run_id: &RunId) -> Option<Run> {
                 // to the real kind by `RunLaunched` via `Run::apply`
                 // below, same event stream this loop already replays.
                 kind: wirk_core::ActorKind::default(),
+                // P3 native launch selection: same seed-then-fold as
+                // `kind` above — `RunLaunched` moves these via `Run::apply`.
+                selection: wirk_core::ActorSelection::default(),
+                launched: false,
+                launch_requested: false,
+                launch_attempt: None,
+                launch_argv: Vec::new(),
             });
         }
         if let Some(run) = run.as_mut() {
@@ -5298,6 +5721,11 @@ fn current_producing_action(events: &[Event]) -> Result<ProducingAction, Reply> 
             world_hash: world_hash.clone(),
             state: RunState::Open,
             kind: Default::default(),
+            selection: Default::default(),
+            launched: false,
+            launch_requested: false,
+            launch_argv: Vec::new(),
+            launch_attempt: None,
         };
         for later in events {
             folded.apply(later);
@@ -5440,6 +5868,7 @@ fn handle_atlas_relate(state: &Arc<WirkdState>, payload: super::AtlasRelatePaylo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
 
     fn work_submitted_event(waypoints: Vec<&str>) -> Event {
         Event {
@@ -5504,6 +5933,361 @@ mod tests {
         assert_eq!(
             resolve_route_path(estate, "/abs/route.json"),
             PathBuf::from("/abs/route.json")
+        );
+    }
+
+    // ---- P3 native launch attempt admission (the review's N1) --------
+    //
+    // Every holder below is a real process this test can name: this
+    // test's own, or a child it spawned and reaped. No fake stands in
+    // for the kernel — "is that process still running" is the whole
+    // mechanism, so faking it would pin nothing (0040).
+
+    /// A holder wirkd itself admitted: the running process, with the
+    /// start token the kernel reports for it right now.
+    fn live_holder() -> AttemptHolder {
+        let pid = std::process::id();
+        AttemptHolder {
+            pid,
+            start_token: process_start_token(pid),
+        }
+    }
+
+    /// A pid that is definitely not running: a child spawned and
+    /// reaped, so the kernel has released it. (A recycled pid is
+    /// covered separately by the start-token case below, which is what
+    /// makes this safe to assert.)
+    fn reaped_pid() -> u32 {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap");
+        pid
+    }
+
+    fn attempt(holder: AttemptHolder, destination: &str) -> LaunchAttempt {
+        LaunchAttempt {
+            holder,
+            destination: destination.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_running_process_reads_live_and_a_reaped_one_reads_gone() {
+        assert!(matches!(holder_state(&live_holder()), HolderState::Live));
+        let gone = AttemptHolder {
+            pid: reaped_pid(),
+            start_token: Some("1".to_string()),
+        };
+        assert!(matches!(holder_state(&gone), HolderState::Gone));
+    }
+
+    /// Poll `/proc/<pid>/stat` until the kernel reports the state this
+    /// test is waiting for. Real states of real processes: nothing here
+    /// simulates the kernel. Returns rather than panicking, so a
+    /// caller always reaches its own cleanup — a test that leaves a
+    /// stopped child behind hangs the whole run.
+    fn wait_for_state(pid: u32, want: char) -> bool {
+        for _ in 0..500 {
+            if process_stat(pid).is_some_and(|(state, _)| state == want) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn signal_process(pid: u32, signal: libc::c_int) {
+        let pid = libc::pid_t::try_from(pid).expect("a pid fits pid_t");
+        // SAFETY: a plain `kill(2)` with a pid this test spawned itself
+        // and has not reaped, so the pid still names that process and
+        // cannot have been recycled under us.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "kill({pid}) failed");
+    }
+
+    /// The review's Z1, as a rule. A child this test kills and
+    /// deliberately never reaps is *dead* — it cannot drive an agent,
+    /// answer Herdr or write a journal — but `/proc/<pid>` still exists
+    /// and its start token is unchanged, which is precisely what a
+    /// crashed `wirk run` leaves behind under any parent that does not
+    /// `wait()`. It must read `Gone`, and it must hold nothing.
+    #[test]
+    fn a_dead_but_unreaped_holder_is_gone_and_traps_nothing() {
+        let mut child = Command::new("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        let holder = AttemptHolder {
+            pid,
+            start_token: process_start_token(pid),
+        };
+
+        // Everything is read while the corpse is still unreaped, and
+        // the child is reaped before a single assertion runs.
+        let is_zombie = wait_for_state(pid, 'Z');
+        let still_in_proc = std::fs::metadata(format!("/proc/{pid}")).is_ok();
+        let token_now = process_start_token(pid);
+        let state = holder_state(&holder);
+        let admitted = admit_launch_attempt(
+            Some(&attempt(holder.clone(), "/run/herdr.sock")),
+            &live_holder(),
+            "/run/herdr.sock",
+        );
+        // The kernel says dead; there is nothing left to be uncertain
+        // about, so this holds even when no start token was ever read.
+        let untokened = holder_state(&AttemptHolder {
+            pid,
+            start_token: None,
+        });
+        child.wait().expect("reap");
+
+        assert!(is_zombie, "the child never became a zombie");
+        assert!(
+            still_in_proc,
+            "the whole point of this case: a zombie is still in /proc"
+        );
+        assert_eq!(
+            holder.start_token, token_now,
+            "and its start token is unchanged, so the token cannot tell us it died"
+        );
+        assert!(
+            matches!(state, HolderState::Gone),
+            "a dead holder is gone, reaped or not"
+        );
+        assert!(
+            admitted.is_ok(),
+            "a crashed invocation must not trap a valid Run by going unreaped"
+        );
+        assert!(matches!(untokened, HolderState::Gone));
+    }
+
+    /// The other side of that distinction, and the reason it is a state
+    /// and not just "did it exit": a *stopped* process is alive. It can
+    /// be continued, and it may still be holding a Herdr pane open, so
+    /// it keeps what it holds.
+    #[test]
+    fn a_stopped_holder_is_still_live_and_keeps_its_run() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let holder = AttemptHolder {
+            pid,
+            start_token: process_start_token(pid),
+        };
+        signal_process(pid, libc::SIGSTOP);
+
+        // Read while it is stopped, then put it back and reap it
+        // *before* asserting: a `SIGSTOP`ped child that outlives a
+        // failing test never exits and the whole run hangs on it.
+        let is_stopped = wait_for_state(pid, 'T');
+        let state = holder_state(&holder);
+        let admitted = admit_launch_attempt(
+            Some(&attempt(holder, "/run/herdr.sock")),
+            &live_holder(),
+            "/run/herdr.sock",
+        );
+        signal_process(pid, libc::SIGCONT);
+        child.kill().expect("kill");
+        child.wait().expect("reap");
+
+        assert!(is_stopped, "the child never stopped");
+        assert!(matches!(state, HolderState::Live), "stopped is not dead");
+        let refusal = admitted.expect_err("a stopped holder still owns its attempt");
+        assert!(refusal.contains("still running"), "{refusal}");
+    }
+
+    /// The pid-reuse case, which is why the start token exists at all:
+    /// this very pid is running, but it is not the process that was
+    /// admitted, so the attempt it held is gone.
+    #[test]
+    fn a_recycled_pid_is_gone_not_live() {
+        let recycled = AttemptHolder {
+            pid: std::process::id(),
+            start_token: Some("this-is-not-the-token-the-kernel-reports".to_string()),
+        };
+        assert!(matches!(holder_state(&recycled), HolderState::Gone));
+    }
+
+    /// A holder wirkd admitted without ever reading a start token, whose
+    /// pid is in use now, cannot be shown to be gone — and wirkd will
+    /// not replace an owner it cannot show is gone.
+    #[test]
+    fn a_holder_with_no_start_token_whose_pid_is_in_use_is_unverifiable() {
+        let unknown = AttemptHolder {
+            pid: std::process::id(),
+            start_token: None,
+        };
+        assert!(matches!(holder_state(&unknown), HolderState::Unverifiable));
+    }
+
+    /// L2 (`native-launch-zombie-verify/VERDICT.md` §8): the outer
+    /// `None` arm below `holder_state_at`'s `process_stat_at` call —
+    /// "`/proc/<pid>` exists, but its `stat` entry cannot be read" —
+    /// was unpinned by any test; flipping it to `Gone` left all 711
+    /// tests passing. Reached here by a real, non-racy filesystem
+    /// failure at the seam `holder_state_at` takes as a parameter: a
+    /// directory that exists (so `metadata` succeeds, taking the
+    /// `Ok(_)` arm) whose `stat` entry is itself a directory, so
+    /// `std::fs::read_to_string` on it fails for real — no live pid,
+    /// no exit-and-reap race, nothing stubbed. A `wirk work retry`
+    /// remains available regardless (`HolderState::Unverifiable`'s own
+    /// doc comment); this test is only about which state is reported.
+    #[test]
+    fn an_unreadable_stat_after_metadata_succeeds_is_unverifiable_not_gone() {
+        let proc_dir = tempfile::tempdir().expect("proc_dir tempdir");
+        std::fs::create_dir(proc_dir.path().join("stat")).expect("stat entry is a directory");
+
+        let holder = AttemptHolder {
+            pid: 1,
+            start_token: Some("123".to_string()),
+        };
+        assert!(
+            matches!(
+                holder_state_at(proc_dir.path(), &holder),
+                HolderState::Unverifiable
+            ),
+            "an unreadable stat file must never be reported as Gone — a read \
+             failure is not proof of death"
+        );
+    }
+
+    /// N1 itself, as a rule: a Run whose attempt is held by a process
+    /// that is still running admits no second attempt — not a duplicate
+    /// invocation, not a recovery. Nothing about this depends on Herdr's
+    /// agent-name uniqueness.
+    #[test]
+    fn a_second_attempt_is_refused_while_its_holder_is_running() {
+        let held = attempt(live_holder(), "/run/herdr.sock");
+        let other = AttemptHolder {
+            pid: std::process::id() + 1,
+            start_token: Some("t".to_string()),
+        };
+        let refusal = admit_launch_attempt(Some(&held), &other, "/run/herdr.sock")
+            .expect_err("a live holder owns it");
+        assert!(refusal.contains("still running"), "{refusal}");
+    }
+
+    /// And the other side of the same rule: nothing is trapped. The
+    /// holder's own process *is* the marker, so a holder that died
+    /// releases what it held by dying — there is no lease to expire and
+    /// no marker to clear by hand.
+    #[test]
+    fn an_attempt_whose_holder_died_is_superseded_not_stuck() {
+        let orphaned = attempt(
+            AttemptHolder {
+                pid: reaped_pid(),
+                start_token: Some("1".to_string()),
+            },
+            "/run/herdr.sock",
+        );
+        assert!(
+            admit_launch_attempt(Some(&orphaned), &live_holder(), "/run/herdr.sock").is_ok(),
+            "a dead holder must never keep a valid Run from being recovered"
+        );
+    }
+
+    /// The same process asking again is the same owner, not a rival —
+    /// a Run this invocation already holds stays holdable across the
+    /// several records one launch makes.
+    #[test]
+    fn the_current_holder_may_re_attempt_its_own_run() {
+        let held = attempt(live_holder(), "/run/herdr.sock");
+        assert!(admit_launch_attempt(Some(&held), &live_holder(), "/run/herdr.sock").is_ok());
+    }
+
+    /// The destination binding: the review's own unexecuted inference
+    /// was that two Herdr sessions would not collide on agent name. A
+    /// Run's launch is bound to the Herdr it was attempted on, so a
+    /// recovery pointed somewhere else is refused *before* it can turn
+    /// an uncertain launch into a second real one — and the refusal is
+    /// about the destination, not about the holder, so it stands even
+    /// when the previous holder is long gone.
+    #[test]
+    fn a_second_herdr_destination_is_refused_even_when_the_holder_is_gone() {
+        let elsewhere = attempt(
+            AttemptHolder {
+                pid: reaped_pid(),
+                start_token: Some("1".to_string()),
+            },
+            "/run/herdr-one.sock",
+        );
+        let refusal = admit_launch_attempt(Some(&elsewhere), &live_holder(), "/run/herdr-two.sock")
+            .expect_err("a different Herdr cannot see the first one's agent");
+        assert!(refusal.contains("herdr-one.sock"), "{refusal}");
+        assert!(refusal.contains("herdr-two.sock"), "{refusal}");
+    }
+
+    /// A Run nobody has attempted yet — and every journal written
+    /// before attempts existed, which folds to exactly the same
+    /// `None` — admits the first attempt without any of this.
+    #[test]
+    fn a_run_with_no_admitted_attempt_admits_the_first_one() {
+        assert!(admit_launch_attempt(None, &live_holder(), "/run/herdr.sock").is_ok());
+    }
+
+    /// A stale owner goes quiet: after replacement it may not publish a
+    /// competing failure, nor keep appending observations to a Run it
+    /// no longer drives.
+    #[test]
+    fn a_replaced_owner_may_not_record_this_runs_outcome() {
+        let held = attempt(live_holder(), "/run/herdr.sock");
+        let stale = AttemptHolder {
+            pid: std::process::id() + 1,
+            start_token: Some("t".to_string()),
+        };
+        for kind in [
+            EventKind::RunFailed {
+                cause: FailureCause {
+                    status: None,
+                    request_id: None,
+                    at: Timestamp(0),
+                    detail: Some("I think it failed".to_string()),
+                },
+            },
+            EventKind::LifecycleObserved {
+                status: "idle".to_string(),
+                detail: None,
+            },
+            EventKind::RunVanished,
+        ] {
+            let refusal = admit_outcome_record(Some(&held), Some(&stale), &kind)
+                .expect_err("a replaced owner is refused");
+            assert!(refusal.contains("no longer owns it"), "{refusal}");
+        }
+        assert!(
+            admit_outcome_record(Some(&held), Some(&live_holder()), &EventKind::RunVanished)
+                .is_ok(),
+            "the holder itself still records freely"
+        );
+    }
+
+    /// Ownership governs the launch outcome, not the journal at large:
+    /// a Run that nobody has attempted, and wirkd's own internal
+    /// recovery path (no peer at all), are both unaffected.
+    #[test]
+    fn outcome_ownership_only_applies_where_an_attempt_exists() {
+        let held = attempt(live_holder(), "/run/herdr.sock");
+        assert!(admit_outcome_record(None, Some(&live_holder()), &EventKind::RunVanished).is_ok());
+        assert!(admit_outcome_record(Some(&held), None, &EventKind::RunVanished).is_ok());
+        assert!(
+            admit_outcome_record(
+                Some(&held),
+                Some(&AttemptHolder {
+                    pid: std::process::id() + 1,
+                    start_token: None,
+                }),
+                &EventKind::WorktreeCreated {
+                    repo: "r".to_string(),
+                    base_sha: "s".to_string(),
+                },
+            )
+            .is_ok(),
+            "materialization is not a launch outcome"
         );
     }
 }

@@ -505,6 +505,113 @@ pub struct WaypointDefinition {
     /// Actor/Deterministic Waypoint.
     #[serde(default)]
     pub required_child_outcomes: Vec<ChildOutcomeSpec>,
+    /// P3 native launch selection (BUILD-BRIEF.md, PREPARATION-ADJUDICATION.md
+    /// point 1): the workflow-authored default harness/model/effort/raw-args
+    /// for an Actor Waypoint's Run, layered under `wirk run`'s own explicit
+    /// `--actor-kind`/`--actor-model`/`--actor-effort` overrides (documented
+    /// precedence: CLI-explicit > this authored default > the harness's own
+    /// native default). `Actor` only — mechanism, not content, so it never
+    /// touches `ActorWorld`/`WorldHash::of` (same separation `Run.kind`
+    /// already draws, orient/actor.md §2). A `Deterministic`/`Container`
+    /// Waypoint carries no Run of its own to launch, so a `selection` there
+    /// would be authored and silently unused; `validate_tree` refuses it
+    /// (`RouteError::ActorSelectionOnNonActor`) rather than accept dead
+    /// configuration. No inheritance: a `Container`'s `leaves` each carry
+    /// their own independent `selection`, never their parent's or a
+    /// sibling's — nothing here reads up or across the tree.
+    #[serde(default)]
+    pub selection: Option<AuthoredSelection>,
+}
+
+/// The workflow-authored half of P3 native launch selection (`WaypointDefinition.selection`).
+/// `harness` is the Route's own default `ActorKind` (`wirk run`'s
+/// `--actor-kind` still overrides it, per the documented precedence);
+/// `model`/`effort` are translated into the harness's own real CLI
+/// controls at launch (`wirk-herdr`'s `build_selection_args`, verified
+/// against the installed `claude`/`opencode`/`codex` binaries, never a
+/// headless-only guess); `args` is raw, verbatim pass-through for
+/// anything neither convenience field covers (R1: no product tries to
+/// name every harness flag — an author who needs one types it here).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredSelection {
+    #[serde(default)]
+    pub harness: Option<ActorKind>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// The resolved half of P3 native launch selection, carried on `Run`
+/// exactly like `Run.kind` (mechanism, never `World` content): the
+/// model/effort/raw-args this Run's launch was actually requested with,
+/// after CLI/Route-authored precedence was applied and before Herdr was
+/// ever called. Distinct from `Run.launch_argv` (`RunLaunched.launch_argv`):
+/// this is *what wirk asked for*, that is *what Herdr says it submitted*
+/// — Herdr's own reply proves what reached the shell, never that a
+/// provider actually served the requested model (PREPARATION-ADJUDICATION.md
+/// point 3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActorSelection {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Who holds a Run's launch *attempt* — P3 native launch attempt
+/// admission. Minted by `wirkd` itself from the connected client's
+/// kernel-reported credentials (`SO_PEERCRED`), never from anything a
+/// client says about itself, and never a claim of authenticity: any
+/// process that can write this estate's journal could write any event,
+/// so this is exclusion between cooperating invocations, not a
+/// security boundary.
+///
+/// `start_token` is the holder process's own start time as the kernel
+/// reports it (`/proc/<pid>/stat` field 22), read by `wirkd` at the
+/// moment it admits the attempt. Without it a recycled pid would read
+/// as the original holder still being alive; with it, "this pid is
+/// live *and* is the same process" is one comparison. `None` means
+/// `wirkd` could not read it, which is deliberately *not* the same as
+/// zero (`holder_state`'s own doc, `server.rs`).
+///
+/// The token answers *which* process, never *whether it is alive*: a
+/// dead but unreaped holder keeps both its pid and its start token, so
+/// `wirkd` reads the process state alongside it and treats a corpse as
+/// gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptHolder {
+    #[serde(default)]
+    pub pid: u32,
+    #[serde(default)]
+    pub start_token: Option<String>,
+}
+
+/// One admitted launch attempt: who holds it and where that holder
+/// will call Herdr. Folded onto `Run.launch_attempt` — only the latest
+/// admitted attempt is kept, because `wirkd` refuses a new one while
+/// the previous holder is still alive (`handle_record`), so the latest
+/// is the only one that can be current.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchAttempt {
+    pub holder: AttemptHolder,
+    /// The Herdr destination this Run's launch is bound to — the
+    /// client's own canonicalized Herdr socket path. Client-declared
+    /// (wirkd has no way to observe which Herdr a client dialed) and
+    /// bound at this Run's first admitted attempt: every later attempt
+    /// must present the same one or is refused. That is what stops an
+    /// uncertain launch in one Herdr session from being "recovered"
+    /// into a second, real launch in another, where the first session's
+    /// agent is neither visible nor name-colliding.
+    pub destination: String,
 }
 
 /// One child-Work role a container's outcome contract requires (§3.1).
@@ -598,6 +705,13 @@ pub enum RouteError {
     /// all — refused rather than silently vacuous.
     #[error("container waypoint {} has no leaves", id.0)]
     ContainerWithoutLeaves { id: WaypointId },
+    /// P3 native launch selection (BUILD-BRIEF.md item 1): a
+    /// `Deterministic`/`Container` Waypoint has no Run of its own to
+    /// launch, so an authored `selection` there would be silently
+    /// unused — refused at load, the same posture `ActorWithCommand`
+    /// already takes for the reverse mismatch.
+    #[error("non-actor waypoint {} carries an actor-only selection", id.0)]
+    ActorSelectionOnNonActor { id: WaypointId },
 }
 
 /// Reads and validates a Route file (format.md §3, R2 co-located with
@@ -683,6 +797,11 @@ fn validate_tree(
                         ),
                     });
                 }
+                if waypoint.selection.is_some() {
+                    return Err(RouteError::ActorSelectionOnNonActor {
+                        id: waypoint.id.clone(),
+                    });
+                }
             }
             WaypointKind::Container => {
                 if waypoint.intent.is_some()
@@ -695,6 +814,11 @@ fn validate_tree(
                 }
                 if waypoint.leaves.is_empty() {
                     return Err(RouteError::ContainerWithoutLeaves {
+                        id: waypoint.id.clone(),
+                    });
+                }
+                if waypoint.selection.is_some() {
+                    return Err(RouteError::ActorSelectionOnNonActor {
                         id: waypoint.id.clone(),
                     });
                 }
@@ -999,6 +1123,54 @@ pub struct Run {
     /// launched kind when `RunLaunched` folds (`Run::apply`).
     #[serde(default)]
     pub kind: ActorKind,
+    /// P3 native launch selection: the resolved model/effort/raw-args
+    /// this Run's launch was requested with, moved off `ActorSelection::default()`
+    /// only when `RunLaunched` folds (`Run::apply`) — same seed/move
+    /// pattern as `kind` above, and additive for the same reason
+    /// (`#[serde(default)]`: a journal written before this field existed
+    /// folds to the empty selection, honest for a Run that only ever
+    /// launched bare).
+    #[serde(default)]
+    pub selection: ActorSelection,
+    /// `true` once this Run's own `RunLaunched` has folded — the durable
+    /// marker `wirk run` reads to refuse silently altering an
+    /// already-fixed launch on a repeated invocation
+    /// (PREPARATION-ADJUDICATION.md point 3: "recovery/reinvocation
+    /// cannot silently change an already fixed launch request"). Neither
+    /// `kind`'s nor `selection`'s own default value can stand in for
+    /// this: both are indistinguishable from "never launched" when the
+    /// resolved request itself was the harness default.
+    #[serde(default)]
+    pub launched: bool,
+    /// `true` once this Run's own `RunLaunchRequested` has folded — the
+    /// durable binding of the resolved request, written **before** the
+    /// irreversible Herdr `agent.start` call rather than after it
+    /// (`RunLaunchRequested`'s own doc). `launch_requested && !launched`
+    /// is the honest "a launch for this exact request was admitted, and
+    /// what Herdr did with it is not known here" state: it is what a
+    /// daemon loss or a lost reply in the launch window leaves behind,
+    /// and it is deliberately *not* collapsed into either "never
+    /// launched" or "launched".
+    #[serde(default)]
+    pub launch_requested: bool,
+    /// Herdr's own `agent_started.argv` for this Run's launch — what
+    /// Herdr says it submitted to the shell, evidence distinct from
+    /// `selection` (what wirk asked for) and never proof a provider
+    /// actually served the requested model (PREPARATION-ADJUDICATION.md
+    /// point 3). Empty for a journal written before this field existed,
+    /// or a Run that failed before Herdr ever replied.
+    #[serde(default)]
+    pub launch_argv: Vec<String>,
+    /// The latest launch attempt `wirkd` admitted for this Run
+    /// (`RunLaunchAttempted`) — who owns launching and driving it, and
+    /// which Herdr destination its launch is bound to. `None` for a Run
+    /// nobody has attempted yet and for every journal written before
+    /// this field existed: an old journal folds with the fact absent,
+    /// and absent is read as "no attempt admission was ever taken",
+    /// never as "the attempt is free" for the purposes of claiming an
+    /// already-launched Run.
+    #[serde(default)]
+    pub launch_attempt: Option<LaunchAttempt>,
 }
 
 /// Reshaped hard from sergeant's `StageStatus` (domain/workflow.rs:561-578,
@@ -1085,8 +1257,50 @@ impl Run {
             // being seeded (at `RunOpened`, before `--actor-kind` is
             // known) to the kind `wirk run` actually launched —
             // `run_launched_with_opencode_kind_updates_run` pins it.
-            EventKind::RunLaunched { actor_kind, .. } => {
+            //
+            // P3 native launch selection: `selection`/`launch_argv` move
+            // the same way, and `launched` becomes `true` — the durable
+            // marker a repeated `wirk run` invocation reads to refuse
+            // silently altering an already-fixed launch.
+            EventKind::RunLaunched {
+                actor_kind,
+                selection,
+                launch_argv,
+                ..
+            } => {
                 self.kind = actor_kind.clone();
+                self.selection = selection.clone();
+                self.launch_argv = launch_argv.clone();
+                self.launched = true;
+            }
+            // The pre-launch half of the same move: the request is bound
+            // here, before Herdr is called at all, so a launch that
+            // really happened can never be an unrecorded model choice.
+            // `RunLaunched` above then re-states the same
+            // `actor_kind`/`selection` (wirkd refuses a mismatch) and
+            // adds Herdr's own argv.
+            EventKind::RunLaunchRequested {
+                actor_kind,
+                selection,
+                ..
+            } => {
+                self.kind = actor_kind.clone();
+                self.selection = selection.clone();
+                self.launch_requested = true;
+            }
+            // The attempt admission (N1's repair): the latest admitted
+            // holder/destination replaces the previous one, which
+            // `wirkd` only ever admits once the previous holder is
+            // gone from the kernel's own process table.
+            EventKind::RunLaunchAttempted {
+                destination,
+                holder,
+                ..
+            } => {
+                self.launch_attempt = Some(LaunchAttempt {
+                    holder: holder.clone(),
+                    destination: destination.clone(),
+                });
             }
             // W2 (p1-journal): RunOpened is Run-scoped bookkeeping the
             // Work-level `fold` owns (fold.md §1);
@@ -1407,10 +1621,78 @@ pub enum EventKind {
     /// Named `actor_kind`, not `kind`: `EventKind`'s own internal tag
     /// field is already named `kind` (`#[serde(tag = "kind")]` above),
     /// same reason `ClaimRecorded.claim_kind` isn't `kind` either.
+    /// P3 native launch selection, D1 (BUILD-BRIEF.md "resolve and
+    /// durably bind the requested launch **before** starting it"): the
+    /// resolved launch request, journaled *before* `agent.start` — the
+    /// one irreversible call in the launch — rather than after it.
+    ///
+    /// wirkd accepts at most one of these per Run and refuses every
+    /// later one (`handle_record`), which is what makes admission
+    /// atomic against the Run's actual journal under the daemon's own
+    /// authority: two concurrent `wirk run` invocations for one Run
+    /// serialize here, exactly one is admitted, and the other never
+    /// reaches Herdr at all. Nothing about it depends on a git worktree
+    /// lock or on Herdr's agent-name uniqueness, both of which are
+    /// incidental guards this contract must not lean on.
+    ///
+    /// It is deliberately *not* proof that anything launched: it is
+    /// admission of the request. `RunLaunched` — carrying the same
+    /// `actor_kind`/`selection` plus Herdr's own argv — is the
+    /// separate record of the launch actually returning. A Run with
+    /// this event and no `RunLaunched` is a launch whose outcome this
+    /// estate does not know (`Run.launch_requested`).
+    RunLaunchRequested {
+        run: RunId,
+        #[serde(default)]
+        actor_kind: ActorKind,
+        #[serde(default)]
+        selection: ActorSelection,
+    },
+    /// P3 native launch *attempt* admission (the independent review's
+    /// N1): admission of the request is not admission of the attempt.
+    /// Once `RunLaunchRequested` is bound, every later invocation —
+    /// a plain duplicate, or a recovery after a daemon or client loss
+    /// — used to walk straight into `agent.start` with nothing but
+    /// Herdr's own agent-name uniqueness between them. This event is
+    /// the second admission, taken under the same journal lock and the
+    /// same daemon authority as the first: one invocation at a time
+    /// owns the launch *and* the drive loop of a Run.
+    ///
+    /// `holder` is server-minted, exactly as `RunFailed.cause.at` is;
+    /// whatever a client sends is discarded. `destination` is the
+    /// client's own Herdr socket, bound at the first attempt and
+    /// required to match on every later one.
+    ///
+    /// The attempt is released by nothing: it *expires* when its
+    /// holder process is no longer alive, which `wirkd` checks against
+    /// the kernel when a new attempt asks. There is deliberately no
+    /// marker to leave behind and no lease to forget to release, so a
+    /// crashed holder can never trap a valid Run, and a live one can
+    /// never be silently replaced.
+    RunLaunchAttempted {
+        run: RunId,
+        #[serde(default)]
+        destination: String,
+        #[serde(default)]
+        holder: AttemptHolder,
+    },
     RunLaunched {
         run: RunId,
         #[serde(default)]
         actor_kind: ActorKind,
+        /// P3 native launch selection (BUILD-BRIEF.md item 3): the
+        /// resolved request — CLI-explicit, Route-authored, or the
+        /// harness's own native default, precedence applied before this
+        /// event was ever built. `#[serde(default)]` so a `RunLaunched`
+        /// written before this field existed still folds, to the empty
+        /// selection (honest: every such Run only ever launched bare).
+        #[serde(default)]
+        selection: ActorSelection,
+        /// Herdr's own `agent_started.argv` for this launch — submission
+        /// evidence, never provider attestation (PREPARATION-ADJUDICATION.md
+        /// point 3). `#[serde(default)]`, same reason as `selection`.
+        #[serde(default)]
+        launch_argv: Vec<String>,
     },
     /// Terminal Work failure is never inferred from `RunFailed`
     /// (incident file); an explicit event keeps `fold` retry-policy-
@@ -1606,7 +1888,11 @@ pub fn fold(events: &[Event]) -> Work {
                 // already cleared `Waiting`/`held` — nothing left to do
                 // here for that case.
             }
-            EventKind::RunLaunched { .. } => {}
+            // Neither the request nor the launch moves Work-level
+            // state: both are Run-scoped facts `Run::apply` folds.
+            EventKind::RunLaunched { .. }
+            | EventKind::RunLaunchRequested { .. }
+            | EventKind::RunLaunchAttempted { .. } => {}
             // D9#2: inert at Run level (0001 D9 #2; 0017 D56) and, for
             // every status but the two named below, equally inert here
             // — a lifecycle event alone does not otherwise advance or

@@ -47,12 +47,17 @@ pub struct FakeHerdrClient {
     /// assert `kind`/`args` per actor kind, the way `split_pane_calls`
     /// already does for `split_pane`.
     pub start_agent_calls: Mutex<Vec<StartAgent>>,
-    /// P2.5 W2: one reply per call, popped in order, `Ok(())` once the
-    /// queue is empty (every test predating this wave leaves it unset
-    /// and keeps today's always-`Ok` behaviour) — lets a test script
-    /// Herdr's `agent_pane_busy` refusal on the first N attempts and
-    /// `Ok` after, the way `with_subscribe_channel` scripts events.
-    pub start_agent_responses: Mutex<VecDeque<Result<(), HerdrError>>>,
+    /// P2.5 W2: one reply per call, popped in order, defaulting once the
+    /// queue is empty (every test predating this wave leaves it unset)
+    /// to `Ok([kind] + args)` — the same `argv = [executable] + args`
+    /// shape real Herdr's own `agent_started.argv` returns
+    /// (`refs/herdr` `0f8ad12` `src/app/agents.rs::start_agent`), so a
+    /// fake that never configures this still "behaves like the
+    /// service" (0040 D127) rather than an inert `Ok(())` a real
+    /// `agent.start` reply never actually shapes like. Lets a test
+    /// script Herdr's `agent_pane_busy` refusal on the first N attempts
+    /// and `Ok` after, the way `with_subscribe_channel` scripts events.
+    pub start_agent_responses: Mutex<VecDeque<Result<Vec<String>, HerdrError>>>,
     /// Fix 2 (item C, D133): records every `agent.prompt` call so a
     /// `RunLoop` test can assert how many prompts were sent and what
     /// they said.
@@ -110,8 +115,13 @@ impl FakeHerdrClient {
     }
 
     /// Scripts `start_agent`'s replies in call order (P2.5 W2) — e.g.
-    /// `[Err(agent_pane_busy), Ok(())]` for "busy once then accepts".
-    pub fn with_start_agent_responses(self, responses: Vec<Result<(), HerdrError>>) -> Self {
+    /// `[Err(agent_pane_busy), Ok(vec![])]` for "busy once then
+    /// accepts" (an empty `Ok` argv when a test does not care what
+    /// Herdr says it submitted).
+    pub fn with_start_agent_responses(
+        self,
+        responses: Vec<Result<Vec<String>, HerdrError>>,
+    ) -> Self {
         *self.start_agent_responses.lock().unwrap() = responses.into();
         self
     }
@@ -131,6 +141,12 @@ impl FakeHerdrClient {
 }
 
 impl HerdrClient for FakeHerdrClient {
+    /// A fake is not a Herdr session; it says so rather than borrowing
+    /// a real destination's shape.
+    fn destination(&self) -> String {
+        "fake-herdr".to_string()
+    }
+
     fn create_workspace(&self, _req: CreateWorkspace) -> Result<WorkspaceInfo, HerdrError> {
         Err(HerdrError::Transport(
             "FakeHerdrClient: create_workspace not configured".to_string(),
@@ -162,13 +178,16 @@ impl HerdrClient for FakeHerdrClient {
         Ok(())
     }
 
-    fn start_agent(&self, req: StartAgent) -> Result<(), HerdrError> {
+    fn start_agent(&self, req: StartAgent) -> Result<Vec<String>, HerdrError> {
+        let default_argv: Vec<String> = std::iter::once(req.kind.clone())
+            .chain(req.args.iter().cloned())
+            .collect();
         self.start_agent_calls.lock().unwrap().push(req);
         self.start_agent_responses
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(default_argv))
     }
 
     fn prompt_agent(&self, req: PromptAgent) -> Result<(), HerdrError> {

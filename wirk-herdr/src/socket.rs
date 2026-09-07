@@ -778,6 +778,17 @@ pub mod params {
 // ---- HerdrClient ------------------------------------------------------
 
 impl HerdrClient for SocketClient {
+    /// The socket path this client dials, canonicalized when the
+    /// filesystem can (two spellings of one session are one
+    /// destination; a path that cannot be canonicalized is used
+    /// verbatim rather than dropped).
+    fn destination(&self) -> String {
+        std::fs::canonicalize(&self.socket_path)
+            .unwrap_or_else(|_| self.socket_path.clone())
+            .display()
+            .to_string()
+    }
+
     fn create_workspace(&self, req: CreateWorkspace) -> Result<WorkspaceInfo, HerdrError> {
         let result = self.call("workspace.create", params::workspace_create(&req))?;
         extract(result, "workspace_created", "workspace")
@@ -803,9 +814,15 @@ impl HerdrClient for SocketClient {
         expect_type(&result, "ok")
     }
 
-    fn start_agent(&self, req: StartAgent) -> Result<(), HerdrError> {
+    /// P3 native launch selection (PREPARATION-ADJUDICATION.md point 3):
+    /// `agent_started`'s own `argv` field
+    /// (`success_response/$defs/ResponseResult`'s `agent_started` arm,
+    /// vendored `tests/fixtures/herdr-schema-0.8.2-p20.json`, required)
+    /// — Herdr's launch-submission evidence, extracted the same way
+    /// `extract` already unwraps every other tagged reply (R2).
+    fn start_agent(&self, req: StartAgent) -> Result<Vec<String>, HerdrError> {
         let result = self.call("agent.start", params::agent_start(&req))?;
-        expect_type(&result, "agent_started")
+        extract(result, "agent_started", "argv")
     }
 
     fn prompt_agent(&self, req: PromptAgent) -> Result<(), HerdrError> {

@@ -51,7 +51,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use wirkd::{ClaimPayload, Reply, Request, StatusPayload, WirkdPointer};
+use wirkd::{ClaimPayload, RecordPayload, Reply, Request, StatusPayload, WirkdPointer};
 
 use wirk_core::{ClaimKind, EventKind, ExecutionTriple, Journal, RunId, WorkId};
 
@@ -369,7 +369,7 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
     let run_launched_opencode = events.iter().any(|event| {
         matches!(
             &event.kind,
-            EventKind::RunLaunched { run, actor_kind } if run.0 == run_id && *actor_kind == wirk_core::ActorKind::opencode()
+            EventKind::RunLaunched { run, actor_kind, .. } if run.0 == run_id && *actor_kind == wirk_core::ActorKind::opencode()
         )
     });
     assert!(
@@ -1778,6 +1778,192 @@ fn wirk_run_drives_two_works_at_once_with_no_cross_contamination() {
     );
 }
 
+/// P3 native launch selection (BUILD-BRIEF.md item 3;
+/// PREPARATION-ADJUDICATION.md point 3: "a repeated invocation must not
+/// silently alter an already fixed Run launch") against a real daemon
+/// and a real Herdr session — the live twin of `executor::tests::
+/// reinvocation_with_a_conflicting_model_is_refused` (`wirk/src/
+/// executor.rs`), and of `codex_with_requested_model_and_effort_maps_
+/// to_its_real_controls`-style argv-mapping coverage
+/// (`wirk-herdr/tests/contracts.rs`), together in one real launch: an
+/// explicit `--actor-model` really reaches Herdr's own `agent.start`
+/// and comes back in its own `agent_started.argv` (`RunLaunched.
+/// launch_argv`, journaled by the real `wirkd` this test drives, never
+/// a fake), and a second `wirk run` invocation for the same still-open
+/// Run refuses a conflicting `--actor-model` — exiting non-zero,
+/// touching neither Herdr nor the journal — while the first
+/// invocation's own drive loop, never interrupted, still reaches
+/// Claimed exactly as `wirk_run_drives_one_actor_run_to_claimed` does.
+#[test]
+fn wirk_run_reinvocation_with_a_conflicting_actor_model_is_refused_and_first_launch_stays_fixed() {
+    let scripted = scripted_actor::ScriptedActor::install(&[
+        "idle",
+        "edit:report.md:a throwaway repo for the selection-immutability tried step",
+        "claim:--artifact report.md=report.md",
+    ]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_reinvocation_with_a_conflicting_actor_model_is_refused",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_pointer(&estate);
+    let _ = &pointer;
+
+    let (work_id, run_id, _waypoint) = submit_actor_named(
+        &estate,
+        &repo,
+        "write report.md, then claim",
+        "selection-immutability",
+    );
+
+    // First invocation: an explicit, real `--actor-model` this Run has
+    // never had before — nothing to conflict with yet.
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["run", "--estate"])
+            .arg(&estate)
+            .args(["--work", &work_id, "--session", session.name()])
+            .args(["--herdr-socket"])
+            .arg(session.socket_path())
+            .args(["--actor-kind", "opencode"])
+            .args(["--actor-model", "scripted-model-a"])
+            .env("PATH", &path_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirk run (first invocation)"),
+    );
+
+    wait_for_event(&estate, &work_id, |kind| {
+        matches!(kind, EventKind::RunLaunched { .. })
+    });
+
+    // The bound request really reached Herdr and really came back in
+    // its own `agent_started.argv` — not a fake, this journal's own
+    // `RunLaunched` as the real `wirkd` wrote it.
+    let read_journal = || {
+        let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
+        journal.replay().expect("journal replays cleanly")
+    };
+    let events = read_journal();
+    let launched: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::RunLaunched {
+                run,
+                selection,
+                launch_argv,
+                ..
+            } if run.0 == run_id => Some((selection.clone(), launch_argv.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        launched.len(),
+        1,
+        "exactly one RunLaunched before the second invocation: {launched:?}"
+    );
+    let (first_selection, first_argv) = &launched[0];
+    assert_eq!(first_selection.model.as_deref(), Some("scripted-model-a"));
+    assert!(
+        first_argv
+            .windows(2)
+            .any(|w| w[0] == "--model" && w[1] == "scripted-model-a"),
+        "Herdr's own returned argv must carry the real --model it actually submitted: {first_argv:?}"
+    );
+
+    // Second invocation, same Run, an explicit and *conflicting*
+    // `--actor-model` — refused before Herdr or the journal are ever
+    // touched again, the first invocation's own drive loop (still
+    // running, unaffected) never interrupted.
+    let second = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session.name()])
+        .args(["--herdr-socket"])
+        .arg(session.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .args(["--actor-model", "scripted-model-b"])
+        .env("PATH", &path_env)
+        .output()
+        .expect("run wirk run (second, conflicting invocation)");
+    assert!(
+        !second.status.success(),
+        "a conflicting reinvocation must not exit 0: {second:?}"
+    );
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second_stderr.contains("scripted-model-a") && second_stderr.contains("scripted-model-b"),
+        "the refusal must name both the bound and the conflicting model: {second_stderr:?}"
+    );
+
+    // The historical record is exactly what it was before the second
+    // invocation ran — still one RunLaunched, still the first model.
+    let events_after = read_journal();
+    let launched_after: Vec<_> = events_after
+        .iter()
+        .filter(|event| {
+            event.run.as_ref().is_some_and(|r| r.0 == run_id)
+                && matches!(event.kind, EventKind::RunLaunched { .. })
+        })
+        .collect();
+    assert_eq!(
+        launched_after.len(),
+        1,
+        "the conflicting reinvocation must not add a second RunLaunched"
+    );
+    match &launched_after[0].kind {
+        EventKind::RunLaunched { selection, .. } => {
+            assert_eq!(
+                selection.model.as_deref(),
+                Some("scripted-model-a"),
+                "the bound selection must be unchanged by the refused reinvocation"
+            );
+        }
+        other => panic!("expected RunLaunched, got {other:?}"),
+    }
+
+    // The first invocation's own drive loop was never touched by any of
+    // the above — it still reaches Claimed on its own, exactly as
+    // `wirk_run_drives_one_actor_run_to_claimed` does.
+    let run_status = guard
+        .0
+        .last_mut()
+        .expect("wirk run child is in guard")
+        .wait()
+        .expect("reap wirk run");
+    assert!(
+        run_status.success(),
+        "the first invocation's own drive loop must still reach Claimed: {run_status:?}"
+    );
+}
+
 /// Bounded retry (a test's own termination bound, never a product one —
 /// the owner's ruling of 2026-09-02 §3) around `agent.wait`, the
 /// server's own block-until-this-status primitive: a single call can
@@ -1825,4 +2011,300 @@ fn wait_agent_status_any(
         assert!(Instant::now() < deadline, "never observed: {what}");
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Same submit as `submit_actor_named`, with a workflow-authored
+/// `selection` on the Waypoint (P3 native launch selection).
+fn submit_actor_with_selection(
+    estate: &Path,
+    repo: &Path,
+    name: &str,
+    selection_json: &str,
+) -> (String, String, String) {
+    let route_json = format!(
+        r#"{{"id":{name:?},"waypoints":[{{"id":"{name}/wp-1","kind":"Actor","intent":"idle","declared_outputs":[{{"name":"report.md","required":true}}],"boundary":["**"],"selection":{selection_json}}}]}}"#
+    );
+    route_fixture::write_route(estate, name, &route_json);
+    let output = Command::new(wirk_bin())
+        .args(["work", "submit", "--estate"])
+        .arg(estate)
+        .args(["--route", name, "--kind", "actor", "--repo-path"])
+        .arg(repo)
+        .args(["--base", "HEAD"])
+        .output()
+        .expect("work submit runs");
+    assert!(
+        output.status.success(),
+        "work submit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    let (mut work_id, mut run_id, mut waypoint) = (String::new(), String::new(), String::new());
+    for pair in words.chunks(2) {
+        if let [key, value] = pair {
+            match *key {
+                "work_id" => work_id = (*value).to_string(),
+                "run_id" => run_id = (*value).to_string(),
+                "waypoint" => waypoint = (*value).to_string(),
+                _ => {}
+            }
+        }
+    }
+    (work_id, run_id, waypoint)
+}
+
+/// P3 native launch selection D1, against a real `wirkd` and a real
+/// Herdr session: the resolved request is journaled **before** the
+/// irreversible `agent.start`, and wirkd admits exactly one such
+/// request per Run.
+///
+/// The review this corrects (`native-launch-verify/VERDICT.md` D1)
+/// killed `wirkd` inside the launch window and found a live agent the
+/// estate had no record of at all, because `RunLaunched` — the only
+/// durable record of the resolved selection — was written *after* the
+/// call that starts the agent. This pins both halves of the repair: the
+/// order of the two events, with identical `actor_kind`/`selection`,
+/// and the daemon-side admission that makes a second binding
+/// impossible. The admission is what two concurrent invocations
+/// serialize on; nothing here depends on a git worktree lock or on
+/// Herdr's own agent-name uniqueness, the two incidental guards the
+/// review found doing this job by accident.
+#[test]
+fn wirkd_admits_one_launch_request_per_run_and_binds_it_before_the_launch() {
+    let scripted = scripted_actor::ScriptedActor::install(&[
+        "idle",
+        "edit:report.md:a throwaway repo for the pre-launch binding tried step",
+        "claim:--artifact report.md=report.md",
+    ]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirkd_admits_one_launch_request_per_run",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_pointer(&estate);
+
+    let (work_id, run_id, _waypoint) = submit_actor_named(
+        &estate,
+        &repo,
+        "write report.md, then claim",
+        "prelaunch-binding",
+    );
+
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["run", "--estate"])
+            .arg(&estate)
+            .args(["--work", &work_id, "--session", session.name()])
+            .args(["--herdr-socket"])
+            .arg(session.socket_path())
+            .args(["--actor-kind", "opencode"])
+            .args(["--actor-model", "scripted-model-bound"])
+            .env("PATH", &path_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirk run"),
+    );
+
+    wait_for_event(&estate, &work_id, |kind| {
+        matches!(kind, EventKind::RunLaunched { .. })
+    });
+
+    let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
+    let events = journal.replay().expect("journal replays cleanly");
+    let launch_events: Vec<&EventKind> = events
+        .iter()
+        .filter(|event| event.run.as_ref().is_some_and(|r| r.0 == run_id))
+        .map(|event| &event.kind)
+        .filter(|kind| {
+            matches!(
+                kind,
+                EventKind::RunLaunchRequested { .. } | EventKind::RunLaunched { .. }
+            )
+        })
+        .collect();
+    match launch_events.as_slice() {
+        [
+            EventKind::RunLaunchRequested {
+                actor_kind: requested_kind,
+                selection: requested,
+                ..
+            },
+            EventKind::RunLaunched {
+                actor_kind: launched_kind,
+                selection: launched,
+                launch_argv,
+                ..
+            },
+        ] => {
+            assert_eq!(
+                requested.model.as_deref(),
+                Some("scripted-model-bound"),
+                "the resolved request is bound before the launch, not after it"
+            );
+            assert_eq!(requested_kind, launched_kind);
+            assert_eq!(
+                requested, launched,
+                "the launch may only ever state the request that was admitted"
+            );
+            assert!(
+                launch_argv
+                    .windows(2)
+                    .any(|w| w[0] == "--model" && w[1] == "scripted-model-bound"),
+                "Herdr's own returned argv belongs to the launch, not the request: {launch_argv:?}"
+            );
+        }
+        other => panic!("expected exactly RunLaunchRequested then RunLaunched, got {other:?}"),
+    }
+
+    // wirkd's own authority: a second admission for this Run is refused,
+    // whatever it carries. This is what a concurrent invocation hits.
+    let second = wirkd::client::call(
+        &pointer.socket,
+        &Request::record(RecordPayload {
+            work_id: WorkId(work_id.clone()),
+            run: Some(RunId(run_id.clone())),
+            kind: EventKind::RunLaunchRequested {
+                run: RunId(run_id.clone()),
+                actor_kind: wirk_core::ActorKind::opencode(),
+                selection: wirk_core::ActorSelection {
+                    model: Some("scripted-model-second".to_string()),
+                    effort: None,
+                    args: Vec::new(),
+                },
+            },
+        }),
+    )
+    .expect("the record call itself is answered");
+    match second {
+        Reply::Err { error, .. } => assert!(
+            error.message.contains("already bound"),
+            "expected an already-bound refusal, got {error:?}"
+        ),
+        other => panic!("a second launch request must be refused, got {other:?}"),
+    }
+
+    let after = Journal::open(estate.join("works").join(&work_id))
+        .expect("open journal")
+        .replay()
+        .expect("journal replays cleanly");
+    assert_eq!(
+        after
+            .iter()
+            .filter(|event| matches!(event.kind, EventKind::RunLaunchRequested { .. }))
+            .count(),
+        1,
+        "the refused admission wrote nothing"
+    );
+
+    let run_status = guard
+        .0
+        .last_mut()
+        .expect("wirk run child is in guard")
+        .wait()
+        .expect("reap wirk run");
+    assert!(
+        run_status.success(),
+        "the admitted invocation still drives to Claimed: {run_status:?}"
+    );
+}
+
+/// P3 native launch selection D2, live: a request that sets the same
+/// harness flag twice — once structurally, once raw — is refused before
+/// anything happens at all. No worktree, no journal entry, no Herdr
+/// call: the Run is exactly as it was, and nothing was submitted under
+/// a request wirk would then have had to describe dishonestly.
+#[test]
+fn a_selection_whose_raw_args_restate_its_model_is_refused_before_any_effect() {
+    let Some(session) = live_herdr::LiveHerdrSession::start("selection_conflict_refused") else {
+        return;
+    };
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_id, run_id, _waypoint) = submit_actor_with_selection(
+        &estate,
+        &repo,
+        "selection-conflict",
+        r#"{"harness":"claude","model":"model-A","args":["--model","raw-B"]}"#,
+    );
+
+    let out = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session.name()])
+        .args(["--herdr-socket"])
+        .arg(session.socket_path())
+        .output()
+        .expect("wirk run runs");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a self-contradicting selection is refused: {out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("selection.model") && stderr.contains("raw-B"),
+        "the refusal names both sides: {stderr:?}"
+    );
+
+    let events = Journal::open(estate.join("works").join(&work_id))
+        .expect("open journal")
+        .replay()
+        .expect("journal replays cleanly");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.kind,
+            EventKind::RunLaunchRequested { .. }
+                | EventKind::RunLaunched { .. }
+                | EventKind::WorktreeCreated { .. }
+        )),
+        "nothing was bound, launched or materialized for run {run_id}: {events:?}"
+    );
+    assert!(
+        !estate.join("worktrees").join(&work_id).exists(),
+        "no worktree was created for a request that was never valid"
+    );
 }
