@@ -187,6 +187,30 @@ struct WirkdState {
     /// time `append_event` tries to send to it and gets `Err` — no
     /// separate deregistration path, no timer.
     watchers: Mutex<HashMap<WorkId, Vec<std::sync::mpsc::Sender<Event>>>>,
+    /// P3 W3: one Atlas owner for this daemon's one canonical estate
+    /// (`estate_root`, already canonicalized before this state is
+    /// built) — `wirk_atlas::AtlasStore` is itself a single-writer,
+    /// estate-local catalog (its own module doc); no other component
+    /// opens a second handle on the same `<estate_root>/atlas/`.
+    atlas: Mutex<wirk_atlas::AtlasStore>,
+    /// This estate's own continuation-signing secret (ruling 0095;
+    /// W3-SECOND-CORRECTION.md item 1) — 32 bytes from the kernel CSPRNG,
+    /// created once at daemon start under `<estate_root>/.wirk/` mode
+    /// 0600 and re-read on every later start. It is a *daemon* secret,
+    /// not Atlas catalog state, which is why it lives beside the pointer
+    /// file rather than under `estate/atlas/`: a query must never create
+    /// Atlas state (W3-CORRECTION.md item 3), and a fresh estate must
+    /// still answer a search without a catalog appearing.
+    ///
+    /// A continuation token is only an *answer receipt* if this daemon
+    /// actually issued it. Nothing in a token's plaintext is secret — a
+    /// caller can read every field of its own answer — so a checksum over
+    /// those fields is recomputable by the caller and proves nothing (0095:
+    /// "do not mistake a client-recomputable checksum for authenticity").
+    /// A MAC under a key the caller never sees is what makes "this is a
+    /// generation vector I captured for you" checkable. Persisted, not
+    /// in-memory, because a continuation must survive `wirkd` restart.
+    continuation_key: [u8; 32],
 }
 
 /// Appends `event` to `journal`, then hands a clone to every live
@@ -238,10 +262,27 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
         socket: socket_path.clone(),
         source,
     })?;
+    // P3 W3: the canonical estate scope Atlas checks every membership
+    // against is this same canonicalized root — the filesystem identity
+    // *is* the estate identity for this increment (BUILD-BRIEF.md:
+    // "Until [a foundation EstateId] lands, APIs accept an opaque
+    // estate scope from wirkd").
+    let atlas = wirk_atlas::AtlasStore::open(&estate_root, estate_root.display().to_string())
+        .map_err(|source| WirkdError::Bind {
+            socket: socket_path.clone(),
+            source: io::Error::other(source.to_string()),
+        })?;
+    let continuation_key =
+        load_or_create_continuation_key(&wirk_dir).map_err(|source| WirkdError::Bind {
+            socket: socket_path.clone(),
+            source,
+        })?;
     let state = Arc::new(WirkdState {
         estate_root,
         journals: Mutex::new(HashMap::new()),
         watchers: Mutex::new(HashMap::new()),
+        atlas: Mutex::new(atlas),
+        continuation_key,
     });
 
     // W5 (0035 D110): before this listener starts accepting
@@ -765,6 +806,48 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>) -> Outcome {
             Ok(payload) => Outcome::Reply(handle_cancel(state, payload)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
+        Verb::AtlasAcquire => {
+            match serde_json::from_value::<super::AtlasAcquirePayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_acquire(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasRefresh => {
+            match serde_json::from_value::<super::AtlasRefreshPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_refresh(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasPublish => {
+            match serde_json::from_value::<super::AtlasPublishPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_publish(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasStatus => {
+            match serde_json::from_value::<super::AtlasStatusPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_status(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasSearch => {
+            match serde_json::from_value::<super::AtlasSearchPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_search(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasResolve => {
+            match serde_json::from_value::<super::AtlasResolvePayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_resolve(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasRelate => {
+            match serde_json::from_value::<super::AtlasRelatePayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_relate(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
         // `handle_connection` intercepts `watch` before ever calling
         // `dispatch` (its own long-lived, many-lines-out shape does not
@@ -984,6 +1067,20 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
     let output_contract = OutputContract(first_def.declared_outputs.clone());
     let branch = format!("wirk/{}", work_id.0);
 
+    // P3 W3 (ruling 0090): resolved once, before any World is built, so
+    // every arm below (and the child-spawn identity check further down)
+    // reads the same name — never a bare `repositories.first()`.
+    let execution_repo_name =
+        match resolve_execution_repo(&payload.repositories, payload.execution_repo.as_deref()) {
+            Ok(name) => name,
+            Err((code, message)) => return err_reply(code, &message),
+        };
+    // Populated only where a real checkout (`repo_path`) exists to
+    // verify at submit time (the Deterministic-Git and immediate-Actor
+    // arms below); the bare Actor arm materializes its worktree later
+    // via `wirk run`, with nothing yet to canonicalize here.
+    let mut execution_identity: Option<String> = None;
+
     // The reserved World's own kind follows the *Route's* first
     // Waypoint (`first_def.kind`), not `payload.kind` directly — a
     // Route file's own authored order decides what gets reserved first
@@ -1023,6 +1120,12 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                         Ok(sha) => sha,
                         Err(detail) => return err_reply("GitError", &detail),
                     };
+                    if execution_repo_name.is_some() {
+                        execution_identity = match canonical_repository_identity(&repo_path) {
+                            Ok(identity) => Some(identity),
+                            Err(detail) => return err_reply("GitError", &detail),
+                        };
+                    }
                     (
                         verified.clone(),
                         SourceBasis::Git { base: verified },
@@ -1069,6 +1172,12 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 Ok(sha) => sha,
                 Err(detail) => return err_reply("GitError", &detail),
             };
+            if execution_repo_name.is_some() {
+                execution_identity = match canonical_repository_identity(&repo_path) {
+                    Ok(identity) => Some(identity),
+                    Err(detail) => return err_reply("GitError", &detail),
+                };
+            }
             World::Actor(ActorWorld {
                 repository: repo_path.clone(),
                 // Empty until `wirk run` creates the worktree and
@@ -1097,10 +1206,14 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             })
         }
         WaypointKind::Actor => {
-            let repository = payload
-                .repositories
-                .first()
-                .map(|binding| binding.name.clone())
+            // P3 W3 (ruling 0090): the resolved execution binding's
+            // name, never `repositories.first()` — a Work declaring
+            // more than one `--repo` binding without saying which is
+            // execution already refused above, so this arm only ever
+            // sees an unambiguous name (or none, the legacy no-binding
+            // fallback preserved verbatim).
+            let repository = execution_repo_name
+                .clone()
                 .unwrap_or_else(|| route_id.0.clone());
             World::Actor(ActorWorld {
                 repository,
@@ -1137,7 +1250,14 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
     // binding both halves are later checked against.
     let mut recorded_parent = payload.parent.clone();
     if let Some(parent) = &payload.parent {
-        match spawn_child_on_parent(state, parent, &work_id, &payload.repositories) {
+        match spawn_child_on_parent(
+            state,
+            parent,
+            &work_id,
+            &payload.repositories,
+            execution_repo_name.as_deref(),
+            execution_identity.as_deref(),
+        ) {
             Ok(attempt) => {
                 if let Some(binding) = recorded_parent.as_mut() {
                     binding.attempt = Some(attempt);
@@ -1174,6 +1294,8 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             // never re-read the file (or reconstruct a fallback) again.
             waypoint_defs,
             parent: recorded_parent,
+            execution_repo: execution_repo_name,
+            execution_identity,
         },
     );
     if let Err(err) = append_event(state, &mut journal, &work_id, &submitted) {
@@ -1234,7 +1356,20 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
 /// `waypoint`, so a leaf nested arbitrarily deep under the named
 /// container may request its role — `ChildParentMismatch` otherwise);
 /// every one of `child_repositories` is bound no wider than the
-/// parent's own binding of the same name (`ChildExceedsParentBinding`).
+/// parent's own binding of the same name (`ChildExceedsParentBinding`);
+/// whenever a binding names the *parent's own* execution repository,
+/// the child's and the parent's own real, wirkd-verified canonical
+/// repository identities must also agree — always, never a Route
+/// opt-in (ruling 0090, corrected by 0092 after a first draft of this
+/// function gated the check behind a Route field that defaulted off:
+/// that preserved the demonstrated defect as default behavior, which
+/// is not what 0090 asked for). This is what
+/// `loop-a-native-verify/VERDICT.md` §4 found missing: a same-named,
+/// disconnected throwaway repository was admitted under the parent's
+/// own alias with no check that it was actually the parent's
+/// repository. A child's own, legitimately distinct output repository
+/// must be admitted under a name the parent explicitly declared for
+/// that purpose, never by reusing the parent's own execution alias.
 /// Estate boundary is automatic: a `WorkId` from another estate simply
 /// resolves to no journal here (`journal_for`'s own containment).
 fn spawn_child_on_parent(
@@ -1242,6 +1377,8 @@ fn spawn_child_on_parent(
     parent: &ParentBinding,
     child_id: &WorkId,
     child_repositories: &[RepositoryBinding],
+    child_execution_repo: Option<&str>,
+    child_execution_identity: Option<&str>,
 ) -> Result<u32, (&'static str, String)> {
     let journal = journal_for(state, &parent.work)
         .map_err(|err| ("JournalError", err.to_string()))?
@@ -1325,6 +1462,62 @@ fn spawn_child_on_parent(
                 ),
             ));
         }
+        // Ruling 0090/0092: name/access alone cannot tell a child
+        // genuinely inheriting the parent's own repository from one
+        // bound only to a same-named, disconnected throwaway repository
+        // (`loop-a-native-verify/VERDICT.md` §4) — and this is not a
+        // Route opt-in (0092: an opt-in that defaults off preserves the
+        // demonstrated defect as default behavior). Whenever this
+        // binding's name *is* the parent's own resolved execution
+        // repository, a child that also declares this same name as its
+        // own execution repository is inheriting that specific
+        // repository's authority, not merely a permission label —
+        // wirkd verifies the two checkouts are actually the same
+        // repository before admitting it. A child that wants its own,
+        // legitimately distinct output repository must be admitted
+        // under a name the parent does *not* already use for its own
+        // execution checkout (a separate binding the parent explicitly
+        // declared for that purpose); reusing the parent's own
+        // execution alias for a different repository is exactly the
+        // defect this closes, never a supported shape.
+        if parent_work.execution_repo.as_deref() == Some(binding.name.as_str()) {
+            if Some(binding.name.as_str()) != child_execution_repo {
+                return Err((
+                    "ChildExceedsParentBinding",
+                    format!(
+                        "repository {} is the parent's own execution repository; the child must declare it as its own execution repository too, not merely list it",
+                        binding.name
+                    ),
+                ));
+            }
+            let Some(parent_identity) = parent_work.execution_identity.as_deref() else {
+                return Err((
+                    "ChildExceedsParentBinding",
+                    format!(
+                        "repository {} cannot be verified against the parent's own unverified execution binding",
+                        binding.name
+                    ),
+                ));
+            };
+            let Some(child_identity) = child_execution_identity else {
+                return Err((
+                    "ChildExceedsParentBinding",
+                    format!(
+                        "repository {} has no resolvable execution identity for the child",
+                        binding.name
+                    ),
+                ));
+            };
+            if child_identity != parent_identity {
+                return Err((
+                    "ChildExceedsParentBinding",
+                    format!(
+                        "repository {} does not resolve to the parent's own repository",
+                        binding.name
+                    ),
+                ));
+            }
+        }
     }
 
     // W-A correction (F4): the child serves one *generation* of the
@@ -1393,6 +1586,72 @@ fn resolve_git_sha(repo_path: &str, base_ref: &str) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// P3 W3 (ruling 0090): resolves which declared `--repo` binding is the
+/// Work's actual execution/write checkout. `requested` must name a real
+/// binding when given; when omitted, a single binding is unambiguous
+/// (the legacy submit line keeps working unchanged) but more than one
+/// binding is refused rather than silently taking `repositories[0]` —
+/// the defect this whole correction exists to remove
+/// (`is_read_binding`'s and the bare Actor World's own former `.first()`
+/// reads, both replaced by this resolved name).
+fn resolve_execution_repo(
+    repositories: &[RepositoryBinding],
+    requested: Option<&str>,
+) -> Result<Option<String>, (&'static str, String)> {
+    match requested {
+        Some(name) => {
+            if repositories.iter().any(|binding| binding.name == name) {
+                Ok(Some(name.to_string()))
+            } else {
+                Err((
+                    "UnknownExecutionRepository",
+                    format!("--execution-repo {name} names no --repo binding on this submission"),
+                ))
+            }
+        }
+        None => match repositories.len() {
+            0 => Ok(None),
+            1 => Ok(Some(repositories[0].name.clone())),
+            _ => Err((
+                "AmbiguousExecutionRepository",
+                "more than one --repo binding is declared; --execution-repo <name> must say \
+                 which one is the execution checkout"
+                    .to_string(),
+            )),
+        },
+    }
+}
+
+/// P3 W3 (ruling 0090): the real, wirkd-verified identity of the
+/// repository backing an execution checkout — `git rev-parse
+/// --path-format=absolute --git-common-dir`, canonicalized. Two
+/// worktrees of the same repository (`git worktree add`) share one
+/// common Git directory and therefore resolve identically here; two
+/// unrelated repositories that merely happen to share a `--repo` alias
+/// or a same-named on-disk directory do not. This is the check
+/// `loop-a-native-verify/VERDICT.md` §4 found missing: admission by
+/// binding name/access alone could not tell a child genuinely bound to
+/// the parent's own repository from one bound only to a same-named,
+/// disconnected throwaway repository.
+fn canonical_repository_identity(repo_path: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .map_err(|err| format!("failed to spawn git: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git -C {repo_path} rev-parse --git-common-dir failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    std::fs::canonicalize(&raw)
+        .map(|p| p.display().to_string())
+        .map_err(|err| format!("could not canonicalize resolved Git common directory {raw}: {err}"))
 }
 
 /// W3: appends one `EventKind` through the same single write path
@@ -2034,15 +2293,35 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                         }
                     }
                     // P2.4 W2 (build-brief.md §3 W2; refuse.md §2): a Work
-                    // whose one repository binding is `Access::Read`
-                    // refuses any changed path at all, whatever the
-                    // Waypoint's globs say — `work.repositories.first()`
-                    // per orient's own read (a single-binding case; the
-                    // name/path match against `ActorWorld.repository` is
-                    // P2.5's question, carried, not answered here).
+                    // whose *execution* repository binding is
+                    // `Access::Read` refuses any changed path at all,
+                    // whatever the Waypoint's globs say. P3 W3 (ruling
+                    // 0090): resolved by `Work.execution_repo` — the same
+                    // name `resolve_execution_repo` fixed at submit time
+                    // for every Waypoint kind and every submit shape
+                    // (`handle_submit`'s own doc) — never
+                    // `repositories.first()` and never `ActorWorld.
+                    // repository` (which is a bare path, not a binding
+                    // name, for the immediate `--kind actor --repo-path`
+                    // submit shape, so matching against it would silently
+                    // miss and fall back to `.first()` for exactly the
+                    // shape real actor Runs use). A multi-source Work
+                    // whose execution repository happens to be listed
+                    // second must refuse identically to one where it is
+                    // listed first, and a readable evidence source's own
+                    // access must never stand in for it. Falls back to
+                    // `.first()` only for a pre-correction journal or a
+                    // Work with no resolvable name, preserving the legacy
+                    // single-binding read.
                     let is_read_binding = work
-                        .repositories
-                        .first()
+                        .execution_repo
+                        .as_deref()
+                        .and_then(|name| {
+                            work.repositories
+                                .iter()
+                                .find(|candidate| candidate.name == name)
+                        })
+                        .or_else(|| work.repositories.first())
                         .is_some_and(|binding| binding.access == Access::Read);
                     // 0050 D150: "A Read repository binding refuses any
                     // change at all" — no exception for a declared
@@ -4239,6 +4518,925 @@ fn cancel_work(
     Ok(())
 }
 
+// ---- Atlas (P3 W3, BUILD-BRIEF.md "Public surface") ----------------------
+
+/// An `ExactCoordinate` travels the wire as hex-encoded JSON bytes (R3/
+/// R6: stdlib only, no new dependency for a base64 crate) — argv-safe
+/// and line-safe, since a Git pathname is raw bytes, never guaranteed
+/// text. `decode_coordinate` is the inverse, used by every verb that
+/// accepts a caller-supplied coordinate.
+fn encode_coordinate(coordinate: &wirk_atlas::ExactCoordinate) -> String {
+    let bytes = serde_json::to_vec(coordinate).expect("ExactCoordinate always serializes");
+    hex_encode(&bytes)
+}
+
+fn decode_coordinate(encoded: &str) -> Result<wirk_atlas::ExactCoordinate, String> {
+    let bytes = hex_decode(encoded)?;
+    serde_json::from_slice(&bytes).map_err(|err| format!("malformed coordinate: {err}"))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) {
+        return Err("odd-length coordinate".to_string());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&text[i..i + 2], 16)
+                .map_err(|_| "invalid coordinate hex".to_string())
+        })
+        .collect()
+}
+
+fn membership_json(membership: &wirk_atlas::Membership) -> Value {
+    json!({
+        "id": membership.id.0,
+        "estate": membership.estate.0,
+        "alias": membership.alias,
+        "source": membership.source.0,
+        "locator": membership.locator,
+        "requested_ref": membership.requested_ref,
+    })
+}
+
+fn generation_json(generation: &wirk_atlas::SourceGeneration) -> Value {
+    let mut coverage = std::collections::BTreeMap::from([
+        ("indexed", 0u64),
+        ("excluded", 0u64),
+        ("unsupported", 0u64),
+        ("unavailable", 0u64),
+        ("error", 0u64),
+    ]);
+    for resource in &generation.resources {
+        let key = match resource.disposition {
+            wirk_atlas::CoverageDisposition::Indexed => "indexed",
+            wirk_atlas::CoverageDisposition::Excluded => "excluded",
+            wirk_atlas::CoverageDisposition::Unsupported => "unsupported",
+            wirk_atlas::CoverageDisposition::Unavailable => "unavailable",
+            wirk_atlas::CoverageDisposition::Error => "error",
+        };
+        *coverage.get_mut(key).expect("all five keys pre-seeded") += 1;
+    }
+    json!({
+        "generation": generation.id.0,
+        "source": generation.source.0,
+        "revision": generation.revision,
+        "content": generation.content,
+        "extractor_set": generation.extractor_set,
+        "acquisition_policy": generation.acquisition_policy,
+        "coverage": {
+            "indexed": coverage["indexed"],
+            "excluded": coverage["excluded"],
+            "unsupported": coverage["unsupported"],
+            "unavailable": coverage["unavailable"],
+            "error": coverage["error"],
+            "total": generation.resources.len(),
+        },
+    })
+}
+
+/// `handle_atlas_acquire`: registers `source` (on first use) against
+/// `repository`, then stages an acquisition at `revision` — creation
+/// only, never a query's side effect (BUILD-BRIEF.md: "Query and exact
+/// resolution cannot create, refresh, fetch, embed or repair stores").
+fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePayload) -> Reply {
+    let mut atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let membership =
+        match atlas.register_git(&payload.source, &payload.repository, &payload.revision) {
+            Ok(membership) => membership,
+            Err(err) => return err_reply("AtlasError", &err.to_string()),
+        };
+    acquire_reply(&mut atlas, &membership, &payload.revision)
+}
+
+/// `handle_atlas_refresh`: reuses `source`'s existing registration and
+/// membership (`UnknownSource` if none exists yet — refresh never
+/// creates a registration, only `acquire` does); stages a candidate
+/// generation without publishing it.
+fn handle_atlas_refresh(state: &Arc<WirkdState>, payload: super::AtlasRefreshPayload) -> Reply {
+    let mut atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(membership) = atlas
+        .memberships()
+        .find(|membership| membership.alias == payload.source)
+        .cloned()
+    else {
+        return err_reply(
+            "UnknownSource",
+            &format!("no registered source named {}", payload.source),
+        );
+    };
+    acquire_reply(&mut atlas, &membership, &payload.revision)
+}
+
+fn acquire_reply(
+    atlas: &mut wirk_atlas::AtlasStore,
+    membership: &wirk_atlas::Membership,
+    revision: &str,
+) -> Reply {
+    match atlas.acquire(membership, revision, wirk_atlas::ExtractorPolicy::default()) {
+        Ok(wirk_atlas::AcquireOutcome::Staged(generation)) => ok_reply(json!({
+            "membership": membership_json(membership),
+            "outcome": "staged",
+            "generation": generation_json(&generation),
+        })),
+        Ok(wirk_atlas::AcquireOutcome::Unavailable(detail)) => ok_reply(json!({
+            "membership": membership_json(membership),
+            "outcome": "unavailable",
+            "detail": detail,
+        })),
+        Err(err) => err_reply("AtlasError", &err.to_string()),
+    }
+}
+
+/// `handle_atlas_publish`: atomically advances `source`'s published
+/// generation to the already-staged `generation` — a second, explicit
+/// operation from `acquire`/`refresh` (BUILD-BRIEF.md: "An immutable
+/// staged generation is unreadable to queries until a separate catalog
+/// publication names it").
+fn handle_atlas_publish(state: &Arc<WirkdState>, payload: super::AtlasPublishPayload) -> Reply {
+    let mut atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(membership) = atlas
+        .memberships()
+        .find(|membership| membership.alias == payload.source)
+        .cloned()
+    else {
+        return err_reply(
+            "UnknownSource",
+            &format!("no registered source named {}", payload.source),
+        );
+    };
+    let generation = wirk_atlas::GenerationId(payload.generation.clone());
+    match atlas.publish(&membership, &generation) {
+        Ok(()) => ok_reply(json!({
+            "membership": membership_json(&membership),
+            "generation": payload.generation,
+            "publication_revision": atlas.publication_revision(),
+        })),
+        Err(err) => err_reply("AtlasError", &err.to_string()),
+    }
+}
+
+/// `handle_atlas_status`: every registered source (or the one named),
+/// its currently published generation and coverage summary, and its
+/// recent acquisition attempts — read-only, creates nothing (a fresh
+/// estate or an unregistered source name reports emptily rather than
+/// fabricating a generation).
+///
+/// P3 W3 correction (ruling 0093, W3-CORRECTION.md item 3): `registered`
+/// used to read `true` on a totally fresh estate whenever no specific
+/// `--source` was named (`!sources.is_empty() || payload.source.is_none()`
+/// — vacuously true for an empty catalog) — a fresh estate now reports
+/// `sources_total: 0` unambiguously instead. `registered` is reported
+/// only when a specific `--source` was named, meaning exactly "this name
+/// exists in the catalog".
+///
+/// Item 3 also requires `--work` scoping: when given, a source this
+/// Work's own journaled bindings do not admit is dropped entirely,
+/// never disclosing its locator, revision or generation (VERDICT.md
+/// L4). Omitting `--work` remains estate-wide catalog administration —
+/// an explicit, distinct capability from Work-scoped retrieval, not a
+/// bug to close by removing it.
+fn handle_atlas_status(state: &Arc<WirkdState>, payload: super::AtlasStatusPayload) -> Reply {
+    let scope = match resolve_query_scope(state, &payload.work) {
+        Ok(scope) => scope,
+        Err(reply) => return reply,
+    };
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Ruling 0095 (correction-verify VERDICT §5 R3): under a Work scope,
+    // both of these count only what this scope actually admits. Counting
+    // — or answering `registered` over — every alias in the catalog made
+    // a Work-scoped call an existence oracle for aliases the same scope
+    // refuses to search: `--source secret` answered `registered: true`
+    // for a denied alias and `false` for a name that does not exist. No
+    // locator, revision or generation leaked, but the alias itself did.
+    // The estate-wide administrative call (`payload.work` absent) is
+    // unchanged and still discloses everything, exactly as 0093 requires
+    // the explicit administration surface to.
+    let scoped = payload.work.is_some();
+    let mut sources_total = 0usize;
+    let mut sources = Vec::new();
+    let mut name_found = false;
+    for membership in atlas.memberships() {
+        let admitted = admitted_membership_for(&atlas, &scope, &membership.id).is_some();
+        if !scoped || admitted {
+            sources_total += 1;
+        }
+        if let Some(wanted) = &payload.source
+            && &membership.alias != wanted
+        {
+            continue;
+        }
+        if !scoped || admitted {
+            name_found = true;
+        }
+        if !admitted {
+            continue;
+        }
+        let current = match atlas.current(membership) {
+            Ok(generation) => generation,
+            Err(err) => return err_reply("AtlasError", &err.to_string()),
+        };
+        let attempts: Vec<Value> = atlas
+            .attempts()
+            .iter()
+            .filter(|attempt| attempt.membership == membership.id)
+            .map(|attempt| {
+                json!({
+                    "at_unix_millis": attempt.at_unix_millis,
+                    "requested_ref": attempt.requested_ref,
+                    "outcome": attempt.outcome,
+                    "generation": attempt.generation.as_ref().map(|g| g.0.clone()),
+                    "diagnostic": attempt.diagnostic,
+                })
+            })
+            .collect();
+        sources.push(json!({
+            "membership": membership_json(membership),
+            "published_generation": current.as_ref().map(generation_json),
+            "recent_attempts": attempts,
+        }));
+    }
+    let mut result = json!({
+        "publication_revision": atlas.publication_revision(),
+        "sources_total": sources_total,
+        "sources": sources,
+        "work_scoped": payload.work.is_some(),
+    });
+    if let Some(wanted) = &payload.source {
+        if scoped {
+            // Deliberately one answer for both "denied" and "no such
+            // alias": under a Work scope the only honest thing to say is
+            // whether *this scope* can see it.
+            result["admitted"] = json!(name_found);
+        } else {
+            result["registered"] = json!(name_found);
+        }
+        result["source"] = json!(wanted);
+    }
+    ok_reply(result)
+}
+
+/// Estate-wide orientation (`payload.work` absent) or a real Work's own
+/// journaled `repositories` (present) — the complete admission scope,
+/// never a client-supplied replacement grant set (BUILD-AMENDMENTS.md:
+/// "A Work-scoped query must derive its complete read admission from
+/// the journaled Work, not accept a replacement grant set from the
+/// client").
+fn resolve_query_scope(
+    state: &Arc<WirkdState>,
+    work: &Option<WorkId>,
+) -> Result<wirk_atlas::QueryScope, Reply> {
+    let Some(work_id) = work else {
+        return Ok(wirk_atlas::QueryScope::EstateOrientation);
+    };
+    let events = match journal_for(state, work_id) {
+        Ok(Some(journal)) => {
+            let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+            match journal.replay() {
+                Ok(events) => events,
+                Err(err) => return Err(err_reply("JournalError", &err.to_string())),
+            }
+        }
+        Ok(None) => return Err(err_reply("NotFound", "no such work")),
+        Err(err) => return Err(err_reply("JournalError", &err.to_string())),
+    };
+    if events.is_empty() {
+        return Err(err_reply("NotFound", "no such work"));
+    }
+    Ok(wirk_atlas::QueryScope::Work(fold(&events).repositories))
+}
+
+/// Re-derives `wirk_atlas::admission::admit`'s own single rule (that
+/// function is private to its crate; W3 is a trusted caller across the
+/// crate boundary, not a reason to widen its public surface) rather
+/// than admitting on the daemon's own separate judgment: a membership
+/// is admissible under `QueryScope::EstateOrientation` unconditionally,
+/// or under `QueryScope::Work(grants)` only if some grant names its
+/// alias.
+fn admitted_membership_for(
+    atlas: &wirk_atlas::AtlasStore,
+    scope: &wirk_atlas::QueryScope,
+    id: &wirk_atlas::MembershipId,
+) -> Option<wirk_atlas::Membership> {
+    let membership = atlas.memberships().find(|member| &member.id == id)?.clone();
+    match scope {
+        wirk_atlas::QueryScope::EstateOrientation => Some(membership),
+        wirk_atlas::QueryScope::Work(grants) => grants
+            .iter()
+            .any(|grant| grant.name == membership.alias)
+            .then_some(membership),
+    }
+}
+
+fn evidence_hit_json(hit: &wirk_atlas::EvidenceHit) -> Value {
+    json!({
+        "coordinate": encode_coordinate(&hit.coordinate),
+        "estate": hit.coordinate.estate.0,
+        "source": hit.coordinate.source.0,
+        "generation": hit.coordinate.generation.0,
+        // P3 W3 correction (ruling 0093, W3-CORRECTION.md item 4;
+        // VERDICT.md L3): BUILD-BRIEF.md's own decisive assertion is
+        // "every hit names estate, source, generation,
+        // revision/content/extractor identities" — these three were
+        // previously only recoverable by joining against a separate
+        // `atlas status` call.
+        "revision": hit.generation_identity.revision,
+        "content": hit.generation_identity.content,
+        "extractor_set": hit.generation_identity.extractor_set,
+        "path": String::from_utf8_lossy(&hit.coordinate.path),
+        "line_start": hit.coordinate.line_start,
+        "line_end": hit.coordinate.line_end,
+        "score": hit.score,
+        "snippet": hit.snippet,
+    })
+}
+
+fn budget_json(budget: &wirk_atlas::AnswerBudget) -> Value {
+    json!({
+        "limit": budget.limit,
+        "offset": budget.offset,
+        "total_candidates": budget.total_candidates,
+        "returned": budget.returned,
+    })
+}
+
+fn semantic_status_json(status: &wirk_atlas::SemanticStatus) -> Value {
+    match status {
+        wirk_atlas::SemanticStatus::Applied => json!({"status": "applied"}),
+        wirk_atlas::SemanticStatus::Unavailable(reason) => {
+            json!({"status": "unavailable", "reason": reason})
+        }
+        wirk_atlas::SemanticStatus::Disabled => json!({"status": "disabled"}),
+    }
+}
+
+fn coverage_json(coverage: &wirk_atlas::AnswerCoverage) -> Value {
+    json!({
+        "no_match": coverage.no_match,
+        "partial": coverage.partial,
+        "source_unavailable": coverage.source_unavailable,
+        "generation_unavailable": coverage.generation_unavailable,
+        "unsupported_family": coverage.unsupported_family,
+        // P3 W3 correction (ruling 0093, W3-CORRECTION.md item 3;
+        // VERDICT.md M1/L1/L2): distinct from `no_match` — the scope
+        // admitted nothing to search (`denied`) or the addressed estate
+        // (or named source) has no registered membership at all
+        // (`no_sources`, the fresh-estate case) are both "never
+        // searched", never a positive assertion of absence.
+        "denied": coverage.denied,
+        "no_sources": coverage.no_sources,
+        // Ruling 0095: end of *this answer's* pages, reported in its own
+        // right so it is never told as "the corpus held nothing" beside a
+        // `budget.total_candidates` that says otherwise.
+        "spent": coverage.spent,
+        "complete": coverage.is_complete(),
+    })
+}
+
+/// One `search` answer's own continuation token (ruling 0093,
+/// W3-CORRECTION.md item 1): the exact generation vector it read plus
+/// the request that produced it and the next page offset — hex-encoded
+/// JSON, the same convention `encode_coordinate` uses. Every field of
+/// the *request* that produced an answer is captured so a later
+/// `--continue` can be checked against the caller's own restated
+/// request rather than trusted blind; only `offset`/`generations`
+/// actually drive re-execution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+struct ContinuationToken {
+    work: Option<String>,
+    query: String,
+    source: Option<String>,
+    families: Vec<String>,
+    semantic: Option<String>,
+    limit: usize,
+    offset: usize,
+    generations: Vec<(String, String)>,
+}
+
+/// Reads `<wirk_dir>/continuation-key`, creating it from the kernel
+/// CSPRNG on first use (`WirkdState::continuation_key`'s own doc for why
+/// it lives here and not in the Atlas estate). R4: `/dev/urandom` is the
+/// platform's own CSPRNG, read the ordinary way — no dependency, no
+/// hand-rolled seeding. Mode 0600 is set before any byte is written, so
+/// the secret is never briefly world-readable.
+fn load_or_create_continuation_key(wirk_dir: &Path) -> io::Result<[u8; 32]> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = wirk_dir.join("continuation-key");
+    if let Ok(existing) = std::fs::read(&path)
+        && existing.len() == 32
+    {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&existing);
+        return Ok(key);
+    }
+    let mut key = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(&key)?;
+    file.sync_all()?;
+    Ok(key)
+}
+
+/// HMAC-SHA256 over one continuation token's exact serialized bytes.
+/// R5: the `hmac` crate's own construction over the `sha2` this
+/// workspace already depends on, not a hand-rolled keyed hash.
+fn continuation_tag(key: &[u8; 32], body: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts a 32-byte key");
+    mac.update(body);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// `<hex of the token's JSON>.<hex of its HMAC>` — the tag covers the
+/// exact bytes transmitted, so there is no canonicalization gap between
+/// what was signed and what is later verified.
+fn encode_continuation(key: &[u8; 32], token: &ContinuationToken) -> String {
+    let body = serde_json::to_vec(token).expect("ContinuationToken always serializes");
+    let tag = continuation_tag(key, &body);
+    format!("{}.{}", hex_encode(&body), hex_encode(&tag))
+}
+
+/// Why the tag is checked *before* the token is interpreted at all: the
+/// fields a continuation carries (`generations`, `offset`) are the ones
+/// that decide which immutable blobs `wirk_atlas::search` will read, and
+/// every one of them is visible to any caller who has ever received one
+/// answer. Ruling 0095: "A token assembled by a client from known
+/// metadata must not masquerade as a previously captured answer."
+/// `verify_slice` is the `hmac` crate's own constant-time comparison.
+fn decode_continuation(key: &[u8; 32], encoded: &str) -> Result<ContinuationToken, Reply> {
+    use hmac::{Hmac, KeyInit, Mac};
+    let Some((body_hex, tag_hex)) = encoded.split_once('.') else {
+        return Err(err_reply(
+            "MalformedContinuation",
+            "a continuation token is <body>.<tag>; this one carries no authenticity tag",
+        ));
+    };
+    let body =
+        hex_decode(body_hex).map_err(|detail| err_reply("MalformedContinuation", &detail))?;
+    let tag = hex_decode(tag_hex).map_err(|detail| err_reply("MalformedContinuation", &detail))?;
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC-SHA256 accepts a 32-byte key");
+    mac.update(&body);
+    if mac.verify_slice(&tag).is_err() {
+        return Err(err_reply(
+            "ForgedContinuation",
+            "this continuation token was not issued by this estate for a real answer",
+        ));
+    }
+    serde_json::from_slice(&body).map_err(|err| {
+        err_reply(
+            "MalformedContinuation",
+            &format!("malformed continuation: {err}"),
+        )
+    })
+}
+
+/// `handle_atlas_search`: lexical (optionally semantic-*requested*,
+/// never silently applied — W4 owns the real backend) ranked search
+/// over the resolved scope's admitted, published generations.
+///
+/// P3 W3 correction (ruling 0093, W3-CORRECTION.md item 1): `payload.
+/// continuation`, when present, must name the *same* query/scope this
+/// request restates — a caller cannot swap `--work`, `--query`,
+/// `--source`, `--family`, `--semantic` or `--limit` mid-continuation
+/// and inherit a different answer's captured generations. The scope
+/// itself is still re-derived fresh from the *current* journaled Work
+/// on every call (`resolve_query_scope`), never taken from the token —
+/// a continuation cannot mint authority a Work's real bindings do not
+/// currently grant, even if they once did.
+fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPayload) -> Reply {
+    let scope = match resolve_query_scope(state, &payload.work) {
+        Ok(scope) => scope,
+        Err(reply) => return reply,
+    };
+    let semantic = match payload.semantic.as_deref() {
+        None | Some("disabled") => wirk_atlas::SemanticRequest::Disabled,
+        Some("requested") => wirk_atlas::SemanticRequest::Requested,
+        Some(other) => {
+            return err_reply("BadRequest", &format!("unknown --semantic value {other}"));
+        }
+    };
+    let mut families = Vec::new();
+    for family in &payload.families {
+        families.push(match family.as_str() {
+            "code" => wirk_atlas::ContentFamily::Code,
+            "knowledge" => wirk_atlas::ContentFamily::Knowledge,
+            "config" => wirk_atlas::ContentFamily::Config,
+            other => return err_reply("BadRequest", &format!("unknown content family {other}")),
+        });
+    }
+    let limit = payload.limit.unwrap_or(10);
+    let (pinned, offset) = match &payload.continuation {
+        None => (None, 0),
+        Some(token) => {
+            let decoded = match decode_continuation(&state.continuation_key, token) {
+                Ok(decoded) => decoded,
+                Err(reply) => return reply,
+            };
+            let restated = ContinuationToken {
+                work: payload.work.as_ref().map(|w| w.0.clone()),
+                query: payload.query.clone(),
+                source: payload.source.clone(),
+                families: payload.families.clone(),
+                semantic: payload.semantic.clone(),
+                limit,
+                offset: decoded.offset,
+                generations: decoded.generations.clone(),
+            };
+            if decoded != restated {
+                return err_reply(
+                    "ContinuationMismatch",
+                    "the continuation token names a different work/query/source/family/semantic/limit than this request",
+                );
+            }
+            let pinned: BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId> = decoded
+                .generations
+                .iter()
+                .map(|(membership, generation)| {
+                    (
+                        wirk_atlas::MembershipId(membership.clone()),
+                        wirk_atlas::GenerationId(generation.clone()),
+                    )
+                })
+                .collect();
+            (Some(pinned), decoded.offset)
+        }
+    };
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let request = wirk_atlas::SearchRequest {
+        scope,
+        requested_source: payload.source.clone(),
+        query: payload.query.clone(),
+        families,
+        semantic,
+        limit,
+        pinned,
+        offset,
+    };
+    match wirk_atlas::search(&atlas, &request) {
+        Ok(answer) => {
+            let continuation = ContinuationToken {
+                work: payload.work.as_ref().map(|w| w.0.clone()),
+                query: payload.query.clone(),
+                source: payload.source.clone(),
+                families: payload.families.clone(),
+                semantic: payload.semantic.clone(),
+                limit,
+                offset: offset + answer.hits.len(),
+                generations: answer
+                    .generations
+                    .iter()
+                    .map(|(membership, generation)| (membership.0.clone(), generation.0.clone()))
+                    .collect(),
+            };
+            ok_reply(json!({
+                "publication_revision": answer.publication_revision,
+                "generations": answer.generations.iter().map(|(membership, generation)| json!({
+                    "membership": membership.0,
+                    "generation": generation.0,
+                })).collect::<Vec<_>>(),
+                "admission": {"admitted": answer.admission.admitted, "denied": answer.admission.denied},
+                "hits": answer.hits.iter().map(evidence_hit_json).collect::<Vec<_>>(),
+                "semantic": semantic_status_json(&answer.semantic),
+                "coverage": coverage_json(&answer.coverage),
+                "truncated": answer.truncated,
+                "budget": budget_json(&answer.budget),
+                "continuation": if answer.coverage.no_sources || answer.coverage.denied {
+                    None
+                } else {
+                    Some(encode_continuation(&state.continuation_key, &continuation))
+                },
+            }))
+        }
+        Err(err) => err_reply("AtlasError", &err.to_string()),
+    }
+}
+
+/// `handle_atlas_resolve`: exact evidence-coordinate resolution.
+/// `InadmissibleEstate` refuses a coordinate naming a different estate
+/// before any lookup/ranking, without disclosing its path/content
+/// (BUILD-BRIEF.md's decisive-scenario requirement); `Inadmissible`
+/// refuses one naming a membership this scope does not grant, same
+/// non-disclosure.
+fn handle_atlas_resolve(state: &Arc<WirkdState>, payload: super::AtlasResolvePayload) -> Reply {
+    let scope = match resolve_query_scope(state, &payload.work) {
+        Ok(scope) => scope,
+        Err(reply) => return reply,
+    };
+    let coordinate = match decode_coordinate(&payload.coordinate) {
+        Ok(coordinate) => coordinate,
+        Err(detail) => return err_reply("MalformedCoordinate", &detail),
+    };
+    if coordinate.estate.0 != state.estate_root.display().to_string() {
+        return err_reply(
+            "InadmissibleEstate",
+            "coordinate names a different estate than this daemon's own",
+        );
+    }
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let Some(membership) = admitted_membership_for(&atlas, &scope, &coordinate.membership) else {
+        return err_reply(
+            "Inadmissible",
+            "coordinate's membership is not admissible under this scope",
+        );
+    };
+    match atlas.resolve_exact(&membership, &coordinate) {
+        Ok(outcome) => ok_reply(resolve_outcome_json(outcome, &membership.locator)),
+        Err(err) => err_reply("AtlasError", &err.to_string()),
+    }
+}
+
+/// The full committed blob's own byte length (P3 W3 correction, ruling
+/// 0093, W3-CORRECTION.md item 4; VERDICT.md L3: "no evidence budget is
+/// disclosed on either search or resolve"): `resolve`'s own answer
+/// already names an exact `byte_start`/`byte_end` span the caller
+/// chose; this discloses how large the object it was cut from actually
+/// is, so a caller can tell a deliberately narrow span from the whole
+/// object. Read directly from Git (`cat-file -s`), never from the
+/// bounded extracted unit — the same real-object source `resolve_exact`
+/// itself already re-verified the span against.
+fn blob_total_bytes(locator: &str, object_id: &str) -> Option<u64> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(locator)
+        .args(["cat-file", "-s", object_id])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+fn resolve_outcome_json(outcome: wirk_atlas::ResolveOutcome, locator: &str) -> Value {
+    match outcome {
+        wirk_atlas::ResolveOutcome::Resolved(evidence) => json!({
+            "outcome": "resolved",
+            "coordinate": encode_coordinate(&evidence.coordinate),
+            "path": String::from_utf8_lossy(&evidence.coordinate.path),
+            "line_start": evidence.coordinate.line_start,
+            "line_end": evidence.coordinate.line_end,
+            "text": String::from_utf8(evidence.bytes.clone()).ok(),
+            "bytes_hex": hex_encode(&evidence.bytes),
+            "budget": {
+                "returned_bytes": evidence.bytes.len(),
+                "total_bytes": blob_total_bytes(locator, &evidence.coordinate.object_id),
+            },
+        }),
+        wirk_atlas::ResolveOutcome::Absent => json!({"outcome": "absent"}),
+        wirk_atlas::ResolveOutcome::Excluded(detail) => {
+            json!({"outcome": "excluded", "detail": detail})
+        }
+        wirk_atlas::ResolveOutcome::Unsupported(detail) => {
+            json!({"outcome": "unsupported", "detail": detail})
+        }
+        wirk_atlas::ResolveOutcome::Unavailable(detail) => {
+            json!({"outcome": "unavailable", "detail": detail})
+        }
+    }
+}
+
+/// The producing action an assertion is attributed to: one Run that is
+/// *executing right now* under this Work, and the World it was reserved
+/// against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProducingAction {
+    run: RunId,
+    waypoint: WaypointId,
+    world_hash: WorldHash,
+}
+
+/// Why a *current open* Run and not the Work's latest validated Claim
+/// (ruling 0095, superseding this function's ruling-0093 predecessor
+/// `latest_validated_claim`).
+///
+/// A validated Claim is a real journal fact, but it is the receipt of
+/// some *earlier* action: it says this Work once produced something the
+/// estate validated, and nothing at all about the assertion now being
+/// recorded. Two consequences the correction-verify VERDICT demonstrated
+/// on the previous code: a Claim over an unrelated artifact, produced by
+/// a route with no relation to Atlas, authorized an assertion between two
+/// unrelated coordinates (§5 R2); and, because a Work could not assert
+/// until it had already claimed, an actor that must *report* its own
+/// assertion had to mutate an artifact it had already claimed, leaving a
+/// permanent digest mismatch in the estate (§5 R1). Ruling 0095 names
+/// the lifecycle instead: assert during the work, report the outcome,
+/// then Claim the finished report once.
+///
+/// So the producing action is the Work's current `RunOpened` that is
+/// still `RunState::Open` after every journaled event is applied
+/// (`wirk_core::Run::apply`, R2 — the same reducer every other reader
+/// uses), on a Work that is not itself terminal. A retried, failed,
+/// vanished or already-claimed Run is not an action anything is
+/// currently being produced by.
+///
+/// This is accountability under the local execution contract, exactly as
+/// 0093/0095 frame it: it attributes the assertion to a real, journaled,
+/// currently-executing action of a real Work. It is not an
+/// authentication guarantee — the socket contract provides none — and it
+/// is not a claim that the assertion is true.
+fn current_producing_action(events: &[Event]) -> Result<ProducingAction, Reply> {
+    use wirk_core::{RunState, WorkState};
+
+    let work = fold(events);
+    match work.state {
+        WorkState::Completed | WorkState::Failed | WorkState::Canceled => {
+            return Err(err_reply(
+                "NoAdmittedProducingAction",
+                "this Work is terminal; a completed Work's past Claims are history, not a producing action for a new assertion",
+            ));
+        }
+        _ => {}
+    }
+
+    let mut open: Option<ProducingAction> = None;
+    let mut any_run = false;
+    for event in events {
+        let EventKind::RunOpened {
+            run,
+            waypoint,
+            world_hash,
+            ..
+        } = &event.kind
+        else {
+            continue;
+        };
+        any_run = true;
+        let mut folded = Run {
+            id: run.clone(),
+            waypoint: waypoint.clone(),
+            attempt: 0,
+            world_hash: world_hash.clone(),
+            state: RunState::Open,
+            kind: Default::default(),
+        };
+        for later in events {
+            folded.apply(later);
+        }
+        if matches!(folded.state, RunState::Open) {
+            open = Some(ProducingAction {
+                run: run.clone(),
+                waypoint: waypoint.clone(),
+                world_hash: world_hash.clone(),
+            });
+        }
+    }
+    match open {
+        Some(action) => Ok(action),
+        None if any_run => Err(err_reply(
+            "NoAdmittedProducingAction",
+            "every Run this Work opened is terminal (claimed, failed, vanished or superseded by retry); a spent action does not produce a new assertion",
+        )),
+        None => Err(err_reply(
+            "NoAdmittedProducingAction",
+            "this Work has never opened a Run; a retrieved Work id alone is not a producing action",
+        )),
+    }
+}
+
+/// `handle_atlas_relate`: admits one evidenced `GovernedBy` relationship.
+///
+/// P3 W3 correction (ruling 0093, W3-CORRECTION.md item 2): the review's
+/// recommended fix — requiring `Access::Write` on the relationship's own
+/// source endpoints — is rejected by ruling 0077 (a Read knowledge
+/// source must remain usable in a real investigation; an all-Read
+/// source set does not by itself prove an unauthorized producer). The
+/// actual gap VERDICT.md M2 found is different: `resolve_query_scope`
+/// only proves the caller supplied a real `WorkId` it can retrieve —
+/// not that this Work has ever *done* anything. `work` is required, and
+/// the producer identity is derived from the journal, never from a
+/// client-supplied producer string and never from a bare `work:<id>`
+/// formatted from retrieval alone.
+///
+/// P3 W3 second correction (ruling 0095, W3-SECOND-CORRECTION.md item
+/// 3): that producer is now the Work's *current* admitted Run and the
+/// World it was reserved against — `current_producing_action`, whose own
+/// doc records why a historical validated Claim is not it. `payload.run`
+/// and `payload.world`, when the caller states them, are checked against
+/// that current action rather than believed: a stale, retried, foreign
+/// or invented receipt is refused `ProducingActionMismatch`, and a Work
+/// whose Runs are all spent is refused `NoAdmittedProducingAction`. A
+/// Read-only grant set still asserts perfectly well (0077); the
+/// assertion still mutates nothing in any source repository; and it
+/// remains an attributed assertion, not settlement, Application or
+/// semantic truth.
+fn handle_atlas_relate(state: &Arc<WirkdState>, payload: super::AtlasRelatePayload) -> Reply {
+    let scope = match resolve_query_scope(state, &Some(payload.work.clone())) {
+        Ok(scope) => scope,
+        Err(reply) => return reply,
+    };
+    let events = match journal_for(state, &payload.work) {
+        Ok(Some(journal)) => {
+            let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+            match journal.replay() {
+                Ok(events) => events,
+                Err(err) => return err_reply("JournalError", &err.to_string()),
+            }
+        }
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let action = match current_producing_action(&events) {
+        Ok(action) => action,
+        Err(reply) => return reply,
+    };
+    if let Some(stated) = &payload.run
+        && stated != &action.run.0
+    {
+        return err_reply(
+            "ProducingActionMismatch",
+            "the stated run is not this Work's current producing action",
+        );
+    }
+    if let Some(stated) = &payload.world
+        && stated != &action.world_hash.0
+    {
+        return err_reply(
+            "ProducingActionMismatch",
+            "the stated world is not the World this Work's current producing action was reserved against",
+        );
+    }
+    let kind = match payload.kind.as_str() {
+        "governed_by" => wirk_atlas::RelationshipKind::GovernedBy,
+        other => return err_reply("BadRequest", &format!("unknown relationship kind {other}")),
+    };
+    let from = match decode_coordinate(&payload.from) {
+        Ok(coordinate) => coordinate,
+        Err(detail) => return err_reply("MalformedCoordinate", &detail),
+    };
+    let to = match decode_coordinate(&payload.to) {
+        Ok(coordinate) => coordinate,
+        Err(detail) => return err_reply("MalformedCoordinate", &detail),
+    };
+    let mut evidence = Vec::new();
+    for encoded in &payload.evidence {
+        match decode_coordinate(encoded) {
+            Ok(coordinate) => evidence.push(coordinate),
+            Err(detail) => return err_reply("MalformedCoordinate", &detail),
+        }
+    }
+    let mut atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let producer = format!(
+        "explicit-admission/v1/work:{}/run:{}/world:{}",
+        payload.work.0, action.run.0, action.world_hash.0
+    );
+    match wirk_atlas::admit_relationship(
+        &mut atlas, &scope, None, kind, from, to, evidence, &producer,
+    ) {
+        Ok(relationship) => ok_reply(json!({
+            "id": relationship.id.0,
+            "kind": "governed_by",
+            "from": encode_coordinate(&relationship.from),
+            "to": encode_coordinate(&relationship.to),
+            "evidence": relationship.evidence.iter().map(encode_coordinate).collect::<Vec<_>>(),
+            "producer": relationship.producer,
+            // The exact receipt an actor puts in its own final report —
+            // recorded during the work, so the report it later Claims
+            // stays byte-identical to what was claimed (ruling 0095).
+            "producing_action": {
+                "work": payload.work.0,
+                "run": action.run.0,
+                "waypoint": action.waypoint.0,
+                "world": action.world_hash.0,
+            },
+            "published_at_unix_millis": relationship.published_at_unix_millis,
+        })),
+        Err(err) => err_reply("AtlasRelationshipError", &err.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4259,6 +5457,8 @@ mod tests {
                     .collect(),
                 waypoint_defs: Vec::new(),
                 parent: None,
+                execution_repo: None,
+                execution_identity: None,
             },
         }
     }

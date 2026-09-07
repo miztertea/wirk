@@ -261,6 +261,17 @@ pub struct Work {
     /// container from the next without re-deriving it.
     #[serde(default)]
     pub activations: Vec<ContainerActivation>,
+    /// P3 W3 (ruling 0090): folded from `WorkSubmitted.execution_repo`
+    /// — which named `repositories` entry is this Work's actual
+    /// execution checkout. `#[serde(default)]`: `Work` is never itself
+    /// journaled (only rebuilt fresh by `fold`), so this only matters
+    /// on the in-memory value, which never predates this field.
+    #[serde(default)]
+    pub execution_repo: Option<String>,
+    /// Folded from `WorkSubmitted.execution_identity` — wirkd's own
+    /// verified canonical identity of that checkout.
+    #[serde(default)]
+    pub execution_identity: Option<String>,
 }
 
 impl Work {
@@ -1343,6 +1354,27 @@ pub enum EventKind {
         /// field existed still folds.
         #[serde(default)]
         parent: Option<ParentBinding>,
+        /// P3 W3 (ruling 0090; the narrow core allowance W3-BUILD.md
+        /// grants for "the already-required W3 authority binding"):
+        /// which named entry of `repositories` is this Work's actual
+        /// execution/write checkout, distinct from a merely readable
+        /// evidence source — `wirkd` resolves this itself (refusing an
+        /// ambiguous or unknown designation, `handle_submit`), never
+        /// trusting a bare position in the list. `#[serde(default)]` so
+        /// a `WorkSubmitted` written before this field existed still
+        /// folds, reading as the legacy "first binding is execution"
+        /// interpretation wherever a reader still needs one.
+        #[serde(default)]
+        execution_repo: Option<String>,
+        /// The canonical repository identity (`git rev-parse
+        /// --path-format=absolute --git-common-dir`) `wirkd` itself
+        /// verified for `execution_repo`'s real checkout at submit
+        /// time — never accepted from a client's own claim. `None`
+        /// when this Work has no checkout yet to verify (a bare Actor
+        /// submission materialized later by `wirk run`) or predates
+        /// this field.
+        #[serde(default)]
+        execution_identity: Option<String>,
     },
     /// Journals the compiled World at reservation (BRIEF.md Intent;
     /// evidence/work/p1-executor-design/orient/world.md §5) so a
@@ -1500,6 +1532,8 @@ pub fn fold(events: &[Event]) -> Work {
                 waypoints,
                 waypoint_defs: defs,
                 parent,
+                execution_repo,
+                execution_identity,
             } = &event.kind
             {
                 route_waypoints = waypoints.clone();
@@ -1516,6 +1550,8 @@ pub fn fold(events: &[Event]) -> Work {
                     parent: parent.clone(),
                     held: None,
                     activations: Vec::new(),
+                    execution_repo: execution_repo.clone(),
+                    execution_identity: execution_identity.clone(),
                 });
             }
             // No `Work` exists yet and this isn't `WorkSubmitted`: there

@@ -257,6 +257,8 @@ fn replay_then_fold_equals_folding_the_original_events() {
                 waypoints: vec![WaypointId("wp-1".to_string())],
                 waypoint_defs: Vec::new(),
                 parent: None,
+                execution_repo: None,
+                execution_identity: None,
             },
         },
         Event {
@@ -364,6 +366,8 @@ fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
             ],
             waypoint_defs: Vec::new(),
             parent: None,
+            execution_repo: None,
+            execution_identity: None,
         },
     };
     let wp1_events = [
@@ -527,6 +531,8 @@ fn fold_leaves_work_state_unchanged_on_a_refused_question_claim() {
                 waypoints: vec![WaypointId("wp-1".to_string())],
                 waypoint_defs: Vec::new(),
                 parent: None,
+                execution_repo: None,
+                execution_identity: None,
             },
         },
         Event {
@@ -595,6 +601,8 @@ fn fold_advances_last_activity_across_events_with_increasing_timestamps() {
                 waypoints: vec![WaypointId("wp-1".to_string())],
                 waypoint_defs: Vec::new(),
                 parent: None,
+                execution_repo: None,
+                execution_identity: None,
             },
         },
         Event {
@@ -661,6 +669,8 @@ fn old_worksubmitted_without_waypoint_defs_field_still_folds() {
             waypoints: vec![WaypointId("wp-1".to_string())],
             waypoint_defs: Vec::new(),
             parent: None,
+            execution_repo: None,
+            execution_identity: None,
         },
     };
     let mut value = serde_json::to_value(&event).expect("event serializes");

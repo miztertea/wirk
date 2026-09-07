@@ -58,6 +58,11 @@ mod executors;
 // Herdr session and wirkd via `wirk_herdr::run_loop::RunLoop`.
 mod executor;
 
+// `wirk atlas ...` (P3 W3, source-orient/BUILD-BRIEF.md "Public
+// surface"): thin JSON-capable clients over wirkd's own seven Atlas
+// verbs. This crate holds no Atlas domain logic of its own.
+mod atlas;
+
 use wirkd::{
     ClaimPayload, FailPayload, Reply, Request, RetryPayload, StatusPayload, SubmitPayload,
     WorkFailPayload,
@@ -89,9 +94,10 @@ fn main() -> ExitCode {
         Some("run-deterministic") => run_deterministic_command(&args[2..]),
         Some("run") => executor::run_command(&args[2..]),
         Some("plugin") => plugin_command(&args[2..]),
+        Some("atlas") => atlas::atlas_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind claude|opencode] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root>"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind claude|opencode] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate --estate <root> ..."
             );
             ExitCode::FAILURE
         }
@@ -898,6 +904,12 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
     let kind = flag_value(rest, "--kind");
     let repo_path = flag_value(rest, "--repo-path");
     let route = flag_value(rest, "--route");
+    // P3 W3 (ruling 0090): required only when more than one `--repo`
+    // binding is declared; wirkd itself refuses an ambiguous submission
+    // rather than guessing the first one (`work_usage` below still
+    // accepts a submit line that omits it, same as always, when there
+    // is at most one binding to be ambiguous about).
+    let execution_repo = flag_value(rest, "--execution-repo");
     // W-A (§3.3): a child submission names its requesting parent
     // Work/container/Run and the role it claims — all four or none;
     // wirkd itself is the one that checks the binding is real
@@ -960,6 +972,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
         repo_path,
         route,
         parent,
+        execution_repo,
     };
     wirkd_client_call(&estate, &Request::submit(payload), |result| {
         println!(
@@ -973,7 +986,7 @@ fn work_submit_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>]"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>]"
     );
     ExitCode::from(1)
 }
@@ -1487,6 +1500,8 @@ fn demo_events() -> Vec<Event> {
                 waypoints: vec![waypoint.clone()],
                 waypoint_defs: Vec::new(),
                 parent: None,
+                execution_repo: None,
+                execution_identity: None,
             },
         ),
         new_event(

@@ -244,6 +244,8 @@ fn work_submitted(waypoints: Vec<WaypointDefinition>) -> EventKind {
         waypoints: wirk_core::flatten_leaves(&waypoints),
         waypoint_defs: waypoints,
         parent: None,
+        execution_repo: None,
+        execution_identity: None,
     }
 }
 

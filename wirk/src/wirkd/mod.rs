@@ -100,6 +100,27 @@ pub enum Verb {
     /// `caused_by`, before canceling the named Work itself; without it,
     /// an open child refuses the whole verb (`OpenChild`).
     Cancel,
+    /// P3 W3: registers a source (on first use) and stages an
+    /// exact-generation acquisition (`wirk-atlas`'s own domain) from a
+    /// real Git repository — a producer operation, never implicit from
+    /// a query.
+    AtlasAcquire,
+    /// P3 W3: re-acquires a registered source's current ref, staging a
+    /// candidate generation without publishing it.
+    AtlasRefresh,
+    /// P3 W3: atomically advances a registered source's published
+    /// generation to an already-staged one.
+    AtlasPublish,
+    /// P3 W3: reports registered sources, their published generation
+    /// and coverage summary, and recent acquisition attempts.
+    AtlasStatus,
+    /// P3 W3: lexical (optionally semantic-requested) ranked search
+    /// over admitted, published generations.
+    AtlasSearch,
+    /// P3 W3: exact evidence-coordinate resolution.
+    AtlasResolve,
+    /// P3 W3: admits one evidenced `GovernedBy` relationship.
+    AtlasRelate,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -210,6 +231,55 @@ impl Request {
             payload: serde_json::to_value(payload).expect("CancelPayload always serializes"),
         }
     }
+
+    pub fn atlas_acquire(payload: AtlasAcquirePayload) -> Self {
+        Request {
+            verb: Verb::AtlasAcquire,
+            payload: serde_json::to_value(payload).expect("AtlasAcquirePayload always serializes"),
+        }
+    }
+
+    pub fn atlas_refresh(payload: AtlasRefreshPayload) -> Self {
+        Request {
+            verb: Verb::AtlasRefresh,
+            payload: serde_json::to_value(payload).expect("AtlasRefreshPayload always serializes"),
+        }
+    }
+
+    pub fn atlas_publish(payload: AtlasPublishPayload) -> Self {
+        Request {
+            verb: Verb::AtlasPublish,
+            payload: serde_json::to_value(payload).expect("AtlasPublishPayload always serializes"),
+        }
+    }
+
+    pub fn atlas_status(payload: AtlasStatusPayload) -> Self {
+        Request {
+            verb: Verb::AtlasStatus,
+            payload: serde_json::to_value(payload).expect("AtlasStatusPayload always serializes"),
+        }
+    }
+
+    pub fn atlas_search(payload: AtlasSearchPayload) -> Self {
+        Request {
+            verb: Verb::AtlasSearch,
+            payload: serde_json::to_value(payload).expect("AtlasSearchPayload always serializes"),
+        }
+    }
+
+    pub fn atlas_resolve(payload: AtlasResolvePayload) -> Self {
+        Request {
+            verb: Verb::AtlasResolve,
+            payload: serde_json::to_value(payload).expect("AtlasResolvePayload always serializes"),
+        }
+    }
+
+    pub fn atlas_relate(payload: AtlasRelatePayload) -> Self {
+        Request {
+            verb: Verb::AtlasRelate,
+            payload: serde_json::to_value(payload).expect("AtlasRelatePayload always serializes"),
+        }
+    }
 }
 
 /// `submit`'s payload (transport.md §2): the repository bindings the
@@ -262,6 +332,16 @@ pub struct SubmitPayload {
     /// `ChildExceedsParentBinding`).
     #[serde(default)]
     pub parent: Option<ParentBinding>,
+    /// P3 W3 (ruling 0090): names which entry of `repositories` is this
+    /// Work's actual execution/write checkout, when more than one
+    /// binding is declared (`handle_submit` refuses an ambiguous or
+    /// unknown designation rather than guessing the first element).
+    /// Optional when zero or one binding is declared, preserving the
+    /// legacy single-repository submit line unchanged. Never itself
+    /// trusted as the verified identity — `wirkd` resolves the real
+    /// canonical repository this names from `repo_path` itself.
+    #[serde(default)]
+    pub execution_repo: Option<String>,
 }
 
 /// `claim`'s payload (transport.md §2): the injected
@@ -347,6 +427,132 @@ pub struct CancelPayload {
     pub cascade: bool,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+// ---- Atlas (P3 W3) -------------------------------------------------------
+
+/// `atlas acquire`'s payload: registers `source` (on first use, against
+/// `repository`) in this daemon's one canonical estate and stages an
+/// exact-generation acquisition at `revision`. An existing `source`
+/// resolves through its membership and refuses a conflicting
+/// `repository` (`wirk_atlas::AtlasStore::register_git`'s own check).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasAcquirePayload {
+    pub source: String,
+    pub repository: String,
+    pub revision: String,
+}
+
+/// `atlas refresh`'s payload: reuses `source`'s existing registration
+/// and membership; stages a candidate generation at `revision` without
+/// publishing it (`AtlasStore::refresh`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasRefreshPayload {
+    pub source: String,
+    pub revision: String,
+}
+
+/// `atlas publish`'s payload: atomically advances `source`'s published
+/// generation to the already-staged `generation` (its encoded
+/// `GenerationId`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasPublishPayload {
+    pub source: String,
+    pub generation: String,
+}
+
+/// `atlas status`'s payload: every registered source, or one named
+/// `source`, in this daemon's canonical estate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasStatusPayload {
+    #[serde(default)]
+    pub source: Option<String>,
+    /// P3 W3 correction (ruling 0093, W3-CORRECTION.md item 3): when
+    /// present, scopes disclosure to only the sources this Work's own
+    /// journaled `repositories` admit — a denied source's
+    /// locator/generation/revision is never disclosed through this
+    /// verb (the exact leak W3-REVIEW-OBSERVATIONS bullet 4 and
+    /// VERDICT.md L4 found: status has no `--work` scope at all).
+    /// Absent, this is explicit estate-wide catalog administration —
+    /// a distinct, intentionally broader capability from Work-scoped
+    /// retrieval, never silently generalized into a source-grant of
+    /// its own.
+    #[serde(default)]
+    pub work: Option<WorkId>,
+}
+
+/// `atlas search`'s payload. `work` is optional: present, admission is
+/// derived *only* from that Work's own journaled `repositories`
+/// (`handle_atlas_search` opens the Work itself — this wire shape
+/// cannot carry a replacement grant set from the client); absent, the
+/// estate-wide orientation scope applies (status/orientation tooling
+/// only, `wirk_atlas::admission::QueryScope::EstateOrientation`).
+/// `semantic`: `"requested"` or `"disabled"` (default `"disabled"`).
+/// `continuation` (ruling 0093, W3-CORRECTION.md item 1): when present,
+/// an opaque token a prior `search` answer's own `continuation` field
+/// returned — pins that answer's exact generation vector and resumes
+/// it at its own next offset, regardless of any `publish` since. The
+/// decoded token's own `query`/`source`/`families`/`semantic`/`limit`/
+/// `work` must match this request's exactly, or the request is refused
+/// rather than silently continuing a different query under someone
+/// else's captured generations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasSearchPayload {
+    #[serde(default)]
+    pub work: Option<WorkId>,
+    pub query: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub semantic: Option<String>,
+    #[serde(default)]
+    pub families: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub continuation: Option<String>,
+}
+
+/// `atlas resolve`'s payload: `coordinate` is a hex encoding of one
+/// JSON-serialized `wirk_atlas::ExactCoordinate` (`server.rs`'s own
+/// `encode_coordinate`/`decode_coordinate` — Git pathnames are raw
+/// bytes, never line-oriented text, so this travels as one opaque
+/// argv-safe token rather than a delimited string). `work` is optional,
+/// exactly as `AtlasSearchPayload`'s.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasResolvePayload {
+    #[serde(default)]
+    pub work: Option<WorkId>,
+    pub coordinate: String,
+}
+
+/// `atlas relate`'s payload: `work` is required (never optional) —
+/// admitting an evidenced relationship needs a real, accountable
+/// producer identity, which `handle_atlas_relate` derives itself from
+/// the journaled `work` (never a client-supplied producer string, per
+/// `wirk-atlas`'s own `admit_relationship` doc: "W3 must bind
+/// `producer` to an admitted coordinator identity at the public
+/// boundary"). `kind` is `"governed_by"` today (the only
+/// `RelationshipKind` this increment admits). `from`/`to`/each
+/// `evidence` entry are encoded coordinates, same shape as
+/// `AtlasResolvePayload::coordinate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasRelatePayload {
+    pub work: WorkId,
+    pub kind: String,
+    pub from: String,
+    pub to: String,
+    pub evidence: Vec<String>,
+    /// P3 W3 second correction (ruling 0095): the producing action the
+    /// caller believes it is asserting under. Optional — `wirkd` derives
+    /// the Work's current action itself either way — and never believed:
+    /// a stated value that is not the current action is refused rather
+    /// than adopted, so an actor can state its own receipt and find out
+    /// it is stale instead of silently asserting under a different one.
+    #[serde(default)]
+    pub run: Option<String>,
+    #[serde(default)]
+    pub world: Option<String>,
 }
 
 // ---- Reply -------------------------------------------------------------

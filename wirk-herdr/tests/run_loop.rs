@@ -124,6 +124,8 @@ fn work_submitted() -> EventKind {
         waypoints: vec![WaypointId("route-1/wp-1".to_string())],
         waypoint_defs: Vec::new(),
         parent: None,
+        execution_repo: None,
+        execution_identity: None,
     }
 }
 

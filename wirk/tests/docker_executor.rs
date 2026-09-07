@@ -496,6 +496,8 @@ fn sweep_work_submitted(waypoints: Vec<&str>) -> EventKind {
             .collect(),
         waypoint_defs: Vec::new(),
         parent: None,
+        execution_repo: None,
+        execution_identity: None,
     }
 }
 

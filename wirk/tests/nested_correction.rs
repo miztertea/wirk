@@ -135,8 +135,14 @@ fn retrying_a_leaf_inside_a_closed_nested_container_reopens_it_and_blocks_false_
 
     let repo = dir.path().join("repo");
     init_repo(&repo);
-    let work =
-        submit(&estate, "wa_reopen", &repo, &["demo:write"], None).expect("submit wa_reopen");
+    let work = submit(
+        &estate,
+        "wa_reopen",
+        &repo,
+        &["demo:write", "child-output:write"],
+        None,
+    )
+    .expect("submit wa_reopen");
     assert_eq!(work.waypoint, "outer/inner/leaf");
 
     // inner closes on its own leaf, outer advances to its lead leaf.
@@ -169,7 +175,7 @@ fn retrying_a_leaf_inside_a_closed_nested_container_reopens_it_and_blocks_false_
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "outer",
@@ -228,7 +234,7 @@ fn retrying_a_leaf_inside_a_closed_nested_container_reopens_it_and_blocks_false_
         &estate,
         "wa_simple_leaf",
         &child_repo2,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "outer",
@@ -282,8 +288,14 @@ fn reopen_invalidates_ancestor_container_closure_at_grandchild_depth() {
 
     let repo = dir.path().join("repo");
     init_repo(&repo);
-    let work =
-        submit(&estate, "wa_reopen_deep", &repo, &["demo:write"], None).expect("submit deep");
+    let work = submit(
+        &estate,
+        "wa_reopen_deep",
+        &repo,
+        &["demo:write", "child-output:write"],
+        None,
+    )
+    .expect("submit deep");
     assert_eq!(work.waypoint, "top/outer/a/leaf");
 
     write_file(&repo, "b.md", "b\n");
@@ -322,7 +334,7 @@ fn reopen_invalidates_ancestor_container_closure_at_grandchild_depth() {
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "top",
@@ -366,7 +378,7 @@ fn reopen_invalidates_ancestor_container_closure_at_grandchild_depth() {
         &estate,
         "wa_simple_leaf",
         &child_repo2,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "top",
@@ -409,8 +421,14 @@ fn a_reopened_activation_survives_a_daemon_restart_without_fabricating_closure()
 
     let repo = dir.path().join("repo");
     init_repo(&repo);
-    let work =
-        submit(&estate, "wa_reopen", &repo, &["demo:write"], None).expect("submit wa_reopen");
+    let work = submit(
+        &estate,
+        "wa_reopen",
+        &repo,
+        &["demo:write", "child-output:write"],
+        None,
+    )
+    .expect("submit wa_reopen");
     write_file(&repo, "b.md", "b\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "b.md=b.md");
     let lead_run = current_run(&pointer.socket, &work.work_id);
@@ -455,7 +473,7 @@ fn a_reopened_activation_survives_a_daemon_restart_without_fabricating_closure()
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "outer",
@@ -498,7 +516,7 @@ fn closure_records_validated_artifact_digest_and_reports_changed_bytes_unavailab
         &estate,
         "wa_container_child_role",
         &repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
     )
     .expect("submit");
@@ -525,7 +543,7 @@ fn closure_records_validated_artifact_digest_and_reports_changed_bytes_unavailab
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "outer",
@@ -627,7 +645,7 @@ fn an_unrelated_completed_work_cannot_be_credited_as_a_child_receipt() {
         &estate,
         "wa_container_child_role",
         &repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
     )
     .expect("submit");
@@ -692,7 +710,7 @@ fn an_unrelated_completed_work_cannot_be_credited_as_a_child_receipt() {
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "outer",
@@ -729,8 +747,14 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
 
     let repo = dir.path().join("repo");
     init_repo(&repo);
-    let work =
-        submit(&estate, "wa_reopen_roles", &repo, &["demo:write"], None).expect("submit roles");
+    let work = submit(
+        &estate,
+        "wa_reopen_roles",
+        &repo,
+        &["demo:write", "child-output:write"],
+        None,
+    )
+    .expect("submit roles");
     write_file(&repo, "b.md", "b\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "b.md=b.md");
     let lead_run = current_run(&pointer.socket, &work.work_id);
@@ -745,7 +769,7 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
         &estate,
         "wa_simple_leaf",
         &helper_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "top/outer",
@@ -765,7 +789,7 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
         &estate,
         "wa_simple_leaf",
         &helper_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "top/outer",
@@ -820,7 +844,7 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
         &estate,
         "wa_simple_leaf",
         &helper2_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "top/outer",
@@ -868,7 +892,7 @@ fn a_container_mixing_actor_and_deterministic_leaves_closes_with_exact_receipts(
         &estate,
         "wa_mixed_mechanism",
         &repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
         Some("actor"),
     )
@@ -896,7 +920,7 @@ fn a_container_mixing_actor_and_deterministic_leaves_closes_with_exact_receipts(
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &work.work_id,
             waypoint: "outer",

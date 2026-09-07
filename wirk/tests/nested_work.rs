@@ -254,7 +254,7 @@ fn child_submit_naming_superseded_parent_run_is_refused() {
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:read"],
+        &["child-output:read"],
         Some(ParentRef {
             work: &parent.work_id,
             waypoint: "outer",
@@ -289,7 +289,7 @@ fn held_container_closes_when_child_completes_and_receipt_binds_current_run() {
         &estate,
         "wa_container_child_role",
         &parent_repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
     )
     .expect("submit parent");
@@ -303,7 +303,7 @@ fn held_container_closes_when_child_completes_and_receipt_binds_current_run() {
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &parent.work_id,
             waypoint: "outer",
@@ -373,7 +373,7 @@ fn retried_parent_leaf_cannot_reuse_earlier_attempts_child_receipt() {
         &estate,
         "wa_container_child_role",
         &parent_repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
     )
     .expect("submit parent");
@@ -388,7 +388,7 @@ fn retried_parent_leaf_cannot_reuse_earlier_attempts_child_receipt() {
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &parent.work_id,
             waypoint: "outer",
@@ -459,7 +459,7 @@ fn dangling_spawn_without_child_journal_is_missing_not_credited() {
         &estate,
         "wa_container_child_role",
         &repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
     )
     .expect("submit parent");
@@ -522,7 +522,7 @@ fn restart_reevaluates_held_container_after_crash_between_journals() {
         &estate,
         "wa_container_child_role",
         &parent_repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
     )
     .expect("submit parent");
@@ -536,7 +536,7 @@ fn restart_reevaluates_held_container_after_crash_between_journals() {
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:read"],
+        &["child-output:read"],
         Some(ParentRef {
             work: &parent.work_id,
             waypoint: "outer",
@@ -619,7 +619,7 @@ fn cancel_refuses_open_child_without_cascade_and_cascades_with_attribution() {
         &estate,
         "wa_container_child_role",
         &parent_repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
     )
     .expect("submit parent");
@@ -632,7 +632,7 @@ fn cancel_refuses_open_child_without_cascade_and_cascades_with_attribution() {
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:read"],
+        &["child-output:read"],
         Some(ParentRef {
             work: &parent.work_id,
             waypoint: "outer",
@@ -699,7 +699,7 @@ fn retried_child_leaf_mints_fresh_world_and_receipt_is_unaffected() {
         &estate,
         "wa_container_child_role",
         &parent_repo,
-        &["demo:write"],
+        &["demo:write", "child-output:write"],
         None,
     )
     .expect("submit parent");
@@ -712,7 +712,7 @@ fn retried_child_leaf_mints_fresh_world_and_receipt_is_unaffected() {
         &estate,
         "wa_simple_leaf",
         &child_repo,
-        &["demo:write"],
+        &["child-output:write"],
         Some(ParentRef {
             work: &parent.work_id,
             waypoint: "outer",
@@ -827,7 +827,19 @@ fn child_work_can_itself_spawn_a_child_and_the_full_chain_completes() {
         &estate,
         "wa_container_child_role",
         &g_repo,
-        &["demo:write"],
+        // "demo" is G's own execution repository. Binding names only
+        // ever narrow down an admission chain, never get invented
+        // partway through it (`ChildExceedsParentBinding` checks every
+        // name against the immediate parent's own bindings) — so the
+        // root of this three-generation chain must itself carry both
+        // "child-output" (P's own distinct output authority) and
+        // "grandchild-output" (GC's, granted through P) explicitly,
+        // even though G never uses either itself (ruling 0090/0092).
+        &[
+            "demo:write",
+            "child-output:write",
+            "grandchild-output:write",
+        ],
         None,
     )
     .expect("submit grandparent G");
@@ -842,11 +854,18 @@ fn child_work_can_itself_spawn_a_child_and_the_full_chain_completes() {
 
     let p_repo = dir.path().join("p-repo");
     init_repo(&p_repo);
+    // P inherits "child-output" from G as its own real, explicitly
+    // admitted execution repository (ruling 0090/0092: a distinct
+    // repository identity, not a bare label), and separately
+    // pre-declares "grandchild-output" — its own further-distinct
+    // output authority for its own eventual child GC below. Reusing
+    // "child-output" for GC would wrongly claim GC's checkout is the
+    // *same repository* as P's own (`p_repo`), which it is not.
     let parent = submit(
         &estate,
         "wa_container_child_role", // P's own route also needs a child for its "helper" role
         &p_repo,
-        &["demo:write"],
+        &["child-output:write", "grandchild-output:write"],
         Some(ParentRef {
             work: &grandparent.work_id,
             waypoint: "outer",
@@ -872,7 +891,7 @@ fn child_work_can_itself_spawn_a_child_and_the_full_chain_completes() {
         &estate,
         "wa_simple_leaf",
         &gc_repo,
-        &["demo:write"],
+        &["grandchild-output:write"],
         Some(ParentRef {
             work: &parent.work_id,
             waypoint: "outer",

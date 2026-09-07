@@ -265,6 +265,8 @@ fn raw_work_submitted(waypoint: &str, repositories: Vec<RepositoryBinding>) -> E
             required_child_outcomes: Vec::new(),
         }],
         parent: None,
+        execution_repo: None,
+        execution_identity: None,
     }
 }
 
@@ -917,6 +919,8 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
                         required_child_outcomes: Vec::new(),
                     }],
                     parent: None,
+                    execution_repo: None,
+                    execution_identity: None,
                 },
             ),
             raw_event(
@@ -1211,4 +1215,100 @@ fn question_before_actor_materialization_refuses_before_touching_daemon_cwd() {
     ));
 
     stop_wirkd(&estate, child);
+}
+
+/// `wirk work submit --kind actor --repo-path <path>` (the immediate,
+/// eagerly-Git-verified shape real actor Runs use) with more than one
+/// `--repo` binding, naming which one is the execution checkout
+/// explicitly rather than leaving it to `.first()`.
+fn submit_multi_repo_actor(
+    estate: &Path,
+    route: &Path,
+    execution_repo_path: &Path,
+    sha: &str,
+    repo_flags: &[&str],
+    execution_repo_name: &str,
+) -> (String, String, String) {
+    let mut cmd = Command::new(wirk_bin());
+    cmd.args(["work", "submit", "--estate"]).arg(estate);
+    for flag in repo_flags {
+        cmd.args(["--repo", flag]);
+    }
+    cmd.args(["--execution-repo", execution_repo_name]);
+    cmd.args(["--kind", "actor", "--repo-path"])
+        .arg(execution_repo_path);
+    cmd.args(["--base"]).arg(sha);
+    cmd.args(["--route"]).arg(route);
+    parse_submit(&cmd.output().expect("multi-repo actor submit runs"))
+}
+
+fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i32>, String) {
+    let output = Command::new(wirk_bin())
+        .arg("claim")
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", work_id)
+        .env("WIRK_RUN_ID", run_id)
+        .args(args)
+        .output()
+        .expect("wirk claim runs");
+    (
+        output.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+/// BUILD-BRIEF.md's own decisive check, direct: "Never select Read/Write
+/// from repositories.first(). Both binding orders must be equivalent."
+/// Ruling 0090's `is_read_binding` fix reads `Work.execution_repo` (set
+/// by `resolve_execution_repo` at submit time for every submit shape),
+/// never `ActorWorld.repository` or list position — this proves it
+/// against the *immediate* `--kind actor --repo-path` shape specifically
+/// (where `ActorWorld.repository` is a bare checkout path, not a
+/// binding name, so matching against it would silently miss and fall
+/// back to `.first()` for exactly this real-actor submit shape). A
+/// genuinely Read execution checkout refuses any change at all,
+/// identically, whichever position it is declared in.
+#[test]
+fn both_repository_binding_orders_refuse_identically_on_the_read_execution_repo() {
+    let root = tempfile::tempdir().expect("temp root");
+    let estate = root.path().join("estate");
+    fs::create_dir_all(&estate).expect("create estate");
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+    let route = actor_route(root.path());
+
+    for (order_label, repo_flags) in [
+        ("write-first", ["wirk:write", "workspace:read"]),
+        ("read-first", ["workspace:read", "wirk:write"]),
+    ] {
+        let case_root = tempfile::tempdir().expect("case root");
+        let (read_repo, sha) = scratch_repo(case_root.path());
+        let (work, run, waypoint) =
+            submit_multi_repo_actor(&estate, &route, &read_repo, &sha, &repo_flags, "workspace");
+        materialize_legacy_actor(&estate, &pointer.socket, &work, &run, &waypoint, &read_repo);
+
+        // A Read execution checkout refuses *any* change (0050 D150),
+        // even one that exactly matches a declared output.
+        fs::write(
+            estate.join("worktrees").join(&work).join("report.md"),
+            "not really produced under a Write binding\n",
+        )
+        .expect("write report.md into the Read execution checkout");
+
+        let (code, out) = claim(&estate, &work, &run, &["--artifact", "report.md=report.md"]);
+        assert_ne!(
+            code,
+            Some(0),
+            "[{order_label}] a Read execution checkout must refuse any change, got: {out}"
+        );
+        assert!(
+            out.contains("OutOfBoundary"),
+            "[{order_label}] expected OutOfBoundary, got: {out}"
+        );
+    }
+
+    stop_wirkd(&estate, wirkd_child);
 }

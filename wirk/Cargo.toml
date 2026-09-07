@@ -31,6 +31,17 @@ libc = "0.2.189"
 # https://crates.io/api/v1/crates/globset -A wirk` -> max_stable_version
 # 0.4.20, matching the cached series (0.4.16/.18/.20).
 globset = { version = "0.4.20", default-features = false }
+# The continuation token's authenticity tag (P3 W3 second correction,
+# ruling 0095; `server.rs::continuation_tag`). R5: HMAC is the standard
+# construction for "did I issue this?", and this is the RustCrypto
+# implementation over the `sha2` version wirk-core/wirk-atlas already
+# pin — not a hand-rolled keyed hash. Latest stable on crates.io today
+# (0031 D97), checked 2026-09-06:
+# `curl -s https://crates.io/api/v1/crates/hmac -A wirk` ->
+# max_stable_version 0.13.0 (which is the release that tracks
+# digest 0.11 / sha2 0.11, already in Cargo.lock).
+hmac = "0.13.0"
+sha2 = "0.11.0"
 
 [dev-dependencies]
 # wirk/tests/journal_demo.rs's tempdirs (R5, cache-resolvable; same pin

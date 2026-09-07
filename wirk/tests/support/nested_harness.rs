@@ -173,6 +173,17 @@ pub fn submit_kind(
     for binding in repos {
         cmd.args(["--repo", binding]);
     }
+    // P3 W3 (ruling 0090): more than one `--repo` binding is now
+    // ambiguous without an explicit `--execution-repo`; every caller
+    // here always meant the first one (the real preserved legacy
+    // reading), so the harness says so explicitly rather than every
+    // call site repeating it.
+    if let Some(first) = repos.first()
+        && repos.len() > 1
+        && let Some((name, _)) = first.split_once(':')
+    {
+        cmd.args(["--execution-repo", name]);
+    }
     cmd.args(["--base", "HEAD", "--source-basis", "git", "--repo-path"])
         .arg(repo)
         .args(["--route", route]);
