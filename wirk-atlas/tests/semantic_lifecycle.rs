@@ -50,7 +50,8 @@ fn fixture_repo() -> TempDir {
     repo
 }
 
-/// A real `wirk-embed/v1` backend, on disk, executed as a real child
+/// A real `wirk-embed/v2` backend in its `embed` mode, on disk, executed
+/// as a real child
 /// process. `flavour` controls what it claims and writes so a defective
 /// backend can be exercised as a defective *backend*, not as a mocked
 /// return value inside the product.
@@ -180,7 +181,7 @@ with open(header["output"], "wb") as handle:
 if FLAVOUR == "wrong_model":
     digest = "0" * 64
 reply = {{
-    "protocol": "wirk-embed/v1",
+    "protocol": "wirk-embed/v2",
     "backend": "test-backend/" + FLAVOUR,
     "model_path": header["model_path"],
     "model_digest": digest,
@@ -268,6 +269,7 @@ fn config_with_args(estate: &Estate, model: &Path, args: Vec<String>) -> Semanti
         backend_args: args,
         model: model.to_path_buf(),
         producer: "test/v1".into(),
+        chunking: wirk_atlas::SemanticChunking::Units,
     }
 }
 
@@ -1040,6 +1042,7 @@ fn child_build_crash() {
                 backend_args: Vec::new(),
                 model: PathBuf::from(std::env::var("W4_CHILD_MODEL").unwrap()),
                 producer: "test/v1".into(),
+                chunking: wirk_atlas::SemanticChunking::Units,
             },
         )
         .unwrap();
@@ -1279,7 +1282,12 @@ fn u_backend_environment_is_re_measured_bound_and_honestly_absent() {
         bare.backend.environment,
         wirk_atlas::BackendEnvironment::Unreported
     );
-    assert_eq!(bare.identity, wirk_atlas::IDENTITY_V3);
+    // The scheme this product writes now: `v4` bound the chunker, the
+    // retrieval representation and the coverage on top of everything `v3`
+    // bound, and `v5` adds the grammar libraries the boundaries actually
+    // came out of. `v1`/`v2`/`v3` records still read back as themselves,
+    // which `v_...` and `w_g_...` below pin.
+    assert_eq!(bare.identity, wirk_atlas::IDENTITY_V5);
 
     let reported = staged(build_with_args(
         &mut estate,
@@ -1631,7 +1639,7 @@ fn w_a_two_implementation_mutations_with_identical_counts_are_distinct_editions(
         wirk_atlas::ModuleAttribution::Declared("stubdist".into())
     );
     assert_eq!(measured.coverage, wirk_atlas::EnvironmentCoverage::Complete);
-    assert_eq!(c.identity, wirk_atlas::IDENTITY_V3);
+    assert_eq!(c.identity, wirk_atlas::IDENTITY_V5);
 }
 
 /// Item 1. A module that loads from somewhere the claiming distribution's

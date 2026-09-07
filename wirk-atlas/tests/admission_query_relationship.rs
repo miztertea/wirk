@@ -122,6 +122,10 @@ fn work_filters_sources_before_ranking() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -158,6 +162,10 @@ fn read_binding_allows_retrieval_but_grants_no_write() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -185,6 +193,10 @@ fn query_captures_one_coherent_generation_vector_during_refresh() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -228,6 +240,10 @@ fn query_captures_one_coherent_generation_vector_during_refresh() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -253,6 +269,10 @@ fn semantic_requested_unavailable_and_disabled_are_distinct() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -267,6 +287,10 @@ fn semantic_requested_unavailable_and_disabled_are_distinct() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -426,6 +450,10 @@ fn estate_scope_never_crosses_even_with_colliding_aliases() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -588,6 +616,10 @@ fn claim_implementation_and_governing_workspace_contract_resolve_together() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -645,6 +677,10 @@ fn coverage_reports_generation_unavailable_when_a_source_never_published() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -699,6 +735,10 @@ fn real_query_timings_are_recorded_as_scoped_evidence_not_parity() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -781,6 +821,10 @@ fn a_pinned_generation_must_belong_to_the_membership_it_is_pinned_to() {
             limit: 10,
             pinned: Some(pinned),
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         };
 
     // The honest pin — the generation this membership really published —
@@ -834,6 +878,10 @@ fn an_offset_past_the_last_candidate_is_spent_not_no_match() {
                 limit: 10,
                 pinned: None,
                 offset,
+                semantic_query: None,
+                pinned_editions: None,
+                pinned_mode: None,
+                pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
             },
         )
         .unwrap()

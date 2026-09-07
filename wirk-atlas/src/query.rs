@@ -1,8 +1,10 @@
 use crate::admission::{AdmissionSummary, QueryScope, admit};
 use crate::domain::actual_line_bounds;
+use crate::retrieval::{RankingMode, SemanticApplication, SemanticPlan, SemanticQueryConfig};
+use crate::semantic::QueryProducerPin;
 use crate::{
-    AtlasError, AtlasStore, ContentFamily, CoverageDisposition, ExactCoordinate, GenerationId,
-    MembershipId,
+    AtlasError, AtlasStore, ContentFamily, CoverageDisposition, EditionId, ExactCoordinate,
+    GenerationId, MembershipId,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,9 +19,39 @@ pub enum SemanticRequest {
 /// backend exists": `Requested` without an applied backend must say so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SemanticStatus {
+    /// Every admitted source that contributed a generation to this answer
+    /// also contributed its verified semantic rows, and the ranking is
+    /// the native implementation's over exactly those rows.
     Applied,
+    /// Semantic ranking ran, but not over everything this scope admits.
+    /// Deliberately its own state: calling it `Applied` would assert a
+    /// coverage the answer does not have, and calling it `Unavailable`
+    /// would deny a ranking that actually happened.
+    Partial(String),
     Unavailable(String),
     Disabled,
+}
+
+impl SemanticStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Partial(_) => "partial",
+            Self::Unavailable(_) => "unavailable",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    /// The sentence a human is owed. `W4-PUBLIC-RETRIEVAL-BUILD.md` and
+    /// `SEMANTIC-LIFECYCLE-LIMITS.md`: plain search must say *why*
+    /// semantic use is unavailable or degraded and identify the lexical
+    /// fallback, not print a bare token.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Applied | Self::Disabled => None,
+            Self::Partial(reason) | Self::Unavailable(reason) => Some(reason),
+        }
+    }
 }
 
 /// Independent dimensions rather than one mutually-exclusive label: more
@@ -53,6 +85,13 @@ pub struct AnswerCoverage {
     /// nothing while `budget.total_candidates` in the very same answer
     /// says how many it held.
     pub spent: bool,
+    /// A continuation whose captured semantic editions can no longer be
+    /// ranked through. The answer refuses explicitly rather than silently
+    /// restarting at page 1 or quietly switching this page to a different
+    /// corpus or ranking mode (`W4-PUBLIC-RETRIEVAL-BUILD.md`: "use
+    /// retained verified state where available or explicitly refuse
+    /// unrecoverable continuation").
+    pub continuation_unrecoverable: bool,
 }
 impl AnswerCoverage {
     pub fn is_complete(&self) -> bool {
@@ -63,7 +102,8 @@ impl AnswerCoverage {
             || self.unsupported_family
             || self.denied
             || self.no_sources
-            || self.spent)
+            || self.spent
+            || self.continuation_unrecoverable)
     }
 }
 
@@ -105,6 +145,17 @@ pub struct AnswerBudget {
 pub struct SearchAnswer {
     pub publication_revision: u64,
     pub generations: Vec<(MembershipId, GenerationId)>,
+    /// The semantic editions this answer actually ranked through, if any.
+    /// A continuation captures these exactly as it captures generations:
+    /// the next page must read the same bytes, not whatever is selected
+    /// by then.
+    pub editions: Vec<(MembershipId, EditionId)>,
+    /// How this answer was ranked. Pinned into a continuation so a later
+    /// page cannot change it.
+    pub mode: RankingMode,
+    /// What the native implementation reported about a ranking that
+    /// actually happened. `None` for a lexical answer.
+    pub application: Option<SemanticApplication>,
     pub admission: AdmissionSummary,
     pub hits: Vec<EvidenceHit>,
     pub semantic: SemanticStatus,
@@ -132,6 +183,51 @@ pub struct SearchRequest {
     /// How many already-ranked candidates to skip before taking `limit` —
     /// continuation's own page cursor. Zero for a fresh request.
     pub offset: usize,
+    /// The configured semantic query backend. Absent means the caller did
+    /// not configure one, which is a truthful `unavailable` reason and not
+    /// an error: the product ships no backend, no model and no host path.
+    pub semantic_query: Option<SemanticQueryConfig>,
+    /// A continuation's captured semantic editions, per membership.
+    pub pinned_editions: Option<BTreeMap<MembershipId, EditionId>>,
+    /// A continuation's captured ranking mode. When present it is
+    /// authoritative: a page that began lexical stays lexical even if an
+    /// edition became available in between, and a page that began
+    /// semantic is refused rather than silently downgraded.
+    pub pinned_mode: Option<RankingMode>,
+    /// A semantic continuation's captured query producer identity: the
+    /// implementation that ranked its first page. When it no longer
+    /// matches, the page is refused outright rather than re-ranked — a
+    /// backend path and an argv are the *spelling* of an implementation,
+    /// not its bytes, and a file edited in place at that same path is a
+    /// different ranker wearing the first page's receipt.
+    ///
+    /// Absence is not "no check", and the *kind* of absence is not one
+    /// thing: see `PinnedProducer`.
+    pub pinned_producer: PinnedProducer,
+}
+
+/// What a continuation token says about the implementation that ranked
+/// its first page.
+///
+/// Three states rather than an `Option`, because the two absences are
+/// different facts and telling a caller the wrong one is exactly the
+/// defect `public-retrieval-identity-verify/VERDICT.md` V2 found: a token
+/// this build issued seconds ago was refused with "issued before the
+/// query producer identity was recorded". A refusal may be right while
+/// the cause it states is false, and a product whose doctrine is "Known
+/// is a trail" does not get to call its own fresh token legacy history.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PinnedProducer {
+    /// No producer fields at all. On a fresh request that is simply the
+    /// normal state; on a semantic continuation it is genuine
+    /// pre-correction history, whose producer is unknown and unverifiable.
+    #[default]
+    Unrecorded,
+    /// Producer fields are present but do not form a pin — a digest or the
+    /// basis is missing. That is a malformed token, not history, and it
+    /// says so.
+    Incomplete,
+    Recorded(QueryProducerPin),
 }
 
 struct Candidate {
@@ -142,104 +238,31 @@ struct Candidate {
     generation_identity: HitGenerationIdentity,
 }
 
-/// What `--semantic requested` can honestly be told, given what this
-/// estate has actually built and selected.
+/// The sentence a caller gets when semantic ranking did not happen, or
+/// did not happen everywhere.
 ///
-/// It is never `Applied` in this increment, and that is a contract, not
-/// an omission: W4 A builds and selects semantic editions; W4 B is the
-/// increment that ranks through them. Reporting `Applied` because a
-/// verified edition exists would assert that a search consulted vectors
-/// it did not consult — the exact "asserting search happened" failure
-/// `W4-PUBLIC-LIFECYCLE-BUILD.md` forbids. The reason text distinguishes
-/// the two genuinely different states so a caller can tell "nothing is
-/// built" from "something is built and this answer still did not use it".
-fn semantic_status(
-    store: &AtlasStore,
-    request: &SearchRequest,
-    admitted: &[crate::AdmittedSource],
-) -> SemanticStatus {
-    if request.semantic == SemanticRequest::Disabled {
-        return SemanticStatus::Disabled;
-    }
-    // The same derived answer `atlas status` gives, over the same
-    // selected editions (`W4-LIFECYCLE-CORRECTION.md` item 1: the human
-    // status, the JSON status and this fallback must agree). A selection
-    // that is superseded, corrupt or unreadable is counted as what it
-    // is, never as a usable edition. Only admitted sources are consulted,
-    // so nothing here reaches past a denial.
-    let mut usable = 0usize;
-    let mut unusable = 0usize;
-    // The reason classes actually present, kept apart rather than summed.
-    // `W4-PRODUCER-PROVENANCE-CORRECTION.md` item 4: a selection whose own
-    // record has gone is not a selection whose source generation moved on,
-    // and this sentence used to assert the second for both.
-    let mut superseded = 0usize;
-    let mut unverified = 0usize;
-    let mut unreadable = 0usize;
-    for source in admitted {
-        match store.semantic_availability(&source.membership) {
-            Ok(crate::SemanticAvailability::None) => {}
-            Ok(availability) if availability.is_available() => usable += 1,
-            // A selection this product cannot presently evaluate is
-            // reported with the ones it evaluated and rejected, never
-            // silently as usable.
-            Ok(other) => {
-                unusable += 1;
-                match other {
-                    crate::SemanticAvailability::Superseded(_) => superseded += 1,
-                    crate::SemanticAvailability::Unusable(_) => unverified += 1,
-                    _ => unreadable += 1,
-                }
-            }
-            Err(_) => {
-                unusable += 1;
-                unreadable += 1;
-            }
-        }
-    }
-    // Only the classes that actually occurred, so the sentence never
-    // names a condition this estate is not in.
-    let mut classes: Vec<String> = Vec::new();
-    if superseded > 0 {
-        classes.push(format!(
-            "{superseded} built over a source generation this source no longer publishes"
-        ));
-    }
-    if unverified > 0 {
-        classes.push(format!("{unverified} whose bytes no longer verify"));
-    }
-    if unreadable > 0 {
-        classes.push(format!(
-            "{unreadable} whose own edition record is absent or unreadable"
-        ));
-    }
-    let classes = classes.join(", ");
-    let total = admitted.len();
-    if usable == 0 && unusable == 0 {
-        return SemanticStatus::Unavailable(
-            "no admitted source has a selected semantic edition; \
-             build and select one explicitly before requesting semantic retrieval"
-                .into(),
-        );
-    }
-    if usable == 0 {
-        return SemanticStatus::Unavailable(format!(
-            "no admitted source has a usable selected semantic edition: {unusable} of {total} \
-             have a selection that is not currently usable — {classes}. `atlas status` names the \
-             condition per source."
-        ));
-    }
-    let mut reason = format!(
-        "{usable} of {total} admitted sources have a usable selected semantic edition, but \
-         semantic retrieval is not implemented in this increment: these hits are lexical"
-    );
-    if unusable > 0 {
-        reason.push_str(&format!(
-            "; a further {unusable} of {total} have a selection that is not currently usable — \
-             {classes}; see `atlas status`"
-        ));
-    }
-    SemanticStatus::Unavailable(reason)
+/// Every branch names a condition this estate is actually in and says
+/// what the returned hits therefore are. It never asserts a state that
+/// was not evaluated, and under a denial it says nothing about editions
+/// at all.
+fn fallback_reason(detail: &str) -> String {
+    format!("semantic ranking was requested but did not run, so these hits are lexical: {detail}")
+}
+
+/// The sentence a caller gets when a *semantic continuation* cannot be
+/// reproduced.
+///
+/// Deliberately not `fallback_reason`: an unrecoverable continuation
+/// returns no hit at all, so telling the reader that "these hits are
+/// lexical" describes hits that do not exist
+/// (`public-retrieval-verify/VERDICT.md` D5). The plain surface's
+/// adjacent line and `coverage.continuation_unrecoverable` already say a
+/// page was refused; this says why, in the same words on both surfaces.
+fn unrecoverable_reason(detail: &str) -> String {
+    format!(
+        "this continuation's own ranking cannot be reproduced, so no page was returned and \
+         nothing was restarted: {detail}"
+    )
 }
 
 /// Coherence does not come from the `&AtlasStore` borrow (source-verify-w2
@@ -264,37 +287,28 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
         None => store.memberships().count(),
     };
     if registered_total == 0 {
-        return Ok(SearchAnswer {
-            publication_revision: store.publication_revision(),
-            generations: Vec::new(),
-            admission: AdmissionSummary::default(),
-            hits: Vec::new(),
-            semantic: match request.semantic {
+        return Ok(empty_answer(
+            store,
+            request,
+            AdmissionSummary::default(),
+            AnswerCoverage {
+                no_sources: true,
+                ..AnswerCoverage::default()
+            },
+            match request.semantic {
                 SemanticRequest::Disabled => SemanticStatus::Disabled,
                 // Scoped to the request, not to the estate
                 // (`W4-LIFECYCLE-CORRECTION.md` item 2): this branch is
                 // reached both by a fresh estate and by a `--source` no
                 // membership answers to, and asserting the second case is
                 // the first would be a plain falsehood on a surface whose
-                // whole value is that it says nothing untrue. It still
-                // discloses no more than the old sentence did.
-                SemanticRequest::Requested => SemanticStatus::Unavailable(
+                // whole value is that it says nothing untrue.
+                SemanticRequest::Requested => SemanticStatus::Unavailable(fallback_reason(
                     "no registered source matched this request, so no semantic edition can be \
-                     selected for one"
-                        .into(),
-                ),
+                     selected for one",
+                )),
             },
-            coverage: AnswerCoverage {
-                no_sources: true,
-                ..AnswerCoverage::default()
-            },
-            truncated: false,
-            budget: AnswerBudget {
-                limit: request.limit,
-                offset: request.offset,
-                ..AnswerBudget::default()
-            },
-        });
+        ));
     }
 
     let (admitted, admission) = admit(
@@ -306,39 +320,36 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
     // all — a denial (or a requested source this scope was never granted),
     // never a searched-and-empty `no_match`.
     if admitted.is_empty() {
-        return Ok(SearchAnswer {
-            publication_revision: store.publication_revision(),
-            generations: Vec::new(),
+        return Ok(empty_answer(
+            store,
+            request,
             admission,
-            hits: Vec::new(),
-            semantic: match request.semantic {
-                SemanticRequest::Disabled => SemanticStatus::Disabled,
-                // Deliberately says nothing about which editions exist:
-                // this scope admitted nothing, so disclosing the estate's
-                // semantic state here would leak past the denial.
-                SemanticRequest::Requested => {
-                    SemanticStatus::Unavailable("this scope admitted no source to search".into())
-                }
-            },
-            coverage: AnswerCoverage {
+            AnswerCoverage {
                 denied: true,
                 ..AnswerCoverage::default()
             },
-            truncated: false,
-            budget: AnswerBudget {
-                limit: request.limit,
-                offset: request.offset,
-                ..AnswerBudget::default()
+            match request.semantic {
+                SemanticRequest::Disabled => SemanticStatus::Disabled,
+                // Deliberately says nothing about which editions exist,
+                // which backend is configured, or what is on disk: this
+                // scope admitted nothing, so any of that would leak past
+                // the denial.
+                SemanticRequest::Requested => SemanticStatus::Unavailable(fallback_reason(
+                    "this scope admitted no source to search",
+                )),
             },
-        });
+        ));
     }
     let publication_revision = store.publication_revision();
-    let mut generations = Vec::new();
     let mut coverage = AnswerCoverage::default();
-    let mut blob_cache: BTreeMap<(String, String), Vec<u8>> = BTreeMap::new();
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut saw_any_generation = false;
 
+    // ---- the immutable generation vector this answer reads ---------------
+    //
+    // Resolved before anything is read, and before the ranking mode is
+    // decided, because both the lexical and the semantic path are defined
+    // over exactly this vector and nothing else.
+    let mut resolved: Vec<(crate::AdmittedSource, crate::SourceGeneration)> = Vec::new();
+    let mut generations: Vec<(MembershipId, GenerationId)> = Vec::new();
     for source in &admitted {
         let generation = match &request.pinned {
             Some(pinned) => match pinned.get(&source.membership.id) {
@@ -347,15 +358,9 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
                         // Ruling 0095 / W3-SECOND-CORRECTION.md item 1:
                         // `store.generation` is a *global* lookup by id —
                         // it says nothing about which source the manifest
-                        // belongs to. Without this check a pin can name
-                        // any generation in the estate, including one
-                        // acquired under an alias this scope denies, and
-                        // the loop below would then read that generation's
-                        // blobs through the *admitted* membership's
-                        // locator: two aliases over one repository is
-                        // exactly the case where that succeeds. Bind the
-                        // pinned generation to the membership's own source
-                        // before any manifest, blob or snippet is touched.
+                        // belongs to. Bind the pinned generation to the
+                        // membership's own source before any manifest,
+                        // blob or snippet is touched.
                         if generation.source != source.membership.source {
                             return Err(AtlasError::InvalidCoordinate(
                                 "pinned generation does not belong to this membership's source"
@@ -382,8 +387,352 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
                 generation
             }
         };
-        saw_any_generation = true;
         generations.push((source.membership.id.clone(), generation.id.clone()));
+        resolved.push((source.clone(), generation));
+    }
+    generations.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    let saw_any_generation = !resolved.is_empty();
+
+    // ---- ranking mode ----------------------------------------------------
+    let mut editions_used: Vec<(MembershipId, EditionId)> = Vec::new();
+    let mut application: Option<SemanticApplication> = None;
+    let mut semantic = SemanticStatus::Disabled;
+    let mut mode = RankingMode::Lexical;
+    let mut hits: Vec<EvidenceHit> = Vec::new();
+    let mut total_candidates = 0usize;
+    let mut ranked_lexically = true;
+
+    if request.semantic == SemanticRequest::Requested
+        && request.pinned_mode != Some(RankingMode::Lexical)
+    {
+        let generation_of: BTreeMap<MembershipId, GenerationId> = resolved
+            .iter()
+            .map(|(source, generation)| (source.membership.id.clone(), generation.id.clone()))
+            .collect();
+        let memberships: Vec<crate::Membership> = resolved
+            .iter()
+            .map(|(source, _)| source.membership.clone())
+            .collect();
+        let outcome =
+            semantic_attempt(store, request, &memberships, &generation_of, &mut coverage)?;
+        match outcome {
+            Ok((ranked, applied, status)) => {
+                hits = ranked;
+                total_candidates = hits.len();
+                editions_used = applied.0;
+                application = Some(applied.1);
+                semantic = status;
+                mode = RankingMode::Semantic;
+                ranked_lexically = false;
+            }
+            Err(detail) => {
+                let unrecoverable = request.pinned_mode == Some(RankingMode::Semantic);
+                semantic = SemanticStatus::Unavailable(if unrecoverable {
+                    unrecoverable_reason(&detail)
+                } else {
+                    fallback_reason(&detail)
+                });
+                if unrecoverable {
+                    // The continuation's own ranking cannot be
+                    // reproduced. Falling back to lexical here would hand
+                    // the caller a different corpus under the first
+                    // page's receipt; restarting would hide it entirely.
+                    coverage.continuation_unrecoverable = true;
+                    return Ok(SearchAnswer {
+                        publication_revision,
+                        generations,
+                        editions: Vec::new(),
+                        mode: RankingMode::Semantic,
+                        application: None,
+                        admission,
+                        hits: Vec::new(),
+                        semantic,
+                        coverage,
+                        truncated: false,
+                        budget: AnswerBudget {
+                            limit: request.limit,
+                            offset: request.offset,
+                            ..AnswerBudget::default()
+                        },
+                    });
+                }
+            }
+        }
+    } else if request.semantic == SemanticRequest::Requested {
+        semantic = SemanticStatus::Unavailable(fallback_reason(
+            "this continuation's first page was ranked lexically, and a continuation keeps the \
+             ranking mode it was issued under even when a semantic edition has become available \
+             since",
+        ));
+    }
+
+    if ranked_lexically {
+        let (lexical, candidates_total) = lexical_hits(store, request, &resolved, &mut coverage)?;
+        hits = lexical;
+        total_candidates = candidates_total;
+        if !request.families.is_empty() && total_candidates == 0 && saw_any_generation {
+            coverage.unsupported_family = true;
+        }
+    }
+
+    // ---- one deterministic ranked list, paged ----------------------------
+    let page: Vec<EvidenceHit> = hits
+        .into_iter()
+        .skip(request.offset)
+        .take(request.limit)
+        .collect();
+    let truncated = request.offset + page.len() < total_candidates;
+    let budget = AnswerBudget {
+        limit: request.limit,
+        offset: request.offset,
+        total_candidates,
+        returned: page.len(),
+    };
+    let hits = page;
+    // A continuation window that starts at or past the end of its own
+    // ranked list has run out of *page*, not out of *corpus* (ruling
+    // 0095).
+    coverage.spent = request.offset > 0 && request.offset >= total_candidates;
+    // `no_match` must mean the admitted, family-filtered corpus was fully
+    // searched and genuinely produced nothing (source-verify-w2 Failure 1):
+    // an empty presentation window (`truncated`/`spent`) or an unread
+    // source (`source_unavailable`/`generation_unavailable`) is missing
+    // evidence, not proven absence, and must never present as one.
+    if hits.is_empty()
+        && !coverage.unsupported_family
+        && !truncated
+        && !coverage.spent
+        && !coverage.source_unavailable
+        && !coverage.generation_unavailable
+    {
+        coverage.no_match = true;
+    }
+    coverage.partial = coverage.partial
+        || truncated
+        || coverage.source_unavailable
+        || coverage.generation_unavailable;
+
+    Ok(SearchAnswer {
+        publication_revision,
+        generations,
+        editions: editions_used,
+        mode,
+        application,
+        admission,
+        hits,
+        semantic,
+        coverage,
+        truncated,
+        budget,
+    })
+}
+
+fn empty_answer(
+    store: &AtlasStore,
+    request: &SearchRequest,
+    admission: AdmissionSummary,
+    coverage: AnswerCoverage,
+    semantic: SemanticStatus,
+) -> SearchAnswer {
+    SearchAnswer {
+        publication_revision: store.publication_revision(),
+        generations: Vec::new(),
+        editions: Vec::new(),
+        mode: RankingMode::Lexical,
+        application: None,
+        admission,
+        hits: Vec::new(),
+        semantic,
+        coverage,
+        truncated: false,
+        budget: AnswerBudget {
+            limit: request.limit,
+            offset: request.offset,
+            ..AnswerBudget::default()
+        },
+    }
+}
+
+/// The `Err` side is the raw *detail*, not a finished `SemanticStatus`:
+/// the same failure is told two different ways depending on what the
+/// answer then does with it — a fresh request falls back to lexical hits
+/// and says so, an unrecoverable continuation returns no hit at all and
+/// must not claim any (`unrecoverable_reason`, VERDICT.md D5).
+type SemanticOutcome = Result<
+    (
+        Vec<EvidenceHit>,
+        (Vec<(MembershipId, EditionId)>, SemanticApplication),
+        SemanticStatus,
+    ),
+    String,
+>;
+
+/// Try to rank this answer semantically, and say truthfully what happened.
+///
+/// The whole admission decision has already been made by the caller: this
+/// sees only the memberships that survived it and only the immutable
+/// generation each is pinned to. What it adds is the second admission the
+/// retrieval side owns — which of those sources has a verified, current,
+/// compatible edition — and it applies the family filter to *rows* before
+/// the view exists, so an excluded row never reaches a corpus statistic.
+fn semantic_attempt(
+    store: &AtlasStore,
+    request: &SearchRequest,
+    memberships: &[crate::Membership],
+    generations: &BTreeMap<MembershipId, GenerationId>,
+    coverage: &mut AnswerCoverage,
+) -> Result<SemanticOutcome, AtlasError> {
+    let Some(config) = &request.semantic_query else {
+        return Ok(Err(
+            "no semantic query backend is configured for this request; a backend \
+             executable and an offline model directory are the caller's explicit configuration, \
+             and this product ships neither"
+                .to_owned(),
+        ));
+    };
+    // A semantic continuation whose token predates the query producer
+    // identity carries no pin. That is honest history, not a positive
+    // statement that nothing moved, and it is the one thing this check
+    // cannot verify — so the page is refused with that as the reason
+    // rather than served on an assumption (`W4-PRODUCER-PROVENANCE-
+    // CORRECTION.md`: historical unmeasured identities stay unknown).
+    let pinned_producer = if request.pinned_mode == Some(RankingMode::Semantic)
+        && request.pinned_editions.is_some()
+    {
+        match &request.pinned_producer {
+            PinnedProducer::Unrecorded => {
+                return Ok(Err(
+                    "this continuation was issued before the query producer identity was \
+                     recorded on an answer, so there is nothing to check the implementation that \
+                     would rank this page against; re-run the query to start a continuation that \
+                     carries one"
+                        .to_owned(),
+                ));
+            }
+            PinnedProducer::Incomplete => {
+                return Ok(Err(
+                    "this continuation carries an incomplete query producer pin: some of its \
+                     producer fields are present and some are missing, so it is a malformed \
+                     token rather than a record of an implementation, and there is nothing \
+                     complete to check this ranking against; re-run the query"
+                        .to_owned(),
+                ));
+            }
+            PinnedProducer::Recorded(pin) => Some(pin),
+        }
+    } else {
+        None
+    };
+    let plan = crate::retrieval::plan_semantic(
+        store,
+        memberships,
+        generations,
+        request.pinned_editions.as_ref(),
+        &request.families,
+    )?;
+    let (editions, partial) = match plan {
+        SemanticPlan::Unavailable(detail) => return Ok(Err(detail)),
+        SemanticPlan::Ready { editions, partial } => (editions, partial),
+    };
+    // A continuation may not quietly widen or narrow its own corpus: the
+    // editions it captured are the editions it ranks, exactly.
+    if let Some(pinned) = &request.pinned_editions {
+        let ranked: std::collections::BTreeSet<&MembershipId> =
+            editions.iter().map(|edition| &edition.membership).collect();
+        if pinned.len() != ranked.len() || !pinned.keys().all(|key| ranked.contains(key)) {
+            return Ok(Err(format!(
+                "this continuation was issued over {} semantic edition(s) and only {} can be \
+                 ranked through now; the page it asks for cannot be reproduced{}",
+                pinned.len(),
+                ranked.len(),
+                partial
+                    .as_ref()
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default()
+            )));
+        }
+    }
+    let used: Vec<(MembershipId, EditionId)> = editions
+        .iter()
+        .map(|edition| (edition.membership.clone(), edition.edition.id.clone()))
+        .collect();
+    let (view, ranked, applied) =
+        match crate::retrieval::rank(config, &editions, store, &request.query, pinned_producer)? {
+            Ok(result) => result,
+            Err(detail) => return Ok(Err(detail)),
+        };
+    let identities: BTreeMap<MembershipId, HitGenerationIdentity> = editions
+        .iter()
+        .map(|edition| {
+            (
+                edition.membership.clone(),
+                HitGenerationIdentity {
+                    revision: edition.edition.generation_revision.clone(),
+                    content: edition.edition.generation_content.clone(),
+                    extractor_set: edition.edition.chunker.extractor_set.clone(),
+                },
+            )
+        })
+        .collect();
+    let mut hits = Vec::with_capacity(ranked.len());
+    for result in &ranked {
+        let row = &view[result.row];
+        let Some(identity) = identities.get(&row.membership) else {
+            return Ok(Err(
+                "a ranked row named a membership this answer did not admit".to_owned(),
+            ));
+        };
+        hits.push(EvidenceHit {
+            coordinate: ExactCoordinate {
+                estate: row.estate.clone(),
+                membership: row.membership.clone(),
+                source: row.source.clone(),
+                generation: row.generation.clone(),
+                path: row.path.clone(),
+                object_id: row.object_id.clone(),
+                byte_start: row.byte_start,
+                byte_end: row.byte_end,
+                line_start: row.line_start,
+                line_end: row.line_end,
+            },
+            score: result.score,
+            // The *evidence* bytes, not the ranking text: what a reader is
+            // shown is what the repository holds at this coordinate.
+            snippet: String::from_utf8_lossy(&row.bytes).into_owned(),
+            generation_identity: identity.clone(),
+        });
+    }
+    // The candidate pool is frozen so paging is a slice of one list. When
+    // the native ranker fills it, more candidates may exist beyond it and
+    // the answer says so rather than implying completeness.
+    if applied.saturated {
+        coverage.partial = true;
+    }
+    let status = match &partial {
+        None => SemanticStatus::Applied,
+        Some(detail) => SemanticStatus::Partial(format!(
+            "semantic ranking ran over {} of {} admitted source(s); the rest were not searched \
+             semantically and contribute no hit to this answer: {detail}",
+            editions.len(),
+            memberships.len(),
+            detail = detail
+        )),
+    };
+    Ok(Ok((hits, (used, applied), status)))
+}
+
+/// The lexical path, unchanged in behaviour: a deterministic small BM25
+/// over the admitted, family-filtered generation units.
+fn lexical_hits(
+    store: &AtlasStore,
+    request: &SearchRequest,
+    resolved: &[(crate::AdmittedSource, crate::SourceGeneration)],
+    coverage: &mut AnswerCoverage,
+) -> Result<(Vec<EvidenceHit>, usize), AtlasError> {
+    let mut blob_cache: BTreeMap<(String, String), Vec<u8>> = BTreeMap::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let _ = store;
+    for (source, generation) in resolved {
         let generation_identity = HitGenerationIdentity {
             revision: generation.revision.clone(),
             content: generation.content.clone(),
@@ -452,64 +801,9 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
             }
         }
     }
-    generations.sort_by(|a, b| a.0.0.cmp(&b.0.0));
-
-    if !request.families.is_empty() && candidates.is_empty() && saw_any_generation {
-        coverage.unsupported_family = true;
-    }
-
-    let mut ranked = score(&request.query, candidates);
-    let total_candidates = ranked.len();
-    // Continuation's own page cursor (W3-CORRECTION.md item 1): skip
-    // already-returned candidates before taking this page's `limit`, over
-    // the same deterministic ranked order a fresh, unpaged request would
-    // see (the ranking itself never depends on `offset`).
-    let page: Vec<EvidenceHit> = ranked
-        .drain(..)
-        .skip(request.offset)
-        .take(request.limit)
-        .collect();
-    let truncated = request.offset + page.len() < total_candidates;
-    let budget = AnswerBudget {
-        limit: request.limit,
-        offset: request.offset,
-        total_candidates,
-        returned: page.len(),
-    };
-    let hits = page;
-    // A continuation window that starts at or past the end of its own
-    // ranked list has run out of *page*, not out of *corpus* (ruling
-    // 0095). `offset > 0` keeps a genuine fresh zero-hit query
-    // (`offset 0`, `total_candidates 0`) reporting `no_match` as before.
-    coverage.spent = request.offset > 0 && request.offset >= total_candidates;
-    // `no_match` must mean the admitted, family-filtered corpus was fully
-    // searched and genuinely produced nothing (source-verify-w2 Failure 1):
-    // an empty presentation window (`truncated`/`spent`) or an unread
-    // source (`source_unavailable`/`generation_unavailable`) is missing
-    // evidence, not proven absence, and must never present as one.
-    if hits.is_empty()
-        && !coverage.unsupported_family
-        && !truncated
-        && !coverage.spent
-        && !coverage.source_unavailable
-        && !coverage.generation_unavailable
-    {
-        coverage.no_match = true;
-    }
-    coverage.partial = truncated || coverage.source_unavailable || coverage.generation_unavailable;
-
-    let semantic = semantic_status(store, request, &admitted);
-
-    Ok(SearchAnswer {
-        publication_revision,
-        generations,
-        admission,
-        hits,
-        semantic,
-        coverage,
-        truncated,
-        budget,
-    })
+    let ranked = score(&request.query, candidates);
+    let total = ranked.len();
+    Ok((ranked, total))
 }
 
 /// Deterministic small BM25 over the admitted, family-filtered candidate

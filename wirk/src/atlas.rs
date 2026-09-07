@@ -39,8 +39,8 @@ fn atlas_usage() -> ExitCode {
          | wirk atlas publish --estate <root> --source <name> --generation <id> [--json] \
          | wirk atlas status --estate <root> [--source <name>] [--work <id>] [--json] \
          | wirk atlas resolve --estate <root> [--work <id>] --coordinate <encoded> [--json] \
-         | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--family code|knowledge|config]... [--limit <n>] [--continue <token>] [--json] \
-         | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--json] \
+         | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--semantic-backend <path>] [--semantic-backend-arg <arg>...] [--semantic-model <dir>] [--family code|knowledge|config]... [--limit <n>] [--continue <token>] [--json] \
+         | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--chunker units|native] [--json] \
          | wirk atlas semantic select --estate <root> --source <name> --edition <id> [--json] \
          | wirk atlas relate --estate <root> --work <id> --kind governed_by --from <coordinate> --to <coordinate> --evidence <coordinate> [--evidence <coordinate>...] [--run <id>] [--world <hash>] [--json]"
     );
@@ -105,6 +105,12 @@ fn flag_values(rest: &[String], flag: &str) -> Vec<String> {
         .filter(|(name, _)| name.as_str() == flag)
         .map(|(_, value)| value.clone())
         .collect()
+}
+
+/// The first 16 characters of a digest, for a line a human reads. The
+/// full value is always in `--json`; this never replaces it.
+fn short(digest: &str) -> &str {
+    digest.get(..16).unwrap_or(digest)
 }
 
 fn print_result(json: bool, result: &serde_json::Value, summary: impl FnOnce(&serde_json::Value)) {
@@ -386,6 +392,9 @@ fn search_command(rest: &[String]) -> ExitCode {
             ("--query", true),
             ("--source", true),
             ("--semantic", true),
+            ("--semantic-backend", true),
+            ("--semantic-backend-arg", true),
+            ("--semantic-model", true),
             ("--family", true),
             ("--limit", true),
             ("--continue", true),
@@ -414,6 +423,9 @@ fn search_command(rest: &[String]) -> ExitCode {
             families,
             limit,
             continuation,
+            semantic_backend: flag_value(rest, "--semantic-backend"),
+            semantic_backend_args: flag_values(rest, "--semantic-backend-arg"),
+            semantic_model: flag_value(rest, "--semantic-model"),
         }),
         |result| {
             print_result(json, result, |result| {
@@ -423,13 +435,114 @@ fn search_command(rest: &[String]) -> ExitCode {
                 // plain text before — the admission/coverage state is
                 // shown here, not only reachable via --json.
                 println!(
-                    "hits {} admission {} coverage {} budget {} semantic {}",
+                    "hits {} admission {} coverage {} budget {} semantic {} ranking {}",
                     hits.len(),
                     result["admission"],
                     result["coverage"],
                     result["budget"],
-                    result["semantic"]["status"].as_str().unwrap_or("?")
+                    result["semantic"]["status"].as_str().unwrap_or("?"),
+                    result["ranking"]["mode"].as_str().unwrap_or("?")
                 );
+                // P3 W4 B (0104's W1 limit, SEMANTIC-LIFECYCLE-LIMITS.md):
+                // the plain surface is the one a human actually reads, so
+                // the *reason* semantic use is unavailable or degraded —
+                // and the fact that these hits are lexical instead — is
+                // printed here, not left reachable only through --json.
+                // The reason text is the same string the JSON carries;
+                // both come from one place, so they cannot drift.
+                if let Some(reason) = result["semantic"]["reason"].as_str() {
+                    println!("  semantic reason {reason}");
+                }
+                // A ranking that actually happened names what did it.
+                if let Some(application) = result["ranking"]["application"].as_object() {
+                    println!(
+                        "  ranked by {} over {} admitted rows, {} of {} editions, candidate \
+                         limit {}{}",
+                        application
+                            .get("native")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("?"),
+                        application
+                            .get("rows_ranked")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                        result["ranking"]["editions"]
+                            .as_array()
+                            .map(|editions| editions.len())
+                            .unwrap_or(0),
+                        result["ranking"]["editions"]
+                            .as_array()
+                            .map(|editions| editions.len())
+                            .unwrap_or(0),
+                        application
+                            .get("candidate_limit")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0),
+                        if application
+                            .get("candidates_saturated")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                        {
+                            " (saturated: more candidates exist beyond it)"
+                        } else {
+                            ""
+                        }
+                    );
+                    // The measured half of "ranked by …". `native` above
+                    // is the child's own claim; this is the executable the
+                    // product opened and digested, how many argv tokens it
+                    // ran it with, and how much of what loaded inside it
+                    // the record actually covers. A reader who only ever
+                    // sees the plain surface still learns that the version
+                    // string is not the identity.
+                    if let Some(producer) = application.get("producer").and_then(|p| p.as_object())
+                    {
+                        let environment = &producer["environment"];
+                        println!(
+                            "  query implementation {} {} argv {} token(s), environment {}{}, \
+                             identity {}, basis {}",
+                            producer["program"]["canonical"].as_str().unwrap_or("?"),
+                            short(producer["program"]["digest"].as_str().unwrap_or("?")),
+                            producer["argv"].as_array().map(Vec::len).unwrap_or(0),
+                            environment["state"].as_str().unwrap_or("?"),
+                            environment["coverage"]["state"]
+                                .as_str()
+                                .map(|state| format!(" (coverage {state})"))
+                                .unwrap_or_default(),
+                            short(producer["digest"].as_str().unwrap_or("?")),
+                            producer["basis"].as_str().unwrap_or("?"),
+                        );
+                        // O2: the plain reader was told "coverage partial"
+                        // and left to guess what was unaccounted for, and
+                        // is now told which packages. And a
+                        // configuration-only basis is stated in words,
+                        // because it is the one that changes what the
+                        // caller can do next: this answer is complete and
+                        // usable, and its continuation will be refused.
+                        if let Some(detail) = environment["coverage"]["detail"].as_str() {
+                            println!("    coverage detail: {detail}");
+                        }
+                        // Both bases now print their sentence, not just
+                        // the weak one: what an `implementation_measured`
+                        // pin covers — the modules the backend reported,
+                        // and nothing else in the process — is exactly
+                        // the thing a plain reader was previously left to
+                        // read as a guarantee over the whole ranker
+                        // (`EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(b)).
+                        if let Some(detail) = producer["basis_detail"].as_str() {
+                            println!("    basis: {detail}");
+                        }
+                    }
+                }
+                if result["coverage"]["continuation_unrecoverable"]
+                    .as_bool()
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "  this continuation cannot be reproduced; no page was returned and \
+                         nothing was restarted"
+                    );
+                }
                 for hit in hits {
                     println!(
                         "  {} {}:{}-{} rev {} score {}",
@@ -475,6 +588,7 @@ fn semantic_build_command(rest: &[String]) -> ExitCode {
             ("--backend", true),
             ("--backend-arg", true),
             ("--model", true),
+            ("--chunker", true),
         ],
     ) {
         return code;
@@ -497,6 +611,7 @@ fn semantic_build_command(rest: &[String]) -> ExitCode {
             backend,
             backend_args: flag_values(rest, "--backend-arg"),
             model,
+            chunker: flag_value(rest, "--chunker"),
         }),
         &["staged"],
         |result| {
@@ -513,6 +628,98 @@ fn semantic_build_command(rest: &[String]) -> ExitCode {
                         .as_str()
                         .unwrap_or("-"),
                 );
+                // P3 W4 B: what the rows are, what ranks them, and what
+                // they honestly do not cover — in plain text, not only in
+                // `--json`. An edition that skipped resources says so
+                // here rather than leaving a caller to discover it.
+                let edition = &result["edition"];
+                if let Some(retrieval) = edition["retrieval"].as_object() {
+                    println!(
+                        "  chunks {} chunker {} retrieval {}",
+                        retrieval
+                            .get("chunking")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("?"),
+                        edition["chunker"]["chunks"]["implementation"]
+                            .as_str()
+                            .unwrap_or("generation units"),
+                        retrieval
+                            .get("digest")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("-"),
+                    );
+                    // O1: the parse trees these boundaries came out of
+                    // were produced by shared libraries the version
+                    // string above does not pin. What was actually
+                    // digested — or that nothing was — is said here, in
+                    // plain text, and a library whose bytes the
+                    // provider's own archive does not declare is named.
+                    let grammars = &edition["chunker"]["chunks"]["grammars"];
+                    match grammars["state"].as_str() {
+                        Some("measured") => {
+                            let libraries = grammars["libraries"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default();
+                            println!(
+                                "  grammars {} shared librar{} digested from {}",
+                                libraries.len(),
+                                if libraries.len() == 1 { "y" } else { "ies" },
+                                grammars["cache_root"].as_str().unwrap_or("?"),
+                            );
+                            for library in &libraries {
+                                if library["declaration"]["state"].as_str() == Some("undeclared") {
+                                    println!(
+                                        "    undeclared {} — {}",
+                                        library["file"]["canonical"].as_str().unwrap_or("?"),
+                                        library["declaration"]["detail"].as_str().unwrap_or("?"),
+                                    );
+                                }
+                            }
+                            for entry in grammars["uncovered"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                            {
+                                println!(
+                                    "    uncovered {} — {}",
+                                    entry["name"].as_str().unwrap_or("?"),
+                                    entry["reason"].as_str().unwrap_or("?"),
+                                );
+                            }
+                        }
+                        Some(state @ ("none_loaded" | "unavailable")) => println!(
+                            "  grammars {state}: {}",
+                            grammars["reason"].as_str().unwrap_or("?")
+                        ),
+                        _ => println!(
+                            "  grammars unreported: this build measured no parser shared library"
+                        ),
+                    }
+                }
+                let coverage = &edition["coverage"];
+                if coverage["resources_indexed"].as_u64().unwrap_or(0) > 0 {
+                    println!(
+                        "  coverage {} of {} indexed resources produced rows, {} of {} bytes \
+                         addressed",
+                        coverage["resources_with_rows"].as_u64().unwrap_or(0),
+                        coverage["resources_indexed"].as_u64().unwrap_or(0),
+                        coverage["covered_bytes"].as_u64().unwrap_or(0),
+                        coverage["indexed_bytes"].as_u64().unwrap_or(0),
+                    );
+                    for (label, key) in [
+                        ("no rows", "resources_without_rows"),
+                        ("unmapped", "resources_unmapped"),
+                    ] {
+                        for entry in coverage[key].as_array().cloned().unwrap_or_default() {
+                            println!(
+                                "    {label} {} — {}",
+                                entry["name"].as_str().unwrap_or("?"),
+                                entry["reason"].as_str().unwrap_or("?")
+                            );
+                        }
+                    }
+                }
                 if let Some(detail) = result["detail"].as_str() {
                     println!("detail {detail}");
                 }

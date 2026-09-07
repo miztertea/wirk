@@ -266,6 +266,10 @@ fn a_v2_generation_still_validates_and_resolves_under_the_v3_default() {
             limit: 10,
             pinned: Some(pinned),
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();

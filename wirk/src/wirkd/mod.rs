@@ -497,6 +497,12 @@ pub struct AtlasSemanticBuildPayload {
     #[serde(default)]
     pub backend_args: Vec<String>,
     pub model: String,
+    /// `"units"` or `"native"` (default `"units"`). What a row of the
+    /// edition *is*, and the caller's explicit choice: a native-chunk
+    /// edition and a unit edition over the same generation are different
+    /// artifacts with different identities.
+    #[serde(default)]
+    pub chunker: Option<String>,
 }
 
 /// `atlas semantic select`'s payload (P3 W4 A).
@@ -556,6 +562,16 @@ pub struct AtlasSearchPayload {
     pub limit: Option<usize>,
     #[serde(default)]
     pub continuation: Option<String>,
+    /// The semantic query backend, exactly as `semantic build`'s is:
+    /// caller configuration travelling as data over an argv boundary.
+    /// Absent means no semantic ranking can run, which is a truthful
+    /// reason on the answer rather than an error.
+    #[serde(default)]
+    pub semantic_backend: Option<String>,
+    #[serde(default)]
+    pub semantic_backend_args: Vec<String>,
+    #[serde(default)]
+    pub semantic_model: Option<String>,
 }
 
 /// `atlas resolve`'s payload: `coordinate` is a hex encoding of one

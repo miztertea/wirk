@@ -44,10 +44,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// The stdin/stdout contract this crate speaks to a configured backend.
-/// Versioned because it is a compatibility surface with something the
-/// product does not compile: a backend that answers with a different
-/// protocol string is refused rather than guessed at.
+/// The first stdin/stdout contract this crate spoke to a configured
+/// backend. Retained as a public constant because every edition built
+/// before native chunking records it as the protocol its vectors were
+/// produced under, and those records stay readable and stay labelled with
+/// the protocol they actually used. Nothing writes it any more.
 pub const EMBED_PROTOCOL: &str = "wirk-embed/v1";
 
 /// The only vector encoding this increment writes or verifies: little
@@ -60,6 +61,53 @@ pub const VECTOR_FORMAT: &str = "f32le-row-major/v1";
 pub const EDITION_RECORD: &str = "edition.json";
 pub const MAPPING_FILE: &str = "mapping.ndjson";
 pub const VECTORS_FILE: &str = "vectors.bin";
+
+/// The build protocol that also *chunks*. `wirk-embed/v1` sends text and
+/// receives vectors; a native chunker's boundaries are not the product's
+/// to compute, so `v2` sends the committed blob bytes of each admitted
+/// resource and receives, per produced row, the byte range **in those
+/// original bytes**. `v1` remains exactly what it was: every edition
+/// already built binds the bytes of a backend that speaks it.
+pub const EMBED_PROTOCOL_V2: &str = "wirk-embed/v2";
+
+/// The query protocol. The product composes the admitted ranking view —
+/// which rows, in which order, with which vectors — and the backend ranks
+/// it with the installed native implementation. No index is persisted and
+/// nothing but the query itself is ever embedded.
+pub const QUERY_PROTOCOL: &str = "wirk-query/v1";
+
+/// How a row's ranking text relates to the committed bytes it addresses.
+/// `identity` means the two are the same bytes; the other value names the
+/// transformation the native reader applies
+/// (`native-chunk-boundary-use/HANDOFF.md` N1), so a row whose digests
+/// differ says *why* rather than reading as corrupt.
+pub const TEXT_IDENTITY: &str = "identity";
+pub const TEXT_NORMALIZED: &str = "universal-newline+utf8-replace/v1";
+
+/// The frozen path string convention fed to the native ranker, disclosed
+/// in every edition that uses it.
+///
+/// It is not cosmetic and it is not recoverable afterwards: the path is
+/// concatenated into the BM25 document text (`enrich_for_bm25` appends the
+/// file stem twice and the last three directory components), it is the
+/// BM25 document key (`make_chunk_id`), it is what `boost_multi_chunk_files`
+/// groups by, and `_boost_stem_matches` reads its parent directory name.
+/// Two memberships publishing the same source-relative path must therefore
+/// be distinct *here*, one layer below any adapter
+/// (`W4-CONTROL-ADJUDICATION.md`), and the convention must be frozen and
+/// disclosed before any reserved label rather than chosen from scores.
+pub const RANKING_PATH_CONVENTION: &str = "membership-alias/source-relative-path/v1";
+
+/// The retrieval identity scheme this product writes.
+pub const RETRIEVAL_SCHEME: &str = "wirk-retrieval/v1";
+
+/// How many ranked candidates one admitted view yields, frozen so that
+/// paging is a pure slice of one deterministic list rather than a second
+/// ranking at a different depth: the native ranker over-fetches
+/// `top_k * 5` and fuses, so asking for a different `top_k` is not
+/// guaranteed to return a prefix of the larger answer. Bound into the
+/// retrieval identity and into every continuation.
+pub const CANDIDATE_LIMIT: u64 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EditionId(pub String);
@@ -240,8 +288,12 @@ pub struct UnavailableEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", tag = "state", content = "detail")]
 pub enum EnvironmentCoverage {
-    /// The backend enumerated distributions but no loaded modules. The
-    /// implementation bytes that ran are simply not part of this record.
+    /// No loaded module was measured: the backend reported no module
+    /// list, reported an empty one, or reported one whose every entry it
+    /// could not read. All three are the same epistemic state — the
+    /// implementation bytes that ran are not part of this record — and
+    /// the count is what decides it, never the presence of the key
+    /// (`EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(a)).
     #[default]
     Unmeasured,
     /// Every distribution the run imported was described, every module
@@ -359,7 +411,119 @@ pub struct BackendIdentity {
 pub struct ChunkerIdentity {
     pub extractor_set: String,
     pub unitizer: String,
+    /// The chunker that actually produced this edition's rows, and the
+    /// silent inputs that determine its output.
+    ///
+    /// `extractor_set`/`unitizer` above describe the *generation*: what
+    /// W3 committed. They do not determine a semantic row, because a
+    /// semantic edition may group those units differently. Absent on
+    /// every edition built before native chunking existed, which is
+    /// exactly what `default` means here — such a record says "the rows
+    /// are the generation's units" and stays readable as that.
+    #[serde(default)]
+    pub chunks: Option<NativeChunkerIdentity>,
 }
+
+/// The installed chunker as it actually is, not as a name.
+///
+/// `native-chunk-boundary-use/HANDOFF.md` §6.3: an identity that records
+/// only a name and a version does not determine the output. Chunk size is
+/// a module constant carrying an upstream `# TODO: make this
+/// configurable`; boundaries come from parse trees, so a grammar bump
+/// moves them; and the resolved language — derived from the path suffix,
+/// not from the blob — changes both the count and the boundaries. Every
+/// one of those is recorded, the implementation files by digest. The
+/// resolved language is per resource and lives on the row, because it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeChunkerIdentity {
+    /// The implementation and version, e.g. `semble/0.5.2`.
+    pub implementation: String,
+    /// The public entry point actually called.
+    pub entry_point: String,
+    /// The module constants that decide boundary size, verbatim.
+    pub constants: String,
+    /// The parser generation the boundaries came out of.
+    pub parsers: String,
+    /// The implementation files themselves, digested by the product.
+    pub files: Vec<ConfiguredPath>,
+    /// The parser shared libraries that actually produced the parse
+    /// trees, by their bytes — or the honest statement that none is
+    /// covered. `parsers` above is a version string, and a version does
+    /// not pin the extracted library it names
+    /// (`EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` O1). Absent on every
+    /// edition built before this was measured, which is what `default`
+    /// means here: unreported, never "none loaded".
+    #[serde(default)]
+    pub grammars: GrammarCoverage,
+}
+
+/// What an edition records about the parser shared libraries that decided
+/// its boundaries.
+///
+/// Four states, and the empty case is deliberately *not* one of the
+/// measured ones: D1(a)'s lesson applies here too, so "the loader had
+/// loaded nothing" is its own state and can never be read as coverage of
+/// something.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", tag = "state", content = "detail")]
+pub enum GrammarCoverage {
+    /// The backend said nothing about grammar libraries. Every edition
+    /// built before O1 reads as this, and nothing is minted for them.
+    #[default]
+    Unreported,
+    /// The backend reported that no parser shared library was loaded, so
+    /// every boundary came from the line chunker. Zero libraries, and
+    /// zero claimed.
+    NoneLoaded(String),
+    /// The backend reported that its parsers come from a provider whose
+    /// loaded files it cannot enumerate. Missing coverage, named.
+    Unavailable(String),
+    /// One or more libraries were reported and re-read by the product.
+    Measured(Box<GrammarLibraries>),
+}
+
+/// The parser shared libraries a build actually loaded, as the product
+/// re-measured them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrammarLibraries {
+    /// The module that supplied the parsers, e.g.
+    /// `semble_grammars.loader`.
+    pub provider: String,
+    /// The cache directory the loader extracted them into — the
+    /// overridable location whose bytes no version pins.
+    pub cache_root: String,
+    /// What this record measures and what it does not, in words.
+    pub scope: String,
+    pub libraries: Vec<GrammarLibrary>,
+    /// Libraries the backend loaded and could not read, and any reason
+    /// the bundled archive's own declarations were unavailable. Empty is
+    /// a claim: nothing was skipped.
+    pub uncovered: Vec<UnavailableEntry>,
+}
+
+/// One loaded grammar library, digested by the product at the path the
+/// loader loaded it from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrammarLibrary {
+    /// The languages the bundled manifest maps onto this file.
+    pub languages: Vec<String>,
+    /// The file itself, canonicalized and digested by the product.
+    pub file: ConfiguredPath,
+    /// Whether the bundled archive manifest declares these exact bytes.
+    ///
+    /// Never assumed from the file merely existing: upstream's
+    /// `extract_atomic` returns early without re-checking the sha256 of a
+    /// destination that already exists, so a cached library can differ
+    /// from what the archive declares and still be loaded.
+    pub declaration: ModuleAttribution,
+}
+
+/// The scope of a grammar-library record, written into it.
+pub const GRAMMAR_SCOPE_V1: &str = "measured: every parser shared library the backend's loader reports having loaded in this \
+     build, re-read and digested by the product at the path it was loaded from, with the sha256 \
+     the provider's bundled archive manifest declares for that file recorded beside it. not \
+     measured: libraries no parser was asked for in this build, the archive the loader extracted \
+     from, and whether the process that parsed is the one this record describes.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorManifest {
@@ -407,15 +571,85 @@ pub struct MappingRow {
     pub membership: MembershipId,
     pub source: SourceId,
     pub generation: GenerationId,
+    /// The *first* generation unit this row's byte range touches. Under
+    /// the one-unit-per-row editions this field was the only unit, and a
+    /// record written then still reads back meaning exactly that.
     pub unit: UnitId,
+    /// The last unit the range touches; absent means the range lies
+    /// inside `unit` alone. Two ids, never a list: `validate_generation`
+    /// pins the generation's units as a contiguous gapless partition of
+    /// the blob, so the interior of the run is derivable and storing it
+    /// would be storing a duplicate.
+    ///
+    /// The run is a *covering superset*, never an equality claim: 80 % of
+    /// native chunks begin or end mid-line
+    /// (`native-chunk-boundary-use/HANDOFF.md` N2), so evidence recovery
+    /// reads `byte_start`/`byte_end` and never the unit run.
+    #[serde(default)]
+    pub unit_last: Option<UnitId>,
     pub path: Vec<u8>,
     pub object_id: String,
     pub byte_start: u64,
     pub byte_end: u64,
+    /// Display coordinates, computed from the *original* blob bytes.
+    /// Adjacent rows may overlap on a line and a row may begin in the
+    /// middle of one; they are never a way to reconstruct the text.
     pub line_start: u64,
     pub line_end: u64,
     pub byte_len: u64,
+    /// Digest of the committed bytes at `[byte_start, byte_end)`. This is
+    /// what the 0078 re-derivation control reads, and its meaning is
+    /// unchanged from the editions that only ever had this field.
     pub content_digest: String,
+    /// Digest of the text that was actually embedded and is actually
+    /// ranked. Equal to `content_digest` whenever `text_normalization` is
+    /// `identity`; different, legitimately, when the native reader's
+    /// universal-newline translation or lossy decode stands between the
+    /// committed bytes and the ranked string. Keeping one digest for both
+    /// would either forge the evidence digest or report every CRLF row as
+    /// corrupt.
+    #[serde(default)]
+    pub text_digest: Option<String>,
+    #[serde(default)]
+    pub text_normalization: Option<String>,
+    /// The language the chunker resolved for this resource, from the
+    /// ranking path's suffix — an input to the boundaries, so an input to
+    /// the identity. `None` is the honest answer for a suffix the
+    /// implementation maps to nothing.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// The exact path string handed to the native ranker, under
+    /// `RANKING_PATH_CONVENTION`. Recorded per row because it is indexed
+    /// text, not decoration.
+    #[serde(default)]
+    pub ranking_path: Option<String>,
+    /// This row's slot within its own resource, which is what the native
+    /// document key is built from.
+    #[serde(default)]
+    pub slot: Option<u64>,
+    /// The content family of the resource this row came from, so family
+    /// admission can be applied *before* any ranking statistic is
+    /// computed rather than by filtering a finished ranking.
+    #[serde(default)]
+    pub family: Option<crate::ContentFamily>,
+}
+
+impl MappingRow {
+    /// The digest of the committed bytes this row addresses.
+    pub fn source_digest(&self) -> &str {
+        &self.content_digest
+    }
+
+    /// The digest of the text that was embedded. Falls back to the
+    /// evidence digest for the editions where the two were the same
+    /// thing by construction.
+    pub fn ranking_text_digest(&self) -> &str {
+        self.text_digest.as_deref().unwrap_or(&self.content_digest)
+    }
+
+    pub fn normalization(&self) -> &str {
+        self.text_normalization.as_deref().unwrap_or(TEXT_IDENTITY)
+    }
 }
 
 /// The identity scheme this product writes. `v1` is W4 A's first
@@ -435,9 +669,154 @@ pub struct MappingRow {
 /// Nothing recomputes: an existing `v1` or `v2` record verifies against
 /// the environment digest it already stores, which is why a model or
 /// scheme change never rewrites a prior edition's bytes.
+/// What an edition's rows *are*, and therefore what a retrieval over them
+/// ranks. Explicit, because the two are genuinely different artifacts and
+/// a reader must be able to tell which one they have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticChunking {
+    /// One row per generation unit: the W3 one-line extraction, which is
+    /// what every edition before native chunking contains.
+    #[default]
+    Units,
+    /// One row per native chunk: meaningful multi-line spans produced by
+    /// the installed chunker over the same unchanged generation.
+    Native,
+}
+
+impl SemanticChunking {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Units => "units",
+            Self::Native => "native",
+        }
+    }
+}
+
+/// How this edition's rows are ranked, fixed at build time and disclosed.
+///
+/// `VectorManifest` binds the vector *file*; that is not a retrieval
+/// representation. The same vectors ranked under a different sparse text
+/// rule, a different path convention or a different fusion are a different
+/// retrieval, and a continuation that silently crossed between them would
+/// be handing a caller a second answer while calling it the first one's
+/// next page. Every field here is read from the installed implementation
+/// rather than asserted about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalIdentity {
+    pub scheme: String,
+    /// Which rows this edition holds.
+    pub chunking: SemanticChunking,
+    /// The native implementation that will rank them.
+    pub native: String,
+    /// Dense side: metric, normalisation, and which text was embedded.
+    pub dense: String,
+    /// Sparse side: the synthesised document text and its tokenizer.
+    /// This is not the evidence text — it appends path components that
+    /// exist in no source file.
+    pub sparse: String,
+    /// The frozen ranking path convention.
+    pub path_convention: String,
+    /// Fusion and re-ranking, named as the installed implementation does.
+    pub fusion: String,
+    /// The frozen candidate depth one admitted view yields.
+    pub candidate_limit: u64,
+    /// One digest over every field above, length-prefixed. It is this
+    /// value that an edition id absorbs and a continuation pins.
+    pub digest: String,
+}
+
+impl RetrievalIdentity {
+    pub(crate) fn new(chunking: SemanticChunking, native: &str) -> Self {
+        let mut identity = Self {
+            scheme: RETRIEVAL_SCHEME.into(),
+            chunking,
+            native: native.to_owned(),
+            dense: "cosine over unnormalised stored vectors with the query side normalised \
+                    (vicinity CosineBasicBackend via semble.index.dense.SelectableBasicBackend); \
+                    embedded text is the row's ranking text verbatim"
+                .into(),
+            sparse: "semble.index.sparse.enrich_for_bm25: \
+                     `<text> <stem> <stem> <last three directory components>`, tokenised by \
+                     semble.tokens.tokenize, indexed by semble.index.bm25.BM25 under the document \
+                     key semble.index.types.make_chunk_id(<ranking path>, <slot>)"
+                .into(),
+            path_convention: RANKING_PATH_CONVENTION.into(),
+            fusion: "semble.search.search: reciprocal rank fusion k=60 with alpha from \
+                     semble.ranking.resolve_alpha, then boost_multi_chunk_files, \
+                     apply_query_boost and rerank_topk path penalties"
+                .into(),
+            candidate_limit: CANDIDATE_LIMIT,
+            digest: String::new(),
+        };
+        let mut hasher = Sha256::new();
+        absorb(&mut hasher, b"wirk-retrieval/v1");
+        for part in [
+            identity.scheme.as_bytes(),
+            identity.chunking.label().as_bytes(),
+            identity.native.as_bytes(),
+            identity.dense.as_bytes(),
+            identity.sparse.as_bytes(),
+            identity.path_convention.as_bytes(),
+            identity.fusion.as_bytes(),
+        ] {
+            absorb(&mut hasher, part);
+        }
+        absorb(&mut hasher, &identity.candidate_limit.to_be_bytes());
+        identity.digest = hex(&hasher.finalize());
+        identity
+    }
+}
+
+/// What an edition's rows actually cover of the generation they describe,
+/// and what they honestly do not.
+///
+/// Native chunks are not a partition: inter-node whitespace falls between
+/// them, and a whitespace-only resource yields no chunk at all. An
+/// edition that claimed to tile every blob would be asserting something
+/// the installed chunker does not do
+/// (`native-chunk-boundary-use/HANDOFF.md` N3/N5), so the covered byte
+/// count is recorded beside the indexed byte count instead, and the
+/// resources that produced nothing are named rather than counted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EditionCoverage {
+    pub resources_indexed: u64,
+    pub resources_with_rows: u64,
+    pub indexed_bytes: u64,
+    pub covered_bytes: u64,
+    /// Indexed resources the chunker returned no row for, each with the
+    /// reason. Not an error and not a missing resource.
+    #[serde(default)]
+    pub resources_without_rows: Vec<UnavailableEntry>,
+    /// Indexed resources whose committed bytes could not be mapped
+    /// exactly to a ranking text, named with why. This is the "name the
+    /// exact unsupported coverage honestly" slot; it is deliberately not
+    /// a silent omission and deliberately not a build failure, and it is
+    /// frozen at build time rather than chosen later.
+    #[serde(default)]
+    pub resources_unmapped: Vec<UnavailableEntry>,
+}
+
 pub const IDENTITY_V1: &str = "wirk-semantic-edition/v1";
 pub const IDENTITY_V2: &str = "wirk-semantic-edition/v2";
 pub const IDENTITY_V3: &str = "wirk-semantic-edition/v3";
+/// `v4` adds the three things a retrieval needs and `v3` never bound: the
+/// chunker that produced the rows, the ranking representation those rows
+/// are ranked under, and the honest coverage of what the rows do and do
+/// not address. As with every previous bump nothing is recomputed — a
+/// `v1`, `v2` or `v3` record verifies against the scheme it was written
+/// under and stays labelled as that.
+pub const IDENTITY_V4: &str = "wirk-semantic-edition/v4";
+/// `v5` binds the parser shared libraries that actually produced the
+/// parse trees. `v4` bound `parsers` — a provider and a version string —
+/// and a version does not pin the library the provider extracted into a
+/// cache and loaded: those bytes can change under an unchanged version
+/// and move every boundary while the recorded identity stands still
+/// (`EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` O1). As with every previous
+/// bump nothing is recomputed: a `v4` record verifies under `v4` and
+/// stays labelled as that, and no historical edition gains coverage it
+/// never had.
+pub const IDENTITY_V5: &str = "wirk-semantic-edition/v5";
 
 fn identity_v1() -> String {
     IDENTITY_V1.to_owned()
@@ -466,6 +845,14 @@ pub struct SemanticEdition {
     pub vectors: VectorManifest,
     pub mapping: MappingManifest,
     pub producer: ProducerIdentity,
+    /// How these rows are ranked. Absent on every edition built before
+    /// retrieval existed; such an edition binds no ranking representation
+    /// at all, and a query refuses to invent one for it rather than
+    /// ranking it under whatever this build happens to do today.
+    #[serde(default)]
+    pub retrieval: Option<RetrievalIdentity>,
+    #[serde(default)]
+    pub coverage: EditionCoverage,
 }
 
 #[derive(Debug, Clone)]
@@ -474,6 +861,12 @@ pub struct SemanticBuildConfig {
     pub backend_args: Vec<String>,
     pub model: PathBuf,
     pub producer: String,
+    /// What a row is. The caller's explicit choice, never inferred from
+    /// the corpus: a native-chunk edition and a unit edition over the
+    /// same generation are different artifacts with different identities,
+    /// and which one an estate wants is not something a build may decide
+    /// on its behalf.
+    pub chunking: SemanticChunking,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -591,6 +984,48 @@ fn absorb(hasher: &mut Sha256, part: &[u8]) {
     hasher.update(part);
 }
 
+/// Absorb a grammar record, states distinguished by their own domain
+/// strings so "nothing was loaded", "nothing can be enumerated" and
+/// "these exact libraries" can never digest alike.
+fn absorb_grammars(hasher: &mut Sha256, grammars: &GrammarCoverage) {
+    match grammars {
+        GrammarCoverage::Unreported => absorb(hasher, b"grammars-unreported"),
+        GrammarCoverage::NoneLoaded(reason) => {
+            absorb(hasher, b"grammars-none-loaded");
+            absorb(hasher, reason.as_bytes());
+        }
+        GrammarCoverage::Unavailable(reason) => {
+            absorb(hasher, b"grammars-unavailable");
+            absorb(hasher, reason.as_bytes());
+        }
+        GrammarCoverage::Measured(measured) => {
+            absorb(hasher, b"grammars-measured");
+            absorb(hasher, measured.provider.as_bytes());
+            absorb(hasher, measured.scope.as_bytes());
+            absorb(hasher, &(measured.libraries.len() as u64).to_be_bytes());
+            for library in &measured.libraries {
+                absorb(hasher, library.file.canonical.as_bytes());
+                absorb(hasher, library.file.digest.as_bytes());
+                match &library.declaration {
+                    ModuleAttribution::Declared(detail) => {
+                        absorb(hasher, b"declared");
+                        absorb(hasher, detail.as_bytes());
+                    }
+                    ModuleAttribution::Undeclared(detail) => {
+                        absorb(hasher, b"undeclared");
+                        absorb(hasher, detail.as_bytes());
+                    }
+                }
+            }
+            absorb(hasher, &(measured.uncovered.len() as u64).to_be_bytes());
+            for entry in &measured.uncovered {
+                absorb(hasher, entry.name.as_bytes());
+                absorb(hasher, entry.reason.as_bytes());
+            }
+        }
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -598,6 +1033,235 @@ fn hex(bytes: &[u8]) -> String {
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
+    hex(&hasher.finalize())
+}
+
+/// The scheme a *query-time* producer identity is digested under.
+///
+/// Deliberately its own scheme rather than the edition's: an edition id
+/// is the identity of stored bytes and must never move, while this is the
+/// identity of the implementation that ranked one answer, computed fresh
+/// on every query and pinned into that answer's own continuation.
+pub const QUERY_PRODUCER_SCHEME: &str = "wirk-query-producer/v1";
+
+/// What a query producer identity measures, and what it does not, written
+/// into the answer so a reader does not have to infer it from the fields
+/// that happen to be present.
+///
+/// The build side's `ENVIRONMENT_SCOPE_V2` states the same bound for the
+/// environment half; this states the bound of the whole record. It is the
+/// honest edge of "ranked by semble/0.5.2": the product measures the file
+/// it executed, the tokens it executed it with, and — when the backend
+/// reports them — the modules that loaded in the process that answered.
+/// It does not, and at a local argv boundary cannot, attest that the
+/// process which returned these scores is the one it described.
+pub const QUERY_PRODUCER_SCOPE: &str = "measured: the executable this query ran, canonicalized and \
+     digested by the product; every argv token in its executed position, with the bytes of each \
+     token that names an existing absolute file; and, when the backend reports one, the \
+     environment record measured under the build side's own rules. not measured: anything the \
+     backend does not report, and whether the process that returned these scores is the one this \
+     record describes — that is execution attestation, which no local argv boundary provides.";
+
+/// How much of the ranking implementation a producer record actually
+/// binds, which is not the same question as whether its coverage is
+/// honest.
+///
+/// `public-retrieval-identity-verify/VERDICT.md` V1, executed: a backend
+/// that reports no environment is a legal, useful backend, and
+/// `environment: unreported` is a truthful thing for its answer to say.
+/// What that answer's *continuation* cannot do is tell the second page
+/// that the ranker changed underneath it: the executable at the
+/// configured path and every argv token are byte-identical, and the
+/// change lives in a module that loaded inside the process. So the two
+/// digests still match and a re-ranked page is served under the first
+/// page's token.
+///
+/// The distinction is therefore recorded rather than inferred, published
+/// on the answer, and pinned into the token — because it is a property of
+/// the page-1 measurement, and only page 1 can state it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryProducerBasis {
+    /// The record covers the bytes of at least one module file the
+    /// backend reported loading in the process that ranked, each read and
+    /// digested by the product. A same-path change to a *reported* module
+    /// moves `identity`. It is a statement about the reported scope and
+    /// never about the whole process: a module the backend did not report
+    /// is outside the record, and so is anything that is not a module at
+    /// all — a native shared library among them
+    /// (`EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(b), the 0104 limit
+    /// restated rather than repaired).
+    ImplementationMeasured,
+    /// The record covers the configured executable and its argv, and
+    /// nothing below them: the backend reported no environment at all, or
+    /// reported one that measured no module — no list, an empty list, or
+    /// a list whose entries could none of them be read. Honest, usable,
+    /// and not a basis a continuation can be checked against.
+    ConfigurationOnly,
+}
+
+impl QueryProducerBasis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ImplementationMeasured => "implementation_measured",
+            Self::ConfigurationOnly => "configuration_only",
+        }
+    }
+
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "implementation_measured" => Some(Self::ImplementationMeasured),
+            "configuration_only" => Some(Self::ConfigurationOnly),
+            _ => None,
+        }
+    }
+}
+
+/// What is missing when the basis is `ConfigurationOnly`, in the words a
+/// refused continuation gives its caller. Deliberately names the actual
+/// missing basis rather than the state name alone.
+pub const QUERY_PRODUCER_BASIS_MISSING: &str = "the first page's query producer record measured the configured executable and its argv \
+     only: the backend reported no environment, or reported one that measured no module at all \
+     (no list, an empty list, or a list whose entries could not be read), so nothing in the pin \
+     covers the implementation bytes that ran inside it. A module changed at the same path \
+     inside the same process would leave both digests identical, so this continuation cannot be \
+     checked against the ranking that produced its first page";
+
+/// What an `ImplementationMeasured` basis actually claims, in the words
+/// both public surfaces print.
+///
+/// `EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(b): the sentence this
+/// replaces said "the loaded-module bytes of the process that ranked this
+/// answer were measured", which claims the process, not the report. A
+/// backend that honestly narrows its list to modules it did measure —
+/// omitting the very file that ranks — publishes a true list and a false
+/// sentence, and its continuation cannot see a change in what it omitted.
+/// That limit is 0104's reported-scope bound; it is stated here, not
+/// repaired by prose, and no whitelist, execution attestation or
+/// complete-dependency claim follows from it.
+pub const QUERY_PRODUCER_BASIS_MEASURED: &str = "the pin covers the module files this backend reported: the product read and digested each \
+     one, so a change to any of them is detected before a continuation is served. It does not \
+     cover the rest of the process — a module the backend did not report, and anything that is \
+     not a module at all, such as a native shared library — and a change to one of those cannot \
+     be detected here";
+
+/// The two digests a semantic answer publishes and its continuation pins,
+/// and the basis they were measured on.
+///
+/// Two digests, not one, and the split is the whole point: `configuration`
+/// is the half the product can measure *before* it starts a child, so a
+/// continuation whose backend file has changed underneath it is refused
+/// without ranking anything at all; `identity` additionally covers what
+/// the backend reported about its own loaded modules, which only exists
+/// once the child has answered. A page is served only when both match —
+/// and only when `basis` says the second digest had something below the
+/// argv line to cover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryProducerPin {
+    pub configuration: String,
+    pub identity: String,
+    /// Derived from the same `environment` the `identity` digest already
+    /// absorbs, so it adds no new measurement and is not absorbed again;
+    /// it is carried because a continuation has only the token, and the
+    /// token has to be able to say what its digests are worth.
+    pub basis: QueryProducerBasis,
+}
+
+/// The basis a measured environment supplies.
+///
+/// `Unreported` and a reported record whose coverage is `Unmeasured` are
+/// different honest statements about the same gap — no loaded-module
+/// bytes were measured — and both yield `ConfigurationOnly`. `Partial` is
+/// *not* in that class: its modules were read and digested by the product,
+/// and only their distribution attribution is incomplete
+/// (`QUERY-IDENTITY-REVIEW-ADJUDICATION.md`: partial attribution is not
+/// unmeasured implementation).
+pub(crate) fn producer_basis(environment: &BackendEnvironment) -> QueryProducerBasis {
+    match environment {
+        BackendEnvironment::Unreported => QueryProducerBasis::ConfigurationOnly,
+        // The count is asked first, and asked of the list itself rather
+        // than of the coverage state derived from it. A record that
+        // measured no module bytes cannot be a basis whatever it is
+        // labelled — including a historical record whose stored coverage
+        // says `Complete` over an empty list, which stays exactly as it
+        // was written and simply stops minting an assurance here
+        // (`EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(a)).
+        BackendEnvironment::Reported(identity) if identity.modules.is_empty() => {
+            QueryProducerBasis::ConfigurationOnly
+        }
+        BackendEnvironment::Reported(identity) => match identity.coverage {
+            EnvironmentCoverage::Unmeasured => QueryProducerBasis::ConfigurationOnly,
+            EnvironmentCoverage::Complete | EnvironmentCoverage::Partial(_) => {
+                QueryProducerBasis::ImplementationMeasured
+            }
+        },
+    }
+}
+
+/// The half of a query producer identity that is measurable before the
+/// child runs: the executable's own bytes and every argv token, each
+/// absorbed separately so `["--alpha", "0.2"]` can never digest as
+/// `["--alpha0.2"]`.
+///
+/// R2: this is `EditionId::compute`'s argv absorption, over the query
+/// side's own configuration, under its own scheme name.
+pub(crate) fn query_producer_configuration_digest(
+    program: &ConfiguredPath,
+    argv: &[BackendArgument],
+) -> String {
+    let mut hasher = Sha256::new();
+    absorb(&mut hasher, QUERY_PRODUCER_SCHEME.as_bytes());
+    absorb(&mut hasher, b"configuration");
+    absorb(&mut hasher, QUERY_PROTOCOL.as_bytes());
+    absorb(&mut hasher, program.configured.as_bytes());
+    absorb(&mut hasher, program.canonical.as_bytes());
+    absorb(&mut hasher, program.digest.as_bytes());
+    absorb(&mut hasher, &program.byte_len.to_be_bytes());
+    absorb(&mut hasher, &(argv.len() as u64).to_be_bytes());
+    for argument in argv {
+        match argument {
+            BackendArgument::Literal { value } => {
+                absorb(&mut hasher, b"literal");
+                absorb(&mut hasher, value.as_bytes());
+            }
+            BackendArgument::File { value, file } => {
+                absorb(&mut hasher, b"file");
+                absorb(&mut hasher, value.as_bytes());
+                absorb(&mut hasher, file.canonical.as_bytes());
+                absorb(&mut hasher, file.digest.as_bytes());
+                absorb(&mut hasher, &file.byte_len.to_be_bytes());
+            }
+        }
+    }
+    hex(&hasher.finalize())
+}
+
+/// The whole query producer identity: the configuration above, the
+/// backend's own claim about itself, and the measured environment record
+/// with its coverage.
+///
+/// The environment enters by its digest, which `measure_environment`
+/// already computed over every module path, byte digest, attribution and
+/// coverage state it recorded — so a run whose loaded module bytes differ
+/// digests differently even when every version string agrees, and a run
+/// that reported no environment at all is `unreported` rather than
+/// silently equal to a measured one.
+pub(crate) fn query_producer_identity_digest(backend: &BackendIdentity) -> String {
+    let mut hasher = Sha256::new();
+    absorb(&mut hasher, QUERY_PRODUCER_SCHEME.as_bytes());
+    absorb(&mut hasher, b"identity");
+    absorb(
+        &mut hasher,
+        query_producer_configuration_digest(&backend.program, &backend.argv).as_bytes(),
+    );
+    absorb(&mut hasher, backend.protocol.as_bytes());
+    absorb(&mut hasher, backend.reported.as_bytes());
+    match &backend.environment {
+        BackendEnvironment::Unreported => absorb(&mut hasher, b"environment-unreported"),
+        BackendEnvironment::Reported(environment) => {
+            absorb(&mut hasher, b"environment-reported");
+            absorb(&mut hasher, environment.digest.as_bytes());
+        }
+    }
     hex(&hasher.finalize())
 }
 
@@ -680,6 +1344,63 @@ impl EditionId {
                 }
             }
         }
+        if edition.identity == IDENTITY_V4 || edition.identity == IDENTITY_V5 {
+            // The retrieval representation, the chunker that produced the
+            // rows and the coverage they honestly claim. Absorbed only
+            // under the scheme that declares them, so no earlier record's
+            // id moves.
+            match &edition.retrieval {
+                None => absorb(&mut hasher, b"retrieval-unbound"),
+                Some(retrieval) => {
+                    absorb(&mut hasher, b"retrieval-bound");
+                    absorb(&mut hasher, retrieval.digest.as_bytes());
+                }
+            }
+            match &edition.chunker.chunks {
+                None => absorb(&mut hasher, b"chunker-generation-units"),
+                Some(chunks) => {
+                    absorb(&mut hasher, b"chunker-native");
+                    for part in [
+                        chunks.implementation.as_bytes(),
+                        chunks.entry_point.as_bytes(),
+                        chunks.constants.as_bytes(),
+                        chunks.parsers.as_bytes(),
+                    ] {
+                        absorb(&mut hasher, part);
+                    }
+                    absorb(&mut hasher, &(chunks.files.len() as u64).to_be_bytes());
+                    for file in &chunks.files {
+                        absorb(&mut hasher, file.canonical.as_bytes());
+                        absorb(&mut hasher, file.digest.as_bytes());
+                    }
+                    if edition.identity == IDENTITY_V5 {
+                        // Only under the scheme that declares it, so no
+                        // `v4` id moves and no earlier edition is
+                        // retroactively said to have covered a grammar.
+                        absorb_grammars(&mut hasher, &chunks.grammars);
+                    }
+                }
+            }
+            let coverage = &edition.coverage;
+            for number in [
+                coverage.resources_indexed,
+                coverage.resources_with_rows,
+                coverage.indexed_bytes,
+                coverage.covered_bytes,
+            ] {
+                absorb(&mut hasher, &number.to_be_bytes());
+            }
+            for list in [
+                &coverage.resources_without_rows,
+                &coverage.resources_unmapped,
+            ] {
+                absorb(&mut hasher, &(list.len() as u64).to_be_bytes());
+                for entry in list {
+                    absorb(&mut hasher, entry.name.as_bytes());
+                    absorb(&mut hasher, entry.reason.as_bytes());
+                }
+            }
+        }
         for number in [
             edition.vectors.rows,
             edition.vectors.dimensions,
@@ -729,7 +1450,13 @@ fn canonicalize(path: &Path, what: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("{what} {} does not resolve: {error}", path.display()))
 }
 
-fn configured_file(path: &Path, what: &str) -> Result<ConfiguredPath, String> {
+/// The query side's own canonicalization of the model it was configured
+/// with, under exactly the rule the build side used (0089 C1/C2/C3).
+pub(crate) fn configured_model(path: &Path) -> Result<ConfiguredPath, String> {
+    configured_directory(path, "model")
+}
+
+pub(crate) fn configured_file(path: &Path, what: &str) -> Result<ConfiguredPath, String> {
     let canonical = canonicalize(path, what)?;
     let bytes = std::fs::read(&canonical)
         .map_err(|error| format!("{what} {} is unreadable: {error}", canonical.display()))?;
@@ -813,6 +1540,105 @@ const MAX_REPORTED_DISTRIBUTIONS: usize = 256;
 /// distributions: this is a record of one run's import closure, not a
 /// filesystem scan, and an unbounded list from the child is an unbounded
 /// read on this side.
+/// Re-measure the parser shared libraries the backend reported loading.
+///
+/// The discipline is the chunker modules' discipline (R2): the product
+/// reads the file at the path the backend named and refuses if the bytes
+/// disagree with what was reported. What it does *not* do is refuse a
+/// library whose bytes differ from the archive manifest's declared
+/// sha256 — that difference is exactly the fact O1 is about, and an
+/// edition that records it honestly is worth more than a build that
+/// declines to exist. Nothing here verifies a cache by its existence.
+fn measure_grammars(reported: Option<&ReportedGrammars>) -> Result<GrammarCoverage, String> {
+    let Some(reported) = reported else {
+        return Ok(GrammarCoverage::Unreported);
+    };
+    match reported.state.as_str() {
+        "none_loaded" => Ok(GrammarCoverage::NoneLoaded(reported.reason.clone())),
+        "unavailable" => Ok(GrammarCoverage::Unavailable(reported.reason.clone())),
+        "measured" => {
+            if reported.libraries.len() > MAX_REPORTED_MODULES {
+                return Err(format!(
+                    "backend reported {} grammar libraries; at most {MAX_REPORTED_MODULES} are \
+                     recorded",
+                    reported.libraries.len()
+                ));
+            }
+            let mut libraries = Vec::new();
+            for library in &reported.libraries {
+                let file = configured_file(
+                    Path::new(&library.path),
+                    &format!("grammar library {}", library.path),
+                )?;
+                if file.digest != library.digest || file.byte_len != library.byte_len {
+                    return Err(format!(
+                        "backend reports grammar library {} as {} but its bytes digest to {}",
+                        library.path, library.digest, file.digest
+                    ));
+                }
+                let declaration = match &library.declared_digest {
+                    Some(declared) if *declared == file.digest => ModuleAttribution::Declared(
+                        format!("the provider's bundled archive manifest declares {declared}"),
+                    ),
+                    Some(declared) => ModuleAttribution::Undeclared(format!(
+                        "the provider's bundled archive manifest declares {declared} for this \
+                         file, but the library actually loaded digests to {}; the loader does \
+                         not re-check a cached file that already exists",
+                        file.digest
+                    )),
+                    None => ModuleAttribution::Undeclared(
+                        "no entry in the provider's bundled archive manifest names this file, so \
+                         nothing declares its bytes"
+                            .into(),
+                    ),
+                };
+                libraries.push(GrammarLibrary {
+                    languages: {
+                        let mut languages = library.languages.clone();
+                        languages.sort();
+                        languages
+                    },
+                    file,
+                    declaration,
+                });
+            }
+            libraries.sort_by(|a, b| a.file.canonical.cmp(&b.file.canonical));
+            if libraries
+                .windows(2)
+                .any(|pair| pair[0].file.canonical == pair[1].file.canonical)
+            {
+                return Err("backend reported the same grammar library twice".into());
+            }
+            let mut uncovered: Vec<UnavailableEntry> = reported
+                .uncovered
+                .iter()
+                .map(|entry| UnavailableEntry {
+                    name: entry.name.clone(),
+                    reason: entry.reason.clone(),
+                })
+                .collect();
+            uncovered.sort_by(|a, b| (&a.name, &a.reason).cmp(&(&b.name, &b.reason)));
+            if libraries.is_empty() && uncovered.is_empty() {
+                return Err(
+                    "backend reported measured grammar libraries but listed none; an empty list \
+                     measures nothing and must be reported as such"
+                        .into(),
+                );
+            }
+            Ok(GrammarCoverage::Measured(Box::new(GrammarLibraries {
+                provider: reported.provider.clone(),
+                cache_root: reported.cache_root.clone(),
+                scope: GRAMMAR_SCOPE_V1.to_owned(),
+                libraries,
+                uncovered,
+            })))
+        }
+        other => Err(format!(
+            "backend reported grammar coverage state {other:?}, which this product does not know"
+        )),
+    }
+}
+
 const MAX_REPORTED_MODULES: usize = 4096;
 const MAX_RECORD_ENTRIES: usize = 65_536;
 
@@ -886,7 +1712,9 @@ fn declared_paths(root: &Path, record: &str) -> BTreeSet<PathBuf> {
 /// reading. What this cannot do — and what the record must therefore not
 /// imply — is prove the backend actually imported what it named; that is
 /// execution attestation, which no local argv boundary provides.
-fn measure_environment(reported: &ReportedEnvironment) -> Result<EnvironmentIdentity, String> {
+pub(crate) fn measure_environment(
+    reported: &ReportedEnvironment,
+) -> Result<EnvironmentIdentity, String> {
     if reported.distributions.len() > MAX_REPORTED_DISTRIBUTIONS {
         return Err(format!(
             "backend reported {} distributions; at most {MAX_REPORTED_DISTRIBUTIONS} are recorded",
@@ -1089,7 +1917,13 @@ fn measure_environment(reported: &ReportedEnvironment) -> Result<EnvironmentIden
     // did not carry the lists. It is never latched into `Complete` by
     // absence: a backend that reported no module list at all gets
     // `Unmeasured`, which is what every pre-correction record reads as.
-    let coverage = if reported.modules.is_none() {
+    let coverage = if modules.is_empty() {
+        // Absent, empty, and "present but nothing in it could be read"
+        // are three ways of reporting the same measurement: none. A list
+        // that names no module has measured no implementation byte, and
+        // an unreadable-module list does not rescue it — the entries in
+        // it are precisely what was *not* measured
+        // (`EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(a)).
         EnvironmentCoverage::Unmeasured
     } else if undescribed.is_empty() && unmeasured.is_empty() && undeclared == 0 {
         EnvironmentCoverage::Complete
@@ -1241,40 +2075,10 @@ fn measure_environment(reported: &ReportedEnvironment) -> Result<EnvironmentIden
 
 // ---- the backend boundary ------------------------------------------------
 
-#[derive(Serialize)]
-struct EmbedHeader<'a> {
-    protocol: &'a str,
-    model_path: &'a str,
-    rows: u64,
-    output: &'a str,
-    vector_format: &'a str,
-}
-
-#[derive(Serialize)]
-struct EmbedRow<'a> {
-    row: u64,
-    text: &'a str,
-}
-
-#[derive(Deserialize)]
-struct EmbedReply {
-    protocol: String,
-    backend: String,
-    model_path: String,
-    model_digest: String,
-    rows: u64,
-    dimensions: u64,
-    /// Optional at the protocol level: a conforming backend that cannot
-    /// enumerate its own environment is still a legal backend, and its
-    /// editions record `Unreported` rather than an implied provenance.
-    #[serde(default)]
-    environment: Option<ReportedEnvironment>,
-}
-
 /// What a backend says about the environment it embedded in. Every field
 /// is re-measured by `measure_environment` before anything is recorded.
 #[derive(Deserialize)]
-struct ReportedEnvironment {
+pub(crate) struct ReportedEnvironment {
     kind: String,
     root: String,
     runtime: String,
@@ -1324,17 +2128,177 @@ struct ReportedDistribution {
     files_mismatched: u64,
 }
 
-/// Run the configured backend over `texts`, writing binary32 vectors to
-/// `output`. The child gets an explicitly constructed environment: nothing
-/// inherited, offline flags on. A backend that wants to reach the network
-/// has to be configured to, and this product never configures it.
-fn run_backend(
+/// The ranking text of a committed byte range, re-derived by the product
+/// itself.
+///
+/// This is the product's own implementation of what the native reader
+/// does to a file before anything chunks or embeds it: UTF-8 with lossy
+/// replacement, then universal-newline translation
+/// (`native-chunk-boundary-use/HANDOFF.md` N1). It exists so that the
+/// backend's claim about a row's ranking text is *checked* rather than
+/// believed — the build re-derives every row here from the committed
+/// bytes and refuses if the digests disagree — and so that a query can
+/// rebuild the ranking view from the blobs without storing a second copy
+/// of the corpus.
+pub(crate) fn normalize_ranking_text(bytes: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(bytes);
+    if !decoded.contains('\r') {
+        return decoded.into_owned();
+    }
+    let mut out = String::with_capacity(decoded.len());
+    let mut characters = decoded.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+/// The frozen ranking path for one resource of one membership.
+///
+/// Deliberately the membership *alias* and not the source id: the string
+/// is indexed text (the stem and the last three directory components are
+/// appended to every BM25 document), so it has to be the name a human
+/// actually searches by, and it has to be stable across generations. It
+/// is also what makes two memberships publishing the same relative path
+/// two distinct files through the whole native ranker rather than one
+/// colliding document key.
+pub(crate) fn ranking_path(alias: &str, path: &[u8]) -> String {
+    format!("{alias}/{}", String::from_utf8_lossy(path))
+}
+
+// ---- the v2 (chunking) backend boundary ----------------------------------
+
+#[derive(Serialize)]
+struct EmbedV2Header<'a> {
+    protocol: &'a str,
+    mode: &'a str,
+    model_path: &'a str,
+    output: &'a str,
+    chunks: &'a str,
+    scratch: &'a str,
+    vector_format: &'a str,
+    inputs: u64,
+    path_convention: &'a str,
+}
+
+#[derive(Serialize)]
+struct EmbedV2Input<'a> {
+    input: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ranking_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct EmbedV2Reply {
+    protocol: String,
+    backend: String,
+    model_path: String,
+    model_digest: String,
+    rows: u64,
+    dimensions: u64,
+    #[serde(default)]
+    unmapped: Vec<ReportedUnmapped>,
+    #[serde(default)]
+    chunker: Option<ReportedChunker>,
+    #[serde(default)]
+    environment: Option<ReportedEnvironment>,
+}
+
+#[derive(Deserialize)]
+struct ReportedUnmapped {
+    path: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct ReportedChunker {
+    implementation: String,
+    entry_point: String,
+    constants: String,
+    parsers: String,
+    files: BTreeMap<String, ReportedChunkerFile>,
+    #[serde(default)]
+    grammars: Option<ReportedGrammars>,
+}
+
+/// What the backend says about the parser shared libraries it loaded.
+/// Every path in here is re-read by the product before it is recorded.
+#[derive(Deserialize)]
+struct ReportedGrammars {
+    state: String,
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    cache_root: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    libraries: Vec<ReportedGrammarLibrary>,
+    #[serde(default)]
+    uncovered: Vec<ReportedUnavailable>,
+}
+
+#[derive(Deserialize)]
+struct ReportedGrammarLibrary {
+    path: String,
+    digest: String,
+    byte_len: u64,
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    declared_digest: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReportedChunkerFile {
+    path: String,
+    digest: String,
+    byte_len: u64,
+}
+
+/// One row the native chunker produced, as the backend reports it. Every
+/// field is re-derived and checked on this side before it becomes a
+/// `MappingRow`.
+#[derive(Deserialize)]
+struct ProducedChunk {
+    input: u64,
+    slot: u64,
+    byte_start: u64,
+    byte_end: u64,
+    #[serde(default)]
+    language: Option<String>,
+    text_digest: String,
+    text_normalization: String,
+}
+
+/// Run the configured backend under `wirk-embed/v2`.
+#[allow(clippy::too_many_arguments)]
+///
+/// Same child-environment rule as `run_backend`: nothing inherited,
+/// offline flags on. The difference is the payload — `chunk-embed` hands
+/// over committed blob bytes by path and receives boundaries back,
+/// `embed` hands over text the product already fixed.
+fn run_backend_v2(
     program: &Path,
     args: &[String],
     model: &str,
-    texts: &[String],
+    mode: &str,
+    inputs: &[EmbedV2Input<'_>],
     output: &Path,
-) -> Result<EmbedReply, String> {
+    chunks: &Path,
+    scratch: &Path,
+) -> Result<EmbedV2Reply, String> {
     use std::process::{Command, Stdio};
     let mut command = Command::new(program);
     command
@@ -1354,22 +2318,23 @@ fn run_backend(
         )
     })?;
     let mut stdin = child.stdin.take().expect("stdin was piped");
-    let header = serde_json::to_vec(&EmbedHeader {
-        protocol: EMBED_PROTOCOL,
+    let header = serde_json::to_vec(&EmbedV2Header {
+        protocol: EMBED_PROTOCOL_V2,
+        mode,
         model_path: model,
-        rows: texts.len() as u64,
         output: &output.display().to_string(),
+        chunks: &chunks.display().to_string(),
+        scratch: &scratch.display().to_string(),
         vector_format: VECTOR_FORMAT,
+        inputs: inputs.len() as u64,
+        path_convention: RANKING_PATH_CONVENTION,
     })
     .map_err(|error| format!("backend request could not be encoded: {error}"))?;
     let write = (|| -> std::io::Result<()> {
         stdin.write_all(&header)?;
         stdin.write_all(b"\n")?;
-        for (row, text) in texts.iter().enumerate() {
-            stdin.write_all(&serde_json::to_vec(&EmbedRow {
-                row: row as u64,
-                text,
-            })?)?;
+        for input in inputs {
+            stdin.write_all(&serde_json::to_vec(input)?)?;
             stdin.write_all(b"\n")?;
         }
         stdin.flush()
@@ -1378,9 +2343,6 @@ fn run_backend(
     let finished = child
         .wait_with_output()
         .map_err(|error| format!("backend {} failed: {error}", program.display()))?;
-    // A backend that exits before reading every row makes the write above
-    // fail with EPIPE; its own stderr is the useful diagnostic, so report
-    // the exit rather than the broken pipe.
     if !finished.status.success() {
         return Err(format!(
             "backend {} exited {} : {}",
@@ -1406,15 +2368,219 @@ fn run_backend(
             program.display()
         ));
     };
-    let reply: EmbedReply = serde_json::from_str(line)
-        .map_err(|error| format!("backend reply is not a {EMBED_PROTOCOL} record: {error}"))?;
-    if reply.protocol != EMBED_PROTOCOL {
+    let reply: EmbedV2Reply = serde_json::from_str(line)
+        .map_err(|error| format!("backend reply is not a {EMBED_PROTOCOL_V2} record: {error}"))?;
+    if reply.protocol != EMBED_PROTOCOL_V2 {
         return Err(format!(
-            "backend speaks protocol {} but this product speaks {EMBED_PROTOCOL}",
+            "backend speaks protocol {} but this request is {EMBED_PROTOCOL_V2}",
             reply.protocol
         ));
     }
     Ok(reply)
+}
+
+/// One indexed resource, with the committed bytes and the generation
+/// units that already partition them.
+struct BuildInput {
+    ranking_path: String,
+    path: Vec<u8>,
+    object_id: String,
+    family: crate::ContentFamily,
+    /// Resolved only when a chunker resolved one; a units edition has no
+    /// language because nothing detected one.
+    language: Option<String>,
+    bytes: Vec<u8>,
+    units: Vec<crate::TextUnit>,
+}
+
+fn read_produced_chunks(path: &Path) -> Result<Vec<ProducedChunk>, String> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        format!(
+            "backend wrote no chunk output at {}: {error}",
+            path.display()
+        )
+    })?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| "backend chunk output is not UTF-8".to_owned())?;
+    let mut produced = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        produced.push(
+            serde_json::from_str(line).map_err(|error| {
+                format!("backend chunk line {} is malformed: {error}", number + 1)
+            })?,
+        );
+    }
+    Ok(produced)
+}
+
+/// The contiguous run of generation units a byte range lies inside.
+///
+/// `validate_generation` pins the units of a resource as an ordered,
+/// gapless partition of its blob, so the run is found by two boundary
+/// searches and the interior never has to be stored. This returns `None`
+/// when the range is not covered at all, which is a refusal rather than a
+/// row with an invented index.
+fn covering_units(units: &[crate::TextUnit], start: u64, end: u64) -> Option<(UnitId, UnitId)> {
+    let first = units.partition_point(|unit| unit.byte_end <= start);
+    let last = units
+        .partition_point(|unit| unit.byte_start < end)
+        .checked_sub(1)?;
+    let (first, last) = (units.get(first)?, units.get(last)?);
+    (first.byte_start <= start && end <= last.byte_end).then(|| (first.id.clone(), last.id.clone()))
+}
+
+/// Turn what the backend reported into rows, re-deriving every claim from
+/// the committed bytes on this side first.
+///
+/// Nothing here trusts the backend about a boundary. The byte range must
+/// lie inside the blob, rows must be ordered and non-overlapping within a
+/// resource, the ranking text is re-derived here and must digest to what
+/// the backend said, and the covering unit run is computed here from the
+/// generation. Display line numbers come from the *original* bytes, so a
+/// CRLF resource reports the lines a reader would count in the file
+/// rather than the lines the chunker counted in its normalised copy.
+fn build_native_rows(
+    membership: &Membership,
+    generation: &SourceGeneration,
+    inputs: &[BuildInput],
+    produced: &[ProducedChunk],
+    coverage: &mut EditionCoverage,
+) -> Result<Vec<MappingRow>, String> {
+    let mut rows = Vec::with_capacity(produced.len());
+    let mut previous: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    let mut with_rows: BTreeSet<u64> = BTreeSet::new();
+    for chunk in produced {
+        let Some(input) = inputs.get(chunk.input as usize) else {
+            return Err(format!(
+                "backend returned a chunk for input {} which was never sent",
+                chunk.input
+            ));
+        };
+        let (start, end) = (chunk.byte_start, chunk.byte_end);
+        if start >= end || end > input.bytes.len() as u64 {
+            return Err(format!(
+                "chunk {} of {} addresses bytes [{start},{end}) outside its own {}-byte blob",
+                chunk.slot,
+                input.ranking_path,
+                input.bytes.len()
+            ));
+        }
+        match previous.get(&chunk.input) {
+            Some((previous_slot, previous_end)) => {
+                if chunk.slot != previous_slot + 1 {
+                    return Err(format!(
+                        "chunk slots of {} are not consecutive: {} follows {previous_slot}",
+                        input.ranking_path, chunk.slot
+                    ));
+                }
+                if start < *previous_end {
+                    return Err(format!(
+                        "chunk {} of {} starts at {start}, inside the previous chunk which ends \
+                         at {previous_end}",
+                        chunk.slot, input.ranking_path
+                    ));
+                }
+            }
+            None => {
+                if chunk.slot != 0 {
+                    return Err(format!(
+                        "the first chunk of {} is slot {} rather than 0",
+                        input.ranking_path, chunk.slot
+                    ));
+                }
+            }
+        }
+        previous.insert(chunk.input, (chunk.slot, end));
+        with_rows.insert(chunk.input);
+
+        let slice = &input.bytes[start as usize..end as usize];
+        // The independent re-derivation. The backend derived this text
+        // through the native reader; the product derives it again here
+        // from the committed bytes and refuses if they are not the same
+        // string. Nothing about the mapping is taken on the backend's
+        // word.
+        let text = normalize_ranking_text(slice);
+        let text_digest = digest_bytes(text.as_bytes());
+        if text_digest != chunk.text_digest {
+            return Err(format!(
+                "chunk {} of {} reports ranking text {} but the committed bytes [{start},{end}) \
+                 normalise to {text_digest}; this build refuses rather than record a mapping it \
+                 could not reproduce",
+                chunk.slot, input.ranking_path, chunk.text_digest
+            ));
+        }
+        let normalization = if text.as_bytes() == slice {
+            TEXT_IDENTITY
+        } else {
+            TEXT_NORMALIZED
+        };
+        if normalization != chunk.text_normalization {
+            return Err(format!(
+                "chunk {} of {} reports normalization {} but its bytes are {normalization}",
+                chunk.slot, input.ranking_path, chunk.text_normalization
+            ));
+        }
+        let Some((unit_first, unit_last)) = covering_units(&input.units, start, end) else {
+            return Err(format!(
+                "chunk {} of {} spans bytes [{start},{end}) which no run of this generation's \
+                 units covers",
+                chunk.slot, input.ranking_path
+            ));
+        };
+        let Some((line_start, line_end)) =
+            crate::domain::actual_line_bounds(&input.bytes, start, end)
+        else {
+            return Err(format!(
+                "chunk {} of {} does not lie on character boundaries of its own blob",
+                chunk.slot, input.ranking_path
+            ));
+        };
+        rows.push(MappingRow {
+            row: rows.len() as u64,
+            estate: membership.estate.clone(),
+            membership: membership.id.clone(),
+            source: membership.source.clone(),
+            generation: generation.id.clone(),
+            unit: unit_first,
+            unit_last: Some(unit_last),
+            path: input.path.clone(),
+            object_id: input.object_id.clone(),
+            byte_start: start,
+            byte_end: end,
+            line_start,
+            line_end,
+            byte_len: slice.len() as u64,
+            content_digest: digest_bytes(slice),
+            text_digest: Some(text_digest),
+            text_normalization: Some(normalization.to_owned()),
+            language: chunk.language.clone(),
+            ranking_path: Some(input.ranking_path.clone()),
+            slot: Some(chunk.slot),
+            family: Some(input.family),
+        });
+    }
+    // A resource the chunker returned nothing for is named, not counted
+    // and not treated as missing: `chunk_source` returns an empty list for
+    // whitespace-only input, and "every resource contributes a row" is not
+    // a safe invariant over the installed implementation.
+    for (index, input) in inputs.iter().enumerate() {
+        if !with_rows.contains(&(index as u64)) {
+            coverage.resources_without_rows.push(UnavailableEntry {
+                name: input.ranking_path.clone(),
+                reason: format!(
+                    "the native chunker produced no chunk for these {} committed bytes",
+                    input.bytes.len()
+                ),
+            });
+        }
+    }
+    coverage
+        .resources_without_rows
+        .sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
 }
 
 // ---- store operations ----------------------------------------------------
@@ -1434,6 +2600,14 @@ impl crate::AtlasStore {
     /// Build one immutable semantic edition for an already-staged
     /// generation of `membership`, leaving it *staged*: no reader consults
     /// it until `select_semantic` names it.
+    ///
+    /// `config.chunking` decides what a row *is*, and it is the caller's
+    /// explicit choice. `Units` keeps one row per generation unit.
+    /// `Native` asks the configured backend to run the installed chunker
+    /// over the same unchanged committed bytes and returns meaningful
+    /// multi-line spans — **without** restaging, re-extracting or
+    /// otherwise disturbing the source generation, whose units remain the
+    /// covering index every chunk is bound to.
     pub fn build_semantic(
         &mut self,
         membership: &Membership,
@@ -1487,13 +2661,13 @@ impl crate::AtlasStore {
             }
         }
 
-        let (rows, texts, unitizer) = match self.collect_units(membership, &generation)? {
+        let (inputs, unitizer) = match self.collect_inputs(membership, &generation)? {
             Ok(collected) => collected,
             Err(reason) => return Ok(SemanticBuildOutcome::Refused(reason)),
         };
-        if rows.is_empty() {
+        if inputs.is_empty() {
             return Ok(SemanticBuildOutcome::Refused(format!(
-                "generation {} has no indexed retrieval unit to embed",
+                "generation {} has no indexed resource to embed",
                 generation.id.0
             )));
         }
@@ -1502,7 +2676,6 @@ impl crate::AtlasStore {
             .semantic_root()
             .join(format!(".tmp-{}", ulid::Ulid::generate()));
         std::fs::create_dir_all(&staging)?;
-        let vectors_path = staging.join(VECTORS_FILE);
         let outcome = self.finish_build(
             membership,
             &generation,
@@ -1511,11 +2684,9 @@ impl crate::AtlasStore {
             program,
             arguments,
             argv,
-            rows,
-            texts,
+            inputs,
             unitizer,
             &staging,
-            &vectors_path,
         );
         match outcome {
             Ok(SemanticBuildOutcome::Staged(edition)) => {
@@ -1559,28 +2730,133 @@ impl crate::AtlasStore {
         program: ConfiguredPath,
         arguments: Vec<ConfiguredPath>,
         argv: Vec<BackendArgument>,
-        rows: Vec<MappingRow>,
-        texts: Vec<String>,
+        inputs: Vec<BuildInput>,
         unitizer: String,
         staging: &Path,
-        vectors_path: &Path,
     ) -> Result<SemanticBuildOutcome, AtlasError> {
+        let vectors_path = staging.join(VECTORS_FILE);
+        let chunks_path = staging.join("chunks.ndjson");
+        let scratch = staging.join("inputs");
+        std::fs::create_dir_all(&scratch)?;
+
+        // What is sent depends only on who owns the boundaries.
+        let mut texts: Vec<String> = Vec::new();
+        let mut prepared: Vec<MappingRow> = Vec::new();
+        let mut coverage = EditionCoverage {
+            resources_indexed: inputs.len() as u64,
+            indexed_bytes: inputs.iter().map(|input| input.bytes.len() as u64).sum(),
+            ..EditionCoverage::default()
+        };
+        let mode = match config.chunking {
+            SemanticChunking::Units => "embed",
+            SemanticChunking::Native => "chunk-embed",
+        };
+        let mut payload: Vec<EmbedV2Input<'_>> = Vec::new();
+        let mut blob_files: Vec<String> = Vec::new();
+        if config.chunking == SemanticChunking::Native {
+            for (index, input) in inputs.iter().enumerate() {
+                let file = scratch.join(format!("{index}.bin"));
+                write_sync(&file, &input.bytes)?;
+                blob_files.push(file.display().to_string());
+            }
+            for (index, input) in inputs.iter().enumerate() {
+                payload.push(EmbedV2Input {
+                    input: index as u64,
+                    ranking_path: Some(&input.ranking_path),
+                    bytes_file: Some(blob_files[index].clone()),
+                    text: None,
+                });
+            }
+        } else {
+            // The product already owns every boundary: one row per unit,
+            // built and digested here, with only the text crossing the
+            // boundary.
+            for input in &inputs {
+                for (slot, unit) in input.units.iter().enumerate() {
+                    let (start, end) = (unit.byte_start as usize, unit.byte_end as usize);
+                    if end > input.bytes.len() || start > end {
+                        return Ok(SemanticBuildOutcome::Refused(format!(
+                            "unit {} addresses bytes outside its own blob",
+                            unit.id.0
+                        )));
+                    }
+                    let slice = &input.bytes[start..end];
+                    if std::str::from_utf8(slice).is_err() {
+                        return Ok(SemanticBuildOutcome::Refused(format!(
+                            "unit {} is not valid UTF-8; refusing rather than substituting bytes",
+                            unit.id.0
+                        )));
+                    }
+                    let text = normalize_ranking_text(slice);
+                    let (line_start, line_end) = crate::domain::actual_line_bounds(
+                        &input.bytes,
+                        unit.byte_start,
+                        unit.byte_end,
+                    )
+                    .unwrap_or((unit.line_start, unit.line_end));
+                    prepared.push(MappingRow {
+                        row: prepared.len() as u64,
+                        estate: membership.estate.clone(),
+                        membership: membership.id.clone(),
+                        source: membership.source.clone(),
+                        generation: generation.id.clone(),
+                        unit: unit.id.clone(),
+                        unit_last: None,
+                        path: input.path.clone(),
+                        object_id: input.object_id.clone(),
+                        byte_start: unit.byte_start,
+                        byte_end: unit.byte_end,
+                        line_start,
+                        line_end,
+                        byte_len: slice.len() as u64,
+                        content_digest: digest_bytes(slice),
+                        text_digest: Some(digest_bytes(text.as_bytes())),
+                        text_normalization: Some(
+                            if text.as_bytes() == slice {
+                                TEXT_IDENTITY
+                            } else {
+                                TEXT_NORMALIZED
+                            }
+                            .to_owned(),
+                        ),
+                        language: input.language.clone(),
+                        ranking_path: Some(input.ranking_path.clone()),
+                        slot: Some(slot as u64),
+                        family: Some(input.family),
+                    });
+                    texts.push(text);
+                }
+            }
+            if prepared.is_empty() {
+                return Ok(SemanticBuildOutcome::Refused(format!(
+                    "generation {} has no indexed retrieval unit to embed",
+                    generation.id.0
+                )));
+            }
+            for (index, text) in texts.iter().enumerate() {
+                payload.push(EmbedV2Input {
+                    input: index as u64,
+                    ranking_path: None,
+                    bytes_file: None,
+                    text: Some(text),
+                });
+            }
+        }
+
         // Deliberately the *configured* path, not the canonical one.
         // Canonicalizing an interpreter is not a no-op: a virtual
         // environment's `bin/python` is a symlink to a base interpreter,
         // and executing the resolved target silently loses the
-        // environment that made the backend's libraries importable (this
-        // is not hypothetical — it is the first thing that happened when
-        // this build ran against a real venv). What is executed is what
-        // the caller configured; what is *recorded* is both that string
-        // and the canonical path and digest of the bytes it resolves to,
-        // which is what the kernel actually runs.
-        let reply = match run_backend(
+        // environment that made the backend's libraries importable.
+        let reply = match run_backend_v2(
             Path::new(&config.backend),
             &config.backend_args,
             &model.canonical,
-            &texts,
-            vectors_path,
+            mode,
+            &payload,
+            &vectors_path,
+            &chunks_path,
+            &scratch,
         ) {
             Ok(reply) => reply,
             Err(reason) => return Ok(SemanticBuildOutcome::Refused(reason)),
@@ -1601,11 +2877,77 @@ impl crate::AtlasStore {
                 reply.model_digest, model.canonical, model.digest
             )));
         }
-        if reply.rows != rows.len() as u64 {
+
+        let mut chunker_identity = None;
+        if config.chunking == SemanticChunking::Native {
+            // Everything the backend says about a boundary is re-derived
+            // from the committed bytes here before it becomes a row.
+            let Some(reported) = &reply.chunker else {
+                return Ok(SemanticBuildOutcome::Refused(
+                    "backend produced native chunks but described no chunker; a boundary whose \
+                     producer is unrecorded cannot be an edition input"
+                        .into(),
+                ));
+            };
+            let mut files = Vec::new();
+            for name in reported.files.keys() {
+                let file = &reported.files[name];
+                match configured_file(Path::new(&file.path), &format!("chunker module {name}")) {
+                    Ok(measured) => {
+                        if measured.digest != file.digest || measured.byte_len != file.byte_len {
+                            return Ok(SemanticBuildOutcome::Refused(format!(
+                                "backend reports chunker module {name} as {} but its bytes digest \
+                                 to {}",
+                                file.digest, measured.digest
+                            )));
+                        }
+                        files.push(measured);
+                    }
+                    Err(reason) => return Ok(SemanticBuildOutcome::Refused(reason)),
+                }
+            }
+            let produced = match read_produced_chunks(&chunks_path) {
+                Ok(produced) => produced,
+                Err(reason) => return Ok(SemanticBuildOutcome::Refused(reason)),
+            };
+            match build_native_rows(membership, generation, &inputs, &produced, &mut coverage) {
+                Ok(rows) => prepared = rows,
+                Err(reason) => return Ok(SemanticBuildOutcome::Refused(reason)),
+            }
+            for entry in &reply.unmapped {
+                coverage.resources_unmapped.push(UnavailableEntry {
+                    name: entry.path.clone(),
+                    reason: entry.reason.clone(),
+                });
+            }
+            coverage
+                .resources_unmapped
+                .sort_by(|a, b| a.name.cmp(&b.name));
+            let grammars = match measure_grammars(reported.grammars.as_ref()) {
+                Ok(grammars) => grammars,
+                Err(reason) => return Ok(SemanticBuildOutcome::Refused(reason)),
+            };
+            chunker_identity = Some(NativeChunkerIdentity {
+                implementation: reported.implementation.clone(),
+                entry_point: reported.entry_point.clone(),
+                constants: reported.constants.clone(),
+                parsers: reported.parsers.clone(),
+                files,
+                grammars,
+            });
+            if prepared.is_empty() {
+                return Ok(SemanticBuildOutcome::Refused(format!(
+                    "the native chunker produced no row for any indexed resource of generation {}",
+                    generation.id.0
+                )));
+            }
+        }
+
+        if reply.rows != prepared.len() as u64 {
             return Ok(SemanticBuildOutcome::Refused(format!(
-                "backend embedded {} rows but {} were sent",
+                "backend embedded {} rows but {} were derived",
                 reply.rows,
-                rows.len()
+                prepared.len()
             )));
         }
         if reply.dimensions == 0 {
@@ -1613,7 +2955,7 @@ impl crate::AtlasStore {
                 "backend reports zero-dimensional vectors".into(),
             ));
         }
-        let vector_bytes = match std::fs::read(vectors_path) {
+        let vector_bytes = match std::fs::read(&vectors_path) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return Ok(SemanticBuildOutcome::Refused(format!(
@@ -1642,8 +2984,22 @@ impl crate::AtlasStore {
             },
         };
 
+        // The build's own temporary inputs are not part of the edition:
+        // they are the committed blobs, which the repository already holds.
+        std::fs::remove_dir_all(&scratch)?;
+        let _ = std::fs::remove_file(&chunks_path);
+
+        coverage.resources_with_rows = {
+            let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
+            for row in &prepared {
+                seen.insert(row.path.as_slice());
+            }
+            seen.len() as u64
+        };
+        coverage.covered_bytes = prepared.iter().map(|row| row.byte_len).sum();
+
         let mut mapping_bytes = Vec::new();
-        for row in &rows {
+        for row in &prepared {
             mapping_bytes.extend_from_slice(&serde_json::to_vec(row)?);
             mapping_bytes.push(b'\n');
         }
@@ -1651,7 +3007,7 @@ impl crate::AtlasStore {
 
         let mut edition = SemanticEdition {
             id: EditionId(String::new()),
-            identity: IDENTITY_V3.into(),
+            identity: IDENTITY_V5.into(),
             estate: membership.estate.clone(),
             membership: membership.id.clone(),
             source: membership.source.clone(),
@@ -1662,6 +3018,7 @@ impl crate::AtlasStore {
             chunker: ChunkerIdentity {
                 extractor_set: generation.extractor_set.clone(),
                 unitizer,
+                chunks: chunker_identity.clone(),
             },
             model: ModelIdentity {
                 consumed: model,
@@ -1669,7 +3026,7 @@ impl crate::AtlasStore {
                 reported_digest: reply.model_digest,
             },
             backend: BackendIdentity {
-                protocol: EMBED_PROTOCOL.into(),
+                protocol: EMBED_PROTOCOL_V2.into(),
                 program,
                 arguments,
                 argv,
@@ -1688,7 +3045,7 @@ impl crate::AtlasStore {
             },
             mapping: MappingManifest {
                 file: MAPPING_FILE.into(),
-                rows: rows.len() as u64,
+                rows: prepared.len() as u64,
                 byte_len: mapping_bytes.len() as u64,
                 digest: digest_bytes(&mapping_bytes),
             },
@@ -1696,6 +3053,14 @@ impl crate::AtlasStore {
                 producer: config.producer.clone(),
                 built_at_unix_millis: now_unix_millis(),
             },
+            retrieval: Some(RetrievalIdentity::new(
+                config.chunking,
+                chunker_identity
+                    .as_ref()
+                    .map(|identity| identity.implementation.as_str())
+                    .unwrap_or("wirk/generation-units"),
+            )),
+            coverage,
         };
         edition.id = EditionId::compute(&edition);
         write_sync(
@@ -1706,19 +3071,18 @@ impl crate::AtlasStore {
         Ok(SemanticBuildOutcome::Staged(Box::new(edition)))
     }
 
-    /// Every indexed unit of `generation`, in one deterministic order,
-    /// with the exact committed bytes behind each. A unit whose blob or
-    /// bounds cannot be read is a refusal for the whole build: a partial
-    /// edition that silently omits rows would be exactly the "publish only
-    /// a fully verified edition" failure.
+    /// Every indexed resource of `generation`, in one deterministic order,
+    /// with the exact committed bytes behind each. A resource whose blob
+    /// cannot be read is a refusal for the whole build: a partial edition
+    /// that silently omitted content would be exactly the "publish only a
+    /// fully verified edition" failure.
     #[allow(clippy::type_complexity)]
-    fn collect_units(
+    fn collect_inputs(
         &self,
         membership: &Membership,
         generation: &SourceGeneration,
-    ) -> Result<Result<(Vec<MappingRow>, Vec<String>, String), String>, AtlasError> {
-        let mut rows = Vec::new();
-        let mut texts = Vec::new();
+    ) -> Result<Result<(Vec<BuildInput>, String), String>, AtlasError> {
+        let mut inputs = Vec::new();
         let mut unitizer: Option<String> = None;
         let mut blob_cache: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         for resource in &generation.resources {
@@ -1758,41 +3122,78 @@ impl crate::AtlasStore {
                         )));
                     }
                 }
-                let (start, end) = (unit.byte_start as usize, unit.byte_end as usize);
-                if end > bytes.len() || start > end {
-                    return Ok(Err(format!(
-                        "unit {} addresses bytes outside its own blob",
-                        unit.id.0
-                    )));
-                }
-                let slice = &bytes[start..end];
-                let Ok(text) = std::str::from_utf8(slice) else {
-                    return Ok(Err(format!(
-                        "unit {} is not valid UTF-8; refusing rather than substituting bytes",
-                        unit.id.0
-                    )));
-                };
-                rows.push(MappingRow {
-                    row: rows.len() as u64,
-                    estate: membership.estate.clone(),
-                    membership: membership.id.clone(),
-                    source: membership.source.clone(),
-                    generation: generation.id.clone(),
-                    unit: unit.id.clone(),
-                    path: resource.path.clone(),
-                    object_id: object_id.clone(),
-                    byte_start: unit.byte_start,
-                    byte_end: unit.byte_end,
-                    line_start: unit.line_start,
-                    line_end: unit.line_end,
-                    byte_len: slice.len() as u64,
-                    content_digest: digest_bytes(slice),
-                });
-                texts.push(text.to_owned());
             }
+            let Some(family) = resource.units.first().map(|unit| unit.family) else {
+                continue;
+            };
+            inputs.push(BuildInput {
+                ranking_path: ranking_path(&membership.alias, &resource.path),
+                path: resource.path.clone(),
+                object_id,
+                family,
+                language: None,
+                bytes,
+                units: resource.units.clone(),
+            });
         }
         let unitizer = unitizer.unwrap_or_default();
-        Ok(Ok((rows, texts, unitizer)))
+        Ok(Ok((inputs, unitizer)))
+    }
+
+    /// The bytes of one file of an edition's immutable directory.
+    pub(crate) fn edition_file(&self, id: &EditionId, file: &str) -> std::io::Result<Vec<u8>> {
+        let directory = self
+            .edition_dir(id)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        std::fs::read(directory.join(file))
+    }
+
+    /// One edition's mapping rows, in the order they were written, which
+    /// is the vector row order.
+    pub(crate) fn read_mapping(
+        &self,
+        edition: &SemanticEdition,
+    ) -> Result<Vec<MappingRow>, String> {
+        let bytes = self
+            .edition_file(&edition.id, &edition.mapping.file)
+            .map_err(|error| format!("edition {} mapping is unreadable: {error}", edition.id.0))?;
+        if digest_bytes(&bytes) != edition.mapping.digest {
+            return Err(format!(
+                "edition {} mapping bytes are not the bytes its record commits to",
+                edition.id.0
+            ));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("edition {} mapping is not UTF-8", edition.id.0))?;
+        let mut rows = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let row: MappingRow = serde_json::from_str(line).map_err(|error| {
+                format!(
+                    "edition {} mapping line {} is malformed: {error}",
+                    edition.id.0,
+                    number + 1
+                )
+            })?;
+            if row.row != rows.len() as u64 {
+                return Err(format!(
+                    "edition {} mapping rows are out of order at {}",
+                    edition.id.0, row.row
+                ));
+            }
+            rows.push(row);
+        }
+        if rows.len() as u64 != edition.mapping.rows {
+            return Err(format!(
+                "edition {} record commits to {} mapping rows and holds {}",
+                edition.id.0,
+                edition.mapping.rows,
+                rows.len()
+            ));
+        }
+        Ok(rows)
     }
 
     pub fn read_edition(&self, id: &EditionId) -> Result<SemanticEdition, AtlasError> {
@@ -2137,4 +3538,61 @@ pub(crate) fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), AtlasError> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(a), at the second of the
+    /// two checks that close it. The load-bearing one is the derivation:
+    /// a measurement of zero modules is `Unmeasured` when it is written,
+    /// which `q11`/`q12` execute end to end through real child processes.
+    /// This one is the check that outlives it — a record whose *stored*
+    /// coverage says `Complete` over an empty module list (a pre-
+    /// correction record, or one written by some other build) mints no
+    /// assurance when it is read back. The record is not rewritten; it
+    /// simply stops being a basis.
+    #[test]
+    fn a_stored_complete_coverage_over_no_modules_is_still_not_a_basis() {
+        let empty = EnvironmentIdentity {
+            kind: "python-distributions/v1".into(),
+            root: "/env".into(),
+            runtime: "test/1.0".into(),
+            executable: "/env/bin/python".into(),
+            distributions: Vec::new(),
+            undescribed_distributions: Vec::new(),
+            modules: Vec::new(),
+            unmeasured_modules: Vec::new(),
+            scope: ENVIRONMENT_SCOPE_V2.into(),
+            coverage: EnvironmentCoverage::Complete,
+            digest: "0".repeat(64),
+        };
+        assert_eq!(
+            producer_basis(&BackendEnvironment::Reported(Box::new(empty.clone()))),
+            QueryProducerBasis::ConfigurationOnly,
+            "zero measured module bytes cannot be an implementation basis, whatever the \
+             record calls its coverage"
+        );
+
+        // And the control that keeps this from being a ban: one module
+        // actually read and digested is a basis, partial attribution and
+        // all.
+        let measured = EnvironmentIdentity {
+            modules: vec![ModuleIdentity {
+                name: "ranker".into(),
+                origin: "/env/ranker.py".into(),
+                path: "/env/ranker.py".into(),
+                digest: "1".repeat(64),
+                byte_len: 12,
+                attribution: ModuleAttribution::Undeclared("no RECORD declares it".into()),
+            }],
+            coverage: EnvironmentCoverage::Partial("one undeclared module".into()),
+            ..empty
+        };
+        assert_eq!(
+            producer_basis(&BackendEnvironment::Reported(Box::new(measured))),
+            QueryProducerBasis::ImplementationMeasured
+        );
+    }
 }

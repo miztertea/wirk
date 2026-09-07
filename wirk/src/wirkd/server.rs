@@ -5268,6 +5268,51 @@ fn edition_json(edition: &wirk_atlas::SemanticEdition) -> Value {
         "chunker": {
             "extractor_set": edition.chunker.extractor_set,
             "unitizer": edition.chunker.unitizer,
+            // The chunker that actually produced the rows. `null` is the
+            // honest answer for an edition whose rows are the
+            // generation's own units — it says "nothing else chunked
+            // this" rather than implying a native boundary.
+            "chunks": edition.chunker.chunks.as_ref().map(|chunks| json!({
+                "implementation": chunks.implementation,
+                "entry_point": chunks.entry_point,
+                "constants": chunks.constants,
+                "parsers": chunks.parsers,
+                "files": chunks.files.iter().map(configured_path_json).collect::<Vec<_>>(),
+                // The bytes behind `parsers`, which is only a provider
+                // and a version. `unreported` is the honest answer for
+                // every edition built before this was measured, and
+                // `none_loaded` says zero libraries rather than
+                // pretending an empty list is coverage
+                // (`EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` O1).
+                "grammars": grammar_coverage_json(&chunks.grammars),
+            })),
+        },
+        // How these rows are ranked. `null` on every edition built before
+        // retrieval existed: such an edition binds no ranking
+        // representation, and a query refuses to invent one for it.
+        "retrieval": edition.retrieval.as_ref().map(|retrieval| json!({
+            "scheme": retrieval.scheme,
+            "chunking": retrieval.chunking.label(),
+            "native": retrieval.native,
+            "dense": retrieval.dense,
+            "sparse": retrieval.sparse,
+            "path_convention": retrieval.path_convention,
+            "fusion": retrieval.fusion,
+            "candidate_limit": retrieval.candidate_limit,
+            "digest": retrieval.digest,
+        })),
+        // What the rows cover of the generation, and what they honestly
+        // do not: native chunks are not a partition and a whitespace-only
+        // resource yields none at all.
+        "coverage": {
+            "resources_indexed": edition.coverage.resources_indexed,
+            "resources_with_rows": edition.coverage.resources_with_rows,
+            "indexed_bytes": edition.coverage.indexed_bytes,
+            "covered_bytes": edition.coverage.covered_bytes,
+            "resources_without_rows": unavailable_entries_json(
+                &edition.coverage.resources_without_rows),
+            "resources_unmapped": unavailable_entries_json(
+                &edition.coverage.resources_unmapped),
         },
         "model": {
             "consumed": configured_path_json(&edition.model.consumed),
@@ -5337,6 +5382,39 @@ fn environment_coverage_json(coverage: &wirk_atlas::EnvironmentCoverage) -> Valu
     }
 }
 
+/// The parser shared libraries an edition's boundaries actually came out
+/// of, or the named absence of that coverage. A version string is not a
+/// measurement of the library it names, and this is where the difference
+/// is published.
+fn grammar_coverage_json(grammars: &wirk_atlas::GrammarCoverage) -> Value {
+    match grammars {
+        wirk_atlas::GrammarCoverage::Unreported => json!({"state": "unreported"}),
+        wirk_atlas::GrammarCoverage::NoneLoaded(reason) => {
+            json!({"state": "none_loaded", "reason": reason})
+        }
+        wirk_atlas::GrammarCoverage::Unavailable(reason) => {
+            json!({"state": "unavailable", "reason": reason})
+        }
+        wirk_atlas::GrammarCoverage::Measured(measured) => json!({
+            "state": "measured",
+            "provider": measured.provider,
+            "cache_root": measured.cache_root,
+            "scope": measured.scope,
+            "libraries": measured.libraries.iter().map(|library| json!({
+                "languages": library.languages,
+                "file": configured_path_json(&library.file),
+                "declaration": match &library.declaration {
+                    wirk_atlas::ModuleAttribution::Declared(detail) =>
+                        json!({"state": "declared", "detail": detail}),
+                    wirk_atlas::ModuleAttribution::Undeclared(detail) =>
+                        json!({"state": "undeclared", "detail": detail}),
+                },
+            })).collect::<Vec<_>>(),
+            "uncovered": unavailable_entries_json(&measured.uncovered),
+        }),
+    }
+}
+
 /// `unreported` is a first-class answer, not a missing field: a backend
 /// that cannot enumerate its own environment produces an edition whose
 /// implementation provenance is honestly absent, which a reader must be
@@ -5394,6 +5472,73 @@ fn backend_environment_json(environment: &wirk_atlas::BackendEnvironment) -> Val
     }
 }
 
+/// The same environment record, rendered for an *answer* rather than for
+/// a stored edition.
+///
+/// An edition is written once and read rarely, so `backend_environment_json`
+/// above prints every module it measured. A query answer is produced on
+/// every page: the full list is 435 rows and about 188 KB here, which
+/// would make the reply fifteen times larger than the hits it carries and
+/// would say the same thing on every page.
+///
+/// What is dropped is only the rows a reader can already account for: the
+/// modules a distribution's own `RECORD` declares and whose bytes verify.
+/// What is kept is everything that answers "what does this record not
+/// cover" — the counts, the coverage state and its detail, the scope
+/// sentence, the digest that actually binds the measurement, and, in
+/// full, every module declared by no `RECORD` and everything the
+/// interpreter could not describe. That is
+/// `W4-PRODUCER-PROVENANCE-CORRECTION.md` item 2's requirement: the
+/// missing scope stays inspectable, and a skipped count alone never
+/// stands in for it.
+fn producer_environment_json(environment: &wirk_atlas::BackendEnvironment) -> Value {
+    let wirk_atlas::BackendEnvironment::Reported(identity) = environment else {
+        return json!({"state": "unreported"});
+    };
+    let undeclared: Vec<Value> = identity
+        .modules
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.attribution,
+                wirk_atlas::ModuleAttribution::Undeclared(_)
+            )
+        })
+        .map(|module| {
+            json!({
+                "name": module.name,
+                "origin": module.origin,
+                "path": module.path,
+                "digest": module.digest,
+                "byte_len": module.byte_len,
+                "detail": match &module.attribution {
+                    wirk_atlas::ModuleAttribution::Undeclared(detail) => detail.clone(),
+                    wirk_atlas::ModuleAttribution::Declared(name) => name.clone(),
+                },
+            })
+        })
+        .collect();
+    json!({
+        "state": "reported",
+        "coverage": environment_coverage_json(&identity.coverage),
+        "scope": identity.scope,
+        "kind": identity.kind,
+        "root": identity.root,
+        "runtime": identity.runtime,
+        "executable": identity.executable,
+        "digest": identity.digest,
+        "distributions_total": identity.distributions.len(),
+        "modules_total": identity.modules.len(),
+        "modules_declared": identity.modules.len() - undeclared.len(),
+        // Named in full, never only counted: these are the modules whose
+        // membership the record declines to assert.
+        "modules_undeclared": undeclared,
+        "undescribed_distributions": unavailable_entries_json(
+            &identity.undescribed_distributions),
+        "unmeasured_modules": unavailable_entries_json(&identity.unmeasured_modules),
+    })
+}
+
 /// `verified` here means "these bytes are the bytes this record commits
 /// to", and nothing else. It deliberately says nothing about retrieval:
 /// W4 A builds and selects editions, and no query reads them yet.
@@ -5448,6 +5593,13 @@ fn handle_atlas_semantic_build(
         // this protocol version. 0089 forbids minting producer proof for
         // vectors this product did not create; it always knows its own.
         producer: format!("wirkd/atlas-semantic-build/{PROTOCOL_VERSION}"),
+        chunking: match payload.chunker.as_deref() {
+            None | Some("units") => wirk_atlas::SemanticChunking::Units,
+            Some("native") => wirk_atlas::SemanticChunking::Native,
+            Some(other) => {
+                return err_reply("BadRequest", &format!("unknown --chunker value {other}"));
+            }
+        },
     };
     let generation = wirk_atlas::GenerationId(payload.generation.clone());
     match atlas.build_semantic(&membership, &generation, &config) {
@@ -5639,13 +5791,77 @@ fn budget_json(budget: &wirk_atlas::AnswerBudget) -> Value {
     })
 }
 
+/// `applied`, `partial`, `unavailable` or `disabled`, and — for the two
+/// that are not self-explanatory — the reason, in the same words the
+/// plain-text surface prints. `partial` is its own state on purpose:
+/// semantic ranking that covered some of the admitted sources is neither
+/// a full application nor an absence.
 fn semantic_status_json(status: &wirk_atlas::SemanticStatus) -> Value {
-    match status {
-        wirk_atlas::SemanticStatus::Applied => json!({"status": "applied"}),
-        wirk_atlas::SemanticStatus::Unavailable(reason) => {
-            json!({"status": "unavailable", "reason": reason})
+    let mut value = json!({"status": status.label()});
+    if let Some(reason) = status.reason() {
+        value["reason"] = json!(reason);
+    }
+    value
+}
+
+/// What the native implementation reported about a ranking that actually
+/// happened. Present only when one did, so "semantic" is never a word the
+/// product says without something behind it.
+fn application_json(application: &wirk_atlas::SemanticApplication) -> Value {
+    json!({
+        "native": application.native,
+        "model_digest": application.model_digest,
+        "retrieval": application.retrieval_digest,
+        "rows_ranked": application.rows_ranked,
+        "candidate_limit": application.candidate_limit,
+        "candidates_saturated": application.saturated,
+        // The implementation that actually ranked this answer, measured by
+        // the product. Rendered through the same helpers the edition's own
+        // backend block uses, because it is the same kind of claim about
+        // the same kind of boundary — and bounded by the same words: this
+        // is what was measured, never an attestation that the process
+        // which returned these scores is the one described.
+        "producer": {
+            "scheme": wirk_atlas::QUERY_PRODUCER_SCHEME,
+            "protocol": application.producer.protocol,
+            "program": configured_path_json(&application.producer.program),
+            "arguments": application.producer.arguments.iter()
+                .map(configured_path_json).collect::<Vec<_>>(),
+            "argv": application.producer.argv.iter()
+                .map(backend_argument_json).collect::<Vec<_>>(),
+            "reported": application.producer.reported,
+            "environment": producer_environment_json(&application.producer.environment),
+            "scope": wirk_atlas::QUERY_PRODUCER_SCOPE,
+            "configuration_digest": application.producer_pin.configuration,
+            "digest": application.producer_pin.identity,
+            // What those digests were measured on, published on page 1
+            // rather than left to be inferred from `environment.state`:
+            // `configuration_only` is an honest, usable answer whose
+            // continuation this product will refuse, and a caller is
+            // entitled to know that before it asks for page 2.
+            "basis": application.producer_pin.basis.label(),
+            "basis_detail": basis_detail(application.producer_pin.basis),
+        },
+    })
+}
+
+/// What a published basis actually claims, in the words both public
+/// surfaces print.
+///
+/// `EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(b): the measured sentence
+/// describes the *reported* scope, never the process — an honestly
+/// narrowed module list is a true list and a bound, and a sentence
+/// claiming "the loaded-module bytes of the process that ranked this
+/// answer were measured" says more than any self-report can carry. Both
+/// arms are the atlas constants so the two surfaces cannot drift apart.
+fn basis_detail(basis: wirk_atlas::QueryProducerBasis) -> &'static str {
+    match basis {
+        wirk_atlas::QueryProducerBasis::ImplementationMeasured => {
+            wirk_atlas::QUERY_PRODUCER_BASIS_MEASURED
         }
-        wirk_atlas::SemanticStatus::Disabled => json!({"status": "disabled"}),
+        wirk_atlas::QueryProducerBasis::ConfigurationOnly => {
+            wirk_atlas::QUERY_PRODUCER_BASIS_MISSING
+        }
     }
 }
 
@@ -5668,6 +5884,10 @@ fn coverage_json(coverage: &wirk_atlas::AnswerCoverage) -> Value {
         // right so it is never told as "the corpus held nothing" beside a
         // `budget.total_candidates` that says otherwise.
         "spent": coverage.spent,
+        // W4 B: this continuation's captured semantic editions cannot be
+        // ranked through any more, so the page it asks for is refused
+        // rather than silently reproduced from a different corpus.
+        "continuation_unrecoverable": coverage.continuation_unrecoverable,
         "complete": coverage.is_complete(),
     })
 }
@@ -5690,6 +5910,47 @@ struct ContinuationToken {
     limit: usize,
     offset: usize,
     generations: Vec<(String, String)>,
+    /// P3 W4 B: the semantic editions the issuing answer actually ranked
+    /// through, and the mode it ranked in. Both are re-executed from the
+    /// token rather than re-derived, so a same-generation edition switch,
+    /// a fresh selection, or semantics becoming available in between
+    /// cannot change what an open continuation is paging through.
+    #[serde(default)]
+    editions: Vec<(String, String)>,
+    #[serde(default)]
+    mode: String,
+    /// The query backend this continuation was issued under. Restated by
+    /// the caller and compared, exactly as the query and limit are: a
+    /// page ranked by a different backend or model is not the next page
+    /// of this answer.
+    #[serde(default)]
+    semantic_backend: Option<String>,
+    #[serde(default)]
+    semantic_backend_args: Vec<String>,
+    #[serde(default)]
+    semantic_model: Option<String>,
+    /// P3 W4 B correction: the *implementation* that ranked the issuing
+    /// answer, as two digests — not a second copy of the backend path,
+    /// which `semantic_backend` above already restates. A file edited in
+    /// place at the same configured path, an alias retargeted to a
+    /// different file, or a module loading from somewhere else inside the
+    /// same interpreter all leave every field above untouched and move
+    /// these (`public-retrieval-verify/VERDICT.md` O1, executed as this
+    /// stage's red). Answer-derived, so a continuation restating the
+    /// request is compared on the request fields alone and these two are
+    /// carried through — then checked against a freshly measured
+    /// producer, in `wirk_atlas`, where the refusal belongs.
+    #[serde(default)]
+    producer_configuration: Option<String>,
+    #[serde(default)]
+    producer_identity: Option<String>,
+    /// What those two digests were measured on
+    /// (`wirk_atlas::QueryProducerBasis`). Carried because only page 1
+    /// can state it, and a continuation that cannot tell a pin covering
+    /// implementation bytes from one covering an argv line cannot know
+    /// what its own check is worth (`VERDICT.md` V1).
+    #[serde(default)]
+    producer_basis: Option<String>,
 }
 
 /// Reads `<wirk_dir>/continuation-key`, creating it from the kernel
@@ -5790,6 +6051,37 @@ fn decode_continuation(key: &[u8; 32], encoded: &str) -> Result<ContinuationToke
 /// on every call (`resolve_query_scope`), never taken from the token —
 /// a continuation cannot mint authority a Work's real bindings do not
 /// currently grant, even if they once did.
+/// What token, if any, an answer hands back.
+///
+/// Pulled out of the reply builder because the interesting case is a
+/// judgement rather than a rendering: an answer that refused a
+/// continuation must not mint a new one
+/// (`public-retrieval-identity-verify/VERDICT.md` V2). The minted token
+/// would carry no application, therefore no producer pin, and following
+/// it would refuse with "issued before the query producer identity was
+/// recorded" — a true sentence about pre-correction history and a false
+/// one about a token this build issued seconds earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationDecision {
+    /// No token at all: there is nothing this caller may page through.
+    Withheld,
+    /// Hand back the caller's own token unchanged, so restoring whatever
+    /// broke resumes the continuation it already holds.
+    Preserved,
+    /// Issue the token this answer's own page earned.
+    Fresh,
+}
+
+fn continuation_decision(coverage: &wirk_atlas::AnswerCoverage) -> ContinuationDecision {
+    if coverage.no_sources || coverage.denied {
+        ContinuationDecision::Withheld
+    } else if coverage.continuation_unrecoverable {
+        ContinuationDecision::Preserved
+    } else {
+        ContinuationDecision::Fresh
+    }
+}
+
 fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPayload) -> Reply {
     let scope = match resolve_query_scope(state, &payload.work) {
         Ok(scope) => scope,
@@ -5812,6 +6104,30 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
         });
     }
     let limit = payload.limit.unwrap_or(10);
+    // The query-time half of the portability boundary: an explicitly
+    // configured executable and an explicitly configured offline model
+    // directory, or nothing. Both are refused unless absolute, by the
+    // same 0089 rule the build side applies — a bare model name resolves
+    // through a shared mutable cache and names no fixed bytes.
+    let semantic_query = match (&payload.semantic_backend, &payload.semantic_model) {
+        (None, None) => None,
+        (Some(backend), Some(model)) => Some(wirk_atlas::SemanticQueryConfig {
+            backend: std::path::PathBuf::from(backend),
+            backend_args: payload.semantic_backend_args.clone(),
+            model: std::path::PathBuf::from(model),
+        }),
+        _ => {
+            return err_reply(
+                "BadRequest",
+                "a semantic query needs both --semantic-backend and --semantic-model; one \
+                 without the other names no runnable configuration",
+            );
+        }
+    };
+    let mut pinned_editions: Option<BTreeMap<wirk_atlas::MembershipId, wirk_atlas::EditionId>> =
+        None;
+    let mut pinned_mode: Option<wirk_atlas::RankingMode> = None;
+    let mut pinned_producer = wirk_atlas::PinnedProducer::Unrecorded;
     let (pinned, offset) = match &payload.continuation {
         None => (None, 0),
         Some(token) => {
@@ -5828,11 +6144,19 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                 limit,
                 offset: decoded.offset,
                 generations: decoded.generations.clone(),
+                editions: decoded.editions.clone(),
+                mode: decoded.mode.clone(),
+                semantic_backend: payload.semantic_backend.clone(),
+                semantic_backend_args: payload.semantic_backend_args.clone(),
+                semantic_model: payload.semantic_model.clone(),
+                producer_configuration: decoded.producer_configuration.clone(),
+                producer_identity: decoded.producer_identity.clone(),
+                producer_basis: decoded.producer_basis.clone(),
             };
             if decoded != restated {
                 return err_reply(
                     "ContinuationMismatch",
-                    "the continuation token names a different work/query/source/family/semantic/limit than this request",
+                    "the continuation token names a different work/query/source/family/semantic/limit/backend than this request",
                 );
             }
             let pinned: BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId> = decoded
@@ -5845,6 +6169,40 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                     )
                 })
                 .collect();
+            pinned_editions = Some(
+                decoded
+                    .editions
+                    .iter()
+                    .map(|(membership, edition)| {
+                        (
+                            wirk_atlas::MembershipId(membership.clone()),
+                            wirk_atlas::EditionId(edition.clone()),
+                        )
+                    })
+                    .collect(),
+            );
+            pinned_mode = wirk_atlas::RankingMode::parse(&decoded.mode);
+            pinned_producer = match (
+                &decoded.producer_configuration,
+                &decoded.producer_identity,
+                decoded
+                    .producer_basis
+                    .as_deref()
+                    .map(wirk_atlas::QueryProducerBasis::parse),
+            ) {
+                (Some(configuration), Some(identity), Some(Some(basis))) => {
+                    wirk_atlas::PinnedProducer::Recorded(wirk_atlas::QueryProducerPin {
+                        configuration: configuration.clone(),
+                        identity: identity.clone(),
+                        basis,
+                    })
+                }
+                // No producer field at all is genuine pre-correction
+                // history. Some but not all is a malformed token, and
+                // calling that history would be false (`VERDICT.md` V2).
+                (None, None, None) => wirk_atlas::PinnedProducer::Unrecorded,
+                _ => wirk_atlas::PinnedProducer::Incomplete,
+            };
             (Some(pinned), decoded.offset)
         }
     };
@@ -5861,6 +6219,10 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
         limit,
         pinned,
         offset,
+        semantic_query,
+        pinned_editions,
+        pinned_mode,
+        pinned_producer,
     };
     match wirk_atlas::search(&atlas, &request) {
         Ok(answer) => {
@@ -5877,6 +6239,27 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                     .iter()
                     .map(|(membership, generation)| (membership.0.clone(), generation.0.clone()))
                     .collect(),
+                editions: answer
+                    .editions
+                    .iter()
+                    .map(|(membership, edition)| (membership.0.clone(), edition.0.clone()))
+                    .collect(),
+                mode: answer.mode.label().to_owned(),
+                semantic_backend: payload.semantic_backend.clone(),
+                semantic_backend_args: payload.semantic_backend_args.clone(),
+                semantic_model: payload.semantic_model.clone(),
+                producer_configuration: answer
+                    .application
+                    .as_ref()
+                    .map(|application| application.producer_pin.configuration.clone()),
+                producer_identity: answer
+                    .application
+                    .as_ref()
+                    .map(|application| application.producer_pin.identity.clone()),
+                producer_basis: answer
+                    .application
+                    .as_ref()
+                    .map(|application| application.producer_pin.basis.label().to_owned()),
             };
             ok_reply(json!({
                 "publication_revision": answer.publication_revision,
@@ -5887,13 +6270,38 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                 "admission": {"admitted": answer.admission.admitted, "denied": answer.admission.denied},
                 "hits": answer.hits.iter().map(evidence_hit_json).collect::<Vec<_>>(),
                 "semantic": semantic_status_json(&answer.semantic),
+                "ranking": {
+                    "mode": answer.mode.label(),
+                    "editions": answer.editions.iter().map(|(membership, edition)| json!({
+                        "membership": membership.0,
+                        "edition": edition.0,
+                    })).collect::<Vec<_>>(),
+                    "application": answer.application.as_ref().map(application_json),
+                },
                 "coverage": coverage_json(&answer.coverage),
                 "truncated": answer.truncated,
                 "budget": budget_json(&answer.budget),
-                "continuation": if answer.coverage.no_sources || answer.coverage.denied {
-                    None
-                } else {
-                    Some(encode_continuation(&state.continuation_key, &continuation))
+                "continuation": match continuation_decision(&answer.coverage) {
+                    ContinuationDecision::Withheld => None,
+                    // `VERDICT.md` V2. A refused continuation returned no
+                    // hit, so a *fresh* token here would advance an offset
+                    // over a page that was never served, and — carrying no
+                    // application, hence no producer — would refuse in
+                    // turn with "issued before the query producer identity
+                    // was recorded", which of a token this build minted
+                    // seconds ago is simply false.
+                    //
+                    // The caller's own token is handed back unchanged
+                    // instead. It is the thing that still resumes: the
+                    // same token replays its page byte-identically once
+                    // the implementation is restored, and the original
+                    // contract asks exactly that a continuation be
+                    // preserved or explicitly refused, never quietly
+                    // replaced by one that cannot work.
+                    ContinuationDecision::Preserved => payload.continuation.clone(),
+                    ContinuationDecision::Fresh => {
+                        Some(encode_continuation(&state.continuation_key, &continuation))
+                    }
                 },
             }))
         }
@@ -6254,6 +6662,82 @@ mod tests {
         );
 
         assert_eq!(route_waypoints(&[]), Vec::<WaypointId>::new());
+    }
+
+    /// `public-retrieval-identity-verify/VERDICT.md` V2, as a guard. An
+    /// answer that refused a continuation hands back the caller's own
+    /// token, not a new one.
+    ///
+    /// The token it used to mint carried no application, therefore no
+    /// producer pin, so following it refused with "issued before the
+    /// query producer identity was recorded" — a description of
+    /// pre-correction history applied to a token this build had issued
+    /// seconds earlier, minted afresh on every attempt. Preserving the
+    /// caller's token is also the branch the original continuation
+    /// contract asks for: the same token resumes byte-identically once
+    /// the implementation is restored.
+    #[test]
+    fn a_refused_continuation_preserves_the_callers_token() {
+        let mut coverage = wirk_atlas::AnswerCoverage::default();
+        assert_eq!(
+            continuation_decision(&coverage),
+            ContinuationDecision::Fresh
+        );
+
+        coverage.continuation_unrecoverable = true;
+        assert_eq!(
+            continuation_decision(&coverage),
+            ContinuationDecision::Preserved
+        );
+
+        // A refusal is still not a route to a token over content this
+        // caller may not read: withholding wins over both.
+        let mut denied = wirk_atlas::AnswerCoverage {
+            denied: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            continuation_decision(&denied),
+            ContinuationDecision::Withheld
+        );
+        denied.continuation_unrecoverable = true;
+        assert_eq!(
+            continuation_decision(&denied),
+            ContinuationDecision::Withheld
+        );
+
+        let no_sources = wirk_atlas::AnswerCoverage {
+            no_sources: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            continuation_decision(&no_sources),
+            ContinuationDecision::Withheld
+        );
+    }
+
+    /// `EMPTY-PRODUCER-REVIEW-ADJUDICATION.md` D1(b), as a guard. The
+    /// sentence a measured pin publishes is bounded by what the backend
+    /// reported, on the JSON surface and the plain one alike — the
+    /// executed counterexample is a real, honestly narrowed list that
+    /// omits the very module that ranks, and no wording repairs that. It
+    /// is stated, not claimed away.
+    #[test]
+    fn a_measured_basis_detail_is_bounded_by_the_reported_scope() {
+        let measured = basis_detail(wirk_atlas::QueryProducerBasis::ImplementationMeasured);
+        assert_eq!(measured, wirk_atlas::QUERY_PRODUCER_BASIS_MEASURED);
+        assert!(
+            measured.contains("the module files this backend reported"),
+            "{measured}"
+        );
+        assert!(
+            !measured.contains("of the process that ranked this answer were measured"),
+            "a self-reported list is not a measurement of the process: {measured}"
+        );
+        assert_eq!(
+            basis_detail(wirk_atlas::QueryProducerBasis::ConfigurationOnly),
+            wirk_atlas::QUERY_PRODUCER_BASIS_MISSING
+        );
     }
 
     /// p2-route-files W2 (format.md §2): a bare name resolves against

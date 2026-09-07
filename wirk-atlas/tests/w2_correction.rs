@@ -82,6 +82,10 @@ fn zero_presentation_budget_is_truncated_not_reported_as_no_match() {
         limit,
         pinned: None,
         offset: 0,
+        semantic_query: None,
+        pinned_editions: None,
+        pinned_mode: None,
+        pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
     };
 
     let full = search(&atlas, &request(10)).unwrap();
@@ -134,6 +138,10 @@ fn an_unavailable_source_is_not_reported_as_no_match() {
             limit: 10,
             pinned: None,
             offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
         },
     )
     .unwrap();
@@ -234,6 +242,10 @@ fn append_relationship_reports_durability_uncertain_on_post_rename_dir_fsync_fai
                 limit: 5,
                 pinned: None,
                 offset: 0,
+                semantic_query: None,
+                pinned_editions: None,
+                pinned_mode: None,
+                pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
             },
         )
         .unwrap();
@@ -437,6 +449,10 @@ fn admit_relationship_with_read_only_grants_never_mutates_either_repository() {
                 limit: 5,
                 pinned: None,
                 offset: 0,
+                semantic_query: None,
+                pinned_editions: None,
+                pinned_mode: None,
+                pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
             },
         )
         .unwrap();
