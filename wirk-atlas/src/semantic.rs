@@ -2706,11 +2706,11 @@ impl crate::AtlasStore {
                     // everything is written and synced, nothing is
                     // visible. `AtlasStore::open` cleans the abandoned
                     // private temporary, and no edition exists.
-                    crate::store::checkpoint_public("semantic-edition-written");
+                    crate::store::checkpoint("semantic-edition-written");
                     std::fs::rename(&staging, &destination)?;
                     std::fs::File::open(self.semantic_root())?.sync_all()?;
                 }
-                crate::store::checkpoint_public("semantic-edition-staged");
+                crate::store::checkpoint("semantic-edition-staged");
                 Ok(SemanticBuildOutcome::Staged(edition))
             }
             other => {
@@ -3415,7 +3415,7 @@ impl crate::AtlasStore {
                 )));
             }
         }
-        crate::store::checkpoint_public("semantic-selection-verified");
+        crate::store::checkpoint("semantic-selection-verified");
         self.commit_semantic_selection(membership, id.clone())?;
         Ok(Ok(edition))
     }

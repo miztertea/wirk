@@ -387,9 +387,7 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
     // (`wirk/tests/boundary_claim.rs`) makes for `world`.
     let status_reply = wirkd::client::call(
         &pointer.socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.clone()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.clone()))),
     )
     .expect("status call reaches wirkd");
     let Reply::Ok { result, .. } = status_reply else {
@@ -2307,4 +2305,616 @@ fn a_selection_whose_raw_args_restate_its_model_is_refused_before_any_effect() {
         !estate.join("worktrees").join(&work_id).exists(),
         "no worktree was created for a request that was never valid"
     );
+}
+
+/// The live twin of `wirk-herdr/tests/run_loop.rs::
+/// resuming_a_run_whose_block_was_resolved_continues_the_same_run`
+/// (ruling 0113, the operator's own `work-18d32a2752f0ca8a-0`): an
+/// actor is held on its pane waiting for a human — the shape a Claude
+/// folder-trust or permission prompt takes — so `wirk run` exits 4 with
+/// the Work `NeedsInput{blocked}`. The human answers it *in the pane*
+/// (`agent.send_keys`, a real Enter into the real pty: Herdr refuses
+/// `agent.prompt` to a blocked agent outright, and answering by hand is
+/// what actually happens). The actor comes back and sits Idle — the
+/// state nothing will move it out of until it is prompted again.
+///
+/// A second `wirk run` must then resume that SAME Run: reconcile onto
+/// the same live pane (no second agent, no second pane, no fresh Run),
+/// deliver the task, and reach the Claim. Red before this wave: the
+/// resumed driver read the *replayed* `Blocked` history back off the
+/// real `wirkd watch` stream — this Run's own `RunOpened` sits ahead of
+/// it in that replay, so `run_opened_this_run` never gated it — and
+/// printed `NeedsInput` immediately, exit 4, without ever prompting the
+/// pane it had just reattached to (`62-run-review-recover.txt`).
+#[test]
+fn wirk_run_resumes_the_same_run_after_a_resolved_block() {
+    use wirk_herdr::{AgentStatus, HerdrClient, SendKeys};
+
+    let scripted = scripted_actor::ScriptedActor::install(&[
+        // Turn 1, the intent prompt: sit on the pane waiting for a
+        // human, exactly as an agent held at a permission prompt does.
+        "block",
+        // Turn 2: the human's own Enter, typed into the pane. The actor
+        // comes back and ends its turn Idle.
+        "idle",
+        // Turns 3 and 4: the resumed drive's own prompt and
+        // continuation.
+        "edit:report.md:a throwaway repo for the blocked-resume tried step",
+        "claim:--artifact report.md=report.md",
+    ]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    // ONE session for the whole test: the resume's whole point is that
+    // the pane the first invocation left behind is still alive.
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_resumes_the_same_run_after_a_resolved_block",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_id, run_id, _waypoint) = submit_actor(
+        &estate,
+        &repo,
+        "Write report.md and claim it. Answer any prompt this harness puts in front of you.",
+    );
+
+    // ---- attempt 1: held on the pane, exit 4 -----------------------
+    let first = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session.name()])
+        .args(["--herdr-socket"])
+        .arg(session.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .env("PATH", &path_env)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .expect("run wirk run (first attempt)");
+    assert_eq!(
+        first.code(),
+        Some(4),
+        "an actor waiting on its pane is NeedsInput: {first:?}"
+    );
+    wait_for_event(
+        &estate,
+        &work_id,
+        |kind| matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "Blocked"),
+    );
+
+    // ---- the human answers the prompt, in the pane ------------------
+    let client = session.client();
+    let pane = client.get_agent(&run_id).expect("the Run's agent is live");
+    client
+        .send_keys(SendKeys {
+            target: pane.pane_id.clone(),
+            keys: vec!["Enter".to_string()],
+        })
+        .expect("agent.send_keys types the human's answer into the pane");
+
+    // The actor comes back and settles Idle: answered, and now waiting
+    // to be told what to do. Bounded poll (issue 359), never a sleep.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = client
+            .get_agent(&run_id)
+            .map(|pane| pane.agent_status)
+            .unwrap_or(AgentStatus::Unknown);
+        if matches!(status, AgentStatus::Idle | AgentStatus::Done) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pane never left Blocked after the human answered: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // ---- attempt 2: the same Run resumes ---------------------------
+    let second = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--session", session.name()])
+        .args(["--herdr-socket"])
+        .arg(session.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .env("PATH", &path_env)
+        .output()
+        .expect("run wirk run (resume)");
+    let stdout = String::from_utf8_lossy(&second.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&second.stderr).to_string();
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "the resumed Run must reach its Claim.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("launch reconciled"),
+        "the resume must reconcile onto the live pane, not launch again:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("NeedsInput"),
+        "a resolved block must never be replayed back as NeedsInput:\n{stdout}"
+    );
+
+    // One Run, one launch, one pane: the resume continued what was
+    // already running rather than duplicating it.
+    let events = Journal::open(estate.join("works").join(&work_id))
+        .expect("open journal")
+        .replay()
+        .expect("journal replays cleanly");
+    let opened: Vec<&RunId> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::RunOpened { run, .. } => Some(run),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened.len(), 1, "a resume opens no new Run: {opened:?}");
+    assert_eq!(opened[0].0, run_id);
+    let launched = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::RunLaunched { .. }))
+        .count();
+    assert_eq!(launched, 1, "a resume launches no second agent");
+    // The observation that cleared the block is the one Herdr actually
+    // gave for the reattached pane, journaled against this Run.
+    assert!(
+        events.iter().any(|event| matches!(
+            (&event.kind, &event.run),
+            (EventKind::LifecycleObserved { status, .. }, Some(run))
+                if (status == "Idle" || status == "Done") && run.0 == run_id
+        )),
+        "the resume journals the status Herdr reported for the pane it reattached to"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ClaimRecorded { .. })),
+        "the resumed Run's own Claim landed"
+    );
+}
+
+/// The live control for the test above (ruling 0113): the prompt is
+/// *not* answered. A second `wirk run` reattaches to the same pane,
+/// finds it still waiting on its human, and must stay `NeedsInput` —
+/// and must say so from its own fresh observation of that pane, not by
+/// echoing the history it replayed. Nothing here may auto-clear.
+#[test]
+fn wirk_run_resuming_a_still_blocked_run_stays_needs_input() {
+    let scripted = scripted_actor::ScriptedActor::install(&["block"]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_resuming_a_still_blocked_run_stays_needs_input",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_id, run_id, _waypoint) = submit_actor(
+        &estate,
+        &repo,
+        "Write report.md and claim it. Answer any prompt this harness puts in front of you.",
+    );
+
+    for attempt in 1..=2 {
+        let status = Command::new(wirk_bin())
+            .args(["run", "--estate"])
+            .arg(&estate)
+            .args(["--work", &work_id, "--session", session.name()])
+            .args(["--herdr-socket"])
+            .arg(session.socket_path())
+            .args(["--actor-kind", "opencode"])
+            .env("PATH", &path_env)
+            .output()
+            .expect("run wirk run");
+        let stdout = String::from_utf8_lossy(&status.stdout).to_string();
+        assert_eq!(
+            status.status.code(),
+            Some(4),
+            "attempt {attempt} must stay NeedsInput while the pane is still waiting:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("NeedsInput"),
+            "attempt {attempt} must say so:\n{stdout}"
+        );
+        wait_for_event(
+            &estate,
+            &work_id,
+            |kind| matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "Blocked"),
+        );
+    }
+
+    let events = Journal::open(estate.join("works").join(&work_id))
+        .expect("open journal")
+        .replay()
+        .expect("journal replays cleanly");
+    let blocked: Vec<&EventKind> = events
+        .iter()
+        .filter(|event| {
+            matches!(&event.kind, EventKind::LifecycleObserved { status, .. } if status == "Blocked")
+                && event.run.as_ref().is_some_and(|run| run.0 == run_id)
+        })
+        .map(|event| &event.kind)
+        .collect();
+    assert!(
+        blocked.len() >= 2,
+        "the resume must record what it observed for itself, not echo the history: {blocked:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::ClaimRecorded { .. })),
+        "nothing was claimed: the human never answered"
+    );
+}
+
+/// One real `wirk run` against this estate, Work and live session,
+/// returning its exit code and its own stdout — the loop prints one
+/// line per prompt it actually sends (`maybe_prompt`), so counting
+/// those lines counts prompts delivered to the pane.
+fn run_once(
+    estate: &Path,
+    work_id: &str,
+    session: &live_herdr::LiveHerdrSession,
+    path_env: &str,
+) -> (Option<i32>, String) {
+    let output = Command::new(wirk_bin())
+        .args(["run", "--estate"])
+        .arg(estate)
+        .args(["--work", work_id, "--session", session.name()])
+        .args(["--herdr-socket"])
+        .arg(session.socket_path())
+        .args(["--actor-kind", "opencode"])
+        .env("PATH", path_env)
+        .output()
+        .expect("run wirk run");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (
+        output.status.code(),
+        format!("{stdout}--- stderr ---\n{stderr}"),
+    )
+}
+
+/// Bounded poll (issue 359, never a sleep-as-ordering) for the Run's
+/// own pane to report a turn end. A resume decides on what the pane is
+/// doing *now*, so a test about resuming a settled pane has to wait for
+/// it to actually settle rather than catch it mid-turn.
+fn wait_for_turn_end(session: &live_herdr::LiveHerdrSession, run_id: &str) {
+    use wirk_herdr::{AgentStatus, HerdrClient};
+    let client = session.client();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = client
+            .get_agent(run_id)
+            .map(|pane| pane.agent_status)
+            .unwrap_or(AgentStatus::Unknown);
+        if matches!(status, AgentStatus::Idle | AgentStatus::Done) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pane never ended its turn: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The correction to ruling 0113's resume, live: a Run stopped on an
+/// **unanswered Question** must not be handed its task again.
+///
+/// The actor files `wirk claim --question` on its first turn, so the
+/// Work folds `NeedsInput{question}` and `wirk run` exits 4 with the
+/// pane still alive and `Idle` — a human's answer is what it is waiting
+/// for. A second `wirk run` reconciles onto that same pane. Before this
+/// correction it read the pane's `agent.get` status and prompted from
+/// it immediately, before a single watch event had been folded: the
+/// returned `Outcome` was still `NeedsInput` (the shipped guard tests
+/// asserted exactly that and could not see this), but the actor had
+/// already been told to carry on — proved here by an artifact, not an
+/// enum. `PROMPTED.md` is the actor's *next* script step: it exists on
+/// disk if, and only if, the pane was prompted.
+#[test]
+fn wirk_run_resuming_an_unanswered_question_never_prompts_the_pane() {
+    let scripted = scripted_actor::ScriptedActor::install(&[
+        // Turn 1, the intent prompt: file the Question and stop.
+        "claim:--question \"which report should I write?\"",
+        // Any further prompt — there must be none — writes this.
+        "edit:PROMPTED.md:the pane was prompted while its Question was unanswered",
+    ]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_resuming_an_unanswered_question_never_prompts_the_pane",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_id, run_id, _waypoint) = submit_actor(
+        &estate,
+        &repo,
+        "Ask the owner which report to write, then stop.",
+    );
+
+    let first = run_once(&estate, &work_id, &session, &path_env);
+    assert_eq!(
+        first.0,
+        Some(4),
+        "a filed Question is NeedsInput:\n{}",
+        first.1
+    );
+    wait_for_event(
+        &estate,
+        &work_id,
+        |kind| matches!(kind, EventKind::ClaimRecorded { claim_kind, .. } if matches!(claim_kind, ClaimKind::Question(_))),
+    );
+    let prompted = estate.join("worktrees").join(&work_id).join("PROMPTED.md");
+    assert!(
+        !prompted.exists(),
+        "the first attempt itself must not have run the marker step; this test cannot \
+         attribute a later marker if it did"
+    );
+    // The actor has finished filing its Question and is sitting on the
+    // pane waiting for a human — the state the resume reconciles onto.
+    wait_for_turn_end(&session, &run_id);
+
+    // ---- the resume: it must leave the pane alone ------------------
+    let (code, stdout) = run_once(&estate, &work_id, &session, &path_env);
+    assert_eq!(
+        code,
+        Some(4),
+        "an unanswered Question still holds the Work:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("launch reconciled"),
+        "the resume must reconcile onto the live pane:\n{stdout}"
+    );
+    println!("--- resume stdout (unanswered Question) ---\n{stdout}");
+    let prompt_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("prompt:"))
+        .count();
+    assert_eq!(
+        prompt_lines, 0,
+        "the resume must deliver nothing to a pane whose Question is unanswered:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("resume withheld"),
+        "and it says why, naming what the complete journal told it:\n{stdout}"
+    );
+    assert!(
+        !prompted.exists(),
+        "the actor's next script step ran: the resume prompted a pane stopped on an \
+         unanswered Question"
+    );
+}
+
+/// The case a *prefix* of the journal cannot decide, live: this Run was
+/// blocked at a harness prompt, a human answered it in the pane, the
+/// resume delivered its task — and the actor then filed a Question. The
+/// block really is behind this Run, and the `Idle` observation that
+/// cleared it really is in the journal, so any decision drawn from the
+/// replayed history up to that point says "carry on". The complete
+/// journal says a human is being waited on.
+///
+/// A third `wirk run` must therefore prompt nothing, even though the
+/// first `NeedsInput`-bearing prefix it replays is a block this Run has
+/// left. Three real `wirk run` invocations, one real `wirkd`, one real
+/// Herdr session, one pane, one Run, and a scripted actor: no model
+/// tokens.
+#[test]
+fn wirk_run_resuming_a_question_filed_after_a_resolved_block_never_prompts() {
+    use wirk_herdr::{HerdrClient, SendKeys};
+
+    let scripted = scripted_actor::ScriptedActor::install(&[
+        // Turn 1, the intent prompt: sit on the pane waiting for a human.
+        "block",
+        // Turn 2: the human's own Enter, typed into the pane.
+        "idle",
+        // Turn 3, the resume's own prompt: file the Question.
+        "claim:--question \"which report should I write?\"",
+        // Any further prompt — there must be none — writes this.
+        "edit:PROMPTED.md:the pane was prompted while its Question was unanswered",
+    ]);
+    let path_env = scripted_actor_path(&scripted);
+    let script_path = scripted.script_path();
+    let script_path = script_path.to_str().expect("script path is utf-8");
+
+    let Some(session) = live_herdr::LiveHerdrSession::start_with_env(
+        "wirk_run_resuming_a_question_filed_after_a_resolved_block_never_prompts",
+        &[
+            ("PATH", &path_env),
+            ("WIRK_SCRIPTED_ACTOR_SCRIPT", script_path),
+            ("SHELL", "/bin/sh"),
+        ],
+    ) else {
+        return;
+    };
+
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+    let repo_dir = tempfile::tempdir().expect("repo tempdir");
+    let repo = repo_dir.path().to_path_buf();
+    init_repo(&repo);
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_id, run_id, _waypoint) = submit_actor(
+        &estate,
+        &repo,
+        "Write report.md and claim it. Answer any prompt this harness puts in front of you.",
+    );
+
+    // ---- attempt 1: held on the pane -------------------------------
+    let (code, stdout) = run_once(&estate, &work_id, &session, &path_env);
+    assert_eq!(code, Some(4), "an actor waiting on its pane:\n{stdout}");
+    wait_for_event(
+        &estate,
+        &work_id,
+        |kind| matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "Blocked"),
+    );
+
+    // ---- the human answers, in the pane ----------------------------
+    let client = session.client();
+    let pane = client.get_agent(&run_id).expect("the Run's agent is live");
+    client
+        .send_keys(SendKeys {
+            target: pane.pane_id.clone(),
+            keys: vec!["Enter".to_string()],
+        })
+        .expect("agent.send_keys types the human's answer into the pane");
+    // The actor comes back and settles: answered, and now waiting to be
+    // told what to do.
+    wait_for_turn_end(&session, &run_id);
+
+    // ---- attempt 2: the resume delivers the task, the actor asks ---
+    let (code, stdout) = run_once(&estate, &work_id, &session, &path_env);
+    assert_eq!(
+        code,
+        Some(4),
+        "the resumed Run's own actor filed a Question:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("prompt:")),
+        "the resolved block must still let this Run be told what to do:\n{stdout}"
+    );
+    wait_for_event(
+        &estate,
+        &work_id,
+        |kind| matches!(kind, EventKind::ClaimRecorded { claim_kind, .. } if matches!(claim_kind, ClaimKind::Question(_))),
+    );
+    let prompted = estate.join("worktrees").join(&work_id).join("PROMPTED.md");
+    assert!(
+        !prompted.exists(),
+        "attempt 2 itself must not have run the marker step; this test cannot attribute \
+         a later marker if it did"
+    );
+    wait_for_turn_end(&session, &run_id);
+
+    // ---- attempt 3: the block is history, the Question is not ------
+    let (code, stdout) = run_once(&estate, &work_id, &session, &path_env);
+    assert_eq!(
+        code,
+        Some(4),
+        "the Question still holds the Work:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("launch reconciled"),
+        "attempt 3 reconciles onto the same live pane:\n{stdout}"
+    );
+    println!("--- resume stdout (Question after a resolved block) ---\n{stdout}");
+    let prompt_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("prompt:"))
+        .count();
+    assert_eq!(
+        prompt_lines, 0,
+        "a resolved block earlier in the same Run's journal does not authorize prompting \
+         past the Question that followed it:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("resume withheld"),
+        "and it says why, naming what the complete journal told it:\n{stdout}"
+    );
+    assert!(
+        !prompted.exists(),
+        "the actor's next script step ran: the resume prompted past an unanswered Question"
+    );
+
+    // One Run and one pane throughout: this is a resume, not a retry.
+    let events = Journal::open(estate.join("works").join(&work_id))
+        .expect("open journal")
+        .replay()
+        .expect("journal replays cleanly");
+    let opened = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::RunOpened { .. }))
+        .count();
+    assert_eq!(opened, 1, "no resume opened a second Run");
 }

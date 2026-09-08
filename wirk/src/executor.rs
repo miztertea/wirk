@@ -121,11 +121,23 @@ struct StatusRunEntry {
 /// and `WirkdRunLoopApi::status` (the ongoing poll: needs only Run
 /// states) read from.
 fn fetch_status(socket: &Path, work_id: &WorkId) -> Result<StatusReply, ExecutorError> {
-    let reply = wirkd::client::call(
+    let reply = wirkd::client::status(
         socket,
-        &Request::status(StatusPayload {
-            work_id: work_id.clone(),
-        }),
+        // W-B launch disclosure integration (the launch review's F-C):
+        // `wirk run` drives exactly one Work and reads exactly that
+        // Work's own status, so it names itself as the requester and
+        // never asks for the administrative surface. A Work's own
+        // bindings trivially cover its own, so both this setup read and
+        // `WirkdRunLoopApi::status`'s ongoing progress poll get the
+        // identical full reply they got before — and an actor that
+        // wanted another Work's launch metadata cannot reach it here by
+        // omitting a scope.
+        // Through the typed `status` door, which refuses an answer
+        // that never established the requested scope rather than
+        // reading it as though it had (the integration review's V-5):
+        // `wirk run` against a daemon predating the gate now fails
+        // honestly instead of driving on an unscoped reply.
+        StatusPayload::scoped(work_id.clone(), work_id.clone()),
     )?;
     match reply {
         Reply::Ok { result, .. } => serde_json::from_value(result)
@@ -237,9 +249,9 @@ impl WirkdApi for WirkdRunLoopApi {
     ) -> Result<wirk_herdr::run_loop::WatchEvents<Self::Error>, Self::Error> {
         let events = wirkd::client::watch(
             &self.socket,
-            WatchPayload {
-                work_id: work_id.clone(),
-            },
+            // Same scope discipline as this Work's own status read
+            // (F-C): `RunLoop` drives one Work and watches that Work.
+            WatchPayload::scoped(work_id.clone(), work_id.clone()),
         )?;
         Ok(Box::new(
             events.map(|item| item.map_err(ExecutorError::from)),

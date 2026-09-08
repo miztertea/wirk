@@ -61,6 +61,7 @@ fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
             required: true,
         }]),
         boundary: Boundary(vec!["src/**".to_string()]),
+        review_targets: Vec::new(),
     })
 }
 

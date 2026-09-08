@@ -144,9 +144,7 @@ fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i
 fn status(socket: &Path, work_id: &str) -> serde_json::Value {
     let reply = wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.to_string()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.to_string()))),
     )
     .expect("status call succeeds");
     match reply {

@@ -72,6 +72,7 @@ fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
             required: true,
         }]),
         boundary: Boundary(vec!["src/**".to_string()]),
+        review_targets: Vec::new(),
     })
 }
 
@@ -2294,5 +2295,473 @@ fn a_start_error_and_an_unanswerable_herdr_is_uncertain_not_failed() {
             EventKind::LifecycleObserved { status, .. } if status == "launch-outcome-uncertain"
         )),
         "{recorded:?}"
+    );
+}
+
+// ---- (4c) ruling 0113: resuming the SAME Run after a resolved harness
+// permission prompt ---------------------------------------------------------
+//
+// The operator's own live defect (`work-18d32a2752f0ca8a-0`,
+// `62-run-review-recover.txt`): a Run held at a Claude folder-trust
+// prompt journals `LifecycleObserved{Blocked}`, which folds the Work to
+// `NeedsInput{reason: "blocked"}` and ends the drive. The human answers
+// the prompt. The next `wirk run` reconciles onto the *same* live pane
+// (`observe_admitted_launch`) -- and then reads that same `Blocked`
+// history back off the replayed watch stream and returns `NeedsInput`
+// again, immediately, without ever delivering the task. `run_opened_
+// this_run` does not gate it: this Run's own `RunOpened` is in the
+// replayed prefix too, ahead of the block it is supposed to gate.
+
+/// A `Run` whose launch is already bound and already launched -- the
+/// state a resume actually finds (`fetch_open_run`/`conflicting_
+/// reinvocation`, `wirk/src/executor.rs`), and the state that sends
+/// `launch` down `observe_admitted_launch` instead of a second
+/// `agent.start`.
+fn resumed_run(run_id: &str) -> Run {
+    let mut run = open_run(run_id);
+    run.launch_requested = true;
+    run.launched = true;
+    run
+}
+
+/// A `FakeHerdrClient` for a resume: `get_agent`/`get_pane` answers for
+/// this Run's own agent name with a pane in `status` (what Herdr
+/// actually reports about the reattached pane), plus the same real
+/// subscription channel `client_for` gives every other test.
+fn client_for_resume(
+    run: &Run,
+    status: AgentStatus,
+) -> (
+    Arc<FakeHerdrClient>,
+    mpsc::Sender<Result<HerdrEvent, HerdrError>>,
+) {
+    let (tx, rx) = mpsc::channel();
+    let client = Arc::new(
+        FakeHerdrClient::default()
+            .with_split_pane_response(pane_info(&run.id.0, status, 1))
+            .with_get_pane_response(&run.id.0, Ok(pane_info(&run.id.0, status, 7)))
+            .with_pane_read_response(
+                &run.id.0,
+                Ok("┃ Permission required\n┃ Access external directory".to_string()),
+            )
+            .with_subscribe_channel(rx),
+    );
+    (client, tx)
+}
+
+fn lifecycle_observed(status: &str, detail: Option<&str>) -> EventKind {
+    EventKind::LifecycleObserved {
+        status: status.to_string(),
+        detail: detail.map(str::to_string),
+    }
+}
+
+/// The history every resume below starts from: the Work, this Run's own
+/// reservation, and its launch. Folds `Active` on its own -- the
+/// "launch outcome uncertain, nothing blocked" resume is exactly this
+/// and nothing more.
+fn launched_history(run: &Run, world: &World) -> Vec<Event> {
+    vec![
+        watch_event(None, work_submitted()),
+        watch_event(None, waypoint_reserved(run, world.clone())),
+        watch_event(Some(&run.id), run_opened(run)),
+        watch_event(Some(&run.id), run_launched(run)),
+    ]
+}
+
+/// The replayed history of a Run that was held at a permission prompt:
+/// its own `RunOpened`/`RunLaunched`, then the `Blocked` observation
+/// that folded the Work to `NeedsInput`.
+fn blocked_history(run: &Run, world: &World) -> Vec<Event> {
+    let mut events = launched_history(run, world);
+    events.push(watch_event(
+        Some(&run.id),
+        lifecycle_observed(
+            "Blocked",
+            Some("the actor is waiting on its pane run-1:\n┃ Permission required"),
+        ),
+    ));
+    events
+}
+
+/// The history the resume authority exists for (the correction to
+/// ruling 0113's prompt path): this Run was blocked, a human answered
+/// the pane -- the `Idle` that cleared that block is in the journal --
+/// and only *then* did the actor file the Question the Work is now
+/// stopped on. The block really is behind it; the Work is held all the
+/// same, and by a decision no lifecycle observation may clear.
+///
+/// Nothing about the pane distinguishes this from `blocked_history`
+/// plus a resolved block -- Herdr reports `Idle` for both -- and
+/// nothing about the *prefix* of this journal does either: read up to
+/// the `Idle`, it is a resolved block. Only the complete journal says
+/// otherwise, which is why the resume asks for the complete journal.
+fn blocked_then_question_history(run: &Run, world: &World, claim_id: &str) -> Vec<Event> {
+    let mut events = blocked_history(run, world);
+    events.push(watch_event(Some(&run.id), lifecycle_observed("Idle", None)));
+    events.push(watch_event(
+        Some(&run.id),
+        claim_recorded_question(claim_id),
+    ));
+    events
+}
+
+/// The same shape with a `ClaimRecorded{Done}` after the resolved
+/// block: this Run is `Claimed` and its Work `Completed`, so there is
+/// nothing to hand back to the pane either.
+fn blocked_then_claim_history(run: &Run, world: &World, claim_id: &str) -> Vec<Event> {
+    let mut events = blocked_history(run, world);
+    events.push(watch_event(Some(&run.id), lifecycle_observed("Idle", None)));
+    events.push(watch_event(Some(&run.id), claim_recorded_done(claim_id)));
+    events
+}
+
+/// An `out_of_boundary` refusal: the one refusal `refuse.md` says only
+/// a human may route around. Not a Run fact -- the Run stays `Open` --
+/// so a resume reaches it, and must not hand the actor its task again.
+fn claim_refused_out_of_boundary(claim_id: &str) -> EventKind {
+    EventKind::ClaimRecorded {
+        artifacts: Vec::new(),
+        claim: ClaimId(claim_id.to_string()),
+        claim_kind: ClaimKind::Done,
+        verdict: ClaimVerdict::Refused(wirk_core::ClaimRefusal::OutOfBoundary(
+            "/etc/passwd".to_string(),
+        )),
+    }
+}
+
+/// A `FakeWirkdApi` holding `history` as the journal it already had
+/// when this drive started -- what a real `wirkd` answers `status`
+/// from, and what its `watch` replays -- and streaming that same
+/// history to the driver, in order, the way `handle_watch_connection`
+/// does.
+fn wirkd_for_resume(history: &[Event]) -> Arc<FakeWirkdApi> {
+    let wirkd = Arc::new(FakeWirkdApi::default().with_journal(history.to_vec()));
+    for event in history {
+        wirkd.push_watch_event(event.clone());
+    }
+    wirkd
+}
+
+/// (a) The defect ruling 0113 fixed, end to end through `drive`: the
+/// block is resolved (Herdr reports the reattached pane `Idle`, and the
+/// journal, once this resume has recorded that observation, folds
+/// `Active` again), so the resumed drive must deliver this Run's task
+/// and reach its Claim -- not report the resolved block back as
+/// `NeedsInput`. Red before that wave: the replayed `Blocked` prefix
+/// folds to `NeedsInput` with this Run's own `RunOpened` already seen,
+/// so `observe_watch` returns immediately and the Claim below is never
+/// reached.
+#[test]
+fn resuming_a_run_whose_block_was_resolved_continues_the_same_run() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Idle);
+    let wirkd = wirkd_for_resume(&blocked_history(&run, &world));
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(
+        outcome,
+        Outcome::Claimed,
+        "a resolved block must let the same Run continue to its own Claim, never \
+         replay itself back as NeedsInput"
+    );
+
+    // No second actor and no second pane: the resume reconciled onto
+    // the live one.
+    assert!(
+        client.start_agent_calls.lock().unwrap().is_empty(),
+        "a resume must never start a second agent"
+    );
+    assert!(
+        client.split_pane_calls.lock().unwrap().is_empty(),
+        "a resume must never split a second pane"
+    );
+
+    // The task was actually delivered to the reattached pane -- the
+    // whole point of resuming an Idle actor, which will never go
+    // Working again until it is prompted.
+    let prompts = client.prompt_agent_calls.lock().unwrap().len();
+    assert_eq!(
+        prompts, 1,
+        "the resumed drive must deliver this Run's task once"
+    );
+
+    // ...and what cleared the block in the journal is the observation
+    // Herdr actually gave, not an invented Working.
+    let recorded = wirkd.recorded();
+    let statuses: Vec<String> = recorded
+        .iter()
+        .filter_map(|(_, _, kind)| match kind {
+            EventKind::LifecycleObserved { status, .. } => Some(status.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        statuses.iter().any(|status| status == "Idle"),
+        "the resume journals the status Herdr actually reported: {statuses:?}"
+    );
+    assert!(
+        !statuses.iter().any(|status| status == "Working"),
+        "no invented Working may be emitted to clear the block: {statuses:?}"
+    );
+}
+
+/// (b) The control: the prompt was never answered. Herdr still reports
+/// the reattached pane `Blocked`, so the resume must stay `NeedsInput`
+/// -- and say so from a fresh observation of the pane, screen lines and
+/// all, not from the stale history.
+#[test]
+fn resuming_a_run_still_blocked_stays_needs_input_with_the_observed_reason() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Blocked);
+    let wirkd = wirkd_for_resume(&blocked_history(&run, &world));
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(
+        outcome,
+        Outcome::NeedsInput,
+        "a pane still sitting on its prompt is still NeedsInput"
+    );
+    assert!(
+        client.prompt_agent_calls.lock().unwrap().is_empty(),
+        "a blocked pane is never prompted"
+    );
+    let recorded = wirkd.recorded();
+    let blocked = recorded
+        .iter()
+        .filter_map(|(_, _, kind)| match kind {
+            EventKind::LifecycleObserved { status, detail } if status == "Blocked" => {
+                detail.clone()
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("the resume must journal its own Blocked observation");
+    assert!(
+        blocked.contains("Permission required"),
+        "the reason must be what the pane actually shows now: {blocked}"
+    );
+}
+
+// ---- (4d) the correction: authority before delivery -----------------------
+//
+// Ruling 0113's resume prompted the reconciled pane from the
+// `agent.get` status alone, before a single watch event had been
+// folded. `NeedsInput` was still returned in every case below -- the
+// enum those tests asserted never moved -- but the pane had already
+// been handed its task, which is the thing a Question, a refusal or a
+// failure exists to stop. What the tests below count is the prompt.
+
+/// (c) A filed Question is a human decision, not a harness prompt: an
+/// `Idle` pane says nothing about it, and the resume must neither
+/// continue nor -- the correction -- prompt.
+#[test]
+fn resuming_never_prompts_a_run_stopped_on_a_question() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Idle);
+    let mut history = launched_history(&run, &world);
+    history.push(watch_event(Some(&run.id), claim_recorded_question("c1")));
+    let wirkd = wirkd_for_resume(&history);
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert!(
+        client.prompt_agent_calls.lock().unwrap().is_empty(),
+        "a Run stopped on an unanswered Question must not be handed its task again: {:?}",
+        client.prompt_agent_calls.lock().unwrap()
+    );
+}
+
+/// (d) A failed Run is not a resolvable block either: an `Idle` pane on
+/// a Run whose own `RunFailed` folded must surface `NeedsInput` and
+/// must not be prompted.
+#[test]
+fn resuming_never_prompts_a_run_that_failed() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Idle);
+    let mut history = launched_history(&run, &world);
+    history.push(watch_event(Some(&run.id), run_failed_agent_pane_busy()));
+    let wirkd = wirkd_for_resume(&history);
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert!(
+        client.prompt_agent_calls.lock().unwrap().is_empty(),
+        "a failed Run's pane must not be handed its task again"
+    );
+}
+
+/// (e) An `out_of_boundary` refusal: the actor touched a path outside
+/// its own boundary, and `refuse.md` gives that refusal to a human to
+/// route around. The Run stays `Open`, so a resume really does reach
+/// it -- and must leave the pane alone.
+#[test]
+fn resuming_never_prompts_a_run_refused_out_of_boundary() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Idle);
+    let mut history = launched_history(&run, &world);
+    history.push(watch_event(
+        Some(&run.id),
+        claim_refused_out_of_boundary("c1"),
+    ));
+    let wirkd = wirkd_for_resume(&history);
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert!(
+        client.prompt_agent_calls.lock().unwrap().is_empty(),
+        "an out-of-boundary refusal is a human's to route around, not an actor's to retry"
+    );
+}
+
+/// (f) The case a *prefix* of the journal cannot decide, and the one
+/// the adjudication names: this Run was blocked, the block was
+/// resolved, and only then did the actor file its Question. Read up to
+/// the resolved block -- which is all any fold taken mid-replay has --
+/// the pane is free to continue. Read whole, the Work is stopped on a
+/// human's answer. The resume must read it whole, and prompt nothing.
+#[test]
+fn resuming_never_prompts_when_a_question_follows_the_resolved_block() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Idle);
+    let wirkd = wirkd_for_resume(&blocked_then_question_history(&run, &world, "c1"));
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(
+        outcome,
+        Outcome::NeedsInput,
+        "a Question filed after the block was resolved still holds this Work"
+    );
+    assert!(
+        client.prompt_agent_calls.lock().unwrap().is_empty(),
+        "the block being behind this Run does not authorize prompting past what came after it"
+    );
+}
+
+/// (g) The same shape ending in a Claim: this Run is `Claimed` and its
+/// Work `Completed`. Nothing is delivered to the pane, and the resume
+/// reports what the journal says it is.
+#[test]
+fn resuming_never_prompts_when_a_claim_follows_the_resolved_block() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Idle);
+    let wirkd = wirkd_for_resume(&blocked_then_claim_history(&run, &world, "c1"));
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(
+        outcome,
+        Outcome::Claimed,
+        "a Run whose Claim is already recorded is claimed, not needing input"
+    );
+    assert!(
+        client.prompt_agent_calls.lock().unwrap().is_empty(),
+        "a claimed Run's pane must not be handed its task again"
+    );
+}
+
+/// (h) The recovery that has nothing to do with a block at all, kept
+/// deliberately rather than inherited: an admitted launch whose outcome
+/// this Run never got to record (`launch-outcome-uncertain`'s own
+/// shape) leaves a live actor sitting `Idle` on its pane with the Work
+/// still `Active`. Nothing in the journal holds it, the pane's turn has
+/// ended, and a subscription will never deliver a change for a pane
+/// that is making none -- so the resume delivers the task, exactly
+/// once. Red before ruling 0113 (nothing was observed at all) and it
+/// stays green through this correction: the authority is what the
+/// journal says, not whether a block was ever recorded.
+#[test]
+fn resuming_an_idle_pane_with_nothing_holding_the_work_delivers_the_task() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Idle);
+    let wirkd = wirkd_for_resume(&launched_history(&run, &world));
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        1,
+        "an idle actor on an Active Work is told what to do, once"
+    );
+    assert!(
+        client.start_agent_calls.lock().unwrap().is_empty(),
+        "and no second agent is started to do it"
+    );
+}
+
+/// (i) The pane has *not* ended its turn: the actor reconciled onto is
+/// still `Working`. The Work is `Active` and nothing holds it, so the
+/// drive continues -- but a working actor is never interrupted with a
+/// prompt, resume or not.
+#[test]
+fn resuming_a_working_pane_continues_without_prompting_it() {
+    let run = resumed_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, _herdr_tx) = client_for_resume(&run, AgentStatus::Working);
+    let wirkd = wirkd_for_resume(&launched_history(&run, &world));
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world.clone());
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+    assert!(
+        client.prompt_agent_calls.lock().unwrap().is_empty(),
+        "a Working actor is not interrupted"
     );
 }

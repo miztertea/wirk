@@ -60,7 +60,12 @@ if [ -z "$ESTATE" ]; then
     echo "wirk wirkd-status: no estate configured"
     exit 0
 fi
-exec "$WIRK_BIN" wirkd status --estate "$ESTATE"
+# `--admin` is named, not omitted (ruling 0117). This is a workspace
+# action reading the estate the operator configured, so the
+# administrative read is what it means; naming it keeps that true no
+# matter what triple the pane happens to inherit, instead of letting a
+# wrapper reach the widest surface by saying nothing.
+exec "$WIRK_BIN" wirkd status --estate "$ESTATE" --admin
 ''']
 
 # One status pane, `placement = "split"`, never `overlay` (0032 D99
@@ -85,5 +90,8 @@ if [ -z "$ESTATE" ]; then
     echo "wirk status: no estate configured"
     exit 0
 fi
-exec "$WIRK_BIN" wirkd watch --estate "$ESTATE"
+# `--admin` named for the same reason as the status action above
+# (ruling 0117): the operator's own pane, over the operator's own
+# configured estate, said rather than defaulted to.
+exec "$WIRK_BIN" wirkd watch --estate "$ESTATE" --admin
 ''']

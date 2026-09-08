@@ -193,9 +193,7 @@ fn workfail(socket: &Path, work_id: &str, reason: &str) -> Reply {
 fn blocked(socket: &Path, estate: &Path, work_id: &str, run_id: &str, detail: &str) {
     let status = match wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.to_string()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.to_string()))),
     )
     .expect("status call succeeds")
     {
@@ -352,9 +350,7 @@ fn wirkd_status_reports_needs_input_cause() {
 
     let reply = wirkd::client::call(
         &pointer.socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.clone()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.clone()))),
     )
     .expect("status call succeeds");
     let result = match reply {
@@ -392,6 +388,12 @@ fn cli_work_status_prints_needs_input() {
     );
 
     let output = Command::new(wirk_bin())
+        // The operator's own read: ruling 0117 makes an inherited actor
+        // triple mean something here, so this asks for the operator
+        // rather than inheriting the runner's environment.
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID")
         .args(["work", "status", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id])
@@ -494,9 +496,7 @@ fn handle_retry_opens_fresh_run_same_world() {
     let status_before = |pointer: &WirkdPointer| -> serde_json::Value {
         match wirkd::client::call(
             &pointer.socket,
-            &Request::status(StatusPayload {
-                work_id: WorkId(work_id.clone()),
-            }),
+            &Request::status(StatusPayload::admin(WorkId(work_id.clone()))),
         )
         .expect("status call succeeds")
         {
@@ -592,9 +592,7 @@ fn handle_retry_uses_triggering_run_exact_reservation_not_injected_latest() {
     let status_result = |pointer: &WirkdPointer| -> serde_json::Value {
         match wirkd::client::call(
             &pointer.socket,
-            &Request::status(StatusPayload {
-                work_id: WorkId(work_id.clone()),
-            }),
+            &Request::status(StatusPayload::admin(WorkId(work_id.clone()))),
         )
         .expect("status call succeeds")
         {
@@ -717,9 +715,7 @@ fn handle_workfail_appends_work_failed_with_reason() {
 
     let status_reply = wirkd::client::call(
         &pointer.socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.clone()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.clone()))),
     )
     .expect("status call succeeds");
     let result = match status_reply {
@@ -889,9 +885,7 @@ fn wirkd_status_reports_needs_input_cause_for_blocked() {
 
     let reply = wirkd::client::call(
         &pointer.socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.clone()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.clone()))),
     )
     .expect("status call succeeds");
     let result = match reply {
@@ -954,9 +948,7 @@ fn cli_work_retry_succeeds_on_a_blocked_needs_input_work() {
 
     let status_reply = wirkd::client::call(
         &pointer.socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.clone()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.clone()))),
     )
     .expect("status call succeeds");
     let result = match status_reply {
@@ -1008,9 +1000,7 @@ fn cli_work_fail_succeeds_on_a_blocked_needs_input_work() {
 
     let status_reply = wirkd::client::call(
         &pointer.socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.clone()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.clone()))),
     )
     .expect("status call succeeds");
     let result = match status_reply {

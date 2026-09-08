@@ -25,12 +25,21 @@ and exits 0 without spawning a `wirkd`.
   session restart or live handoff (ruling 0032 D99).
 - Actions: `submit` (`wirk work submit`), `claim` (`wirk claim`,
   using the execution triple already injected into the pane's
-  environment), `wirkd-status` (`wirk wirkd ping` — wirkd has no
-  separate `status` verb, only `start`/`stop`/`ping`).
+  environment), `wirkd-status` (`wirk wirkd status --estate <root>
+  --admin` — every Work's state under the configured estate; `ping`
+  is the daemon's own liveness and reports nothing about any Work).
 - `[[panes]]` `status`, `placement = "split"`: `wirk wirkd watch
-  --estate <root>` (item B, ruling 0044) — streams every current
+  --estate <root> --admin` (item B, ruling 0044) — streams every current
   Work's journal appends, blocking, no loop and no sleep; the pane
   ends when wirkd does (or was never running).
+
+Both of those name `--admin` rather than omitting a scope (ruling
+0117). `status` and `watch` follow the environment they run in: inside
+an actor context (`WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`) they
+answer as that Work, about that Work; outside one they answer
+administratively. These two entrypoints are the operator's own view of
+the operator's own configured estate, so they say which surface they
+read in instead of depending on whatever triple the pane inherited.
 
 Binary resolution (startup hook and every action/pane command):
 `WIRK_BIN_PATH` if set, else

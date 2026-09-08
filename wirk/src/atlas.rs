@@ -11,9 +11,9 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::wirkd::{
-    AtlasAcquirePayload, AtlasPublishPayload, AtlasRefreshPayload, AtlasRelatePayload,
-    AtlasResolvePayload, AtlasSearchPayload, AtlasSemanticBuildPayload, AtlasSemanticSelectPayload,
-    AtlasStatusPayload, Reply, Request,
+    AtlasAcquirePayload, AtlasFindingsPayload, AtlasPublishPayload, AtlasRefreshPayload,
+    AtlasRelatePayload, AtlasResolvePayload, AtlasSearchPayload, AtlasSemanticBuildPayload,
+    AtlasSemanticSelectPayload, AtlasStatusPayload, Reply, Request,
 };
 use crate::{flag_value, wirkd_client_call};
 use wirk_core::WorkId;
@@ -28,6 +28,10 @@ pub fn atlas_command(rest: &[String]) -> ExitCode {
         Some("resolve") => resolve_command(&rest[1..]),
         Some("relate") => relate_command(&rest[1..]),
         Some("semantic") => semantic_command(&rest[1..]),
+        // W-B (§7): the estate's derived, rebuildable Findings index —
+        // alongside W3's own seven verbs and W4-A's semantic pair, not
+        // one of them.
+        Some("findings") => findings_command(&rest[1..]),
         _ => atlas_usage(),
     }
 }
@@ -42,7 +46,8 @@ fn atlas_usage() -> ExitCode {
          | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--semantic-backend <path>] [--semantic-backend-arg <arg>...] [--semantic-model <dir>] [--family code|knowledge|config]... [--limit <n>] [--continue <token>] [--json] \
          | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--chunker units|native] [--json] \
          | wirk atlas semantic select --estate <root> --source <name> --edition <id> [--json] \
-         | wirk atlas relate --estate <root> --work <id> --kind governed_by --from <coordinate> --to <coordinate> --evidence <coordinate> [--evidence <coordinate>...] [--run <id>] [--world <hash>] [--json]"
+         | wirk atlas relate --estate <root> --work <id> --kind governed_by --from <coordinate> --to <coordinate> --evidence <coordinate> [--evidence <coordinate>...] [--run <id>] [--world <hash>] [--json] \
+         | wirk atlas findings --estate <root> (--requesting-work <id> | --admin [--rebuild]) [--json]"
     );
     ExitCode::from(1)
 }
@@ -854,6 +859,60 @@ fn relate_command(rest: &[String]) -> ExitCode {
                     result["id"].as_str().unwrap_or("?"),
                     result["producer"].as_str().unwrap_or("?")
                 );
+            });
+        },
+    )
+}
+
+/// `wirk atlas findings --estate <root> (--requesting-work <id> |
+/// --admin [--rebuild]) [--json]` (W-B §7, corrected by
+/// `W-B-DISCLOSURE-REPAIR.md`): lists the estate's derived Findings
+/// index for one requesting Work, or — named explicitly — administers
+/// it unscoped, optionally recreating it from every eligible journal
+/// first. There is deliberately no default: the index discloses proof
+/// targets and Application sources, and the shape that read them all
+/// without naming anything is the defect this closes.
+fn findings_command(rest: &[String]) -> ExitCode {
+    if let Err(code) = check_flags(
+        "findings",
+        rest,
+        &[
+            ESTATE,
+            JSON,
+            ("--rebuild", false),
+            ("--admin", false),
+            ("--requesting-work", true),
+        ],
+    ) {
+        return code;
+    }
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return atlas_usage();
+    };
+    let json = is_json(rest);
+    let rebuild = rest.iter().any(|arg| arg == "--rebuild");
+    let admin = rest.iter().any(|arg| arg == "--admin");
+    let requester = flag_value(rest, "--requesting-work").map(wirk_core::WorkId);
+    if admin == requester.is_some() {
+        eprintln!(
+            "wirk atlas findings: name exactly one of --requesting-work <id> (scoped) or --admin (unscoped)"
+        );
+        return ExitCode::from(2);
+    }
+    wirkd_client_call(
+        &estate,
+        &Request::atlas_findings(AtlasFindingsPayload {
+            rebuild,
+            requester,
+            admin,
+        }),
+        |result| {
+            print_result(json, result, |result| {
+                let count = result["rows"]
+                    .as_array()
+                    .map(|rows| rows.len())
+                    .unwrap_or(0);
+                println!("{count} row(s)");
             });
         },
     )

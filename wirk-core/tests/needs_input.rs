@@ -698,3 +698,184 @@ fn fold_terminal_work_ignores_a_later_blocked_observation() {
         work.needs_input
     );
 }
+
+// ---- p3 native blocked resume (ruling 0113; the operator's own
+// work-18d32a2752f0ca8a-0 recovery) -------------------------------------
+//
+// A resolved harness permission prompt must let the SAME Run continue.
+// Two fold arms stand between the resolution and that continuation:
+// which observations count as "the block is over", and whose
+// observation it has to be.
+
+/// The pane whose permission prompt a human just answered is `Idle`,
+/// not `Working`: the actor answered the prompt and is waiting to be
+/// told what to do, and — the whole point of the resume — nothing will
+/// ever make it `Working` again until the loop prompts it. So an
+/// observed `Idle` on the blocked Run's own pane clears a `"blocked"`
+/// cause exactly as `Working` does. Red before this wave: only
+/// `"Working"` cleared, so a Work whose block was resolved stayed
+/// `NeedsInput` forever and its driver could only report that back.
+#[test]
+fn fold_lifecycle_idle_clears_a_blocked_needs_input_on_the_same_run() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::LifecycleObserved {
+            status: "Blocked".to_string(),
+            detail: Some("the actor is waiting on its pane w4X:p2".to_string()),
+        },
+    ));
+    assert!(matches!(
+        wirk_core::fold(&events).state,
+        WorkState::NeedsInput
+    ));
+
+    events.push(event(
+        "ev-5",
+        "work-1",
+        Some("run-1"),
+        2,
+        EventKind::LifecycleObserved {
+            status: "Idle".to_string(),
+            detail: None,
+        },
+    ));
+    let resolved = wirk_core::fold(&events);
+    assert!(
+        matches!(resolved.state, WorkState::Active),
+        "an observed Idle on the blocked Run's own pane says the block is over: {:?}",
+        resolved.state
+    );
+    assert_eq!(resolved.needs_input, None);
+}
+
+/// `Done` — Herdr's own name for a turn end on a pane nothing has
+/// viewed since (`turn_ended`, `run_loop.rs`), which is every pane
+/// `wirk run` drives — says the same thing `Idle` does and clears the
+/// same way.
+#[test]
+fn fold_lifecycle_done_clears_a_blocked_needs_input_on_the_same_run() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::LifecycleObserved {
+            status: "Blocked".to_string(),
+            detail: Some("the actor is waiting on its pane w4X:p2".to_string()),
+        },
+    ));
+    events.push(event(
+        "ev-5",
+        "work-1",
+        Some("run-1"),
+        2,
+        EventKind::LifecycleObserved {
+            status: "Done".to_string(),
+            detail: None,
+        },
+    ));
+    let resolved = wirk_core::fold(&events);
+    assert!(
+        matches!(resolved.state, WorkState::Active),
+        "{:?}",
+        resolved.state
+    );
+    assert_eq!(resolved.needs_input, None);
+}
+
+/// `Unknown` is Herdr declining to say what the pane is doing. Honest
+/// ambiguity is not evidence that a human answered anything, so it
+/// clears nothing — the Work stays `NeedsInput` with the blocked cause
+/// it already had.
+#[test]
+fn fold_lifecycle_unknown_does_not_clear_a_blocked_needs_input() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::LifecycleObserved {
+            status: "Blocked".to_string(),
+            detail: Some("the actor is waiting on its pane w4X:p2".to_string()),
+        },
+    ));
+    events.push(event(
+        "ev-5",
+        "work-1",
+        Some("run-1"),
+        2,
+        EventKind::LifecycleObserved {
+            status: "Unknown".to_string(),
+            detail: None,
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::NeedsInput),
+        "an Unknown status is the absence of an observation, never a resolution: {:?}",
+        work.state
+    );
+    assert_eq!(
+        work.needs_input.expect("still needs_input").reason,
+        "blocked"
+    );
+}
+
+/// The attribution half: a `"blocked"` cause names the Run whose pane
+/// is blocked, and only that Run's own later lifecycle may clear it.
+/// The live hazard (ruling 0113): an *older* Run's pane is still alive
+/// in Herdr and still reporting, while the Run actually being driven
+/// sits blocked on a permission prompt. That older pane going
+/// `Working` says nothing about the blocked one and must not clear its
+/// cause — the human's prompt is still on screen, unanswered. Red
+/// before this wave: the arm checked the cause's `reason` and never
+/// its `run`, so any Run's `Working` cleared any other Run's block.
+#[test]
+fn fold_lifecycle_working_on_another_run_does_not_clear_a_blocked_needs_input() {
+    let mut events = base_events();
+    // A retry: `run-2` is the Run being driven now; `run-1`'s pane is
+    // the predecessor still alive in the session.
+    events.push(event("ev-4", "work-1", None, 1, waypoint_reserved("wp-1")));
+    events.push(event(
+        "ev-5",
+        "work-1",
+        Some("run-2"),
+        1,
+        run_opened("run-2", "wp-1"),
+    ));
+    events.push(event(
+        "ev-6",
+        "work-1",
+        Some("run-2"),
+        2,
+        EventKind::LifecycleObserved {
+            status: "Blocked".to_string(),
+            detail: Some("the actor is waiting on its pane w4X:p2".to_string()),
+        },
+    ));
+    events.push(event(
+        "ev-7",
+        "work-1",
+        Some("run-1"),
+        3,
+        EventKind::LifecycleObserved {
+            status: "Working".to_string(),
+            detail: None,
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::NeedsInput),
+        "another Run's lifecycle must never clear this Run's blocked cause: {:?}",
+        work.state
+    );
+    let cause = work.needs_input.expect("still needs_input");
+    assert_eq!(cause.reason, "blocked");
+    assert_eq!(cause.run, RunId("run-2".to_string()));
+}

@@ -66,6 +66,26 @@
 //! `LifecycleObserved{Working}` is what clears it back to `Active`
 //! (already journaled by this same write, for every status).
 //!
+//! **P3 native usability (ruling 0113): resuming the SAME Run after a
+//! resolved permission prompt.** A Run held at a harness trust or
+//! permission prompt ends `NeedsInput{blocked}`. When the human answers
+//! it, the next `wirk run` reconciles onto that still-live pane
+//! (`observe_admitted_launch`) — and used to read the block straight
+//! back off the replayed `wirkd watch` stream and stop again, without
+//! ever delivering the task. `run_opened_this_run` cannot gate that: a
+//! resume drives the same Run, whose own `RunOpened` sits in the
+//! replayed prefix *ahead* of the block. Two things resolve it, and
+//! both are observations, never inferences. `drive` observes the status
+//! Herdr already reported for the reconciled pane
+//! (`observe_agent_status`), because a subscription delivers only
+//! *changes* and an answered-and-idle actor makes none until it is
+//! prompted; and `observe_watch` withholds a `NeedsInput` decision
+//! whose cause is *this* Run's own block while that observation says
+//! the pane is no longer blocked (`block_this_run_has_since_left`). A
+//! pane still sitting on its prompt still stops the loop, with the
+//! reason it reads off the pane now; every other `NeedsInput` cause is
+//! untouched.
+//!
 //! **P2.3 W5 (build-brief.md §9): `Done` is a turn end, exactly like
 //! `Idle`.** Herdr's own `status_name` (`refs/herdr/src/app/
 //! agent_view.rs`) maps one detector state, `AgentState::Idle`, to two
@@ -114,7 +134,7 @@ use thiserror::Error;
 
 use wirk_core::{
     ActorKind, ActorWorld, AttemptHolder, Event, EventKind, FailureCause, Run, RunId, RunState,
-    Timestamp, WorkId, WorkState, World, fold,
+    Timestamp, Work, WorkId, WorkState, World, fold,
 };
 
 use crate::{
@@ -206,6 +226,16 @@ pub enum Outcome {
     /// its own stream's end (cannot happen by construction; kept so the
     /// channel-receive match stays exhaustive against `RecvError`).
     Pending,
+}
+
+/// What `RunLoop::resume_authority` concluded from the complete
+/// current journal (its own doc): whether a resumed drive may act on
+/// the pane it just reconciled onto, or must leave it untouched and
+/// stop with the outcome the journal names.
+#[derive(Debug)]
+enum ResumeAuthority {
+    Continue,
+    Withheld { outcome: Outcome, detail: String },
 }
 
 #[derive(Debug, Error)]
@@ -385,6 +415,13 @@ pub struct RunLoop<C: HerdrClient, W: WirkdApi> {
     /// history being caught up on, not yet "now". Cleared at the top of
     /// every `drive` alongside `watch_events`.
     run_opened_this_run: bool,
+    /// Ruling 0113 (P3 native usability): the status Herdr reported for
+    /// the pane this Run was *reconciled onto* (`observe_admitted_launch`),
+    /// carried from `launch` to `drive` so the resumed loop starts from
+    /// what the pane is doing **now** rather than from what the journal
+    /// last recorded about it. Taken (cleared) by `drive` the moment it
+    /// is observed, so it is never re-applied.
+    resumed_status: Option<AgentStatus>,
     progress_baseline: Option<ProgressBaseline>,
     /// P2.3 W6 (build-brief.md §10): true once this `RunLoop` has sent
     /// its very first prompt (the intent, `PromptProgress::First`) --
@@ -430,6 +467,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             run_state: None,
             watch_events: Vec::new(),
             run_opened_this_run: false,
+            resumed_status: None,
             progress_baseline: None,
             has_prompted: false,
             stuck_observation: None,
@@ -747,10 +785,17 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             ])
             .map_err(|err| RunLoopError::Herdr(HerdrExecutorError::Herdr(err)))?;
         self.launched_pane = Some(pane.pane_id.clone());
+        // Ruling 0113: what this pane is doing *now* is the fact the
+        // resume turns on, and this reply is the only place it is
+        // available before the subscription's first change event --
+        // which, for a pane sitting still after a human answered its
+        // prompt, may never come at all. `drive` observes it the same
+        // way it observes any other status Herdr reports.
+        self.resumed_status = Some(pane.agent_status);
         self.log_line(&format!(
             "launch reconciled: this Run's request was already admitted and Herdr reports its \
-             agent live in pane {}; attaching to it rather than launching again",
-            pane.pane_id
+             agent live in pane {} ({:?}); attaching to it rather than launching again",
+            pane.pane_id, pane.agent_status
         ));
         self.wirkd
             .record(
@@ -868,6 +913,53 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         spawn_herdr_reader(herdr_events, tx.clone());
         spawn_watch_reader(watch_events, tx);
 
+        // Ruling 0113: `launch` reconciled onto a pane that was already
+        // alive, so this loop has never seen a status for it and the
+        // subscription only ever delivers *changes*. A pane whose human
+        // has just answered its permission prompt sits at `Idle` and
+        // changes nothing further until it is prompted — so waiting for
+        // the subscription to say what it is doing is waiting for a
+        // transition that the resume itself is what unblocks. The
+        // status Herdr already gave in its `agent.get` reply is
+        // observed here, through exactly the path a subscribed status
+        // takes: journaled as the `LifecycleObserved` it is. Nothing is
+        // synthesized — an `Idle` is recorded as `Idle`.
+        //
+        // The observation is journaled here and *nothing is prompted
+        // from it here* (the correction to this path): at this instant
+        // not one watch event has been folded, so the loop knows only
+        // what this pane is doing, never why the Work is being held.
+        // Delivering the task from that alone hands an actor its work
+        // back while the human's own decision — a filed Question, an
+        // out-of-boundary refusal, a failed Run — is still open.
+        // `resume_authority` below is what establishes the other half.
+        if let Some(resumed) = self.resumed_status.take() {
+            if let Some(outcome) =
+                self.observe_agent_status_may_prompt(work_id, run, &actor, &resumed, false)?
+            {
+                return Ok(outcome);
+            }
+            match self.resume_authority(work_id, run)? {
+                ResumeAuthority::Continue => {
+                    if turn_ended(resumed) {
+                        let progress = if self.has_prompted {
+                            PromptProgress::FirstContinuation
+                        } else {
+                            PromptProgress::First
+                        };
+                        self.maybe_prompt(run, &actor, resumed, progress)?;
+                    }
+                }
+                ResumeAuthority::Withheld { outcome, detail } => {
+                    self.log_line(&detail);
+                    if matches!(outcome, Outcome::NeedsInput) {
+                        self.needs_input = true;
+                    }
+                    return Ok(outcome);
+                }
+            }
+        }
+
         let outcome = self.drive_channel(work_id, run, &actor, rx);
         if let Err(err) = &outcome
             && !matches!(err, RunLoopError::WirkdGone { .. })
@@ -930,6 +1022,44 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         let HerdrEvent::PaneAgentStatusChanged { agent_status, .. } = event else {
             return Ok(None);
         };
+        self.observe_agent_status(work_id, run, actor, agent_status)
+    }
+
+    /// One observed agent status, wherever it came from: the pane
+    /// subscription (`observe_herdr`) or, on a resume, the `agent.get`
+    /// reply the reconciliation itself read (`drive`, ruling 0113).
+    /// Both are Herdr saying what this pane is doing; neither is
+    /// inferred, so both are handled identically and journaled
+    /// identically.
+    fn observe_agent_status(
+        &mut self,
+        work_id: &WorkId,
+        run: &Run,
+        actor: &ActorWorld,
+        agent_status: &AgentStatus,
+    ) -> Result<Option<Outcome>, RunLoopError<W>> {
+        self.observe_agent_status_may_prompt(work_id, run, actor, agent_status, true)
+    }
+
+    /// `observe_agent_status`, with the one thing a *resumed* status
+    /// may not do yet made explicit: `may_prompt`.
+    ///
+    /// The whole observation — the `last_status` update, the blocked
+    /// notification, the `LifecycleObserved` write, the screen read
+    /// that gives a `Blocked` its reason — is identical either way and
+    /// happens either way. Only the delivery at the end is withheld,
+    /// and only for the reconciliation's own `agent.get` reply
+    /// (`drive`), which is read before a single watch event has been
+    /// folded. A status arriving on the subscription passes `true`:
+    /// that loop has been folding the journal all along.
+    fn observe_agent_status_may_prompt(
+        &mut self,
+        work_id: &WorkId,
+        run: &Run,
+        actor: &ActorWorld,
+        agent_status: &AgentStatus,
+        may_prompt: bool,
+    ) -> Result<Option<Outcome>, RunLoopError<W>> {
         let changed = self.last_status != Some(*agent_status);
         self.last_status = Some(*agent_status);
         if !changed {
@@ -998,7 +1128,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             _ => {}
         }
 
-        if !turn_ended(*agent_status) {
+        if !turn_ended(*agent_status) || !may_prompt {
             return Ok(None);
         }
 
@@ -1060,6 +1190,95 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
 
         self.maybe_prompt(run, actor, *agent_status, progress)?;
         Ok(None)
+    }
+
+    /// The correction to ruling 0113's resume: what the **complete
+    /// current** journal for this exact Work and this exact Run says
+    /// about whether a resumed drive may act at all.
+    ///
+    /// A resume reconciles onto a live pane and reads its status from
+    /// `agent.get`. That is a fresh observation of the pane and nothing
+    /// more: it says the actor's turn has ended, never why the Work is
+    /// being held. The journal is the other half, and it cannot be read
+    /// off the watch stream at this point — `wirkd`'s `watch` replays
+    /// the whole journal before it live-tails and carries no
+    /// end-of-replay marker, so any fold taken while the replay is
+    /// still arriving is a *prefix*: a Run whose first block was
+    /// resolved may still have a Question, a refusal, a failure or a
+    /// Claim ahead of it in that same replay. Deciding on the prefix is
+    /// deciding on history.
+    ///
+    /// So the authority asked for here is the one read that is already
+    /// complete when it answers: `wirkd`'s own `status` (R2 — the
+    /// scoped, acknowledged read `release_earlier_panes` already makes
+    /// on this same socket, `WirkdApi::status`'s own doc: "kept for a
+    /// caller that wants a point-in-time read"). It is taken *after*
+    /// this resume has journaled its own observation, so the fold it
+    /// answers with includes that observation — the very event that
+    /// clears a resolved `"blocked"` cause (`fold`, `wirk-core`) — and
+    /// every event that followed it. No sleep orders this and no
+    /// `Working` is invented: one request, one complete answer.
+    ///
+    /// `Continue` requires **both** halves to say so, and says nothing
+    /// on its own about prompting (`turn_ended` still governs that):
+    ///
+    /// * the Work folds `Active`. Every hold this loop must not clear
+    ///   is `NeedsInput` in that same fold — a still-unresolved block,
+    ///   a filed Question, an `out_of_boundary` refusal, a `RunFailed`,
+    ///   a `RunVanished` — and every terminal or held Work
+    ///   (`Completed`/`Failed`/`Canceled`/`Waiting`/`Pending`) is not
+    ///   `Active` either.
+    /// * this Run is `Open`. A Run already `Claimed` mid-Route leaves
+    ///   its Work `Active`, and a claimed Run is not one to hand its
+    ///   task back to.
+    ///
+    /// Anything else is `Withheld`, named in a printed line and in this
+    /// invocation's exit: `Claimed` when the Run is claimed (what it
+    /// is), `NeedsInput` otherwise — a human has to look, which is
+    /// exactly what exit 4 means. Withheld never prompts, not even
+    /// transiently.
+    ///
+    /// One consequence, stated rather than hidden: this makes the
+    /// daemon a participant in the resume. A `wirkd` whose own `fold`
+    /// predates ruling 0113 still answers `NeedsInput{blocked}` after
+    /// the resumed `Idle` is journaled, so the resume withholds and
+    /// exits 4 — the behaviour before ruling 0113 exactly, not a hang
+    /// and not a false continuation. Restarting `wirkd` from a build
+    /// that carries the fold is what the resume needs, and the journal
+    /// then shows a reader exactly what this decision saw.
+    fn resume_authority(
+        &self,
+        work_id: &WorkId,
+        run: &Run,
+    ) -> Result<ResumeAuthority, RunLoopError<W>> {
+        let status = self.wirkd.status(work_id).map_err(RunLoopError::Wirkd)?;
+        let run_state = status
+            .runs
+            .iter()
+            .find(|entry| entry.run_id == run.id)
+            .map(|entry| entry.state.clone());
+        if matches!(status.work_state, WorkState::Active)
+            && matches!(run_state, Some(RunState::Open))
+        {
+            return Ok(ResumeAuthority::Continue);
+        }
+        let outcome = if matches!(run_state, Some(RunState::Claimed(_))) {
+            Outcome::Claimed
+        } else {
+            Outcome::NeedsInput
+        };
+        Ok(ResumeAuthority::Withheld {
+            outcome,
+            detail: format!(
+                "resume withheld: this Work's complete current journal says {:?} (run {}: {}) — \
+                 the reconciled pane is left exactly as it is and nothing is delivered to it",
+                status.work_state,
+                run.id.0,
+                run_state
+                    .map(|state| format!("{state:?}"))
+                    .unwrap_or_else(|| "not present in this Work's status".to_string()),
+            ),
+        })
     }
 
     /// One watch-stream `Event`: folds it onto the loop's own tracked
@@ -1124,11 +1343,62 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         if has_work_submitted {
             let work = fold(&self.watch_events);
             if matches!(work.state, WorkState::NeedsInput) {
+                if self.block_this_run_has_since_left(&work) {
+                    return None;
+                }
                 self.needs_input = true;
                 return Some(Outcome::NeedsInput);
             }
         }
         None
+    }
+
+    /// Ruling 0113: true when the `NeedsInput` this fold produced is a
+    /// `"blocked"` cause on the very Run this loop is driving, *and*
+    /// the loop's own current observation of that pane says it is no
+    /// longer blocked.
+    ///
+    /// `run_opened_this_run` cannot cover this case: a resume drives
+    /// the SAME Run, so its own `RunOpened` sits in the replayed prefix
+    /// ahead of the block, the gate opens on it, and the block that
+    /// follows is read as "now" when it is in fact the condition the
+    /// resume exists to have cleared. What separates the two is not
+    /// position in the stream but the pane itself, so that is what is
+    /// asked: `last_status` is only ever set from a status Herdr
+    /// reported (the subscription, or the reconciliation's own
+    /// `agent.get` reply — `observe_agent_status`), never inferred.
+    ///
+    /// Deliberately narrow:
+    ///
+    /// * only `reason == "blocked"`. A filed Question, a `RunFailed`, a
+    ///   vanished Run, a refusal — every other cause is a decision this
+    ///   loop has no standing to overrule, and terminal states never
+    ///   reach here at all (`fold`'s own `is_terminal` guards).
+    /// * only this Run's own block. Another Run's blocked pane is not
+    ///   this pane, and this pane's status says nothing about it.
+    /// * only `Working`/`Idle`/`Done` — the three statuses that
+    ///   positively say the pane is not sitting on a prompt. `Blocked`
+    ///   keeps the `NeedsInput`, and `Unknown`, or no observation at
+    ///   all, is Herdr declining to answer: honest ambiguity, never a
+    ///   resolution.
+    ///
+    /// The journal reaches the same conclusion by the same evidence:
+    /// the observation this loop journals for that status is what
+    /// clears the cause in `fold` (`wirk-core`), so a later reader of
+    /// the journal alone sees exactly what this decision saw.
+    fn block_this_run_has_since_left(&self, work: &Work) -> bool {
+        let Some(cause) = work.needs_input.as_ref() else {
+            return false;
+        };
+        let Some(run_state) = self.run_state.as_ref() else {
+            return false;
+        };
+        cause.reason == "blocked"
+            && cause.run == run_state.id
+            && matches!(
+                self.last_status,
+                Some(AgentStatus::Working | AgentStatus::Idle | AgentStatus::Done)
+            )
     }
 
     /// D133: prompted only while Idle (the caller's own guard),
@@ -1407,13 +1677,24 @@ pub fn compose_first_prompt(actor: &ActorWorld, kind: &ActorKind) -> String {
 // comment already gives).
 
 /// A `WirkdApi` whose `watch` stream is a channel the test feeds
-/// (`push_watch_event`) and closes (`close_watch`); `status`'s reply is
-/// fixed in advance (kept for a caller that still reads it — `RunLoop`
-/// itself no longer does); `record` calls are recorded, never actually
-/// journaled anywhere.
+/// (`push_watch_event`) and closes (`close_watch`); `record` calls are
+/// recorded.
+///
+/// `status` answers one of two ways. A reply fixed in advance
+/// (`with_status`/`set_status`) is returned verbatim — what every test
+/// written before the resume authority used. Otherwise, if the test
+/// seeded a journal (`with_journal`), `status` answers the way the
+/// daemon does: it **folds** that journal, including every event
+/// `record` has appended to it since, and derives each Run's own state
+/// by replaying it through `Run::apply` (0040 D127 — a fake behaves
+/// like the service; a canned `WorkState` here would let a test assert
+/// a resume decision the real daemon would never have answered with).
 #[derive(Debug)]
 pub struct FakeWirkdApi {
     status_response: Mutex<Option<WorkStatus>>,
+    /// The journal this fake answers `status` from when no reply is
+    /// fixed in advance: seeded by the test, appended to by `record`.
+    journal: Mutex<Vec<Event>>,
     recorded: Mutex<Vec<(WorkId, RunId, EventKind)>>,
     watch_tx: Mutex<Option<mpsc::Sender<Result<Event, FakeWirkdError>>>>,
     watch_rx: Mutex<Option<mpsc::Receiver<Result<Event, FakeWirkdError>>>>,
@@ -1425,6 +1706,7 @@ impl Default for FakeWirkdApi {
         let (tx, rx) = mpsc::channel();
         FakeWirkdApi {
             status_response: Mutex::new(None),
+            journal: Mutex::new(Vec::new()),
             recorded: Mutex::new(Vec::new()),
             watch_tx: Mutex::new(Some(tx)),
             watch_rx: Mutex::new(Some(rx)),
@@ -1442,6 +1724,16 @@ impl FakeWirkdApi {
     /// Replaces the configured `status` reply after construction.
     pub fn set_status(&self, status: WorkStatus) {
         *self.status_response.lock().unwrap() = Some(status);
+    }
+
+    /// Seeds the journal this fake folds to answer `status` — the
+    /// history that already existed when the drive under test started,
+    /// exactly what a real `wirkd` would have on disk. `record` appends
+    /// to this same journal, so an observation the loop writes is in
+    /// the next `status` answer, as it is in the real one.
+    pub fn with_journal(self, events: Vec<Event>) -> Self {
+        *self.journal.lock().unwrap() = events;
+        self
     }
 
     pub fn recorded(&self) -> Vec<(WorkId, RunId, EventKind)> {
@@ -1471,6 +1763,48 @@ impl FakeWirkdApi {
     }
 }
 
+/// Every Run `events` opens, with the state replaying those same events
+/// through `Run::apply` leaves it in — the daemon's own `find_run`
+/// (`wirk/src/wirkd/server.rs`) reduced to the one field
+/// `WirkdApi::status` reports. `Run::apply` already ignores an event
+/// naming another Run, so one pass over the journal serves them all.
+fn fake_run_states(events: &[Event]) -> Vec<RunStatusEntry> {
+    let mut runs: Vec<Run> = Vec::new();
+    for event in events {
+        if let EventKind::RunOpened {
+            run: opened,
+            waypoint,
+            attempt,
+            world_hash,
+        } = &event.kind
+            && !runs.iter().any(|run| &run.id == opened)
+        {
+            runs.push(Run {
+                id: opened.clone(),
+                waypoint: waypoint.clone(),
+                attempt: *attempt,
+                world_hash: world_hash.clone(),
+                state: RunState::Open,
+                kind: ActorKind::default(),
+                selection: wirk_core::ActorSelection::default(),
+                launched: false,
+                launch_requested: false,
+                launch_attempt: None,
+                launch_argv: Vec::new(),
+            });
+        }
+        for run in runs.iter_mut() {
+            run.apply(event);
+        }
+    }
+    runs.into_iter()
+        .map(|run| RunStatusEntry {
+            run_id: run.id,
+            state: run.state,
+        })
+        .collect()
+}
+
 #[derive(Debug, Error, Clone)]
 #[error("FakeWirkdApi: {0}")]
 pub struct FakeWirkdError(pub String);
@@ -1480,14 +1814,37 @@ impl WirkdApi for FakeWirkdApi {
 
     fn status(&self, _work_id: &WorkId) -> Result<WorkStatus, Self::Error> {
         *self.status_calls.lock().unwrap() += 1;
-        self.status_response
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| FakeWirkdError("no status configured".to_string()))
+        if let Some(fixed) = self.status_response.lock().unwrap().clone() {
+            return Ok(fixed);
+        }
+        let journal = self.journal.lock().unwrap().clone();
+        // A real journal always opens with `WorkSubmitted` (`fold`'s
+        // own documented precondition); a fake whose test seeded no
+        // history has no Work to answer for, exactly as `wirkd` answers
+        // `NotFound` for a Work it has no journal for.
+        if !journal
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::WorkSubmitted { .. }))
+        {
+            return Err(FakeWirkdError("no status configured".to_string()));
+        }
+        Ok(WorkStatus {
+            work_state: fold(&journal).state,
+            runs: fake_run_states(&journal),
+        })
     }
 
     fn record(&self, work_id: &WorkId, run_id: &RunId, kind: EventKind) -> Result<(), Self::Error> {
+        let mut journal = self.journal.lock().unwrap();
+        let seq = journal.len();
+        journal.push(Event {
+            id: wirk_core::EventId(format!("fake-event-{seq}")),
+            work: work_id.clone(),
+            run: Some(run_id.clone()),
+            at: Timestamp(0),
+            kind: kind.clone(),
+        });
+        drop(journal);
         self.recorded
             .lock()
             .unwrap()

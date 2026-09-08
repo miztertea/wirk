@@ -233,3 +233,48 @@ fn plugin_init_writes_the_estate_file() {
     assert!(output.status.success(), "wirk plugin init must exit 0");
     assert_eq!(written.unwrap().trim(), "/var/tmp/some-estate");
 }
+
+/// Ruling 0117: the two operator surfaces this manifest wraps —
+/// the `wirkd-status` action and the status pane — read the estate the
+/// operator configured, administratively. They must **name** that
+/// scope. The verb's own default now follows the environment the
+/// process is in, so a wrapper that says nothing is a wrapper whose
+/// surface depends on which triple its pane inherited; the guard here
+/// is what stops one edit from reintroducing the omitted default the
+/// correction removed.
+#[test]
+fn the_operator_wrappers_name_the_scope_they_read_in() {
+    let doc = manifest();
+    let program = |command: &Value| -> String {
+        command
+            .as_array()
+            .expect("command is an array")
+            .iter()
+            .map(|part| part.as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let status_action = doc["actions"]
+        .as_array()
+        .expect("actions")
+        .iter()
+        .find(|action| action["id"].as_str() == Some("wirkd-status"))
+        .expect("the wirkd-status action");
+    let status_pane = doc["panes"]
+        .as_array()
+        .expect("panes")
+        .iter()
+        .find(|pane| pane["id"].as_str() == Some("status"))
+        .expect("the status pane");
+
+    for (what, command) in [
+        ("the wirkd-status action", &status_action["command"]),
+        ("the status pane", &status_pane["command"]),
+    ] {
+        let text = program(command);
+        assert!(
+            text.contains("--admin"),
+            "{what} must name the administrative scope it reads in: {text}"
+        );
+    }
+}

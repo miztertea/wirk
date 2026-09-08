@@ -53,15 +53,27 @@ impl Drop for KillOnDrop {
 }
 
 pub fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
-    let child = KillOnDrop(
-        Command::new(wirk_bin())
-            .args(["wirkd", "start", "--estate"])
-            .arg(estate)
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn wirkd"),
-    );
+    start_wirkd_with_path(estate, None)
+}
+
+/// The same real daemon, optionally started with a `PATH` of the
+/// caller's choosing. `findings.rs`'s deterministic Application races
+/// use it to put `git_gate`'s wrapper in front of the `git` the daemon
+/// itself already shells out to (R4: a process's own `PATH`), which is
+/// what lets a race be ordered without a single line of product
+/// instrumentation. `None` is the ambient environment, byte for byte
+/// what every other caller already gets.
+pub fn start_wirkd_with_path(estate: &Path, path: Option<&str>) -> (KillOnDrop, WirkdPointer) {
+    let mut command = Command::new(wirk_bin());
+    command
+        .args(["wirkd", "start", "--estate"])
+        .arg(estate)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let child = KillOnDrop(command.spawn().expect("spawn wirkd"));
     let pointer = wait_for_pointer(estate);
     (child, pointer)
 }
@@ -87,6 +99,21 @@ pub fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
 /// A fresh throwaway Git repository with one empty base commit — every
 /// Work in this file gets its own (module doc: `cwd` is the checkout
 /// itself for a Git-basis Deterministic World, no per-Work worktree).
+/// The base commit's author and committer dates are **pinned**, so
+/// every repository this harness creates has one fixed base SHA rather
+/// than one that depends on which wall-clock second the process reached
+/// this line.
+///
+/// Several tests here compare two independently created repositories'
+/// derived identities — an obligation `basis` folds the reserved
+/// World's hash, which folds the repository's own `base_sha` — and
+/// therefore silently required both `init_repo` calls to land inside
+/// the same second. They passed on a quiet machine and failed under
+/// load, which is not a test (`CLAUDE.md`: "a test is deterministic and
+/// has been watched fail, or it is not a test"). Observed as
+/// `child_investigation_confirmed_...` failing its own
+/// "the stranger's own verification is real and settled" assertion
+/// during a full-suite run while passing alone.
 pub fn init_repo(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo dir");
     let run = |args: &[&str]| {
@@ -94,6 +121,8 @@ pub fn init_repo(repo: &Path) {
             Command::new("git")
                 .args(args)
                 .current_dir(repo)
+                .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00+0000")
+                .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00+0000")
                 .status()
                 .expect("git runs")
                 .success(),
@@ -258,9 +287,7 @@ pub fn claim_ok(estate: &Path, work_id: &str, run_id: &str, artifact: &str) {
 pub fn status(socket: &Path, work_id: &str) -> serde_json::Value {
     let reply = wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.to_string()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.to_string()))),
     )
     .expect("status call succeeds");
     match reply {

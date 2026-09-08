@@ -127,7 +127,8 @@ fn spawn_watch(
     let socket = socket.to_path_buf();
     let work_id = work_id.clone();
     let handle = std::thread::spawn(move || {
-        let events = wirkd::client::watch(&socket, WatchPayload { work_id }).expect("watch dials");
+        let events =
+            wirkd::client::watch(&socket, WatchPayload::admin(work_id)).expect("watch dials");
         for event in events {
             match event {
                 Ok(event) => {
@@ -166,7 +167,7 @@ fn watch_first_bounded(
     let (tx, rx) = mpsc::channel();
     let socket = socket.to_path_buf();
     std::thread::spawn(move || {
-        let outcome = match wirkd::client::watch(&socket, WatchPayload { work_id }) {
+        let outcome = match wirkd::client::watch(&socket, WatchPayload::admin(work_id)) {
             Ok(mut events) => events.next().map(|r| r.map_err(|err| err.to_string())),
             Err(err) => Some(Err(err.to_string())),
         };
@@ -547,6 +548,11 @@ fn live_streamed_event_id_matches_the_persisted_event() {
 /// `wirkd::client::watch`'s iterator.
 fn spawn_cli_watch(estate: &Path) -> (std::process::Child, mpsc::Receiver<String>) {
     let mut child = Command::new(wirk_bin())
+        // The operator's own stream (ruling 0117), not the runner's
+        // inherited actor context.
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID")
         .args(["wirkd", "watch", "--estate"])
         .arg(estate)
         .stdout(Stdio::piped())
@@ -598,6 +604,9 @@ fn cli_watch_of_unknown_work_exits_nonzero_and_labels_the_refusal() {
     let _pointer = wait_for_pointer(&estate);
 
     let output = Command::new(wirk_bin())
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID")
         .args(["wirkd", "watch", "--estate"])
         .arg(&estate)
         .args(["--work", "work-never-submitted"])

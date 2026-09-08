@@ -219,6 +219,12 @@ fn submit_actor_with_repo(
 /// paths, so this reads it the way an operator would.
 fn work_status_cli(estate: &Path, work_id: &str) -> String {
     let output = Command::new(wirk_bin())
+        // The operator's own read: ruling 0117 makes an inherited actor
+        // triple mean something here, so this asks for the operator
+        // rather than inheriting the runner's environment.
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID")
         .args(["work", "status", "--estate"])
         .arg(estate)
         .args(["--work", work_id])
@@ -237,9 +243,7 @@ fn work_status_cli(estate: &Path, work_id: &str) -> String {
 fn reserved_world(socket: &Path, work_id: &str) -> World {
     let reply = wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.to_string()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.to_string()))),
     )
     .expect("status call succeeds");
     match reply {
@@ -908,9 +912,7 @@ fn retry(socket: &Path, estate: &Path, work_id: &str, run_id: &str) -> Reply {
 fn run_state(socket: &Path, work_id: &str, run_id: &str) -> RunState {
     let reply = wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.to_string()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.to_string()))),
     )
     .expect("status call succeeds");
     let result = match reply {

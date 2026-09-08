@@ -475,7 +475,15 @@ impl AtlasStore {
             Err(error) => Err(error),
         }
     }
-    fn write_sync(&self, path: &Path, bytes: &[u8]) -> Result<(), AtlasError> {
+    /// W-B (`findings.rs`): the estate root, so a second append-only log
+    /// beside `relationships.ndjson` can reuse this store's own
+    /// temp-file/fsync/rename/directory-fsync discipline verbatim rather
+    /// than inventing a second durability protocol (`append_relationship`'s
+    /// own doc: "not a second ad hoc durability protocol").
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.root
+    }
+    pub(crate) fn write_sync(&self, path: &Path, bytes: &[u8]) -> Result<(), AtlasError> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -777,11 +785,11 @@ fn valid_path(path: &[u8]) -> bool {
 
 /// Deliberately process-level so a verifier can exercise real crash windows
 /// from a child process, rather than substituting a fake store failure.
-pub(crate) fn checkpoint_public(name: &str) {
-    checkpoint(name)
-}
-
-fn checkpoint(name: &str) {
+/// `pub(crate)` (W-B `findings.rs`, W4-A `semantic.rs`): the identical
+/// failpoint mechanism, reused rather than a second one invented for a
+/// second append-only log or for the semantic edition writer
+/// (`WIRK_ATLAS_FAILPOINT`'s own env var, one gate for the whole crate).
+pub(crate) fn checkpoint(name: &str) {
     if std::env::var("WIRK_ATLAS_FAILPOINT").ok().as_deref() == Some(name) {
         std::process::exit(86);
     }

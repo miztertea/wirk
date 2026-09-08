@@ -129,6 +129,41 @@ pub enum Verb {
     AtlasResolve,
     /// P3 W3: admits one evidenced `GovernedBy` relationship.
     AtlasRelate,
+    /// W-B (§5.2): an actor's own bounded, evidence-backed claim.
+    /// Triple-checked like `claim` — `wirkd` refuses a Run that is not
+    /// current for its Waypoint.
+    FindingRaise,
+    /// W-B (§2.5): records an honestly unverified human/client
+    /// assertion. No execution triple — an operator verb, never a
+    /// settlement (construction review: "do not make a command named
+    /// `settle` return success while only appending an assertion").
+    FindingAssert,
+    /// W-B (§2.4): requests wirkd evaluate the named finding's
+    /// settlement readiness right now and returns the real outcome —
+    /// settled, still pending (naming why), or refused. Never a wire
+    /// field for a decision: settling is minting a derived fact, not
+    /// recording an asserted one.
+    FindingSettle,
+    /// W-B (§4): records the owning source's mechanical before/after
+    /// change plus the attributed judgement that it implements the
+    /// finding — never a bare `applied: true`.
+    FindingApplied,
+    /// W-B (§9): every finding this estate (or one Work) knows about,
+    /// with its settlement/assertions/application.
+    FindingList,
+    /// W-B (§7): the estate's derived Findings index — list, or rebuild
+    /// it from journals alone.
+    AtlasFindings,
+    /// W-B basis access (`loop-b-basis-access`, the integrated review's
+    /// §5.1): read-only inspection of the verification obligations a
+    /// Work's own Route declares, each with the canonical
+    /// `wirk_core::obligation_basis` its currently reserved World
+    /// produces and the admission state of this estate's own settlement
+    /// policy against it. Mints nothing, admits nothing, appends
+    /// nothing — the value an operator needs to write
+    /// `policy/settlement.json` by hand, which before this verb existed
+    /// only inside an already-settled record.
+    WorkObligations,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -304,6 +339,57 @@ impl Request {
             payload: serde_json::to_value(payload).expect("AtlasRelatePayload always serializes"),
         }
     }
+
+    pub fn finding_raise(payload: FindingRaisePayload) -> Self {
+        Request {
+            verb: Verb::FindingRaise,
+            payload: serde_json::to_value(payload).expect("FindingRaisePayload always serializes"),
+        }
+    }
+
+    pub fn finding_assert(payload: FindingAssertPayload) -> Self {
+        Request {
+            verb: Verb::FindingAssert,
+            payload: serde_json::to_value(payload).expect("FindingAssertPayload always serializes"),
+        }
+    }
+
+    pub fn finding_settle(payload: FindingSettlePayload) -> Self {
+        Request {
+            verb: Verb::FindingSettle,
+            payload: serde_json::to_value(payload).expect("FindingSettlePayload always serializes"),
+        }
+    }
+
+    pub fn finding_applied(payload: FindingAppliedPayload) -> Self {
+        Request {
+            verb: Verb::FindingApplied,
+            payload: serde_json::to_value(payload)
+                .expect("FindingAppliedPayload always serializes"),
+        }
+    }
+
+    pub fn finding_list(payload: FindingListPayload) -> Self {
+        Request {
+            verb: Verb::FindingList,
+            payload: serde_json::to_value(payload).expect("FindingListPayload always serializes"),
+        }
+    }
+
+    pub fn atlas_findings(payload: AtlasFindingsPayload) -> Self {
+        Request {
+            verb: Verb::AtlasFindings,
+            payload: serde_json::to_value(payload).expect("AtlasFindingsPayload always serializes"),
+        }
+    }
+
+    pub fn work_obligations(payload: WorkObligationsPayload) -> Self {
+        Request {
+            verb: Verb::WorkObligations,
+            payload: serde_json::to_value(payload)
+                .expect("WorkObligationsPayload always serializes"),
+        }
+    }
 }
 
 /// `submit`'s payload (transport.md §2): the repository bindings the
@@ -383,9 +469,61 @@ pub struct ClaimPayload {
 }
 
 /// `status`'s payload (transport.md §2): the `Work` to report on.
+///
+/// W-B launch disclosure integration (the launch review's F-C):
+/// `requester`/`admin` is the identical exclusive pair
+/// `FindingListPayload` already carries, with **no silent unscoped
+/// default**. `status` returns compiled World content, a Run's resolved
+/// launch selection, Herdr's own `launch_argv`, the attempt's
+/// destination and every validated Claim's artifact paths and digests —
+/// the same record parts `event_source_disclosure` classifies as
+/// checkout-derived. It previously took no requester at all, so any
+/// caller that could reach the socket read all of them for any Work id.
+/// It now answers one of two named ways: scoped to a `requester` Work's
+/// own lineage and bindings, or explicitly `admin`.
+///
+/// `admin` is the *named* operator surface, exactly as it is on
+/// `finding list` and `atlas findings`, and exactly as honestly
+/// unauthenticated: the same OS uid runs an operator's terminal and an
+/// actor's shell, so naming it proves nothing and claims nothing. What
+/// it buys is that a scoped consultation can no longer *silently* fall
+/// through to the unscoped answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusPayload {
     pub work_id: WorkId,
+    /// The caller's own Work: it sees this Work only if it is in that
+    /// Work's own lineage, and sees the checkout-derived halves only if
+    /// its own bindings cover the target Work's whole binding set.
+    #[serde(default)]
+    pub requester: Option<WorkId>,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+impl StatusPayload {
+    /// The explicitly administrative read: every field, unscoped, for
+    /// any Work id. The human `wirk wirkd status`/`wirk work status`
+    /// verbs and estate tooling.
+    pub fn admin(work_id: WorkId) -> Self {
+        Self {
+            work_id,
+            requester: None,
+            admin: true,
+        }
+    }
+
+    /// The scoped consultation: `requester` is the caller's own Work.
+    /// A Work reading its *own* status is always fully admitted (its
+    /// bindings trivially cover its own), which is what keeps `wirk
+    /// run`'s setup read and `RunLoop`'s ongoing progress poll working
+    /// unchanged while never handing either an estate-wide surface.
+    pub fn scoped(work_id: WorkId, requester: WorkId) -> Self {
+        Self {
+            work_id,
+            requester: Some(requester),
+            admin: false,
+        }
+    }
 }
 
 /// `record`'s payload (item 4 W3): the `EventKind` to append, the `Work`
@@ -437,9 +575,47 @@ pub struct WorkFailPayload {
 }
 
 /// `watch`'s payload (item B): the Work whose journal to stream.
+///
+/// W-B launch disclosure integration (the launch review's F-C, applied
+/// to `status`'s own sibling): this streams the Work's **raw journal
+/// events**, launch metadata and captured pane details included, so it
+/// reaches strictly more than `status` does. It takes the identical
+/// exclusive `requester`/`admin` pair, with no silent unscoped default.
+///
+/// A stream is admitted or refused whole — there is no withheld marker
+/// here, because a partially redacted `Event` is not an `Event` and
+/// every consumer of this stream folds it. So a `requester` gets the
+/// stream when the target Work is on its own lineage *and* its own
+/// bindings cover that Work's whole binding set, and `InadmissibleEvidence`
+/// otherwise. `RunLoop`'s drive stream is a Work watching itself, which
+/// is always both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchPayload {
     pub work_id: WorkId,
+    #[serde(default)]
+    pub requester: Option<WorkId>,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+impl WatchPayload {
+    /// The explicitly administrative stream: any Work's raw journal.
+    pub fn admin(work_id: WorkId) -> Self {
+        Self {
+            work_id,
+            requester: None,
+            admin: true,
+        }
+    }
+
+    /// The scoped stream: `requester` is the caller's own Work.
+    pub fn scoped(work_id: WorkId, requester: WorkId) -> Self {
+        Self {
+            work_id,
+            requester: Some(requester),
+            admin: false,
+        }
+    }
 }
 
 /// `cancel`'s payload (W-A, §3.4): the Work to cancel, whether to
@@ -614,6 +790,203 @@ pub struct AtlasRelatePayload {
     pub run: Option<String>,
     #[serde(default)]
     pub world: Option<String>,
+}
+
+// ---- Findings (W-B) -----------------------------------------------------
+
+/// `finding raise`'s payload (§5.2, §9): the injected triple names the
+/// raising Run, `wirkd` refuses one that is not current for its
+/// Waypoint (`TripleMismatch`, the same rule `finding_raise` reuses from
+/// `claim`). `kind`/`scope` are closed strings
+/// (`"gap"|"contradicted_assumption"|"relationship"|"verified_outcome"`,
+/// `"work_local"|"estate_local"`) — parsed by `server.rs`, an unknown
+/// value refuses `BadRequest` rather than defaulting. Each
+/// `evidence`/`contradicts`/`applies_to` entry is either an
+/// already-hex-encoded `wirk_atlas::ExactCoordinate` (§3's `Source`
+/// form, `server.rs::encode_coordinate`'s own shape) or the literal
+/// `work/<id>/event/<id>` string (§3's `Journal` form) — `server.rs`
+/// tells the two apart by the `work/` prefix, since a hex string never
+/// contains `/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingRaisePayload {
+    pub triple: ExecutionTriple,
+    pub kind: String,
+    pub scope: String,
+    pub claim: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub contradicts: Vec<String>,
+    #[serde(default)]
+    pub applies_to: Vec<String>,
+    #[serde(default)]
+    pub supersedes: Option<String>,
+    #[serde(default)]
+    pub proposed_change: Option<String>,
+    /// W-B obligation proof: `--obligation <id>@<edition>`, the
+    /// verification obligation this Finding claims to discharge. A
+    /// pointer wirkd re-checks against the Route's own Waypoint
+    /// definition and the estate's own admitted policy — never a grant.
+    #[serde(default)]
+    pub obligation: Option<String>,
+    /// W-B obligation proof: `--confirmed-by work/<id>/finding/<id>`,
+    /// the child Finding this Finding names as its independent
+    /// confirmation. Explicit, never inferred from matching prose.
+    #[serde(default)]
+    pub confirmed_by: Option<String>,
+}
+
+/// `finding assert`'s payload (§2.5): no execution triple at all — this
+/// is the operator/client path, and `wirkd` records `by` as an honestly
+/// unverified label, never authority. `decision` is one of
+/// `"accepted"|"partially_accepted"|"rejected"|"deferred"|"superseded"`;
+/// `"rejected"` reads `reason` (defaults to empty), `"superseded"` reads
+/// `superseded_by` (a `FindingId`, required for that decision only).
+///
+/// W-B disclosure response repair
+/// (`W-B-DISCLOSURE-RESPONSE-REPAIR.md`): `requester`/`admin` is the
+/// same exclusive pair `FindingListPayload` already carries, no default.
+/// `assert` additionally *writes* a `FindingAsserted` event onto the
+/// target finding's own Work, so a non-admin requester off that Work's
+/// lineage is refused before anything is appended — scope admission is
+/// a read boundary, never itself settlement or write permission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingAssertPayload {
+    pub finding: String,
+    pub decision: String,
+    pub by: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub requester: Option<WorkId>,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+/// `finding settle`'s payload (§2.4, construction review): no decision
+/// field exists on the wire at all — `handle_finding_settle` requests a
+/// real evaluation of the named finding's admitted policy check and
+/// reports the actual outcome, never a client-supplied verdict.
+///
+/// W-B disclosure response repair: `requester`/`admin` is the same
+/// exclusive pair `FindingListPayload` already carries, no default. This
+/// only bounds what the *reply* discloses; the settlement evaluation
+/// itself is triggered and decided identically regardless of who asks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingSettlePayload {
+    pub finding: String,
+    #[serde(default)]
+    pub requester: Option<WorkId>,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+/// `work obligations`'s payload. `requester`/`admin` is the same
+/// exclusive, always-named pair `status`, `finding list` and `finding
+/// settle` carry — there is no silent unscoped default. `waypoint`
+/// narrows the answer to one Waypoint of that Work's own Route and
+/// refuses a name the Route does not carry, so a typo can never read as
+/// "this Work declares no obligation".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkObligationsPayload {
+    pub work_id: WorkId,
+    #[serde(default)]
+    pub waypoint: Option<String>,
+    #[serde(default)]
+    pub requester: Option<WorkId>,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+/// `finding applied`'s payload (§4): `source`/`revision` name the
+/// published generation `wirkd` re-derives and checks against, `by` is
+/// the same honestly-unverified label `finding assert` carries (an
+/// `Attribution::Claim` is only ever derived from a real Validated
+/// Claim, never from this field).
+///
+/// W-B-CORRECT.md defect 3 ("require current valid producing Work/Run/
+/// World for actor-attributed assertions"): `triple` is the caller's own
+/// injected pane triple, exactly like `FindingRaisePayload` — `wirkd`
+/// checks its currency (`TripleMismatch`/`WorkTerminal`/current-run)
+/// before recording *any* attribution, `Asserted` included. This closes
+/// the authority review's own executed counterexample: a bare `--by`
+/// string, with no Work, Run, or checkout at all, previously wrote a
+/// durable `FindingApplied` into another Work's journal. `claim`
+/// requests the exact, checked `Attribution::Claim` path over the
+/// caller's own current Run — a real Validated Done `ClaimRecorded` on
+/// it, that Work's own `Write` binding on the named `source`, and that
+/// Claim's own artifact receipt matching this Finding's exact path with
+/// a digest equal to the after-generation's actual bytes — instead of
+/// the default `Attribution::Asserted`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingAppliedPayload {
+    pub triple: ExecutionTriple,
+    pub finding: String,
+    pub source: String,
+    pub revision: String,
+    pub by: String,
+    /// W-B Application repair: the *cited historical* Claim, named
+    /// separately from `triple` above. `triple` is always the caller —
+    /// the current admitted producing action authoring the judgement
+    /// (ruling 0095) — while these two name a Run whose Validated Done
+    /// Claim is offered as causal evidence, and which is therefore
+    /// allowed to be spent, closed and its Work terminal. The frozen
+    /// candidate conflated the two into one `claim: bool` over the
+    /// caller's own triple, which is why a terminal producer had to be
+    /// admitted for the ordinary closing-Claim shape to work at all.
+    /// `claim_work` defaults to the caller's own Work.
+    #[serde(default)]
+    pub claim_run: Option<String>,
+    #[serde(default)]
+    pub claim_work: Option<String>,
+}
+
+/// `finding list`'s payload (§9): every finding in the estate, or one
+/// Work's own.
+///
+/// W-B-CORRECT.md defect 2 ("journal disclosure"): naming a `work` here
+/// is a *selection*, never itself an evidence grant ("selecting an
+/// origin Work id is not a general evidence grant"). A non-`admin` call
+/// must carry the caller's own `requester` Work id, and the daemon
+/// applies that Work's own effective admission (its own lineage) before
+/// returning anything — the same rule `admit_evidence`'s Journal branch
+/// already applies at raise time. `admin` is the one, explicit,
+/// separately-named administrative path that bypasses this and sees the
+/// whole estate or any named Work unscoped ("keep explicit
+/// administrative inspection separate").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingListPayload {
+    #[serde(default)]
+    pub work: Option<WorkId>,
+    #[serde(default)]
+    pub requester: Option<WorkId>,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+/// `atlas findings`'s payload (§7): `rebuild` recreates the index from
+/// every eligible journal; otherwise this just lists the current index.
+///
+/// W-B disclosure repair: the estate index is a **derived disclosure
+/// surface**, not a neutral listing — a settled row carries its proof
+/// targets' exact source coordinates and an applied row carries the
+/// changed source's alias, both generation points and the published
+/// revision. It previously took no requester at all, so any caller that
+/// reached the estate root read every one of them. It now answers one of
+/// two named ways, exactly as `finding list` already did: scoped to a
+/// `requester`'s own lineage and source grants, or explicitly `admin`.
+/// `rebuild` mutates the index from every journal and is administrative
+/// on its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasFindingsPayload {
+    #[serde(default)]
+    pub rebuild: bool,
+    #[serde(default)]
+    pub requester: Option<WorkId>,
+    #[serde(default)]
+    pub admin: bool,
 }
 
 // ---- Reply -------------------------------------------------------------

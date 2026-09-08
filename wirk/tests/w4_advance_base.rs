@@ -219,9 +219,7 @@ fn submit_deterministic(estate: &Path, base: &str, command: &[&str]) -> (String,
 fn reserved_world(socket: &Path, work_id: &str) -> World {
     let reply = wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.to_string()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.to_string()))),
     )
     .expect("status call succeeds");
     match reply {
@@ -238,9 +236,7 @@ fn reserved_world(socket: &Path, work_id: &str) -> World {
 fn status(socket: &Path, work_id: &str) -> serde_json::Value {
     let reply = wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.to_string()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.to_string()))),
     )
     .expect("status call succeeds");
     match reply {

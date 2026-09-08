@@ -29,6 +29,7 @@ fn actor(id: &str, outputs: &[&str]) -> WaypointDefinition {
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
         selection: None,
+        verifies: None,
     }
 }
 
@@ -52,6 +53,7 @@ fn container(
         command: None,
         boundary: Boundary(Vec::new()),
         leaves,
+        verifies: None,
         required_child_outcomes: roles
             .iter()
             .map(|role| ChildOutcomeSpec {

@@ -145,6 +145,7 @@ fn actor_world(run: &Run) -> wirk_core::World {
         intent: "do the thing".to_string(),
         output_contract: wirk_core::OutputContract(vec![]),
         boundary: wirk_core::Boundary(vec!["src/**".to_string()]),
+        review_targets: Vec::new(),
     })
 }
 

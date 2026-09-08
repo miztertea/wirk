@@ -5,6 +5,7 @@
 mod admission;
 mod domain;
 mod extract;
+mod findings;
 mod git;
 mod query;
 mod relationship;
@@ -15,6 +16,7 @@ mod store;
 pub use admission::{AdmissionSummary, AdmittedSource, QueryScope};
 pub use domain::*;
 pub use extract::ExtractorPolicy;
+pub use findings::{FindingRow, FindingRowId, FindingRowKind, Origin as FindingOrigin};
 pub use query::{
     AnswerBudget, AnswerCoverage, EvidenceHit, HitGenerationIdentity, PathLookupOutcome,
     PathLookupRequest, PinnedProducer, SearchAnswer, SearchRequest, SemanticRequest,

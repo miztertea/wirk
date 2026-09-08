@@ -92,7 +92,28 @@ impl WorldHash {
     ///
     /// Hex-encoded lowercase.
     pub fn of(world: &World) -> WorldHash {
-        if world.source_basis() == &SourceBasis::Unknown {
+        // `legacy` is the compatibility encoding for Worlds that predate
+        // `source_basis` — and, equally, predate frozen review targets.
+        // The independent review's executed D1: an Actor World whose
+        // basis is `Unknown` (the bare public Actor submit, which the
+        // CLI accepts) took this fallback, and `legacy` hashes
+        // repository, branch, `base_sha`, intent, output contract and
+        // boundary and nothing else. The targets really were frozen, the
+        // review really settled, and recomputing `legacy` *without*
+        // feeding the targets in reproduced the journaled hash exactly
+        // (`loop-b-legacy-target-binding/raw/00-red-d1-legacy-basis.txt`)
+        // — so the value the operator admitted did not bind the reviewed
+        // target, which is the one thing the target-binding requirement
+        // exists to make it do.
+        //
+        // A World that carries frozen review targets is therefore never
+        // a pre-v2 World, whatever its source basis says, and takes the
+        // v2 encoding — which already covers the targets, in one place,
+        // length-prefixed and unambiguous. No divergent second list, and
+        // no historical hash moves: no World written before this wave
+        // carries a frozen target, so every one of them still takes the
+        // fallback and hashes exactly as it always did.
+        if world.source_basis() == &SourceBasis::Unknown && !world.carries_review_targets() {
             return Self::legacy(world);
         }
 
@@ -115,6 +136,25 @@ impl WorldHash {
                 for glob in &actor.boundary.0 {
                     hash_string(&mut hasher, glob);
                 }
+                // W-B target binding: the frozen review targets are part
+                // of this World's own content — they are what the review
+                // was actually pointed at. Hashed only when present, so
+                // every Actor World that declares no review keeps the
+                // hash it has always had (there is no unconditional byte
+                // here to shift them).
+                if !actor.review_targets.is_empty() {
+                    hasher.update([0x02]);
+                    hash_len(&mut hasher, actor.review_targets.len());
+                    for target in &actor.review_targets {
+                        hash_string(&mut hasher, &target.source);
+                        hash_string(&mut hasher, &target.path);
+                        hash_string(&mut hasher, &target.estate);
+                        hash_string(&mut hasher, &target.membership);
+                        hash_string(&mut hasher, &target.source_id);
+                        hash_string(&mut hasher, &target.generation);
+                        hash_string(&mut hasher, &target.object_id);
+                    }
+                }
             }
             World::Deterministic(det) => {
                 hasher.update([1u8]);
@@ -133,6 +173,15 @@ impl WorldHash {
         }
         let digest = hasher.finalize();
         WorldHash(hex_lower(&digest))
+    }
+
+    /// The pre-v2 encoding, exposed for the one test that has to assert
+    /// a historical hash is *unchanged* — which cannot be shown by
+    /// calling `of` alone, since `of` is exactly what decides whether the
+    /// fallback still applies.
+    #[doc(hidden)]
+    pub fn legacy_for_tests(world: &World) -> WorldHash {
+        Self::legacy(world)
     }
 
     fn legacy(world: &World) -> WorldHash {
@@ -272,6 +321,30 @@ pub struct Work {
     /// verified canonical identity of that checkout.
     #[serde(default)]
     pub execution_identity: Option<String>,
+    /// W-B: every Finding raised in this Work's own journal, by id —
+    /// `FindingRaised`/`FindingSettled`/`FindingAsserted`/`FindingApplied`
+    /// all fold onto the same record (`FindingRecord`'s own doc).
+    /// `#[serde(default)]`: `Work` is never itself journaled (only
+    /// rebuilt fresh by `fold`), so this only matters on the in-memory
+    /// value, which never predates this field.
+    #[serde(default)]
+    pub findings: BTreeMap<FindingId, FindingRecord>,
+    /// W-B (§6 correction): settlement candidates derivable from this
+    /// Work's own journal alone (`DeterministicVerified`,
+    /// `SupersededInOrigin`) — computed fresh on every fold, order
+    /// independent of when the qualifying event and the `FindingRaised`
+    /// that names it appear in the journal (the terminal design's own
+    /// bug: computing readiness only "at the moment the qualifying event
+    /// folds" made `DeterministicVerified` unreachable, since that
+    /// class's own evidence always names an *earlier* Claim). Only ever
+    /// contains one entry per still-`Proposed` finding (a settled
+    /// finding is dropped). `ChildInvestigationConfirmed` is not derivable
+    /// here at all — it needs a second Work's journal, which the core
+    /// fold must never read (construction review: "pure core fold must
+    /// not read other journals or Atlas"); wirkd's own `settle_ready`
+    /// computes that one from the daemon's cross-journal view.
+    #[serde(default)]
+    pub settlement_ready: Vec<ReadySettlement>,
 }
 
 impl Work {
@@ -467,6 +540,304 @@ pub struct Route {
     pub waypoints: Vec<WaypointDefinition>,
 }
 
+/// W-B obligation proof (`W-B-OBLIGATION-BUILD.md`; construction
+/// review "policy proves the named obligation"; authority adjudication
+/// "bind the admitted policy/check identity and exact evidence basis").
+/// The *name* one verification obligation goes by: a check identity and
+/// the edition of that check. Named by the Route on the Waypoint that
+/// discharges it, named again by the Finding that claims to discharge
+/// it, and admitted — by name **and** by content basis — in the estate's
+/// own settlement policy. Naming alone is never authority: `id` and
+/// `edition` only select which admitted entry must match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObligationRef {
+    pub id: String,
+    pub edition: String,
+}
+
+/// The Route-authored verification obligation a Waypoint discharges:
+/// what check this is (`id`/`edition`), the exact, limited statement a
+/// passing run of it proves (`proves` — never the Finding's own free
+/// sentence), and the named outcomes whose receipts constitute the
+/// discharge (`outputs`, matched against the Claim's own
+/// `ArtifactReceipt` names).
+///
+/// This type is authored content, not authority. A proposer may write
+/// any obligation it likes into its own Route; `obligation_basis` below
+/// content-addresses every field of it together with the immutable
+/// execution basis, and only a basis the estate's own policy file
+/// already admits can settle anything (`try_mint_settlement`). That is
+/// what stops "an actor names a check and thereby makes it
+/// authoritative".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationObligation {
+    pub id: String,
+    pub edition: String,
+    /// The exact sentence a discharge of this obligation proves — and
+    /// nothing wider. Rendered as `settled.proves.statement`; the
+    /// Finding's own `claim` stays a recorded, unverified sentence
+    /// beside it.
+    pub proves: String,
+    /// The **outcome** half, kept separate from the mechanism below:
+    /// declared artifact names (Deterministic) or obligated child roles
+    /// (Container) whose receipts discharge this obligation. Every name
+    /// here must be present in the discharging receipt — for the
+    /// Container class, every obligated role must have closed, in this
+    /// container's current activation, or nothing discharges (the
+    /// independent review's executed C2: `outputs: ["auditor"]`
+    /// discharged through role `scribe` while `auditor` never existed).
+    ///
+    /// Empty is legal for a `Deterministic` Waypoint (the command's own
+    /// validated completion is the whole receipt) and refused for a
+    /// `Container` (a container obligation naming no obligated role
+    /// obliges nothing, so there is nothing for a child to discharge).
+    #[serde(default)]
+    pub outputs: Vec<String>,
+    /// The **mechanism** half, `Container` only: the verification
+    /// obligation each obligated role's child Work must itself have
+    /// *settled* for this container obligation to be discharged.
+    ///
+    /// This is what makes a container obligation bind a real execution.
+    /// A container has no World of its own, so hashing its own shape
+    /// content-addresses prose and an outcome contract and nothing else
+    /// — the independent review's executed C1: two unrelated Routes,
+    /// different repository, different waypoint id, different leaf
+    /// command, collided to the identical admitted basis, and a child
+    /// whose whole "investigation" was one Finding reading *"I did not
+    /// investigate anything"* discharged it. Naming `requires` moves the
+    /// container's own basis, and discharging it forces each obligated
+    /// role's child to have really run — and really settled — a
+    /// `Deterministic` obligation whose own basis content-addresses its
+    /// command, source basis and expected artifacts. The estate admits
+    /// that mechanism basis too (`policy/settlement.json`'s own
+    /// `mechanisms`), so a changed repository generation, a changed
+    /// child verification command or a changed evidence target cannot
+    /// silently reuse the authority already granted.
+    ///
+    /// `None` on a `Container` means the obligation declares no
+    /// mechanism and can therefore discharge nothing.
+    #[serde(default)]
+    pub requires: Option<ObligationRef>,
+    /// The **agentic** mechanism, `Actor` only: the bounded review
+    /// contract this Waypoint's own reviewer must satisfy
+    /// (`ReviewContract`). An `Actor` Waypoint declaring an obligation
+    /// without one discharges nothing — the same fail-closed rule a
+    /// `Container` without `requires` follows.
+    #[serde(default)]
+    pub review: Option<ReviewContract>,
+}
+
+/// `Container` and `Actor` obligations both need a mechanism; this is the
+/// **agentic** one. A Route Waypoint of kind `Actor` that declares a
+/// `review` contract is a bounded independent review: a named recipe, the
+/// exact resource paths it must have looked at, and the closed set of
+/// structured decisions it may return.
+///
+/// What this makes provable and what it deliberately does not:
+///
+/// - Provable, because every part is an immutable journal fact: *this*
+///   World (repository, branch, `base_sha`, source basis, **intent**,
+///   output contract, boundary — all already covered by `WorldHash::of`'s
+///   own `Actor` arm) ran, produced *this* report artifact with *this*
+///   content digest, applied to *these* exact admitted source coordinates,
+///   and recorded *this* decision from the declared set.
+/// - **Not** provable, and never claimed: that the review's English
+///   conclusion is true. A settled agentic review says an admitted review
+///   was performed under an admitted recipe over admitted targets and
+///   recorded a declared decision. The judgement itself stays judgement.
+///
+/// This is why `decisions` is a closed set of `FindingKind` rather than
+/// free text: the *structured outcome* is checkable, the prose is not.
+/// What a Route author can name before the review runs: an admitted
+/// source alias and a resource path inside it. Resolvable, not yet
+/// resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSelector {
+    /// The Atlas source alias, which must be one of the reviewing Work's
+    /// own `repositories` bindings.
+    pub source: String,
+    /// The resource path within that source.
+    pub path: String,
+}
+
+/// One review target as it was **frozen at reservation**: the selector
+/// the Route asked for, and the complete immutable identity wirkd
+/// resolved it to against that source's own currently published
+/// generation, admitted under the reviewing Work's own bindings.
+///
+/// This is where the exact binding becomes fixed. It is carried in the
+/// reserved `ActorWorld`, so `WorldHash::of` covers it, so
+/// `obligation_basis`'s `Actor` arm binds it, so the estate admits *this*
+/// target and not merely *a path*. A different repository, a different
+/// source, a different generation or a different object is a different
+/// World hash, a different basis, and a fresh admission.
+///
+/// Every field is an Atlas identity carried as an opaque `String`, the
+/// same way `EvidenceRef::Source` carries an already-encoded coordinate:
+/// `wirk-core` does not depend on `wirk-atlas` (0022 D71), and only
+/// `wirk/src/wirkd/server.rs` resolves or compares them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewTarget {
+    /// The declared selector, echoed so the record shows what was asked
+    /// for beside what it resolved to.
+    pub source: String,
+    pub path: String,
+    /// The resolved identity.
+    pub estate: String,
+    pub membership: String,
+    pub source_id: String,
+    pub generation: String,
+    pub object_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewContract {
+    /// The bounded verification procedure and its edition, as the Route
+    /// author states it. Hashed into `obligation_basis`, so changing the
+    /// recipe changes what the estate admitted.
+    pub recipe: String,
+    /// What this review must have applied to, as a **selector** the Route
+    /// author can write before any generation exists: an admitted source
+    /// alias and a resource path within it.
+    ///
+    /// A selector is not the binding. Before the review executes, wirkd
+    /// resolves every selector against that source's own currently
+    /// published generation, admitted under the reviewing Work's own
+    /// bindings, and **freezes** the resulting exact identity into the
+    /// reserved World (`ActorWorld.review_targets`) — where
+    /// `WorldHash::of` covers it and `obligation_basis` therefore binds
+    /// it. The selector itself is hashed too, so changing what the Route
+    /// asks for is also a fresh admission.
+    ///
+    /// The independent re-review's executed C1 is why this is a selector
+    /// and not a path: when the declared target was a bare string,
+    /// `socket.rs` in a *different admitted repository*, and `socket.rs`
+    /// at an *earlier generation the reviewing World never opened
+    /// against*, both discharged an admitted review of `demo`'s current
+    /// `socket.rs` — and the settled record could not tell the three
+    /// apart.
+    pub targets: Vec<ReviewSelector>,
+    /// The closed set of structured outcomes this review may return. The
+    /// reviewer's Finding kind must be one of them; a decision outside
+    /// the declared set discharges nothing.
+    pub decisions: Vec<FindingKind>,
+}
+
+/// The immutable content address of one obligation *as it will be
+/// discharged*: the authored obligation (id, edition, statement,
+/// outputs) inseparably bound to the execution basis that discharges it
+/// — for a `Deterministic` Waypoint, its World hash (which already
+/// content-addresses `command` + `base_sha` + `expected_artifacts`,
+/// `WorldHash::of`); for a `Container`, its own declared outputs and
+/// required child roles, the whole of its outcome contract.
+///
+/// The estate's settlement policy admits obligations by this basis, so
+/// nothing a proposer can author — a different command, a different
+/// source basis, a widened `proves` sentence, a dropped required output
+/// — leaves the admitted basis unchanged. `None` for a Waypoint that
+/// declares no obligation, and for an `Actor` Waypoint (no deterministic
+/// check exists there to be discharged; W-B settles only the two classes
+/// compiled in).
+pub fn obligation_basis(
+    def: &WaypointDefinition,
+    world_hash: Option<&WorldHash>,
+) -> Option<String> {
+    let obligation = def.verifies.as_ref()?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"wirk.obligation-basis/v1\0");
+    hash_string(&mut hasher, &obligation.id);
+    hash_string(&mut hasher, &obligation.edition);
+    hash_string(&mut hasher, &obligation.proves);
+    hash_len(&mut hasher, obligation.outputs.len());
+    for output in &obligation.outputs {
+        hash_string(&mut hasher, output);
+    }
+    // The declared agentic review contract is authored content like any
+    // other, and it is admitted like any other: changing the recipe, a
+    // reviewed target, or the set of decisions the review may return
+    // changes the basis the estate has to admit.
+    match &obligation.review {
+        None => hasher.update([0u8]),
+        Some(review) => {
+            hasher.update([1u8]);
+            hash_string(&mut hasher, &review.recipe);
+            hash_len(&mut hasher, review.targets.len());
+            for target in &review.targets {
+                hash_string(&mut hasher, &target.source);
+                hash_string(&mut hasher, &target.path);
+            }
+            hash_len(&mut hasher, review.decisions.len());
+            for decision in &review.decisions {
+                hash_string(&mut hasher, finding_kind_name(*decision));
+            }
+        }
+    }
+    match def.kind {
+        WaypointKind::Deterministic => {
+            hasher.update([1u8]);
+            hash_string(&mut hasher, &world_hash?.0);
+        }
+        WaypointKind::Container => {
+            hasher.update([2u8]);
+            // The declared mechanism is part of what the operator
+            // admits: changing which child obligation this container
+            // requires changes its own basis, so an admitted container
+            // obligation can never be re-pointed at a different
+            // verification without a fresh admission.
+            match &obligation.requires {
+                None => hasher.update([0u8]),
+                Some(required) => {
+                    hasher.update([1u8]);
+                    hash_string(&mut hasher, &required.id);
+                    hash_string(&mut hasher, &required.edition);
+                }
+            }
+            hash_len(&mut hasher, def.declared_outputs.len());
+            for spec in &def.declared_outputs {
+                hash_string(&mut hasher, &spec.name);
+                hasher.update([spec.required as u8]);
+            }
+            hash_len(&mut hasher, def.required_child_outcomes.len());
+            for spec in &def.required_child_outcomes {
+                hash_string(&mut hasher, &spec.role);
+                hasher.update([spec.required as u8]);
+            }
+        }
+        // W-B-AGENTIC-PROOF.md: an `Actor` Waypoint has a real content
+        // identity — `WorldHash::of`'s own `Actor` arm already covers
+        // repository, branch, `base_sha`, source basis, **intent**,
+        // output contract and boundary. The previous revision returned
+        // `None` here and so left the operator with no value to admit at
+        // all; that conflated "its reasoning is not deterministic" with
+        // "its execution inputs have no identity", and it is corrected.
+        // A changed review intent is a changed World is a changed basis.
+        WaypointKind::Actor => {
+            // An Actor obligation with no review contract declares no
+            // mechanism, exactly as a Container with no `requires`.
+            obligation.review.as_ref()?;
+            hasher.update([3u8]);
+            hash_string(&mut hasher, &world_hash?.0);
+        }
+    }
+    Some(hex_lower(&hasher.finalize()))
+}
+
+/// The wire name of a `FindingKind`, used where the kind has to be hashed
+/// or compared as text rather than matched (`obligation_basis`). Kept
+/// beside the enum so the two never drift.
+pub fn finding_kind_name(kind: FindingKind) -> &'static str {
+    match kind {
+        FindingKind::Gap => "gap",
+        FindingKind::ContradictedAssumption => "contradicted_assumption",
+        FindingKind::Relationship => "relationship",
+        FindingKind::VerifiedOutcome => "verified_outcome",
+    }
+}
+
 /// Sergeant's stage, from `StageDefinition`/`StageBinding`
 /// (domain/workflow.rs:460-475); `harness`/`route_source`/`profile`
 /// (backend-selection) dropped, Herdr-adjacent (0022 D71).
@@ -521,6 +892,14 @@ pub struct WaypointDefinition {
     /// sibling's — nothing here reads up or across the tree.
     #[serde(default)]
     pub selection: Option<AuthoredSelection>,
+    /// W-B obligation proof: the verification obligation this Waypoint
+    /// discharges, if any (`VerificationObligation` above). Additive and
+    /// `#[serde(default)]`, so every Route file and every
+    /// `WorkSubmitted.waypoint_defs` written before this wave still
+    /// parses and still folds — reading, correctly, as a Waypoint that
+    /// discharges no obligation and can therefore settle nothing.
+    #[serde(default)]
+    pub verifies: Option<VerificationObligation>,
 }
 
 /// The workflow-authored half of P3 native launch selection (`WaypointDefinition.selection`).
@@ -997,6 +1376,20 @@ pub struct ActorWorld {
     /// Route: declared mutation surface and authority envelope for this
     /// Waypoint (vocabulary.md "Boundary"; 0001 D5).
     pub boundary: Boundary,
+    /// W-B target binding: when this Waypoint declares a
+    /// `ReviewContract`, the exact identity each declared selector
+    /// resolved to at reservation — **the point where the review's
+    /// target becomes fixed**, before the review executes and before the
+    /// operator admits anything.
+    ///
+    /// Empty for every Waypoint that declares no review, which is every
+    /// Waypoint outside the agentic class. `#[serde(default)]`, and
+    /// `WorldHash::of` hashes it **only when non-empty**, so a World
+    /// without frozen targets hashes byte-identically to the way it
+    /// always did: no landed or candidate-era Actor World hash moves
+    /// because this field exists.
+    #[serde(default)]
+    pub review_targets: Vec<ReviewTarget>,
 }
 
 /// World handed to a deterministic (child/docker) Waypoint. Same
@@ -1037,6 +1430,16 @@ pub enum World {
 }
 
 impl World {
+    /// Whether this World carries frozen review targets — the fact that
+    /// disqualifies it from the pre-v2 `WorldHash::legacy` encoding
+    /// (`WorldHash::of`). Only an `ActorWorld` can carry them.
+    pub fn carries_review_targets(&self) -> bool {
+        match self {
+            World::Actor(actor) => !actor.review_targets.is_empty(),
+            World::Deterministic(_) => false,
+        }
+    }
+
     pub fn source_basis(&self) -> &SourceBasis {
         match self {
             World::Actor(world) => &world.source_basis,
@@ -1128,8 +1531,9 @@ pub struct Run {
     /// only when `RunLaunched` folds (`Run::apply`) — same seed/move
     /// pattern as `kind` above, and additive for the same reason
     /// (`#[serde(default)]`: a journal written before this field existed
-    /// folds to the empty selection, honest for a Run that only ever
-    /// launched bare).
+    /// folds to the empty selection, which records that this journal
+    /// carries no selection — not that the Run launched bare; see
+    /// `EventKind::RunLaunched::selection`).
     #[serde(default)]
     pub selection: ActorSelection,
     /// `true` once this Run's own `RunLaunched` has folded — the durable
@@ -1315,7 +1719,11 @@ impl Run {
             | EventKind::ContainerActivated { .. }
             | EventKind::StageHeld { .. }
             | EventKind::StageClosed { .. }
-            | EventKind::ChildWorkSpawned { .. } => {}
+            | EventKind::ChildWorkSpawned { .. }
+            | EventKind::FindingRaised { .. }
+            | EventKind::FindingSettled { .. }
+            | EventKind::FindingAsserted { .. }
+            | EventKind::FindingApplied { .. } => {}
         }
     }
 }
@@ -1456,6 +1864,639 @@ pub enum ClaimRefusal {
 pub enum ClaimKind {
     Done,
     Question(String),
+}
+
+// ---- Findings, Settlement, Assertion, Application (W-B) --------------------
+//
+// P3 W-B (`knowledge/work/p3-world-loop/W-B-BUILD.md`, corrected by
+// `loop-b-prepare-correct/HANDOFF.md` and `W-B-CONSTRUCTION-REVIEW.md`).
+// Five things kept distinct throughout: Evidence -> Finding (a bounded
+// claim, raised) -> Settlement (a decision by an admitted authority,
+// with its own check named) -> Application (the owning source actually
+// changed) -> the estate index (derived, rebuildable, never the only
+// copy). `wirk-core` gains no dependency on `wirk-atlas` (0022 D71's own
+// crate-boundary discipline continued): a source coordinate travels as
+// `EvidenceRef::Source`'s already-encoded, opaque `String` — only
+// `wirk/src/wirkd/server.rs` (which depends on both crates) decodes and
+// resolves it, the same split `encode_coordinate`/`decode_coordinate`
+// already draw for Atlas's own wire shapes.
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct FindingId(pub String);
+
+/// One coordinate a Finding's evidence, contradiction, or `applies_to`
+/// entry names — never a free string (construction review: "well-formed
+/// strings plus alias membership are not admission"). `Source` is
+/// resolved and admitted by `wirk/src/wirkd/server.rs` against the
+/// raising Work's own scope before a `Finding` is ever minted; `Journal`
+/// is checked against the raising Work's own parent/child lineage there
+/// too. Both are frozen at raise time (`AdmittedEvidence`) and never
+/// re-resolved to a different outcome later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvidenceRef {
+    /// The already-encoded `wirk_atlas::ExactCoordinate` string, exactly
+    /// `wirk/src/wirkd/server.rs::encode_coordinate`'s own shape —
+    /// opaque here, decoded only where the Atlas dependency lives.
+    Source(String),
+    /// One event in a Work's own journal, admitted only when that Work
+    /// is the raising Work itself or lies on its own parent/child chain
+    /// (construction review: "journal kinship is not universal evidence
+    /// access" — every other Work in the estate is refused).
+    Journal { work: WorkId, event: EventId },
+    /// One *finding* in a Work's own journal, named as
+    /// `work/<work-id>/finding/<finding-id>` — the spelling
+    /// `--confirmed-by` already uses, one noun over from `Journal`.
+    ///
+    /// This is the reference a later independent Work needs to say what
+    /// it thinks of an earlier record: put in `contradicts` it claims
+    /// disagreement, in `evidence` it claims support. It is admitted by
+    /// two routes and no others (`wirk/src/wirkd/server.rs::
+    /// finding_reference_admitted`): journal kinship, exactly as
+    /// `Journal` is, or — for a Work with no kinship at all — the same
+    /// settled estate publication route the findings index already
+    /// publishes by, so a reference reaches exactly the records its
+    /// author could already discover and no more.
+    ///
+    /// Naming a target is a claim about it and nothing else. It does not
+    /// settle, supersede, publish or validate the named record, it
+    /// appends nothing to the journal that holds it, and it is not the
+    /// `confirmed_by` child-proof obligation, which `ChildInvestigationConfirmed`
+    /// re-derives for itself.
+    Finding { work: WorkId, finding: FindingId },
+}
+
+/// The admission outcome for one `EvidenceRef`, decided once at raise
+/// time and never promoted later (§3's own rule: "unavailable evidence
+/// is never promoted to admitted on reread").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvidenceOutcome {
+    /// `generation`/`object_id` name the exact Atlas generation and blob
+    /// a `Source` reference resolved against, or (for a `Journal`
+    /// reference) the naming Work and Event id — an honest identity
+    /// either way, never a bare boolean.
+    Admitted {
+        generation: String,
+        object_id: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+    /// What a `Finding` reference resolved to, frozen at raise time like
+    /// every other outcome. It keeps the four things a reader of a
+    /// recorded relation has to be able to tell apart: the *claimed*
+    /// relation is the list this entry sits in, the *resolved exact
+    /// target* is `work`/`origin_event`, the *actual admission* is
+    /// `route`, and the target's own *settlement standing at the moment
+    /// of admission* is `standing` — which is a fact about the named
+    /// record, never about the claim that names it.
+    Relation {
+        work: WorkId,
+        origin_event: EventId,
+        route: RelationRoute,
+        standing: RelationStanding,
+    },
+}
+
+/// Which of the two admission routes actually admitted a `Finding`
+/// reference. Recorded rather than recomputed: the requesting Work's
+/// lineage and the estate's publications both move on, and this says
+/// what was true when the relation was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationRoute {
+    /// The named record is in the referencing Work's own journal.
+    OwnJournal,
+    /// The named record is on the referencing Work's own parent/child
+    /// lineage — the same kinship a `Journal` reference needs.
+    Lineage,
+    /// No kinship at all: the named record is a settled EstateLocal
+    /// publication this Work's own bindings already entitle it to
+    /// discover through the estate findings index.
+    SettledEstatePublication,
+}
+
+/// The named record's own state when the relation was admitted. A
+/// disagreement with a settled record and a disagreement with an
+/// unsettled one are different things, and a reader must not have to
+/// guess which it is holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationStanding {
+    Settled,
+    Unsettled,
+}
+
+/// One piece of evidence, frozen at raise time: the reference the
+/// caller named and the outcome admission actually reached.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedEvidence {
+    pub reference: EvidenceRef,
+    pub outcome: EvidenceOutcome,
+}
+
+/// The four kinds a Finding names (accepted proposal §5; no `Shared`
+/// scope variant exists at any layer of this type — estate isolation is
+/// total, per §5.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    Gap,
+    ContradictedAssumption,
+    Relationship,
+    VerifiedOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingScope {
+    WorkLocal,
+    EstateLocal,
+}
+
+/// An actor's own bounded claim (§5.2). Evidence-backed by construction:
+/// `evidence`/`contradicts`/`applies_to` are all `AdmittedEvidence`,
+/// never a free string a proposer could mint authority from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    pub id: FindingId,
+    pub work: WorkId,
+    pub run: RunId,
+    pub waypoint: WaypointId,
+    pub kind: FindingKind,
+    pub scope: FindingScope,
+    pub claim: String,
+    pub evidence: Vec<AdmittedEvidence>,
+    pub contradicts: Vec<AdmittedEvidence>,
+    pub applies_to: Vec<AdmittedEvidence>,
+    /// A Work may replace its own provisional Finding with a traceable
+    /// newer one (construction review: "naming another Finding does not
+    /// grant authority over it") — checked at raise time against this
+    /// same Work's own journal only; superseding an already-settled
+    /// estate record needs its own settlement rules (`SupersededInOrigin`,
+    /// below), never mere same-origin authorship.
+    pub supersedes: Option<FindingId>,
+    pub proposed_change: Option<String>,
+    /// W-B obligation proof: which verification obligation this Finding
+    /// claims to discharge (`--obligation <id>@<edition>`). A
+    /// `VerifiedOutcome` Finding that names none is never settleable —
+    /// naming an obligation is *necessary*, never sufficient: the
+    /// Waypoint whose Claim is cited must itself declare exactly this
+    /// obligation, and the estate policy must admit that obligation's
+    /// own content basis.
+    #[serde(default)]
+    pub obligation: Option<ObligationRef>,
+    /// W-B obligation proof: the child Finding this Finding names as its
+    /// independent confirmation (`--confirmed-by work/<id>/finding/<id>`),
+    /// for the `ChildInvestigationConfirmed` class. Explicit, never
+    /// inferred from matching prose.
+    #[serde(default)]
+    pub confirmed_by: Option<ConfirmedBy>,
+}
+
+/// One named child Finding a parent Finding cites as its confirmation.
+/// Both coordinates are required: the child Work and the Finding id
+/// inside it. wirkd re-derives everything about it from the child's own
+/// journal and the parent's own `StageClosed` receipt — this is a
+/// pointer, never a grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmedBy {
+    pub work: WorkId,
+    pub finding: FindingId,
+}
+
+/// The construction review's corrected shape: a `Settlement` never
+/// carries a wire-supplied "decision" — settling *is* the decision
+/// (some admitted, derived fact held). Accept/reject/defer/supersede
+/// judgements a human states remain real, but only ever as an honestly
+/// unverified `Assertion` (§2.5) that never becomes a `Settlement`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Decision {
+    Accepted,
+    PartiallyAccepted,
+    Rejected { reason: String },
+    Deferred,
+    Superseded(FindingId),
+}
+
+/// `UnixStream::peer_cred()` (R3, stdlib): attribution, never
+/// authentication (§2.3's own boundary — the same OS uid runs both an
+/// honest human terminal and an actor's shell, and this daemon's socket
+/// admits both identically). Recorded on every `Assertion` so a reader
+/// can see who *claims* to have spoken, never a gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerIdentity {
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// §2.5: the complete, usable human/client path — recorded, never
+/// authority. `by` is a caller-supplied label, never verified;
+/// `wirk finding list` renders it "recorded name: `<by>`, unverified".
+/// Never sets a Finding `Settled` and never suppresses it from later
+/// consultation (an asserted `Rejected`/`Deferred` still surfaces,
+/// captioned with the assertion attached).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assertion {
+    pub decision: Decision,
+    pub by: String,
+    pub reason: Option<String>,
+    pub peer: PeerIdentity,
+    pub at: Timestamp,
+    /// Who wirkd itself admitted as the author of this sentence, at the
+    /// moment it was written (`ASSERTION-AUTHOR-ADJUDICATION.md`). An
+    /// assertion is written into the *target* Finding's own journal, and
+    /// `finding assert` admits any requester on that Finding's lineage —
+    /// so the Work whose journal holds an assertion is routinely not the
+    /// Work that wrote it, and only this field says which one did.
+    ///
+    /// `None` on every assertion journaled before this field existed:
+    /// unknown, and it stays unknown. `by` is a caller-supplied label
+    /// and `peer` is an OS credential the daemon explicitly refuses to
+    /// treat as identity — neither may be promoted into an authorship
+    /// claim after the fact.
+    #[serde(default)]
+    pub author: Option<AssertingAuthor>,
+}
+
+/// The authorship half of an `Assertion`: server-admitted at write time,
+/// never client-supplied.
+///
+/// `Administrator` is the explicitly unscoped `--admin` path, which
+/// names no requesting Work and therefore no source breadth — the
+/// sentence it wrote could quote anything in the estate. It is recorded
+/// honestly rather than attributed to the journal that holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AssertingAuthor {
+    Work(WorkId),
+    Administrator,
+}
+
+/// The closed set of settlement mechanisms this increment compiles in
+/// (§2.4: "closed — a client cannot name a class that is not compiled
+/// in, and the policy file cannot introduce one"). `SupersededInOrigin`
+/// is the one derived path for `Decision::Superseded` that settles
+/// rather than merely asserting: a *later* Finding in the *same* Work
+/// naming an earlier one via `supersedes` is a journal fact the Work
+/// owns on both ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementClass {
+    DeterministicVerified,
+    /// W-B-AGENTIC-PROOF.md: the agentic sibling of
+    /// `DeterministicVerified`. A bounded independent Actor review,
+    /// performed under a policy-admitted recipe against admitted targets,
+    /// discharging its Waypoint's own declared review obligation. It is a
+    /// *distinct* mechanism with its own standing, never a deterministic
+    /// check in disguise and never a rubber stamp for one: see
+    /// `ActorReviewProof` for exactly what it proves and what it leaves
+    /// as judgement.
+    ActorReviewed,
+    ChildInvestigationConfirmed,
+    SupersededInOrigin,
+}
+
+/// What a `DeterministicVerified` settlement proves, and the immutable
+/// receipt that discharged it. Every field is re-derived by wirk from
+/// the journal at settlement time, never taken from a proposer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeterministicProof {
+    pub obligation: ObligationRef,
+    /// `obligation_basis` for the discharging Waypoint — the value the
+    /// estate's settlement policy must have admitted.
+    pub basis: String,
+    /// The Route-authored, limited statement the discharge proves.
+    pub proves: String,
+    pub waypoint: WaypointId,
+    pub attempt: u32,
+    pub world_hash: WorldHash,
+    pub artifacts: Vec<ArtifactReceipt>,
+}
+
+/// What an `ActorReviewed` settlement proves.
+///
+/// **Proved**, every field re-derived from the journal at settlement
+/// time: this exact `world_hash` (which content-addresses the reviewing
+/// World's repository, branch, `base_sha`, source basis, `intent`,
+/// output contract and boundary) ran as `attempt` of `waypoint`, on the
+/// Waypoint's current activation and current reservation; it produced the
+/// obligated `report` artifacts with their recorded content digests; its
+/// reviewer's Finding applied to every declared target at the exact
+/// `generation`/`object_id` this daemon admitted; and it recorded
+/// `decision`, which is one of the closed set the Route declared.
+///
+/// **Not proved, and never claimed**: that the review's conclusion is
+/// true. `proves` is the Route-authored statement about the *review
+/// having been performed under this recipe*, not about the world. The
+/// reviewer's own English sentence stays a recorded, unverified claim
+/// beside it, exactly as it does for every other class.
+///
+/// This variant did not exist before the agentic wave, so unlike
+/// `DeterministicProof`/`ChildProof` it is not optional: no journal can
+/// contain an `ActorReview` check written without one, and pretending a
+/// historical form exists would be a fabrication. Future fields go inside
+/// this struct with `#[serde(default)]`, which is the lesson the
+/// historical-readability correction already paid for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorReviewProof {
+    pub obligation: ObligationRef,
+    pub basis: String,
+    pub proves: String,
+    pub waypoint: WaypointId,
+    pub attempt: u32,
+    pub world_hash: WorldHash,
+    /// The reviewing World's own `intent`, as reserved — the actual
+    /// instruction the review was carried out under.
+    pub intent: String,
+    /// The Route-authored verification recipe and edition.
+    pub recipe: String,
+    /// The complete checked identity of every declared target: the
+    /// selector the Route asked for and the exact membership, source,
+    /// generation and object the reviewing World was frozen against and
+    /// the reviewer's own admitted evidence matched.
+    pub targets: Vec<ReviewTarget>,
+    /// The structured outcome the reviewer recorded, from the declared
+    /// closed set. This, not the prose, is the checkable decision.
+    pub decision: FindingKind,
+    /// The obligated report artifacts, as the Claim validated them.
+    pub report: Vec<ArtifactReceipt>,
+}
+
+/// One obligated container role, and the child settlement that actually
+/// discharged it. `mechanism`/`mechanism_basis` are the container
+/// obligation's own `requires` and the exact basis that child's own
+/// settlement discharged — the immutable verification execution behind
+/// the parent's claim, which the estate policy must also have admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DischargedRole {
+    pub role: String,
+    pub child: WorkId,
+    /// The child's own closing `ClaimId`, from the parent's receipt.
+    pub claim: ClaimId,
+    /// The child's own settled Finding that discharged `mechanism`.
+    pub finding: FindingId,
+    pub mechanism: ObligationRef,
+    pub mechanism_basis: String,
+    /// The child's own `FindingSettled` event.
+    pub settled_event: EventId,
+}
+
+/// What a `ChildInvestigationConfirmed` settlement proves. `roles`
+/// carries one entry per **obligated** role (the container obligation's
+/// own `outputs`), each independently verified against the container's
+/// current activation — partial completion is never full proof.
+/// `confirmed_by` is the child Finding the parent named explicitly, and
+/// is always one of `roles`' own findings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildProof {
+    pub obligation: ObligationRef,
+    pub basis: String,
+    pub proves: String,
+    pub confirmed_by: FindingId,
+    pub requires: ObligationRef,
+    pub roles: Vec<DischargedRole>,
+}
+
+/// Fields a record carries that this revision does not interpret.
+///
+/// The independent re-review's executed C2: a settlement written by the
+/// intermediate revision carried its obligation, basis, World hash,
+/// proven statement and artifact receipts as ten *flat* fields, before
+/// they moved inside `proof`. The reader could not match that shape, and
+/// said so as a claim about the past — "the obligation it discharged was
+/// never recorded", "not reconstructible" — while the fields sat unread
+/// in the journal line. That is a fact about this revision stated as a
+/// fact about history.
+///
+/// Capturing them changes what can honestly be said: the record can now
+/// show exactly what it holds and name it as unread, and the bytes
+/// survive a read-and-rewrite. It deliberately does **not** promote them
+/// to a proof: the basis rule those values were computed under is not
+/// this revision's rule, so presenting them as a current
+/// `DeterministicProof` would manufacture a currency they do not have.
+/// They are disclosed, never relied on — `obligation_admission` treats a
+/// record with no readable `proof` as unadmittable, whatever it carries
+/// here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UnreadFields(pub std::collections::BTreeMap<String, serde_json::Value>);
+
+impl UnreadFields {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The journal fact each `SettlementClass` binds to — never a bare id
+/// comparison, never an unrelated successful command. Every field here
+/// is something wirkd itself re-derives from a journal at settlement
+/// time, never trusted from a proposer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettlementCheck {
+    /// The journal facts a `DeterministicVerified` settlement rests on.
+    /// `work`/`claim`/`claim_event` are the three the very first W-B
+    /// revision recorded and are required; `proof` is everything the
+    /// obligation-proof revision added.
+    ///
+    /// **`proof: None` is a historical record, never a default.**
+    /// `#[serde(default)]` is what lets a `FindingSettled` journaled by
+    /// an earlier revision (`0634657` and before) still deserialize —
+    /// the independent review's executed C3, where the added fields
+    /// were required and a base-era Work journal and the estate
+    /// findings index both went malformed rather than fail-closed.
+    /// Absence is rendered as exactly what it is: this settlement
+    /// predates the obligation-proof contract and what it proved was
+    /// not recorded. It is never filled with zero values and never
+    /// presented as newly verified — and nothing in this crate can
+    /// *mint* a `None`: `deterministic_verified_readiness` always
+    /// constructs `Some`.
+    ValidatedClaim {
+        work: WorkId,
+        claim: ClaimId,
+        claim_event: EventId,
+        #[serde(default)]
+        proof: Option<DeterministicProof>,
+        /// Whatever else the record carried that this revision does not
+        /// interpret (`UnreadFields`). Captured so the reader can say
+        /// what is present instead of asserting what the past did not
+        /// record, and re-emitted verbatim so reading a journal never
+        /// loses its bytes.
+        #[serde(flatten, default, skip_serializing_if = "UnreadFields::is_empty")]
+        unread: UnreadFields,
+    },
+    /// The journal facts a `ChildInvestigationConfirmed` settlement
+    /// rests on. Every field except `proof` existed before the
+    /// obligation-proof revision and stays required; `proof` carries
+    /// what that revision added, and `None` means the same historical
+    /// thing it means above.
+    /// W-B-AGENTIC-PROOF.md. The journal facts an `ActorReviewed`
+    /// settlement rests on: the reviewing Work, its Validated `Done`
+    /// Claim and that Claim's own event, plus the review proof itself.
+    ActorReview {
+        work: WorkId,
+        claim: ClaimId,
+        claim_event: EventId,
+        proof: ActorReviewProof,
+    },
+    ChildReceipt {
+        parent: WorkId,
+        waypoint: WaypointId,
+        attempt: u32,
+        child: WorkId,
+        role: String,
+        claim: ClaimId,
+        closed_event: EventId,
+        child_raise_event: EventId,
+        #[serde(default)]
+        proof: Option<ChildProof>,
+        #[serde(flatten, default, skip_serializing_if = "UnreadFields::is_empty")]
+        unread: UnreadFields,
+    },
+    SupersededBy {
+        work: WorkId,
+        finding: FindingId,
+        raise_event: EventId,
+    },
+}
+
+/// §2.4: pre-admission is `<estate>/policy/settlement.json`, read by
+/// wirkd, never written by it or by any Work. `policy_digest` is bound
+/// into the settlement at the moment it is minted and never recomputed
+/// (§6: "an already-journaled settlement is never recomputed, re-minted
+/// or rewritten, whatever the file now says").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettlementAuthority {
+    pub class: SettlementClass,
+    pub policy_version: u32,
+    pub policy_digest: String,
+}
+
+/// wirkd's own sole producer (`FindingSettled`'s own doc). `settled_by`
+/// names the qualifying event `check` relied on; `minted_at_startup`
+/// distinguishes a startup repair mint from an inline one — attribution
+/// only, both are equally settled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settlement {
+    pub authority: SettlementAuthority,
+    pub check: SettlementCheck,
+    pub settled_by: EventId,
+    pub at: Timestamp,
+    #[serde(default)]
+    pub minted_at_startup: bool,
+}
+
+/// One exact generation/resource identity of a source membership (§4):
+/// `generation` is the Atlas `GenerationId`, `object_id` the Git blob at
+/// the finding's own coordinate — both re-derived by wirkd, never taken
+/// from a caller's claim.
+/// W-B-CORRECT.md defect 3 ("preserve ... explicit deletion absence"):
+/// `object_id: None` is a real, distinct fact — the resource is absent
+/// at this generation — never a fabricated empty string standing in for
+/// "no object id" (the authority review's own executed counterexample:
+/// `after_object_id.unwrap_or_default()` rendered `"object_id": ""`, a
+/// value indistinguishable from a real empty-blob object id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationPoint {
+    pub generation: String,
+    pub object_id: Option<String>,
+}
+
+/// W-B-CORRECT.md defect 3 ("require current valid producing Work/Run/
+/// World for actor-attributed assertions"): the real, checked identity
+/// that made the call — never a caller-supplied name alone. `wirkd`
+/// derives this from the caller's own injected triple (`TripleMismatch`/
+/// `WorkTerminal`/current-run, the identical three checks
+/// `handle_finding_raise` already performs), the same way `raise` never
+/// trusts a bare string for *its* own Run identity either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationProducer {
+    pub work: WorkId,
+    pub run: RunId,
+    pub world_hash: WorldHash,
+}
+
+/// §4's "owning-source authority": a `Claim` attribution is derived from
+/// a real Validated Claim whose Work is bound `Write` to the changed
+/// membership; `Asserted` is the same unverified standing as §2.5's
+/// human path (ruling 0077's separation: recording a durable, evidenced
+/// assertion in Atlas state is distinct from source mutation authority)
+/// — unverified means the *judgement*, never the caller's own identity:
+/// `producer` is real and checked either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Attribution {
+    Claim {
+        work: WorkId,
+        run: RunId,
+        claim: ClaimId,
+        claim_event: EventId,
+    },
+    Asserted {
+        by: String,
+        peer: PeerIdentity,
+        producer: ApplicationProducer,
+    },
+}
+
+/// §4.5: whether the recorded byte change *implements* the finding is
+/// never mechanical in P3 and is never pretended to be — always a named,
+/// attributed judgement, distinct from the mechanical proof above it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssertedJudgement {
+    pub by: String,
+    pub peer: PeerIdentity,
+    pub at: Timestamp,
+}
+
+/// §4: the owning source's exact before/after change, split from the
+/// judgement that it implements the finding. `revision` is `after`'s own
+/// generation's revision, re-derived by wirkd, never the caller's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationRef {
+    pub source: String,
+    pub before: GenerationPoint,
+    pub after: GenerationPoint,
+    pub revision: String,
+    pub attribution: Attribution,
+    pub implements_finding: AssertedJudgement,
+}
+
+/// A Finding's own terminal-or-not state, folded from
+/// `FindingSettled` alone — an `Assertion` never appears here (§2.5: it
+/// never sets `Settled`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FindingState {
+    Proposed,
+    // Boxed: `Settlement` is large enough that an unboxed variant here
+    // would make every `FindingState` (most of which are `Proposed`)
+    // pay its size (clippy::large_enum_variant).
+    Settled(Box<Settlement>),
+}
+
+/// One Finding's complete in-Work record: the bounded claim itself, its
+/// settlement state, every assertion ever recorded against it (kept even
+/// once settled — an assertion is never erased by a later settlement),
+/// and its Application, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingRecord {
+    pub finding: Finding,
+    pub state: FindingState,
+    pub assertions: Vec<Assertion>,
+    /// W-B-CORRECT.md defect 3 ("historical Application is not erased
+    /// merely because a newer generation is published"): every real
+    /// `FindingApplied`, appended, newest last — never a single slot a
+    /// later Application silently overwrites.
+    pub applied: Vec<ApplicationRef>,
+}
+
+/// One settlement candidate `fold` derived purely from this Work's own
+/// journal (`Work.settlement_ready`'s own doc) — wirkd checks it against
+/// the admitted policy before minting anything; `fold` itself never
+/// mints, never reads a file, never reads another journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadySettlement {
+    pub finding: FindingId,
+    pub class: SettlementClass,
+    pub check: SettlementCheck,
 }
 
 // ---- Event ------------------------------------------------------------------
@@ -1685,7 +2726,13 @@ pub enum EventKind {
         /// harness's own native default, precedence applied before this
         /// event was ever built. `#[serde(default)]` so a `RunLaunched`
         /// written before this field existed still folds, to the empty
-        /// selection (honest: every such Run only ever launched bare).
+        /// selection — which means *this record carries no selection*,
+        /// never "this Run launched bare". The estate's own pre-field
+        /// launch path passed `--model sonnet` plus a `--settings
+        /// <estate root>/…` pair for every claude Run and
+        /// `--model hecate/…` for opencode; those launches had
+        /// arguments and the journal never recorded them. Absent is
+        /// unrecorded (the W-B launch review's F-D).
         #[serde(default)]
         selection: ActorSelection,
         /// Herdr's own `agent_started.argv` for this launch — submission
@@ -1769,6 +2816,39 @@ pub enum EventKind {
         attempt: u32,
         run: RunId,
     },
+    /// W-B (§5.2): an actor's own bounded claim, with its evidence
+    /// admitted and frozen at raise time (`AdmittedEvidence`, never
+    /// re-resolved later). Its own verb (`wirk finding raise`),
+    /// triple-checked like `claim` — `Event.run` names the raising Run.
+    /// Also joins `handle_record`'s Forbidden arm so a raw `record` can
+    /// never mint one directly, the same defense-in-depth every other
+    /// server-owned transition already has.
+    FindingRaised {
+        finding: Finding,
+    },
+    /// W-B (§2.4): wirkd's own sole producer, minted only when an
+    /// admitted policy class's check holds against a journal fact this
+    /// daemon derived itself — never a wire field, never client-minted.
+    /// `Event.run = None`.
+    FindingSettled {
+        finding: FindingId,
+        settlement: Settlement,
+    },
+    /// W-B (§2.5): an honestly unverified human/client assertion —
+    /// never sets a finding `Settled`, never suppresses it from later
+    /// consultation. `Event.run = None`; the operator verb (`wirk
+    /// finding assert`) carries no execution triple.
+    FindingAsserted {
+        finding: FindingId,
+        assertion: Assertion,
+    },
+    /// W-B (§4): the owning source's mechanical before/after change,
+    /// with the judgement that it implements the finding kept separate
+    /// and always asserted, never derived. `Event.run = None`.
+    FindingApplied {
+        finding: FindingId,
+        application: ApplicationRef,
+    },
 }
 
 /// D9#1: replay rebuilds Work state, no in-memory objects. The
@@ -1834,6 +2914,8 @@ pub fn fold(events: &[Event]) -> Work {
                     activations: Vec::new(),
                     execution_repo: execution_repo.clone(),
                     execution_identity: execution_identity.clone(),
+                    findings: BTreeMap::new(),
+                    settlement_ready: Vec::new(),
                 });
             }
             // No `Work` exists yet and this isn't `WorkSubmitted`: there
@@ -1925,11 +3007,35 @@ pub fn fold(events: &[Event]) -> Work {
                         });
                     }
                 }
-                "Working"
+                // Ruling 0113 (P3 native usability, the operator's own
+                // work-18d32a2752f0ca8a-0): the pane whose permission
+                // prompt a human has just answered is `Idle`, not
+                // `Working` — the actor answered and is waiting to be
+                // told what to do, and nothing will make it `Working`
+                // again until its driver prompts it. Requiring
+                // `Working` to clear a block therefore waited for a
+                // transition that could not happen until the very
+                // continuation the block was holding up. `Done` is the
+                // same turn end under Herdr's own name for a pane
+                // nothing has viewed since (`turn_ended`,
+                // `wirk-herdr/src/run_loop.rs`), which is every pane
+                // `wirk run` drives. `Unknown` is *not* here: it is
+                // Herdr declining to say what the pane is doing, which
+                // is the absence of an observation, never a resolution.
+                //
+                // ...and only the blocked Run's own lifecycle clears
+                // it (`cause.run`). An older Run's pane, still alive in
+                // the session and still reporting, says nothing about
+                // the pane a human is actually looking at; before this
+                // wave any Run's `Working` cleared any other Run's
+                // block. The `reason == "blocked"` guard is unchanged:
+                // a filed Question or a Run failure is a human decision
+                // no lifecycle event may clobber.
+                "Working" | "Idle" | "Done"
                     if w.state == WorkState::NeedsInput
-                        && w.needs_input
-                            .as_ref()
-                            .is_some_and(|cause| cause.reason == "blocked") =>
+                        && w.needs_input.as_ref().is_some_and(|cause| {
+                            cause.reason == "blocked" && Some(&cause.run) == event.run.as_ref()
+                        }) =>
                 {
                     w.state = WorkState::Active;
                     w.needs_input = None;
@@ -2113,6 +3219,76 @@ pub fn fold(events: &[Event]) -> Work {
                 }
             }
             EventKind::ChildWorkSpawned { .. } => {}
+            // W-B (§5.2): a Finding is visible to this Work's own later
+            // Worlds the instant it is raised — no settlement required
+            // for WorkLocal use (fold.md's own "informed immediately"
+            // rule, carried here rather than re-derived by every
+            // reader). `settlement_ready` is recomputed fresh against
+            // the *whole* `events` slice already in hand (order
+            // independent of where the qualifying event sits — the
+            // terminal design's own ordering bug, fixed by never relying
+            // on iteration order to "arrive after" the trigger).
+            EventKind::FindingRaised { finding } => {
+                w.findings.insert(
+                    finding.id.clone(),
+                    FindingRecord {
+                        finding: finding.clone(),
+                        state: FindingState::Proposed,
+                        assertions: Vec::new(),
+                        applied: Vec::new(),
+                    },
+                );
+                if let Some(ready) =
+                    deterministic_verified_readiness(events, &waypoint_defs, finding)
+                {
+                    w.settlement_ready.push(ready);
+                }
+                if let Some(superseded) = &finding.supersedes {
+                    w.settlement_ready.push(ReadySettlement {
+                        finding: superseded.clone(),
+                        class: SettlementClass::SupersededInOrigin,
+                        check: SettlementCheck::SupersededBy {
+                            work: finding.work.clone(),
+                            finding: finding.id.clone(),
+                            raise_event: event.id.clone(),
+                        },
+                    });
+                }
+            }
+            // W-B (§2.4, §6): wirkd's own sole producer; folded as the
+            // record's terminal state. A `FindingSettled` naming a
+            // finding this journal never raised is ignored (fail closed,
+            // R6: the same "no oracle for a fact this Work never
+            // recorded" rule `ClaimRecorded`'s own `claimed_waypoint`
+            // lookup already applies).
+            EventKind::FindingSettled {
+                finding,
+                settlement,
+            } => {
+                if let Some(record) = w.findings.get_mut(finding) {
+                    record.state = FindingState::Settled(Box::new(settlement.clone()));
+                }
+            }
+            // W-B (§2.5): never sets `Settled`, never suppresses —
+            // appended to the record's own assertion history.
+            EventKind::FindingAsserted { finding, assertion } => {
+                if let Some(record) = w.findings.get_mut(finding) {
+                    record.assertions.push(assertion.clone());
+                }
+            }
+            // W-B (§4): the exact before/after record; `Settled` is
+            // never implied and never rewritten by a later Application.
+            // W-B-CORRECT.md defect 3: appended, never replaced — a
+            // historical Application survives a later generation's own
+            // Application of the same Finding.
+            EventKind::FindingApplied {
+                finding,
+                application,
+            } => {
+                if let Some(record) = w.findings.get_mut(finding) {
+                    record.applied.push(application.clone());
+                }
+            }
         }
 
         // Current-vs-historical contract (loop-a-reverify
@@ -2131,7 +3307,245 @@ pub fn fold(events: &[Event]) -> Work {
         }
     }
 
-    work.expect("fold called with no WorkSubmitted event in the slice: no Work to build")
+    let mut work =
+        work.expect("fold called with no WorkSubmitted event in the slice: no Work to build");
+    // W-B (§6): only one still-`Proposed` finding's readiness survives —
+    // a finding `FindingSettled` already resolved (folded above, in
+    // either order) is done, and a readiness fact for it is stale, not
+    // a second candidate for wirkd to re-mint against.
+    let mut seen: std::collections::HashSet<FindingId> = std::collections::HashSet::new();
+    work.settlement_ready.retain(|ready| {
+        matches!(
+            work.findings
+                .get(&ready.finding)
+                .map(|record| &record.state),
+            Some(FindingState::Proposed)
+        ) && seen.insert(ready.finding.clone())
+    });
+    work
+}
+
+/// The Waypoint `run` was opened against, from `events` alone — a
+/// whole-slice lookup (W-B §6, order independence), not the incremental
+/// `run_waypoints` accumulator `fold`'s own loop builds only up to its
+/// current position. Returns the whole opening fact (waypoint, attempt,
+/// the World hash the attempt was opened against), because the
+/// obligation proof needs all three and there is no honest way to ask
+/// for one of them alone.
+fn run_opening(events: &[Event], run: &RunId) -> Option<(WaypointId, u32, WorldHash)> {
+    events.iter().find_map(|event| match &event.kind {
+        EventKind::RunOpened {
+            run: id,
+            waypoint,
+            attempt,
+            world_hash,
+        } if id == run => Some((waypoint.clone(), *attempt, world_hash.clone())),
+        _ => None,
+    })
+}
+
+/// The World hash currently reserved for `waypoint` — the last
+/// `WaypointReserved` naming it. A Run opened against an older
+/// reservation (a re-reserved Waypoint whose World changed) is a
+/// superseded activation: its Claim proves what it proved then, never
+/// what the Waypoint's current activation obliges now (construction
+/// review: "do not settle a superseded activation").
+fn latest_reserved_world_hash<'a>(
+    events: &'a [Event],
+    waypoint: &WaypointId,
+) -> Option<&'a WorldHash> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::WaypointReserved {
+            waypoint: id,
+            world_hash,
+            ..
+        } if id == waypoint => Some(world_hash),
+        _ => None,
+    })
+}
+
+/// The most recently opened Run for `waypoint` — the last `RunOpened`
+/// naming it, walked in reverse so a retried Waypoint's latest attempt
+/// wins. The pure-`wirk-core` mirror of `wirk/src/wirkd/server.rs::
+/// latest_run_for_waypoint` (that helper lives in `wirkd` because it also
+/// returns `attempt`/`world_hash` wirkd's own status replies need; this
+/// one only ever answers "is `run` still current," which `fold`'s own
+/// pure readiness checks can ask without crossing the crate boundary).
+fn latest_run_opened_for_waypoint<'a>(
+    events: &'a [Event],
+    waypoint: &WaypointId,
+) -> Option<&'a RunId> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::RunOpened {
+            run, waypoint: w, ..
+        } if w == waypoint => Some(run),
+        _ => None,
+    })
+}
+
+/// W-B (§5.3, `deterministic-verified`), rebuilt on the obligation
+/// contract `W-B-OBLIGATION-BUILD.md` requires.
+///
+/// The defect this replaces, reproduced through the real service on
+/// `0634657` before a line changed here
+/// (`loop-b-obligation-build/raw/00-counterexample-frozen-base.txt`): a
+/// Finding whose sentence was *"wirk has no remote code execution
+/// vulnerability and its full security audit passed with zero findings"*
+/// settled `deterministic_verified` — and reached the estate index — on
+/// the strength of an earlier leaf running `sh -c "echo one > out1.md"`.
+/// Every guard the prior correction added was satisfied: the cited Claim
+/// was real, Validated, `Done`, on a `Deterministic` leaf, at a Route
+/// position the Finding's own Waypoint had already passed, on that
+/// Waypoint's current Run. **None of that is a proof of the sentence**,
+/// and Route position is not a proof of anything: it says which
+/// obligations *could* have been discharged, never which one *was*.
+///
+/// What is bound instead, all of it re-derived here from the journal:
+///
+/// 1. The Finding **names** an obligation (`Finding.obligation`). A
+///    `VerifiedOutcome` Finding naming none is never ready. Naming is
+///    necessary and never sufficient — the remaining five are why.
+/// 2. The Waypoint whose Claim is cited **declares that same
+///    obligation** on its own Route definition (`WaypointDefinition.
+///    verifies`), by id *and* edition. A Claim of a Waypoint that
+///    declares a different check, a different edition, or no obligation
+///    at all proves nothing here, however successful it was.
+/// 3. That Waypoint is `Deterministic` and its Run is the **current**
+///    one for it, opened against the **currently reserved World** — a
+///    superseded attempt, or an attempt opened against a World the
+///    Waypoint has since re-reserved, is a stale activation.
+/// 4. The cited event is that Run's own Validated `Done` `ClaimRecorded`
+///    — the receipt, not a neighbouring success.
+/// 5. Every `outputs` name the obligation declares appears in that
+///    Claim's own `ArtifactReceipt` set **with a recorded digest**: the
+///    obligated outcome was actually produced and its content identity
+///    was actually read (an unrecorded, pre-correction receipt is not
+///    an evidence basis).
+/// 6. The whole authored obligation plus that exact execution basis
+///    content-address to `basis` (`obligation_basis`) — which
+///    `wirk/src/wirkd/server.rs::try_mint_settlement` then requires the
+///    estate's own settlement policy to have admitted. That is the step
+///    a proposer cannot forge by authoring: changing the command, the
+///    source basis, the expected artifacts, the proven statement or the
+///    obligated outputs all change `basis`, and an unadmitted basis
+///    settles nothing.
+///
+/// The Route-position rule the prior correction introduced is kept as a
+/// further narrowing (a Finding still cannot cite a Waypoint its own
+/// Route has not reached), not as the proof: it is now one of six
+/// necessary conditions rather than the whole binding.
+///
+/// Whole-slice lookup by `EventId` (§6): the referenced Claim may sit
+/// anywhere in `events` relative to this `FindingRaised`, before or
+/// after, so this never depends on fold's own iteration order.
+fn deterministic_verified_readiness(
+    events: &[Event],
+    waypoint_defs: &[WaypointDefinition],
+    finding: &Finding,
+) -> Option<ReadySettlement> {
+    if finding.kind != FindingKind::VerifiedOutcome {
+        return None;
+    }
+    // (1) The Finding must name the obligation it claims to discharge.
+    let named = finding.obligation.as_ref()?;
+    let sequence = flatten_leaves(waypoint_defs);
+    let finding_position = sequence.iter().position(|id| id == &finding.waypoint)?;
+    for item in &finding.evidence {
+        let EvidenceRef::Journal {
+            work,
+            event: event_id,
+        } = &item.reference
+        else {
+            continue;
+        };
+        if work != &finding.work {
+            continue;
+        }
+        let Some(claim_event) = events.iter().find(|event| &event.id == event_id) else {
+            continue;
+        };
+        // (4) The cited event is a Validated `Done` Claim receipt.
+        let EventKind::ClaimRecorded {
+            claim,
+            claim_kind: ClaimKind::Done,
+            verdict: ClaimVerdict::Validated,
+            artifacts,
+        } = &claim_event.kind
+        else {
+            continue;
+        };
+        let Some(run_id) = &claim_event.run else {
+            continue;
+        };
+        let Some((waypoint, attempt, world_hash)) = run_opening(events, run_id) else {
+            continue;
+        };
+        let Some(claim_position) = sequence.iter().position(|id| id == &waypoint) else {
+            continue;
+        };
+        if claim_position > finding_position {
+            continue;
+        }
+        // (3) Current activation, on both axes: the current Run for the
+        // Waypoint, opened against the currently reserved World.
+        if latest_run_opened_for_waypoint(events, &waypoint) != Some(run_id) {
+            continue;
+        }
+        if latest_reserved_world_hash(events, &waypoint)
+            .is_some_and(|current| current != &world_hash)
+        {
+            continue;
+        }
+        let Some(def) = find_definition(waypoint_defs, &waypoint) else {
+            continue;
+        };
+        if def.kind != WaypointKind::Deterministic {
+            continue;
+        }
+        // (2) That Waypoint declares exactly the named obligation.
+        let Some(obligation) = def.verifies.as_ref() else {
+            continue;
+        };
+        if obligation.id != named.id || obligation.edition != named.edition {
+            continue;
+        }
+        // (5) The obligated outputs are in the receipt, with real
+        // recorded content identity.
+        if !obligation.outputs.iter().all(|name| {
+            artifacts
+                .iter()
+                .any(|receipt| &receipt.name == name && !receipt.digest.is_empty())
+        }) {
+            continue;
+        }
+        // (6) The content basis the estate policy must have admitted.
+        let Some(basis) = obligation_basis(def, Some(&world_hash)) else {
+            continue;
+        };
+        return Some(ReadySettlement {
+            finding: finding.id.clone(),
+            class: SettlementClass::DeterministicVerified,
+            check: SettlementCheck::ValidatedClaim {
+                work: work.clone(),
+                claim: claim.clone(),
+                claim_event: event_id.clone(),
+                proof: Some(DeterministicProof {
+                    obligation: ObligationRef {
+                        id: obligation.id.clone(),
+                        edition: obligation.edition.clone(),
+                    },
+                    basis,
+                    proves: obligation.proves.clone(),
+                    waypoint,
+                    attempt,
+                    world_hash,
+                    artifacts: artifacts.clone(),
+                }),
+                unread: UnreadFields::default(),
+            },
+        });
+    }
+    None
 }
 
 // ---- Journal ------------------------------------------------------------

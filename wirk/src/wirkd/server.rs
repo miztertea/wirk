@@ -59,13 +59,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use wirk_core::{
-    Access, ActorWorld, ArtifactReceipt, ArtifactRef, ArtifactSpec, AttemptHolder,
-    AuthoredSelection, Boundary, Claim, ClaimId, ClaimKind, ClaimRefusal, ClaimVerdict,
-    DeterministicWorld, Event, EventKind, ExecutionTriple, FailureCause, Journal, JournalError,
-    LaunchAttempt, OutcomeReceipt, OutputContract, ParentBinding, RepositoryBinding, Route,
-    RouteId, Run, RunId, RunState, SourceBasis, Timestamp, WaypointDefinition, WaypointId,
-    WaypointKind, WorkId, WorkState, World, WorldHash, ancestor_chain, find_definition,
-    first_dfs_leaf, flatten_leaves, fold, load_route, validate_claim,
+    Access, ActorReviewProof, ActorSelection, ActorWorld, AdmittedEvidence, ApplicationProducer,
+    ApplicationRef, ArtifactReceipt, ArtifactRef, ArtifactSpec, AssertedJudgement, AssertingAuthor,
+    Assertion, AttemptHolder, Attribution, AuthoredSelection, Boundary, ChildProof, Claim, ClaimId,
+    ClaimKind, ClaimRefusal, ClaimVerdict, ConfirmedBy, Decision, DeterministicWorld,
+    DischargedRole, Event, EventId, EventKind, EvidenceOutcome, EvidenceRef, ExecutionTriple,
+    FailureCause, Finding, FindingId, FindingKind, FindingRecord, FindingScope, FindingState,
+    GenerationPoint, Journal, JournalError, LaunchAttempt, ObligationRef, OutcomeReceipt,
+    OutputContract, ParentBinding, PeerIdentity, ReadySettlement, RelationRoute, RelationStanding,
+    RepositoryBinding, ReviewTarget, Route, RouteId, Run, RunId, RunState, Settlement,
+    SettlementAuthority, SettlementCheck, SettlementClass, SourceBasis, Timestamp, UnreadFields,
+    WaypointDefinition, WaypointId, WaypointKind, Work, WorkId, WorkState, World, WorldHash,
+    ancestor_chain, find_definition, finding_kind_name, first_dfs_leaf, flatten_leaves, fold,
+    load_route, obligation_basis, validate_claim,
 };
 
 use super::boundary;
@@ -296,6 +302,19 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
     // own completing Claim and this Work's `StageClosed` (module doc,
     // `reevaluate_waiting_works`).
     reevaluate_waiting_works(&state);
+
+    // W-B (§6): every eligible journal, terminal included, before this
+    // listener starts accepting connections — a crash between a
+    // completed Work's last event and its settlement, or between a
+    // journaled `FindingSettled`/`FindingAsserted`/`FindingApplied` and
+    // its index row, is repaired here rather than left missing
+    // indefinitely (the terminal design's own defect: a
+    // non-terminal-or-recently-terminal filter would have preserved it).
+    // Settlement runs first (canonical), the index reconciliation second,
+    // so a settlement this very sweep just minted is indexed in the same
+    // pass.
+    settle_ready_findings(&state);
+    reconcile_findings_index(&state);
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -642,8 +661,17 @@ fn handle_connection(stream: UnixStream, state: &Arc<WirkdState>, socket_path: &
     // P3 native launch attempt admission: who is on the other end of
     // this connection, as the kernel reports it — read once, here,
     // where the socket still exists (`peer_holder`).
-    let peer = peer_holder(&stream);
-    let outcome = dispatch(&request, state, peer.as_ref());
+    let holder = peer_holder(&stream);
+
+    // W-B (§2.3, A2): `UnixStream::peer_cred()` is attribution, never
+    // authentication — the same OS uid runs both an honest human
+    // terminal and an actor's shell (probe A/B, `loop-b-prepare-correct`).
+    // Recorded on every `Assertion`/`Attribution::Asserted`, never a gate;
+    // an unreadable credential (a platform without `SO_PEERCRED`, in
+    // practice never this estate's own Linux/macOS boxes) reads as the
+    // unprivileged `0/0` rather than failing the request.
+    let peer = peer_credentials(&stream).unwrap_or(PeerIdentity { uid: 0, gid: 0 });
+    let outcome = dispatch(&request, state, holder.as_ref(), peer);
 
     let reply = match &outcome {
         Outcome::Reply(reply) | Outcome::Stop(reply) => reply,
@@ -944,7 +972,7 @@ fn reattach_docker_run(
         .ok()
         .flatten()
         .is_some_and(|journal| {
-            let journal = journal.lock().unwrap_or_else(|p| p.into_inner());
+            let journal = lock_journal(&journal);
             journal
                 .replay()
                 .ok()
@@ -1015,7 +1043,12 @@ fn reattach_docker_run(
     );
 }
 
-fn dispatch(request: &Request, state: &Arc<WirkdState>, peer: Option<&AttemptHolder>) -> Outcome {
+fn dispatch(
+    request: &Request,
+    state: &Arc<WirkdState>,
+    holder: Option<&AttemptHolder>,
+    peer: PeerIdentity,
+) -> Outcome {
     match request.verb {
         Verb::Ping => Outcome::Reply(handle_ping()),
         Verb::Submit => match serde_json::from_value::<SubmitPayload>(request.payload.clone()) {
@@ -1045,7 +1078,7 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>, peer: Option<&AttemptHol
             }
         }
         Verb::Record => match serde_json::from_value::<RecordPayload>(request.payload.clone()) {
-            Ok(payload) => Outcome::Reply(handle_record(state, payload, peer)),
+            Ok(payload) => Outcome::Reply(handle_record(state, payload, holder)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
         Verb::Cancel => match serde_json::from_value::<CancelPayload>(request.payload.clone()) {
@@ -1110,6 +1143,48 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>, peer: Option<&AttemptHol
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
+        Verb::FindingRaise => {
+            match serde_json::from_value::<super::FindingRaisePayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_finding_raise(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::FindingAssert => {
+            match serde_json::from_value::<super::FindingAssertPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_finding_assert(state, payload, peer)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::FindingSettle => {
+            match serde_json::from_value::<super::FindingSettlePayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_finding_settle(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::FindingApplied => {
+            match serde_json::from_value::<super::FindingAppliedPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_finding_applied(state, payload, peer)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::FindingList => {
+            match serde_json::from_value::<super::FindingListPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_finding_list(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasFindings => {
+            match serde_json::from_value::<super::AtlasFindingsPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_findings(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::WorkObligations => {
+            match serde_json::from_value::<super::WorkObligationsPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_work_obligations(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
         // `handle_connection` intercepts `watch` before ever calling
         // `dispatch` (its own long-lived, many-lines-out shape does not
@@ -1120,6 +1195,43 @@ fn dispatch(request: &Request, state: &Arc<WirkdState>, peer: Option<&AttemptHol
             "Internal",
             "watch is not dispatched through this path",
         )),
+    }
+}
+
+/// W-B (§2.3, A2): the peer's uid/gid on this Unix domain socket —
+/// attribution, never authentication (the same OS uid runs both an
+/// honest human terminal and an actor's shell). `std::os::unix::net::
+/// UnixStream::peer_cred()` is gated behind the unstable
+/// `peer_credentials_unix_socket` feature on this toolchain (checked
+/// against 1.98.1, corrected from `loop-b-prepare-correct/HANDOFF.md`'s
+/// own "stdlib, R3" citation) — R3 fails, so this falls back to R5:
+/// `getsockopt(SOL_SOCKET, SO_PEERCRED)` through the already-installed
+/// `libc` dependency (`ChildExecutor`'s own `PR_SET_PDEATHSIG` use, same
+/// crate, same discipline), exactly the mechanism the stdlib feature
+/// itself wraps on Linux. `None` on any platform or kernel that refuses
+/// the call — the caller reads that as the unprivileged `0/0`, never a
+/// request failure.
+fn peer_credentials(stream: &UnixStream) -> Option<PeerIdentity> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Some(PeerIdentity {
+            uid: cred.uid,
+            gid: cred.gid,
+        })
+    } else {
+        None
     }
 }
 
@@ -1151,6 +1263,48 @@ fn handle_watch_connection(
     payload: super::WatchPayload,
 ) {
     let work_id = payload.work_id;
+    // The launch review's F-C, applied to `status`'s own sibling: this
+    // streams raw journal events, so it reaches strictly more than
+    // `status` does and cannot be answered unscoped either. Admitted or
+    // refused whole — a partially redacted `Event` is not an `Event`,
+    // and every consumer of this stream folds it.
+    if !payload.admin {
+        let Some(requester_id) = &payload.requester else {
+            write_one_reply(
+                &stream,
+                &err_reply(
+                    "BadRequest",
+                    "a non-administrative watch requires --requesting-work",
+                ),
+            );
+            return;
+        };
+        let Some(requester_events) = replay_events(state, requester_id) else {
+            write_one_reply(&stream, &err_reply("NotFound", "no such requesting work"));
+            return;
+        };
+        let requester = fold(&requester_events);
+        let lineage = lineage_of(state, &requester, &requester_events);
+        let admitted = lineage.contains(&work_id)
+            && fold_work(state, &work_id).is_some_and(|work| {
+                work.repositories
+                    .iter()
+                    .all(|binding| requester_grants_alias(&requester, &binding.name))
+            });
+        if !admitted {
+            // One answer for "not on your lineage" and "not covered by
+            // your bindings", naming neither: the same non-disclosure
+            // discipline every other refusal here follows.
+            write_one_reply(
+                &stream,
+                &err_reply(
+                    "InadmissibleEvidence",
+                    "the named work's journal is not admitted to the requesting work",
+                ),
+            );
+            return;
+        }
+    }
     let journal = match journal_for(state, &work_id) {
         Ok(Some(journal)) => journal,
         Ok(None) => {
@@ -1163,9 +1317,29 @@ fn handle_watch_connection(
         }
     };
 
+    // The scoped stream says, on the wire and before its first `Event`
+    // line, which scope this daemon actually applied (the integration
+    // review's V-5). `status` already carried that fact in its own
+    // reply `scope` field; `watch` had nowhere to carry it, so a client
+    // asking a daemon that predates the gate for a narrow stream got
+    // the whole raw journal and no way to tell. This is the same
+    // `Reply::Ok` envelope every other verb answers in (R2), written
+    // once, ahead of everything — never a warning appended after the
+    // content it was supposed to govern. It names only the applied
+    // scope and the Work the caller already named: no journal content,
+    // no count, no requester identity.
+    //
+    // Only the scoped stream carries it. An `admin` watch is
+    // byte-identical to what it always was, so the ordinary operator
+    // pane and every existing consumer of it are unchanged, and an
+    // older client can still read this daemon's administrative stream.
+    if !payload.admin && write_scope_ack(&stream, &work_id).is_err() {
+        return;
+    }
+
     let (tx, rx) = std::sync::mpsc::channel::<Event>();
     let existing = {
-        let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+        let journal = lock_journal(&journal);
         let existing = match journal.replay() {
             Ok(events) => events,
             Err(err) => {
@@ -1207,6 +1381,23 @@ fn handle_watch_connection(
     // drops the map's own copy) — the connection ends the same as a
     // client hangup: the socket simply closes when this function
     // returns.
+}
+
+/// The scoped `watch` stream's opening line: one ordinary `Reply::Ok`
+/// naming the scope this daemon applied, written before any `Event`
+/// line and only when the request named a scope
+/// (`handle_watch_connection`'s own doc). `wirkd::client::watch`
+/// requires it for a scoped request and refuses the stream without it,
+/// which is what makes a silently-unscoped answer from an older daemon
+/// impossible to consume as though it were scoped. Carries the applied
+/// scope and the Work id the caller itself sent, and nothing else.
+fn write_scope_ack(stream: &UnixStream, work_id: &WorkId) -> io::Result<()> {
+    let reply = ok_reply(json!({"scope": "requester", "work_id": work_id.0}));
+    let mut bytes = serde_json::to_vec(&reply).expect("Reply always serializes");
+    bytes.push(b'\n');
+    let mut writer = stream;
+    writer.write_all(&bytes)?;
+    writer.flush()
 }
 
 /// One NDJSON line per `Event`, raw — not wrapped in the request/reply
@@ -1286,6 +1477,10 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 leaves: Vec::new(),
                 required_child_outcomes: Vec::new(),
                 selection: None,
+                // The ad hoc, Route-less single-Waypoint shape declares
+                // no verification obligation: there is no authored Route
+                // edition here for a policy to have admitted.
+                verifies: None,
             }],
         )
     } else {
@@ -1466,6 +1661,9 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // hashes `actor.boundary.0` (0029 D95, landed before
                 // this item); only the value fed into it changes here.
                 boundary: first_def.boundary.clone(),
+                // W-B target binding: freeze the declared review
+                // selectors here, before the review can run.
+                review_targets: freeze_review_targets(state, &payload.repositories, &first_def),
             })
         }
         WaypointKind::Actor => {
@@ -1491,6 +1689,11 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // the sibling arm above — the Route's own globs, not a
                 // hardcoded empty boundary.
                 boundary: first_def.boundary.clone(),
+                // The ad hoc, unknown-basis Actor shape has no admitted
+                // source basis to freeze a review target against, so a
+                // review obligation here can never discharge — the same
+                // fail-closed outcome an unresolvable selector reaches.
+                review_targets: freeze_review_targets(state, &payload.repositories, &first_def),
             })
         }
         // `waypoint_id` is `all_waypoints[0]`, drawn from `flatten_leaves`
@@ -1534,7 +1737,7 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         Ok(journal) => journal,
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
 
     // W-A (§3.1): explicit journaled identity for every container this
     // first reservation newly enters (BUILD-AMENDMENTS.md: "name it and
@@ -1646,7 +1849,7 @@ fn spawn_child_on_parent(
     let journal = journal_for(state, &parent.work)
         .map_err(|err| ("JournalError", err.to_string()))?
         .ok_or_else(|| ("ChildParentMismatch", "no such parent Work".to_string()))?;
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
     let events = journal
         .replay()
         .map_err(|err| ("JournalError", err.to_string()))?;
@@ -1943,6 +2146,17 @@ fn handle_record(
             | EventKind::StageHeld { .. }
             | EventKind::StageClosed { .. }
             | EventKind::ChildWorkSpawned { .. }
+            // W-B: all four join this arm (HANDOFF.md §8) — the same
+            // defense-in-depth `probe B2` executed for every other
+            // server-owned transition. `FindingRaised` also has its own
+            // dedicated, triple-checked verb (`handle_finding_raise`);
+            // `FindingSettled`/`FindingAsserted`/`FindingApplied` have
+            // no client-callable producer at all outside their own
+            // verbs, so a raw `record` can never mint any of the four.
+            | EventKind::FindingRaised { .. }
+            | EventKind::FindingSettled { .. }
+            | EventKind::FindingAsserted { .. }
+            | EventKind::FindingApplied { .. }
     ) {
         return err_reply(
             "Forbidden",
@@ -1955,7 +2169,7 @@ fn handle_record(
         Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
     let events = match journal.replay() {
         Ok(events) => events,
         Err(err) => return err_reply("JournalError", &err.to_string()),
@@ -2273,7 +2487,11 @@ fn handle_record(
         | EventKind::ContainerActivated { .. }
         | EventKind::StageHeld { .. }
         | EventKind::StageClosed { .. }
-        | EventKind::ChildWorkSpawned { .. } => unreachable!(),
+        | EventKind::ChildWorkSpawned { .. }
+        | EventKind::FindingRaised { .. }
+        | EventKind::FindingSettled { .. }
+        | EventKind::FindingAsserted { .. }
+        | EventKind::FindingApplied { .. } => unreachable!(),
     };
     let event = new_event(&payload.work_id, Some(run_id.clone()), kind);
     if let Err(err) = append_event(state, &mut journal, &payload.work_id, &event) {
@@ -2371,7 +2589,27 @@ fn artifact_canonical_containment(
     Ok(!canonical_artifact.starts_with(&canonical_root))
 }
 
+/// W-B (§6): a thin wrapper so `settle_ready` runs only *after*
+/// `handle_claim_inner`'s own journal lock is fully released — a
+/// Validated Done Claim can be exactly the `deterministic-verified`
+/// trigger a `VerifiedOutcome` finding's evidence already names, and
+/// `close_cascade`'s own `StageClosed` (fired from auto-advance below)
+/// can be the `child-investigation-confirmed` trigger — `settle_ready`
+/// re-locks the same Work's journal internally, which would deadlock if
+/// called while `handle_claim_inner` still held it.
 fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
+    let work_id = payload.triple.work_id.clone();
+    let reply = handle_claim_inner(state, payload);
+    if let Err(err) = settle_ready(state, &work_id, false) {
+        eprintln!(
+            "wirkd: settlement evaluation after claim failed for {}: {err}",
+            work_id.0
+        );
+    }
+    reply
+}
+
+fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     let work_id = payload.triple.work_id.clone();
     let run_id = payload.triple.run_id.clone();
 
@@ -2387,7 +2625,7 @@ fn handle_claim(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
 
     let events = match journal.replay() {
         Ok(events) => events,
@@ -3058,6 +3296,14 @@ fn reserve_next_leaf(
                     intent: next_def.intent.clone().unwrap_or_default(),
                     output_contract: OutputContract(next_def.declared_outputs.clone()),
                     boundary: next_def.boundary.clone(),
+                    // W-B target binding: a review Waypoint reached by
+                    // auto-advance freezes its targets at exactly the
+                    // same point — its own reservation.
+                    review_targets: freeze_review_targets(
+                        state,
+                        &fold(&events).repositories,
+                        next_def,
+                    ),
                 }))
             }
             // `waypoints` (`route_waypoints`) names only executable
@@ -3208,12 +3454,45 @@ fn record_and_reply(
 /// All of these are additive; an old caller reading only the first
 /// three fields is unaffected.
 fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
+    // The launch review's F-C, closed the way `finding list` and
+    // `atlas findings` already answer: one of two *named* scopes, never
+    // a silent unscoped default. `admin` keeps the whole reply; a
+    // `requester` is gated by the identical `lineage_of` set
+    // `admit_evidence` computes at raise time, and then sees the
+    // checkout-derived half only if its own bindings cover this Work's
+    // whole binding set (`DisclosureView::admits_work_checkout`, the
+    // same rule `finding list` applies to an artifact path). A Work
+    // reading its own status is trivially both, which is why `wirk
+    // run`'s setup read and `RunLoop`'s progress poll are unchanged.
+    let scoped: Option<(Work, Vec<Event>, HashSet<WorkId>)> = if payload.admin {
+        None
+    } else {
+        let Some(requester_id) = &payload.requester else {
+            return err_reply(
+                "BadRequest",
+                "a non-administrative status read requires --requesting-work",
+            );
+        };
+        let Some(requester_events) = replay_events(state, requester_id) else {
+            return err_reply("NotFound", "no such requesting work");
+        };
+        let requester = fold(&requester_events);
+        let lineage = lineage_of(state, &requester, &requester_events);
+        if !lineage.contains(&payload.work_id) {
+            return err_reply(
+                "InadmissibleEvidence",
+                "the named work is not the requesting work's own journal or its parent/child lineage",
+            );
+        }
+        Some((requester, requester_events, lineage))
+    };
+
     let journal = match journal_for(state, &payload.work_id) {
         Ok(Some(journal)) => journal,
         Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
-    let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let journal = lock_journal(&journal);
     let events = match journal.replay() {
         Ok(events) => events,
         Err(err) => return err_reply("JournalError", &err.to_string()),
@@ -3353,7 +3632,114 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         result["world_binding"] = world_binding;
     }
 
-    ok_reply(result)
+    // Release this Work's journal guard before the disclosure view
+    // reads any further state — `DisclosureView::admits_work_checkout`
+    // re-reads the reporting Work's own journal, so scoping under the
+    // guard would self-deadlock on the first scoped read. Same order
+    // and same reason as `handle_finding_assert`'s own `drop(journal)`
+    // before it builds a view; the established journal-then-anything
+    // direction is unchanged.
+    drop(journal);
+    match scoped {
+        None => {
+            result["scope"] = json!("administrative");
+            ok_reply(result)
+        }
+        Some((requester, requester_events, lineage)) => {
+            let mut view = DisclosureView::new(&requester, &requester_events, &lineage);
+            if !view.admits_work_checkout(state, &payload.work_id) {
+                view.withheld += withhold_status_content(&mut result);
+            }
+            result["scope"] = json!("requester");
+            // Which Work this scoped answer is *about* — the target the
+            // caller named, not the requester (the acknowledgment
+            // review's F-2). `client::status` compares it to the id it
+            // sent, so a reply that answers about something else cannot
+            // be read as the answer to this consultation. The scoped
+            // `watch` acknowledgment already carried exactly this pair;
+            // `status` named the applied scope alone. Journal identity
+            // the caller itself supplied: no content, and nothing the
+            // requester did not already know. Added on the scoped reply
+            // only — the administrative reply, which asked for no scope
+            // and is bound to none, is byte-identical to what it was.
+            result["work_id"] = json!(payload.work_id.0);
+            result["disclosure"] = json!({"withheld": view.withheld});
+            ok_reply(result)
+        }
+    }
+}
+
+/// Every checkout-derived part of a `status` reply, withheld as whole
+/// objects for a requester whose own bindings do not cover the
+/// reporting Work's. Returns how many parts were withheld — a count and
+/// never a description, the same `withheld_json` discipline `finding
+/// list` uses, so two withheld parts are indistinguishable and no
+/// alias, path, generation, argv or claim text travels in the marker.
+///
+/// What is withheld is exactly what `event_source_disclosure` treats as
+/// content:
+///
+/// - the compiled `world` and its binding, per Run and for the
+///   effective Run — a `DeterministicWorld` is cwd, argv and env;
+/// - a Run's `selection`, `launch_argv` and `launch_attempt`, plus the
+///   Route-authored `selection` the reply offers for the Run's own
+///   Waypoint (all three of `model`/`effort`/`args`, per F-A);
+/// - a `RunFailed` cause's `detail`, wherever it surfaces: inside the
+///   folded `RunState::Failed`, and as the flattened `failure_detail`;
+/// - `needs_input.detail`, which is *the same string* — `fold` copies a
+///   `LifecycleObserved{Blocked}` pane capture straight into it, so
+///   leaving it here would have let the whole F-B correction be read
+///   off a sibling field of the same reply;
+/// - each validated Claim's artifact receipts (paths and digests).
+///
+/// What survives is journal identity: Work state, current waypoint,
+/// event count, Run ids, attempts, content-addressed world hashes,
+/// parent binding, container activations, a hold's declared-output
+/// names, and which Run and *why* (`needs_input.reason`) the Work is
+/// waiting.
+fn withhold_status_content(result: &mut Value) -> usize {
+    let mut withheld = 0usize;
+
+    fn hide(parent: &mut Value, key: &str, withheld: &mut usize) {
+        if let Some(slot) = parent.get_mut(key)
+            && !slot.is_null()
+        {
+            *slot = withheld_json();
+            *withheld += 1;
+        }
+    }
+
+    hide(result, "world", &mut withheld);
+    hide(result, "world_binding", &mut withheld);
+    hide(result, "failure_detail", &mut withheld);
+    if let Some(needs_input) = result.get_mut("needs_input") {
+        hide(needs_input, "detail", &mut withheld);
+    }
+    if let Some(entries) = result.get_mut("evidence").and_then(Value::as_array_mut) {
+        for entry in entries {
+            hide(entry, "artifacts", &mut withheld);
+        }
+    }
+    if let Some(entries) = result.get_mut("runs").and_then(Value::as_array_mut) {
+        for entry in entries {
+            hide(entry, "world", &mut withheld);
+            hide(entry, "world_binding", &mut withheld);
+            hide(entry, "selection", &mut withheld);
+            if let Some(run) = entry.get_mut("run") {
+                hide(run, "selection", &mut withheld);
+                hide(run, "launch_argv", &mut withheld);
+                hide(run, "launch_attempt", &mut withheld);
+                // `RunState` is externally tagged: `"Open"`,
+                // `"Vanished"`, `{"Claimed": <id>}` — all journal
+                // identity — and `{"Failed": {status, request_id, at,
+                // detail}}`, whose `detail` is the one content half.
+                if let Some(failed) = run.pointer_mut("/state/Failed") {
+                    hide(failed, "detail", &mut withheld);
+                }
+            }
+        }
+    }
+    withheld
 }
 
 /// W-A correction (F3): one entry per validated Claim that recorded
@@ -3465,7 +3851,7 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
         Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
     let events = match journal.replay() {
         Ok(events) => events,
         Err(err) => return err_reply("JournalError", &err.to_string()),
@@ -3557,7 +3943,7 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
         Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
     let events = match journal.replay() {
         Ok(events) => events,
         Err(err) => return err_reply("JournalError", &err.to_string()),
@@ -3781,7 +4167,7 @@ fn handle_workfail(state: &Arc<WirkdState>, payload: WorkFailPayload) -> Reply {
         Ok(None) => return err_reply("NotFound", "no such work"),
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
     let events = match journal.replay() {
         Ok(events) => events,
         Err(err) => return err_reply("JournalError", &err.to_string()),
@@ -4075,6 +4461,154 @@ fn work_journal_dir(state: &Arc<WirkdState>, work_id: &WorkId) -> Option<PathBuf
         _ => None,
     }
 }
+
+// ---- The journal lock discipline (ruling 0119) ----------------------------
+//
+// One rule governs every `Mutex<Journal>` in this file: **a thread that
+// is deciding something about another Work's journal does not hold its
+// own Work's journal guard while it reads that other journal.**
+//
+// The defect that rule exists to prevent is an AB/BA inversion, and it
+// is reached by ordinary supported use rather than by anything exotic.
+// `handle_finding_raise` held the raising Work's guard across
+// `admit_evidence`, and admission reads whatever Work the evidence
+// names — an ancestor, a descendant, or (since the off-lineage relation
+// route) any estate publisher at all. Two Works naming each other at the
+// same moment therefore took the same two locks in opposite orders and
+// wedged permanently: not only the two raises, but *every* later read of
+// either journal, `--admin` included, until the daemon was restarted.
+// A settled EstateLocal publication the whole estate could read a moment
+// earlier became unreadable. The rest of the estate stayed responsive,
+// so it presents as two Works going quiet rather than as an outage.
+//
+// Two disciplines already in this file satisfy the rule, and the paths
+// below reuse them rather than inventing a third or serializing the
+// estate behind one lock:
+//
+//   - **A total acquisition order**, `handle_finding_applied`'s: it
+//     needs several journals held at once, so it computes
+//     `journal_lock_order` (ancestor depth, then id) for all of them
+//     *before* taking any, and acquires in that order. Two callers of it
+//     can never invert.
+//   - **Observe, then re-acquire and re-check**, `cancel_work`'s: it
+//     needs other journals *while deciding*, so it reads its own
+//     journal, drops the guard, reads the children with no guard held,
+//     then re-acquires its own guard and re-checks terminality under it
+//     before appending ("a concurrent cancel of the same Work between
+//     the read above and this write is harmless").
+//
+// Evidence admission cannot use the first: the set of journals an
+// admission walk touches is discovered *by* the walk (each record it
+// follows may name another), so there is no set to sort before locking.
+// It uses the second, which is why `handle_finding_raise` and
+// `settle_ready` below are written as an observe/decide/re-check loop.
+//
+// Re-checking is not optional bookkeeping. Between the observation and
+// the append, the raising Work's own authority can change underneath:
+// its Run can be retried and superseded, the Work can be canceled or
+// completed, a child can be spawned that widens its lineage. Everything
+// those checks rest on is derived from that Work's own append-only
+// journal, so "the journal has not moved" is exactly "every authority
+// fact this decision rested on still holds" — and appending under the
+// same guard the check ran under is what keeps a concurrent raise from
+// being lost. What is *not* re-checked, and never was, is the state of
+// the other Works the evidence named: an admission freezes what it
+// observed there, exactly as it did when it read them under a guard.
+//
+// `lock_journal` makes the rule checkable rather than hoped: every
+// journal acquisition in this file goes through it, and `replay_events`
+// — the one place another Work's journal is locked on a decision path —
+// asserts that no guard is held when it is called.
+
+thread_local! {
+    /// How many journal guards this thread holds (or is blocked
+    /// acquiring). Bookkeeping only: it is read by a `debug_assert`, and
+    /// never by anything that decides an outcome.
+    static JOURNAL_GUARDS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A `Journal` guard that counts itself for the discipline above.
+struct JournalGuard<'a> {
+    inner: std::sync::MutexGuard<'a, Journal>,
+}
+
+impl std::ops::Deref for JournalGuard<'_> {
+    type Target = Journal;
+
+    fn deref(&self) -> &Journal {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for JournalGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Journal {
+        &mut self.inner
+    }
+}
+
+impl Drop for JournalGuard<'_> {
+    fn drop(&mut self) {
+        JOURNAL_GUARDS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
+/// The one acquisition path. Poisoning is recovered the way every call
+/// site already did: a panic elsewhere must not make a Work's journal
+/// permanently unreadable.
+fn lock_journal(journal: &Mutex<Journal>) -> JournalGuard<'_> {
+    JOURNAL_GUARDS_HELD.with(|held| held.set(held.get() + 1));
+    JournalGuard {
+        inner: journal.lock().unwrap_or_else(|poison| poison.into_inner()),
+    }
+}
+
+/// The one nested acquisition this file still makes, named so it stays a
+/// stated exception rather than an unremarked second pattern.
+/// `evaluate_closure` runs under the **parent's** own journal guard and
+/// reads the journal of a Work that parent's own `ChildWorkSpawned`
+/// names, so every edge it adds to the lock graph points from a Work to
+/// one of its own children. Those edges cannot close a cycle: a Work's
+/// `parent` is fixed when it is spawned and no Work is its own ancestor.
+/// What made the estate deadlockable was the *opposite* edge — a Work
+/// taking an ancestor's, a sibling's or a stranger's journal under its
+/// own guard — and evidence admission was the only path that took it.
+fn lock_journal_of_declared_child(journal: &Mutex<Journal>) -> JournalGuard<'_> {
+    lock_journal(journal)
+}
+
+/// The discipline above, asserted where it is actually violated — at the
+/// moment a second journal would be locked. `debug_assert` because this
+/// is a construction rule about this file's own call graph, not a
+/// runtime input to validate: a release daemon must not gain a new
+/// failure mode from it, and every test and every daemon this estate
+/// builds runs with debug assertions on.
+fn no_journal_guard_held(site: &str) {
+    debug_assert_eq!(
+        JOURNAL_GUARDS_HELD.with(std::cell::Cell::get),
+        0,
+        "{site} locks another Work's journal and must not run under a journal guard (ruling 0119)"
+    );
+}
+
+/// Two observations of the same journal, taken at different moments.
+/// The journal is append-only, so one is a prefix of the other and
+/// "nothing was appended between them" is the whole question: same
+/// length, and the same event last. Every authority fact the raise and
+/// settlement paths check — the Work's state, its Run's currency for its
+/// Waypoint, its repository bindings, its lineage, which Findings it
+/// holds — is folded from these events and nothing else, so an unmoved
+/// journal is an unchanged decision.
+fn same_observation(before: &[Event], after: &[Event]) -> bool {
+    before.len() == after.len()
+        && before.last().map(|event| &event.id) == after.last().map(|event| &event.id)
+}
+
+/// How many times an observe/decide/re-check loop re-reads before giving
+/// up. Each lap is lost only to a *concurrent append on the same Work*,
+/// which is rare and never a spin: the loser re-reads once and proceeds.
+/// The bound exists so a pathologically busy Work returns an honest
+/// refusal instead of looping.
+const JOURNAL_OBSERVATION_ATTEMPTS: usize = 8;
 
 /// Fetches an existing submitted Work's journal.  This is intentionally not a
 /// creation path: status, watch, claim, record, failure and retry may observe
@@ -4518,12 +5052,19 @@ fn evaluate_closure(
     }
 
     for role in &def.required_child_outcomes {
-        if !role.required {
-            continue;
-        }
         match valid_child_receipt(state, events, container_id, &role.role) {
+            // W-B obligation proof: a role that really closed is
+            // recorded in this activation's own receipts whether or not
+            // the outcome contract *required* it. Before this wave an
+            // optional role's real, valid receipt was discarded, so a
+            // verification obligation naming an optional role could
+            // never be discharged by the role that actually performed it
+            // — which is how the independent review's C2 ended up
+            // crediting `auditor` through `scribe`. Holding is unchanged:
+            // only a missing *required* role still holds the container.
             Some(receipt) => receipts.push(receipt),
-            None => missing.push(format!("child role {}", role.role)),
+            None if role.required => missing.push(format!("child role {}", role.role)),
+            None => {}
         }
     }
 
@@ -4614,7 +5155,7 @@ fn child_work_completed_receipt(
 ) -> Option<(ClaimId, WorldHash)> {
     let journal = journal_for(state, child).ok().flatten()?;
     let events = {
-        let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+        let journal = lock_journal_of_declared_child(&journal);
         journal.replay().ok()?
     };
     if events.is_empty() {
@@ -4733,11 +5274,32 @@ fn close_cascade(
 /// Work no longer exists, is already terminal, or its named container
 /// is not currently held (idempotent: re-evaluating an already-closed
 /// container must never re-open or duplicate its receipts).
+/// W-B (§6): same lock-ordering wrapper as `handle_claim`'s own —
+/// `reevaluate_parent_inner`'s own `close_cascade` can append the exact
+/// `StageClosed` a `child-investigation-confirmed` settlement is waiting
+/// on, and `settle_ready` must never run while that Work's journal lock
+/// is still held.
 fn reevaluate_parent(state: &Arc<WirkdState>, parent: &ParentBinding) -> Result<(), JournalError> {
+    let result = reevaluate_parent_inner(state, parent);
+    if result.is_ok()
+        && let Err(err) = settle_ready(state, &parent.work, false)
+    {
+        eprintln!(
+            "wirkd: settlement evaluation after container closure failed for {}: {err}",
+            parent.work.0
+        );
+    }
+    result
+}
+
+fn reevaluate_parent_inner(
+    state: &Arc<WirkdState>,
+    parent: &ParentBinding,
+) -> Result<(), JournalError> {
     let Some(journal) = journal_for(state, &parent.work)? else {
         return Ok(());
     };
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
     let events = journal.replay()?;
     if events.is_empty() || fold(&events).state.is_terminal() {
         return Ok(());
@@ -4882,7 +5444,7 @@ fn cancel_work(
         .map_err(|err| ("JournalError", err.to_string()))?
         .ok_or_else(|| ("NotFound", "no such work".to_string()))?;
     let events = {
-        let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+        let journal = lock_journal(&journal);
         journal
             .replay()
             .map_err(|err| ("JournalError", err.to_string()))?
@@ -4906,7 +5468,7 @@ fn cancel_work(
                 .ok()
                 .flatten()
                 .and_then(|journal| {
-                    let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+                    let journal = lock_journal(&journal);
                     journal.replay().ok()
                 })
                 .is_some_and(|events| !events.is_empty() && !fold(&events).state.is_terminal())
@@ -4931,7 +5493,7 @@ fn cancel_work(
     let journal = journal_for(state, work_id)
         .map_err(|err| ("JournalError", err.to_string()))?
         .ok_or_else(|| ("NotFound", "no such work".to_string()))?;
-    let mut journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut journal = lock_journal(&journal);
     // Re-check terminality under this Work's own lock: a concurrent
     // cancel of the same Work between the read above and this write is
     // harmless (idempotent no-op), never a double `WorkCanceled`.
@@ -5722,7 +6284,7 @@ fn resolve_query_scope(
     };
     let events = match journal_for(state, work_id) {
         Ok(Some(journal)) => {
-            let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+            let journal = lock_journal(&journal);
             match journal.replay() {
                 Ok(events) => events,
                 Err(err) => return Err(err_reply("JournalError", &err.to_string())),
@@ -5744,6 +6306,86 @@ fn resolve_query_scope(
 /// is admissible under `QueryScope::EstateOrientation` unconditionally,
 /// or under `QueryScope::Work(grants)` only if some grant names its
 /// alias.
+/// W-B target binding: resolve a Waypoint's declared review selectors
+/// against the estate's own published sources and **freeze** them into
+/// the World being reserved. This is the one place the review's target
+/// becomes an exact identity, and it happens before the review executes
+/// and before the operator has anything to admit.
+///
+/// Each selector names an Atlas source alias and a resource path. The
+/// membership must be admitted under the reviewing Work's own
+/// `repositories` bindings — the identical `admitted_membership_for`
+/// call `admit_evidence`'s own `Source` arm makes, so a review can never
+/// be pointed at a source the Work is not bound to. The generation is
+/// that membership's own **currently published** generation, and the
+/// object is the resource record's own object id in it.
+///
+/// A selector that does not resolve contributes nothing rather than
+/// failing the reservation: the resulting World then carries fewer
+/// frozen targets than the contract declares, its hash and therefore its
+/// obligation basis differ from the fully-resolved one, and
+/// `actor_reviewed_readiness` refuses it outright. Fail closed, and
+/// visible in the basis the operator is asked to admit.
+///
+/// Returns an empty vector for every Waypoint that declares no review,
+/// which is every Waypoint outside the agentic class.
+fn freeze_review_targets(
+    state: &Arc<WirkdState>,
+    bindings: &[RepositoryBinding],
+    def: &WaypointDefinition,
+) -> Vec<ReviewTarget> {
+    let Some(obligation) = def.verifies.as_ref() else {
+        return Vec::new();
+    };
+    let Some(review) = obligation.review.as_ref() else {
+        return Vec::new();
+    };
+    if review.targets.is_empty() {
+        return Vec::new();
+    }
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let scope = wirk_atlas::QueryScope::Work(bindings.to_vec());
+    let mut frozen = Vec::new();
+    for selector in &review.targets {
+        let Some(membership) = atlas
+            .memberships()
+            .find(|member| member.alias == selector.source)
+            .cloned()
+        else {
+            continue;
+        };
+        if admitted_membership_for(&atlas, &scope, &membership.id).is_none() {
+            continue;
+        }
+        let Ok(Some(generation)) = atlas.current(&membership) else {
+            continue;
+        };
+        let Some(resource) = generation
+            .resources
+            .iter()
+            .find(|record| record.path == selector.path.as_bytes())
+        else {
+            continue;
+        };
+        let Some(object_id) = resource.object_id.clone() else {
+            continue;
+        };
+        frozen.push(ReviewTarget {
+            source: selector.source.clone(),
+            path: selector.path.clone(),
+            estate: membership.estate.0.clone(),
+            membership: membership.id.0.clone(),
+            source_id: membership.source.0.clone(),
+            generation: generation.id.0.clone(),
+            object_id,
+        });
+    }
+    frozen
+}
+
 fn admitted_membership_for(
     atlas: &wirk_atlas::AtlasStore,
     scope: &wirk_atlas::QueryScope,
@@ -6406,6 +7048,45 @@ struct ProducingAction {
     world_hash: WorldHash,
 }
 
+/// The estate-wide order in which one request acquires more than one
+/// Work journal lock at once (`handle_finding_applied`'s own
+/// linearization boundary is the first caller). Two requests that lock
+/// the same pair in opposite orders deadlock head-on, so the order has
+/// to be a property of the *Works*, never of the request.
+///
+/// The key is `(distance from this Work's root ancestor, WorkId)`. That
+/// is not an arbitrary choice: it is the order this daemon's existing
+/// multi-journal sites already take. `settle_ready` holds a Work's own
+/// journal lock while `child_investigation_ready` reads a child's
+/// journal, and `close_cascade` does the same walking down a container's
+/// children — ancestor first, descendant second, every time. An
+/// ancestor's chain is strictly shorter than its descendant's, so a
+/// smaller key can never be a descendant, and this order agrees with
+/// every one of those sites rather than competing with it.
+/// `reevaluate_parent` is the deliberate counterpart: it drops the
+/// child's lock *before* touching the parent's, and its own comment says
+/// why.
+///
+/// Works with no ancestry between them need only *some* total order for
+/// two requests to agree; the `WorkId` supplies it.
+///
+/// This reads journals (`fold_work`), so it must be called before any of
+/// the locks it is ordering has been taken.
+fn journal_lock_order(state: &Arc<WirkdState>, work_id: &WorkId) -> (usize, String) {
+    let mut depth = 0usize;
+    let mut seen = HashSet::new();
+    seen.insert(work_id.clone());
+    let mut next = fold_work(state, work_id).and_then(|work| work.parent);
+    while let Some(binding) = next {
+        if !seen.insert(binding.work.clone()) {
+            break;
+        }
+        depth += 1;
+        next = fold_work(state, &binding.work).and_then(|work| work.parent);
+    }
+    (depth, work_id.0.clone())
+}
+
 /// Why a *current open* Run and not the Work's latest validated Claim
 /// (ruling 0095, superseding this function's ruling-0093 predecessor
 /// `latest_validated_claim`).
@@ -6532,7 +7213,7 @@ fn handle_atlas_relate(state: &Arc<WirkdState>, payload: super::AtlasRelatePaylo
     };
     let events = match journal_for(state, &payload.work) {
         Ok(Some(journal)) => {
-            let journal = journal.lock().unwrap_or_else(|poison| poison.into_inner());
+            let journal = lock_journal(&journal);
             match journal.replay() {
                 Ok(events) => events,
                 Err(err) => return err_reply("JournalError", &err.to_string()),
@@ -6613,10 +7294,5158 @@ fn handle_atlas_relate(state: &Arc<WirkdState>, payload: super::AtlasRelatePaylo
     }
 }
 
+// ---- Findings, Settlement, Assertion, Application (W-B) ------------------
+//
+// `knowledge/work/p3-world-loop/W-B-BUILD.md`, corrected by
+// `loop-b-prepare-correct/HANDOFF.md` and `W-B-CONSTRUCTION-REVIEW.md`.
+// Five things kept distinct: Evidence -> Finding -> Settlement ->
+// Application -> the estate index. Settlement is never a wire field
+// (§2.4): `EventKind::FindingSettled` has exactly one producer,
+// `settle_ready` below, which mints it only when an admitted policy
+// class's check holds against a journal fact this daemon derived
+// itself. The one caller boundary this daemon actually has (§2.2): a
+// fact wirkd derives from its own journals is authority; anything a
+// client asserts is a label.
+
+/// R2: the same table `wirk_core::finding_kind_name` owns, which
+/// `obligation_basis` now hashes a declared decision set with. One table,
+/// so a rendered kind and an admitted decision can never drift apart.
+fn finding_kind_str(kind: FindingKind) -> &'static str {
+    finding_kind_name(kind)
+}
+
+fn parse_finding_kind(raw: &str) -> Result<FindingKind, String> {
+    match raw {
+        "gap" => Ok(FindingKind::Gap),
+        "contradicted_assumption" => Ok(FindingKind::ContradictedAssumption),
+        "relationship" => Ok(FindingKind::Relationship),
+        "verified_outcome" => Ok(FindingKind::VerifiedOutcome),
+        other => Err(format!("unknown finding kind {other}")),
+    }
+}
+
+fn finding_scope_str(scope: FindingScope) -> &'static str {
+    match scope {
+        FindingScope::WorkLocal => "work_local",
+        FindingScope::EstateLocal => "estate_local",
+    }
+}
+
+fn parse_finding_scope(raw: &str) -> Result<FindingScope, String> {
+    match raw {
+        "work_local" => Ok(FindingScope::WorkLocal),
+        "estate_local" => Ok(FindingScope::EstateLocal),
+        other => Err(format!("unknown finding scope {other}")),
+    }
+}
+
+fn settlement_class_str(class: SettlementClass) -> &'static str {
+    match class {
+        SettlementClass::DeterministicVerified => "deterministic_verified",
+        SettlementClass::ActorReviewed => "actor_reviewed",
+        SettlementClass::ChildInvestigationConfirmed => "child_investigation_confirmed",
+        SettlementClass::SupersededInOrigin => "superseded_in_origin",
+    }
+}
+
+fn parse_settlement_class(raw: &str) -> Option<SettlementClass> {
+    match raw {
+        "deterministic_verified" => Some(SettlementClass::DeterministicVerified),
+        "actor_reviewed" => Some(SettlementClass::ActorReviewed),
+        "child_investigation_confirmed" => Some(SettlementClass::ChildInvestigationConfirmed),
+        "superseded_in_origin" => Some(SettlementClass::SupersededInOrigin),
+        _ => None,
+    }
+}
+
+/// §9's public shape: `"accepted"|"partially_accepted"|"rejected"|
+/// "deferred"|"superseded"`. `"rejected"` reads `reason` (empty if
+/// absent); `"superseded"` requires `superseded_by`.
+fn parse_decision(
+    raw: &str,
+    reason: Option<String>,
+    superseded_by: Option<String>,
+) -> Result<Decision, String> {
+    match raw {
+        "accepted" => Ok(Decision::Accepted),
+        "partially_accepted" => Ok(Decision::PartiallyAccepted),
+        "rejected" => Ok(Decision::Rejected {
+            reason: reason.unwrap_or_default(),
+        }),
+        "deferred" => Ok(Decision::Deferred),
+        "superseded" => match superseded_by {
+            Some(id) => Ok(Decision::Superseded(FindingId(id))),
+            None => Err("decision superseded requires --superseded-by".to_string()),
+        },
+        other => Err(format!("unknown decision {other}")),
+    }
+}
+
+fn decision_json(decision: &Decision) -> Value {
+    match decision {
+        Decision::Accepted => json!({"decision": "accepted"}),
+        Decision::PartiallyAccepted => json!({"decision": "partially_accepted"}),
+        Decision::Rejected { reason } => json!({"decision": "rejected", "reason": reason}),
+        Decision::Deferred => json!({"decision": "deferred"}),
+        Decision::Superseded(id) => json!({"decision": "superseded", "superseded_by": id.0}),
+    }
+}
+
+/// §3: a Source coordinate is the same already-encoded hex string
+/// `wirk atlas resolve`'s own `--coordinate` uses; a hex string never
+/// contains `/`, so a leading `work/` prefix unambiguously names the
+/// Journal form (`work/<id>/event/<id>`).
+/// The exact forms an evidence token takes, named once so a refusal can
+/// quote them back rather than leaving a caller to guess which of three
+/// spellings it got wrong.
+const EVIDENCE_TOKEN_FORMS: &str = "an evidence token is an exact source coordinate, work/<work-id>/event/<event-id>, \
+     or work/<work-id>/finding/<finding-id>";
+
+/// Classifies one evidence token, or refuses its *form*.
+///
+/// A token that opens `work/` has declared itself a journal reference
+/// and is held to one of the two journal shapes; a bare `finding-…` id
+/// has declared itself a finding reference and is missing the Work that
+/// would locate it. Neither can be a source coordinate, which is hex, so
+/// neither is silently handed to `decode_coordinate` to come back as
+/// "invalid coordinate hex" — the diagnostic that sent a real later Work
+/// looking for a malformed coordinate it had never written
+/// (`NATIVE-CHAIN-ADJUDICATION.md` G3, `raw/13-raise-and-escape.txt`).
+///
+/// A form refusal is decided from the token's own characters and names
+/// no record, so it says nothing about what does or does not exist.
+fn parse_evidence_token(raw: &str) -> Result<EvidenceRef, String> {
+    if let Some(rest) = raw.strip_prefix("work/") {
+        if let Some((work, finding)) = rest.split_once("/finding/")
+            && !work.is_empty()
+            && !finding.is_empty()
+        {
+            return Ok(EvidenceRef::Finding {
+                work: WorkId(work.to_string()),
+                finding: FindingId(finding.to_string()),
+            });
+        }
+        if let Some((work, event)) = rest.split_once("/event/")
+            && !work.is_empty()
+            && !event.is_empty()
+        {
+            return Ok(EvidenceRef::Journal {
+                work: WorkId(work.to_string()),
+                event: EventId(event.to_string()),
+            });
+        }
+        return Err(EVIDENCE_TOKEN_FORMS.to_string());
+    }
+    if raw.starts_with("finding-") {
+        return Err(format!(
+            "a bare finding id names no work and is not a source coordinate; {EVIDENCE_TOKEN_FORMS}"
+        ));
+    }
+    Ok(EvidenceRef::Source(raw.to_string()))
+}
+
+fn evidence_ref_json(reference: &EvidenceRef) -> Value {
+    match reference {
+        EvidenceRef::Source(encoded) => json!({"reference": "source", "coordinate": encoded}),
+        EvidenceRef::Journal { work, event } => {
+            json!({"reference": "journal", "work": work.0, "event": event.0})
+        }
+        // The *claimed* half of a relation, rendered exactly as the
+        // caller named it. What it resolved to is the outcome's job.
+        EvidenceRef::Finding { work, finding } => {
+            json!({"reference": "finding", "work": work.0, "finding": finding.0})
+        }
+    }
+}
+
+fn evidence_outcome_json(outcome: &EvidenceOutcome) -> Value {
+    match outcome {
+        EvidenceOutcome::Admitted {
+            generation,
+            object_id,
+        } => json!({"outcome": "admitted", "generation": generation, "object_id": object_id}),
+        EvidenceOutcome::Unavailable { reason } => {
+            json!({"outcome": "unavailable", "reason": reason})
+        }
+        // The *resolved* half, and deliberately four separate things: an
+        // admitted relation is not a settled one, and an admission route
+        // is not a claim's truth.
+        EvidenceOutcome::Relation {
+            work,
+            origin_event,
+            route,
+            standing,
+        } => json!({
+            "outcome": "admitted",
+            "resolved": {"work": work.0, "origin_event": origin_event.0},
+            "admitted_by": relation_route_str(*route),
+            "target_standing": relation_standing_str(*standing),
+        }),
+    }
+}
+
+fn relation_route_str(route: RelationRoute) -> &'static str {
+    match route {
+        RelationRoute::OwnJournal => "own_journal",
+        RelationRoute::Lineage => "lineage",
+        RelationRoute::SettledEstatePublication => "settled_estate_publication",
+    }
+}
+
+fn relation_standing_str(standing: RelationStanding) -> &'static str {
+    match standing {
+        RelationStanding::Settled => "settled",
+        RelationStanding::Unsettled => "unsettled",
+    }
+}
+
+fn admitted_evidence_json(item: &AdmittedEvidence) -> Value {
+    let mut merged = evidence_ref_json(&item.reference);
+    if let (Value::Object(target), Value::Object(source)) =
+        (&mut merged, evidence_outcome_json(&item.outcome))
+    {
+        target.extend(source);
+    }
+    merged
+}
+
+/// A stable, order-independent key for one `AdmittedEvidence`'s own
+/// reference — used only to compare a parent's `applies_to` against a
+/// child's own as *sets* (§5.3: "applies_to must match as sets").
+fn evidence_ref_key(item: &AdmittedEvidence) -> String {
+    match &item.reference {
+        EvidenceRef::Source(encoded) => format!("source:{encoded}"),
+        EvidenceRef::Journal { work, event } => format!("journal:{}/{}", work.0, event.0),
+        EvidenceRef::Finding { work, finding } => format!("finding:{}/{}", work.0, finding.0),
+    }
+}
+
+fn artifact_receipt_json(receipt: &ArtifactReceipt) -> Value {
+    json!({
+        "name": receipt.name,
+        "path": receipt.path,
+        "digest": if receipt.digest.is_empty() { Value::Null } else { Value::String(receipt.digest.clone()) },
+    })
+}
+
+fn settlement_check_json(check: &SettlementCheck) -> Value {
+    match check {
+        SettlementCheck::ValidatedClaim {
+            work,
+            claim,
+            claim_event,
+            proof,
+            unread,
+        } => {
+            let mut value = json!({
+                "check": "validated_claim", "work": work.0, "claim": claim.0,
+                "claim_event": claim_event.0,
+            });
+            match proof {
+                Some(proof) => {
+                    value["waypoint"] = json!(proof.waypoint.0);
+                    value["attempt"] = json!(proof.attempt);
+                    value["world_hash"] = json!(proof.world_hash.0);
+                    value["obligation"] = json!({
+                        "id": proof.obligation.id, "edition": proof.obligation.edition,
+                        "basis": proof.basis,
+                    });
+                    value["artifacts"] =
+                        Value::Array(proof.artifacts.iter().map(artifact_receipt_json).collect());
+                }
+                None => value["obligation"] = historical_obligation_json(unread),
+            }
+            value
+        }
+        SettlementCheck::ActorReview {
+            work,
+            claim,
+            claim_event,
+            proof,
+        } => json!({
+            "check": "actor_review", "work": work.0, "claim": claim.0,
+            "claim_event": claim_event.0,
+            "waypoint": proof.waypoint.0, "attempt": proof.attempt,
+            "world_hash": proof.world_hash.0,
+            "intent": proof.intent,
+            "recipe": proof.recipe,
+            "obligation": {
+                "id": proof.obligation.id, "edition": proof.obligation.edition,
+                "basis": proof.basis,
+            },
+            "decision": finding_kind_str(proof.decision),
+            "targets": proof.targets.iter().map(reviewed_target_json).collect::<Vec<_>>(),
+            "report": proof.report.iter().map(artifact_receipt_json).collect::<Vec<_>>(),
+        }),
+        SettlementCheck::ChildReceipt {
+            parent,
+            waypoint,
+            attempt,
+            child,
+            role,
+            claim,
+            closed_event,
+            child_raise_event,
+            proof,
+            unread,
+        } => {
+            let mut value = json!({
+                "check": "child_receipt", "parent": parent.0, "waypoint": waypoint.0,
+                "attempt": attempt, "child": child.0, "role": role, "claim": claim.0,
+                "closed_event": closed_event.0, "child_raise_event": child_raise_event.0,
+            });
+            match proof {
+                Some(proof) => {
+                    value["child_finding"] = json!(proof.confirmed_by.0);
+                    value["obligation"] = json!({
+                        "id": proof.obligation.id, "edition": proof.obligation.edition,
+                        "basis": proof.basis,
+                    });
+                    value["requires"] = json!({
+                        "id": proof.requires.id, "edition": proof.requires.edition,
+                    });
+                    value["obligated_roles"] =
+                        Value::Array(proof.roles.iter().map(discharged_role_json).collect());
+                }
+                None => value["obligation"] = historical_obligation_json(unread),
+            }
+            value
+        }
+        SettlementCheck::SupersededBy {
+            work,
+            finding,
+            raise_event,
+        } => json!({
+            "check": "superseded_by", "work": work.0, "finding": finding.0,
+            "raise_event": raise_event.0,
+        }),
+    }
+}
+
+/// A settlement minted before the obligation-proof revision recorded no
+/// obligation at all. It renders as exactly that — historical and
+/// unknown — never as a zero-valued obligation and never as something
+/// newly verified. Nothing this daemon mints can produce it: both
+/// readiness functions always construct a real proof.
+/// What this reader can establish about a settlement whose proof it
+/// cannot read — and nothing more. Two genuinely different facts, said
+/// apart:
+///
+/// - the record carries no proof fields at all (a base-era settlement);
+/// - the record carries fields this revision does not interpret, shown
+///   verbatim.
+///
+/// Neither sentence claims the past failed to record something. The
+/// independent re-review's C2 was exactly that overreach.
+fn historical_obligation_json(unread: &UnreadFields) -> Value {
+    if unread.is_empty() {
+        json!({
+            "recorded": false,
+            "reason": "this record carries no obligation-proof fields; this revision reads none and asserts nothing about what minted it",
+        })
+    } else {
+        json!({
+            "recorded": false,
+            "reason": "this revision does not interpret the obligation-proof shape in this record; the fields it carries are shown verbatim, unread and not relied on",
+            "unread_by_this_revision": unread.0,
+        })
+    }
+}
+
+/// The complete checked target identity, rendered. The selector the
+/// Route asked for is shown beside the exact membership, source,
+/// generation and object it was frozen to and the review's own admitted
+/// evidence matched — so a reader can see *which* `socket.rs`, not only
+/// that some file of that name was cited.
+fn reviewed_target_json(target: &ReviewTarget) -> Value {
+    json!({
+        "selector": {"source": target.source, "path": target.path},
+        "estate": target.estate,
+        "membership": target.membership,
+        "source_id": target.source_id,
+        "generation": target.generation,
+        "object_id": target.object_id,
+    })
+}
+
+fn discharged_role_json(role: &DischargedRole) -> Value {
+    json!({
+        "role": role.role,
+        "child": role.child.0,
+        "claim": role.claim.0,
+        "finding": role.finding.0,
+        "mechanism": {"id": role.mechanism.id, "edition": role.mechanism.edition},
+        "mechanism_basis": role.mechanism_basis,
+        "settled_event": role.settled_event.0,
+    })
+}
+
+/// The exact, limited statement a settled check proves, with the
+/// immutable identity that discharged it. Never the Finding's own
+/// sentence, and never a general claim of semantic truth: a settlement
+/// says one Route-authored, estate-admitted obligation was discharged by
+/// one named receipt, and says nothing else.
+///
+/// A settlement whose `proof` is absent was minted before this contract
+/// existed. It renders `recorded: false` with an explicit historical
+/// reason and a `null` statement — readable, honest about what is
+/// unknown, and never dressed up as a verified proof.
+fn settlement_proves_json(check: &SettlementCheck) -> Value {
+    match check {
+        SettlementCheck::ValidatedClaim {
+            work,
+            claim,
+            claim_event,
+            proof,
+            unread,
+        } => match proof {
+            Some(proof) => json!({
+                "recorded": true,
+                "statement": proof.proves,
+                "obligation": {
+                    "id": proof.obligation.id, "edition": proof.obligation.edition,
+                    "basis": proof.basis,
+                },
+                "discharged_by": {
+                    "kind": "validated_claim",
+                    "waypoint": proof.waypoint.0, "attempt": proof.attempt,
+                    "world_hash": proof.world_hash.0, "claim": claim.0,
+                    "artifacts": proof.artifacts.iter().map(artifact_receipt_json).collect::<Vec<_>>(),
+                },
+            }),
+            None => historical_proves_json(
+                unread,
+                json!({
+                    "kind": "validated_claim", "work": work.0, "claim": claim.0,
+                    "claim_event": claim_event.0,
+                }),
+            ),
+        },
+        // The agentic mechanism states its own standing in the record.
+        // A deterministic settlement proves a command's outcome; this
+        // proves that an admitted review happened, under an admitted
+        // recipe, over admitted targets, and recorded a declared
+        // decision — and says so, rather than borrowing the
+        // deterministic vocabulary or implying its conclusion is true.
+        SettlementCheck::ActorReview { claim, proof, .. } => json!({
+            "recorded": true,
+            "statement": proof.proves,
+            "obligation": {
+                "id": proof.obligation.id, "edition": proof.obligation.edition,
+                "basis": proof.basis,
+            },
+            "standing": "an admitted independent review was performed under this recipe over these exact admitted targets and recorded this declared decision; whether its conclusion is true is judgement, not proof",
+            "discharged_by": {
+                "kind": "actor_review",
+                "waypoint": proof.waypoint.0, "attempt": proof.attempt,
+                "world_hash": proof.world_hash.0, "claim": claim.0,
+                "intent": proof.intent,
+                "recipe": proof.recipe,
+                "decision": finding_kind_str(proof.decision),
+                "targets": proof.targets.iter().map(reviewed_target_json).collect::<Vec<_>>(),
+                "report": proof.report.iter().map(artifact_receipt_json).collect::<Vec<_>>(),
+            },
+        }),
+        SettlementCheck::ChildReceipt {
+            waypoint,
+            attempt,
+            child,
+            role,
+            claim,
+            proof,
+            unread,
+            ..
+        } => match proof {
+            Some(proof) => json!({
+                "recorded": true,
+                "statement": proof.proves,
+                "obligation": {
+                    "id": proof.obligation.id, "edition": proof.obligation.edition,
+                    "basis": proof.basis,
+                },
+                "discharged_by": {
+                    "kind": "child_receipt",
+                    "waypoint": waypoint.0, "attempt": attempt,
+                    "child": child.0, "role": role, "claim": claim.0,
+                    "child_finding": proof.confirmed_by.0,
+                    "requires": {"id": proof.requires.id, "edition": proof.requires.edition},
+                    "obligated_roles": proof.roles.iter().map(discharged_role_json).collect::<Vec<_>>(),
+                },
+            }),
+            None => historical_proves_json(
+                unread,
+                json!({
+                    "kind": "child_receipt", "waypoint": waypoint.0, "attempt": attempt,
+                    "child": child.0, "role": role, "claim": claim.0,
+                }),
+            ),
+        },
+        // A Work replacing its own provisional record proves no
+        // verification obligation and says so, rather than borrowing the
+        // vocabulary of one.
+        SettlementCheck::SupersededBy { finding, .. } => json!({
+            "recorded": true,
+            "statement": "this Work replaced its own earlier provisional finding; no verification obligation is discharged",
+            "obligation": Value::Null,
+            "discharged_by": {"kind": "superseded_by", "superseding_finding": finding.0},
+        }),
+    }
+}
+
+fn historical_proves_json(unread: &UnreadFields, discharged_by: Value) -> Value {
+    let mut value = json!({
+        "recorded": false,
+        "statement": Value::Null,
+        "obligation": Value::Null,
+        "discharged_by": discharged_by,
+    });
+    if unread.is_empty() {
+        value["historical"] = json!(
+            "this record carries no obligation-proof fields, so this reader has nothing to render as proved; it makes no claim about what the revision that minted it did or did not record"
+        );
+    } else {
+        value["historical"] = json!(
+            "this revision does not interpret the obligation-proof shape in this record; what the record carries is shown under `unread_by_this_revision`, disclosed and not relied on, because the rule those values were computed under is not this revision's rule"
+        );
+        value["unread_by_this_revision"] = json!(unread.0);
+    }
+    value
+}
+
+fn settlement_json(settlement: &Settlement) -> Value {
+    json!({
+        "authority": {
+            "policy": {
+                "class": settlement_class_str(settlement.authority.class),
+                "policy_version": settlement.authority.policy_version,
+                "policy_digest": settlement.authority.policy_digest,
+            },
+        },
+        "check": settlement_check_json(&settlement.check),
+        // W-B obligation proof: *what this settlement proves* — the
+        // Route-authored, policy-admitted statement of the discharged
+        // obligation and the immutable receipt that discharged it. The
+        // Finding's own `claim` sentence is rendered beside it as a
+        // recorded, unverified sentence (`finding_json`), so a reader is
+        // never shown free text as the settled thing.
+        "proves": settlement_proves_json(&settlement.check),
+        "settled_by_event": settlement.settled_by.0,
+        "at": settlement.at.0,
+        "minted_at_startup": settlement.minted_at_startup,
+    })
+}
+
+/// §2.5: rendered "unverified" always — an assertion is a recorded
+/// label, never a checked identity, whatever the peer credential says.
+fn assertion_json(assertion: &Assertion) -> Value {
+    json!({
+        "decision": decision_json(&assertion.decision),
+        "by": format!("recorded name: {}, unverified", assertion.by),
+        "verified": false,
+        // The operator's own sentence, exactly as recorded — `null` when
+        // none was given, never a caption standing in for one. Ruling
+        // 0114's first carried gap: `Decision` carries a `reason` only
+        // on `Rejected`, so a sentence supplied with any other decision
+        // was journaled durably and then rendered to nobody, `--admin`
+        // included. It is prose, so it goes through
+        // `withhold_assertion_prose` on its recorded author like the
+        // rejected reason already did, and the two renderings of the one
+        // sentence count once.
+        "reason": assertion.reason,
+        "peer": {"uid": assertion.peer.uid, "gid": assertion.peer.gid},
+        "at": assertion.at.0,
+        // The one *checked* thing beside the unverified label: which
+        // requester wirkd admitted when it wrote this
+        // (`ASSERTION-AUTHOR-ADJUDICATION.md`). It is a journal identity,
+        // it is what the prose gate reads, and a reader that is shown a
+        // withheld reason is entitled to see whose reason it was.
+        "author": match &assertion.author {
+            Some(AssertingAuthor::Work(work)) => json!({"author": "work", "work": work.0}),
+            Some(AssertingAuthor::Administrator) => json!({"author": "administrator"}),
+            None => json!({"author": "unknown", "recorded_before_authorship": true}),
+        },
+    })
+}
+
+fn attribution_json(attribution: &Attribution) -> Value {
+    match attribution {
+        Attribution::Claim {
+            work,
+            run,
+            claim,
+            claim_event,
+        } => json!({
+            "attribution": "claim", "work": work.0, "run": run.0, "claim": claim.0,
+            "claim_event": claim_event.0,
+        }),
+        Attribution::Asserted { by, peer, producer } => json!({
+            "attribution": "asserted",
+            "by": format!("recorded name: {by}, unverified"),
+            "verified": false,
+            "peer": {"uid": peer.uid, "gid": peer.gid},
+            "producer": {
+                "work": producer.work.0,
+                "run": producer.run.0,
+                "world_hash": producer.world_hash.0,
+            },
+        }),
+    }
+}
+
+/// The recorded resource identity at one generation point. `object_id`
+/// stays exactly what the journal holds; `resource` names the fact a
+/// bare `null` left the reader to guess — W-B-AUTHORITY-ADJUDICATION.md's
+/// "explicit deleted-resource absence". `handle_finding_applied` refuses
+/// the one case that could otherwise reach here meaning something else
+/// (a resource Atlas recorded with no object id), so absence here is
+/// deletion and nothing else. An emptied file is `present` with a real
+/// zero-byte object id, which is a different fact and reads as one.
+fn generation_point_json(point: &wirk_core::GenerationPoint) -> Value {
+    json!({
+        "generation": point.generation,
+        "object_id": point.object_id,
+        "resource": if point.object_id.is_some() { "present" } else { "absent" },
+    })
+}
+
+fn application_ref_json(application: &ApplicationRef) -> Value {
+    json!({
+        "source": application.source,
+        "before": generation_point_json(&application.before),
+        "after": generation_point_json(&application.after),
+        "revision": application.revision,
+        "attribution": attribution_json(&application.attribution),
+        "implements_finding": {
+            "by": format!("recorded name: {}, unverified", application.implements_finding.by),
+            "verified": false,
+            "peer": {
+                "uid": application.implements_finding.peer.uid,
+                "gid": application.implements_finding.peer.gid,
+            },
+            "at": application.implements_finding.at.0,
+        },
+    })
+}
+
+fn finding_json(work_id: &WorkId, id: &FindingId, record: &FindingRecord) -> Value {
+    json!({
+        "id": id.0,
+        "work": work_id.0,
+        "run": record.finding.run.0,
+        "waypoint": record.finding.waypoint.0,
+        "kind": finding_kind_str(record.finding.kind),
+        "scope": finding_scope_str(record.finding.scope),
+        // W-B obligation proof / authority review §1: a settled Finding
+        // used to render its free-text sentence under `settled`, so the
+        // reader saw the sentence as the settled thing. It is now
+        // rendered exactly as an Assertion's own `by` already is — a
+        // recorded, unverified string — with `claim_text` carrying the
+        // machine-readable sentence and `settled.proves` carrying what
+        // the check actually proves. This makes the *claim* honest about
+        // its standing; it does not declare findings universally
+        // unverifiable, and an unsettled Finding's claim reads the same
+        // way it always did.
+        "claim": format!("recorded claim: {}, unverified", record.finding.claim),
+        "claim_text": record.finding.claim,
+        "claim_verified": false,
+        "obligation": record.finding.obligation.as_ref().map(|obligation| json!({
+            "id": obligation.id, "edition": obligation.edition,
+        })),
+        "confirmed_by": record.finding.confirmed_by.as_ref().map(|reference| json!({
+            "work": reference.work.0, "finding": reference.finding.0,
+        })),
+        "evidence": record.finding.evidence.iter().map(admitted_evidence_json).collect::<Vec<_>>(),
+        "contradicts": record.finding.contradicts.iter().map(admitted_evidence_json).collect::<Vec<_>>(),
+        "applies_to": record.finding.applies_to.iter().map(admitted_evidence_json).collect::<Vec<_>>(),
+        "supersedes": record.finding.supersedes.as_ref().map(|id| id.0.clone()),
+        "proposed_change": record.finding.proposed_change,
+        "settled": match &record.state {
+            FindingState::Settled(settlement) => Some(settlement_json(settlement)),
+            FindingState::Proposed => None,
+        },
+        "assertions": record.assertions.iter().map(assertion_json).collect::<Vec<_>>(),
+        // W-B-CORRECT.md defect 3: every Application, oldest first —
+        // never just the latest, which would erase history a newer
+        // generation's own Application does not undo.
+        "applied": record.applied.iter().map(application_ref_json).collect::<Vec<_>>(),
+    })
+}
+
+// ---- Scoped presentation (W-B-DISCLOSURE-REPAIR.md) -----------------------
+
+/// One requester's own view of the estate's Finding records, shared by
+/// `finding list` and the `atlas findings` index so both draw the
+/// identical boundary rather than each re-deriving one.
+///
+/// `withheld` counts the record parts this view replaced. The count is
+/// reported and the identities are not — the same shape
+/// `wirk_atlas::AdmissionSummary` already uses for a denied membership
+/// on `atlas search`, and the reason a caller can tell "there is nothing
+/// here" from "there is something here you may not see" without learning
+/// what.
+struct DisclosureView<'a> {
+    requester: &'a Work,
+    requester_events: &'a [Event],
+    lineage: &'a HashSet<WorkId>,
+    withheld: usize,
+}
+
+impl<'a> DisclosureView<'a> {
+    fn new(
+        requester: &'a Work,
+        requester_events: &'a [Event],
+        lineage: &'a HashSet<WorkId>,
+    ) -> Self {
+        Self {
+            requester,
+            requester_events,
+            lineage,
+            withheld: 0,
+        }
+    }
+
+    /// Whether this requester may be shown everything read out of
+    /// `work_id`'s own checkout — an artifact path and digest, a
+    /// compiled World. Its bindings must cover that Work's own.
+    fn admits_work_checkout(&self, state: &Arc<WirkdState>, work_id: &WorkId) -> bool {
+        let Some(work) = fold_work(state, work_id) else {
+            // A Work whose journal this daemon cannot read discloses
+            // nothing it can vouch for: fail closed.
+            return false;
+        };
+        work.repositories
+            .iter()
+            .all(|binding| requester_grants_alias(self.requester, &binding.name))
+    }
+
+    fn admits_alias(&self, alias: &str) -> bool {
+        requester_grants_alias(self.requester, alias)
+    }
+
+    /// Whether one frozen evidence entry may be rendered in full: a
+    /// `Source` against the requester's own scope, a `Journal` through
+    /// the identical recursive walk raise-time admission performs, so a
+    /// wrapper cannot launder a coordinate into a *listing* either.
+    fn admits_evidence(&self, state: &Arc<WirkdState>, item: &AdmittedEvidence) -> bool {
+        match &item.reference {
+            EvidenceRef::Source(encoded) => {
+                let disclosure = SourceDisclosure {
+                    coordinates: vec![encoded.clone()],
+                    ..SourceDisclosure::default()
+                };
+                disclosure_admitted(state, self.requester, &disclosure)
+            }
+            EvidenceRef::Journal { work, event } => {
+                let mut walk = ReferenceWalk::new(self.lineage);
+                journal_reference_admitted(
+                    state,
+                    self.requester,
+                    self.requester_events,
+                    &mut walk,
+                    work,
+                    event,
+                )
+                .is_ok()
+            }
+            // A recorded relation is rendered to a *later* reader only
+            // if that reader would itself be admitted to the named
+            // record right now. The author's own admission, frozen at
+            // raise time, is not transferable: a narrower reader of this
+            // finding learns that a part was withheld and nothing else.
+            EvidenceRef::Finding { work, finding } => {
+                let mut walk = ReferenceWalk::new(self.lineage);
+                finding_reference_admitted(
+                    state,
+                    self.requester,
+                    self.requester_events,
+                    &mut walk,
+                    work,
+                    finding,
+                )
+                .is_ok()
+            }
+        }
+    }
+}
+
+/// The one shape every withheld part takes. It says that something was
+/// withheld and nothing whatever about what: no alias, path, generation,
+/// object id, encoded coordinate or claim text travels in it. A caller
+/// that could tell two withheld parts apart could enumerate the estate
+/// through the marker itself.
+fn withheld_json() -> Value {
+    json!({"withheld": true})
+}
+
+fn evidence_array_scoped(
+    state: &Arc<WirkdState>,
+    view: &mut DisclosureView,
+    items: &[AdmittedEvidence],
+) -> Value {
+    Value::Array(
+        items
+            .iter()
+            .map(|item| {
+                if view.admits_evidence(state, item) {
+                    admitted_evidence_json(item)
+                } else {
+                    view.withheld += 1;
+                    withheld_json()
+                }
+            })
+            .collect(),
+    )
+}
+
+/// A settled record, with its source-disclosing half withheld when the
+/// requester's own bindings do not reach it.
+///
+/// What survives is deliberate, not residual: the policy class, version
+/// and digest; the settlement's own event and timestamp; and the check's
+/// **journal** identities — which Work, Claim, Claim event, container
+/// activation, child and role settled it. That is the "useful admitted
+/// cross-Work/child outcome" a narrowed child legitimately consumes: it
+/// learns that its sibling's obligated role closed, and it learns
+/// nothing about the sources that closed it.
+///
+/// What is withheld is `proves` and the proof half of `check`, together
+/// and as whole objects rather than field by field. Those carry the
+/// review targets' exact membership/generation/object identities, the
+/// artifact paths and digests, and — for a historical record — arbitrary
+/// unread JSON that an earlier revision wrote artifact paths into.
+/// Redacting them individually would mean re-auditing this function
+/// every time a proof gains a field; withholding the object means a new
+/// field is withheld by default.
+fn settlement_json_scoped(
+    state: &Arc<WirkdState>,
+    view: &mut DisclosureView,
+    settlement: &Settlement,
+) -> Value {
+    let mut disclosure = SourceDisclosure::default();
+    let mut from_producing_checkout = false;
+    settlement_source_disclosure(settlement, &mut disclosure, &mut from_producing_checkout);
+    let checkout_admitted = !from_producing_checkout
+        || match settlement_producing_work(&settlement.check) {
+            Some(work) => view.admits_work_checkout(state, work),
+            None => false,
+        };
+    if checkout_admitted && disclosure_admitted(state, view.requester, &disclosure) {
+        return settlement_json(settlement);
+    }
+    view.withheld += 1;
+    let mut value = settlement_json(settlement);
+    value["check"] = settlement_check_identities_json(&settlement.check);
+    value["proves"] = withheld_json();
+    value
+}
+
+/// Whose checkout a settlement's artifact receipts were read out of.
+/// `SupersededBy` names no execution at all, and a `ChildReceipt`'s own
+/// unread historical fields belong to the parent that closed the stage.
+fn settlement_producing_work(check: &SettlementCheck) -> Option<&WorkId> {
+    match check {
+        SettlementCheck::ValidatedClaim { work, .. }
+        | SettlementCheck::ActorReview { work, .. } => Some(work),
+        SettlementCheck::ChildReceipt { parent, .. } => Some(parent),
+        SettlementCheck::SupersededBy { .. } => None,
+    }
+}
+
+/// A settled check's journal identities alone — every field of
+/// `settlement_check_json` that names a Work, Run, Claim, Event,
+/// Finding, Waypoint, role or activation, and no field that names a
+/// source, a path, a generation, an object or an artifact digest.
+fn settlement_check_identities_json(check: &SettlementCheck) -> Value {
+    match check {
+        SettlementCheck::ValidatedClaim {
+            work,
+            claim,
+            claim_event,
+            ..
+        } => json!({
+            "check": "validated_claim", "work": work.0, "claim": claim.0,
+            "claim_event": claim_event.0, "proof": withheld_json(),
+        }),
+        SettlementCheck::ActorReview {
+            work,
+            claim,
+            claim_event,
+            proof,
+        } => json!({
+            "check": "actor_review", "work": work.0, "claim": claim.0,
+            "claim_event": claim_event.0,
+            "waypoint": proof.waypoint.0, "attempt": proof.attempt,
+            "decision": finding_kind_str(proof.decision),
+            "proof": withheld_json(),
+        }),
+        SettlementCheck::ChildReceipt {
+            parent,
+            waypoint,
+            attempt,
+            child,
+            role,
+            claim,
+            closed_event,
+            child_raise_event,
+            ..
+        } => json!({
+            "check": "child_receipt", "parent": parent.0, "waypoint": waypoint.0,
+            "attempt": attempt, "child": child.0, "role": role, "claim": claim.0,
+            "closed_event": closed_event.0, "child_raise_event": child_raise_event.0,
+            "proof": withheld_json(),
+        }),
+        // Nothing here is source-disclosing, so this arm is reached only
+        // for symmetry and renders exactly as it always does.
+        SettlementCheck::SupersededBy { .. } => settlement_check_json(check),
+    }
+}
+
+/// An Application's mechanical half is entirely source identity — the
+/// alias, both generation points, the object ids and the published
+/// revision — so an unadmitted source withholds it whole. Its
+/// attribution and its asserted judgement are journal identities and a
+/// recorded unverified name, and stay.
+fn application_json_scoped(view: &mut DisclosureView, application: &ApplicationRef) -> Value {
+    if view.admits_alias(&application.source) {
+        return application_ref_json(application);
+    }
+    view.withheld += 1;
+    let mut value = application_ref_json(application);
+    for field in ["source", "before", "after", "revision"] {
+        value[field] = withheld_json();
+    }
+    value
+}
+
+/// Whether one requester may be shown the free prose the Work behind a
+/// record authored: its claim sentence, its proposed change, an
+/// assertion's rejection reason.
+///
+/// `CHILD-PRODUCER-DISCLOSURE-ADJUDICATION.md`, on the executed
+/// counterexample (`loop-b-child-disclosure-control/raw/scen/41-H.json`):
+/// a child narrowed to `ledger+public` received its parent's authored
+/// claim naming a `vaultx`-only sentinel, while an unrelated Work with
+/// the *identical* bindings was refused the same row whole. Lineage is
+/// permission to consult the family's journal; it is not a source grant,
+/// so it cannot widen what an authored sentence may quote.
+///
+/// The rule is the one the off-lineage publication route already
+/// applies to a whole row (`published_row_scoped`, condition 3),
+/// narrowed to the prose: free text carries no provenance finer than its
+/// author — nothing in the sentence says which source a phrase came from
+/// — so the requester must admit *every* binding of the authoring Work,
+/// or the prose is withheld. Publication is unaffected: a requester that
+/// fails this check off lineage never reached the row at all.
+///
+/// `author` is the Work that *wrote* the prose, which for a claim
+/// sentence and a proposed change is the Work whose journal holds them,
+/// and for an assertion is routinely not
+/// (`ASSERTION-AUTHOR-ADJUDICATION.md`). Callers pass the author; only
+/// `admits_assertion_prose` knows where an assertion's comes from.
+fn admits_authored_prose(state: &Arc<WirkdState>, view: &DisclosureView, author: &WorkId) -> bool {
+    view.admits_work_checkout(state, author)
+}
+
+/// The same rule, applied to the one authored sentence whose author is
+/// *not* the Work whose journal holds it.
+///
+/// `ASSERTION-AUTHOR-ADJUDICATION.md`, on the executed counterexample in
+/// `loop-b-lineage-prose-verify/raw/32-matrix-green.txt` section C: a
+/// parent holding `vaultx` asserted a rejection on a narrowed child's
+/// own Finding, and the child — reading its *own* journal, which it of
+/// course admits whole — was handed a reason quoting the `vaultx`-only
+/// sentinel in clear. Gating on the holder is exactly what made that
+/// pass; the sentence's provenance is `Assertion.author`, and nothing
+/// else in the record carries it.
+///
+/// Two cases withhold from every scoped requester rather than guess:
+///
+/// - `Administrator`: the unscoped path names no source breadth at all,
+///   so no requester's bindings can be said to cover it. `--admin` reads
+///   never reach here and stay total.
+/// - `None`: an assertion older than this field. Its author is genuinely
+///   unknown, and the two labels beside it — `by` and `peer` — are the
+///   very things §2.5 records as attribution and refuses as identity.
+///   Falling back to the holder would re-admit the leak verbatim, since
+///   the leaking requester is precisely the one that admits the holder.
+///   Old records keep their content and their standing; what narrows is
+///   only who is shown the sentence.
+fn admits_assertion_prose(
+    state: &Arc<WirkdState>,
+    view: &DisclosureView,
+    author: Option<&AssertingAuthor>,
+) -> bool {
+    match author {
+        Some(AssertingAuthor::Work(work)) => admits_authored_prose(state, view, work),
+        Some(AssertingAuthor::Administrator) | None => false,
+    }
+}
+
+/// One record's authored free prose, withheld as whole fields through
+/// the standard marker, returning how many authored parts were replaced.
+///
+/// The claim sentence counts once though it is rendered twice (`claim`
+/// and `claim_text` are one authored thing in two forms), and a record
+/// with no proposed change had nothing to withhold and counts nothing —
+/// the same "counts, never identities" discipline `withhold_status_content`
+/// keeps, so the number stays a number.
+///
+/// Everything structural survives: the record's own id, kind, scope,
+/// origin events, obligation *name*, `confirmed_by`, the admitted
+/// evidence entries and the settlement's journal half. That is the
+/// narrowed consultation a child legitimately has, and it is why this is
+/// not "an opinion is unpublishable" — the author's own Work reads its
+/// prose in full, so does any requester as broad as the author, and
+/// `--admin` is untouched.
+fn withhold_authored_prose(target: &mut Value) -> usize {
+    let mut withheld = 0usize;
+    let mut claim_withheld = false;
+    for key in ["claim", "claim_text"] {
+        if let Some(slot) = target.get_mut(key)
+            && !slot.is_null()
+        {
+            *slot = withheld_json();
+            claim_withheld = true;
+        }
+    }
+    if claim_withheld {
+        withheld += 1;
+    }
+    if let Some(slot) = target.get_mut("proposed_change")
+        && !slot.is_null()
+    {
+        *slot = withheld_json();
+        withheld += 1;
+    }
+    withheld
+}
+
+/// An assertion's own free prose. The recorded decision, the recorded
+/// name, the peer credential, the timestamp and the recorded author are
+/// journal-side and stay: what a narrowed reader loses is the sentence,
+/// never the fact that a rejection was recorded, nor who recorded it.
+///
+/// The reason is carried twice on the record — inside
+/// `Decision::Rejected` and again in `Assertion.reason` — so both
+/// renderings are replaced wherever they appear, and the pair counts
+/// once: one authored sentence, one withholding, the same "counts,
+/// never identities" discipline `withhold_authored_prose` keeps.
+fn withhold_assertion_prose(assertion: &mut Value) -> usize {
+    let mut withheld = false;
+    for pointer in ["/decision/reason", "/reason"] {
+        if let Some(slot) = assertion.pointer_mut(pointer)
+            && !slot.is_null()
+        {
+            *slot = withheld_json();
+            withheld = true;
+        }
+    }
+    usize::from(withheld)
+}
+
+/// `finding_json`, rendered for one requester. Journal identities, the
+/// obligation *name*, an assertion's recorded decision and the
+/// settlement's own journal half are disclosed on reference permission;
+/// every source-disclosing part goes through the view, and the authored
+/// prose — which `0110` left uncensored on the reference route and the
+/// child-producer adjudication corrected — goes through
+/// `admits_authored_prose`.
+fn finding_json_scoped(
+    state: &Arc<WirkdState>,
+    view: &mut DisclosureView,
+    work_id: &WorkId,
+    id: &FindingId,
+    record: &FindingRecord,
+) -> Value {
+    let mut value = finding_json(work_id, id, record);
+    if !admits_authored_prose(state, view, work_id) {
+        view.withheld += withhold_authored_prose(&mut value);
+    }
+    // The assertions are gated one at a time, on their own recorded
+    // authors, and never on the Work whose journal holds them: an
+    // assertion's author is routinely a different Work, and on this very
+    // record the two can differ from each other as well.
+    let mut assertion_prose = 0usize;
+    if let Some(assertions) = value["assertions"].as_array_mut() {
+        for (assertion, recorded) in assertions.iter_mut().zip(record.assertions.iter()) {
+            if !admits_assertion_prose(state, view, recorded.author.as_ref()) {
+                assertion_prose += withhold_assertion_prose(assertion);
+            }
+        }
+    }
+    view.withheld += assertion_prose;
+    value["evidence"] = evidence_array_scoped(state, view, &record.finding.evidence);
+    value["contradicts"] = evidence_array_scoped(state, view, &record.finding.contradicts);
+    value["applies_to"] = evidence_array_scoped(state, view, &record.finding.applies_to);
+    if let FindingState::Settled(settlement) = &record.state {
+        value["settled"] = settlement_json_scoped(state, view, settlement);
+    }
+    value["applied"] = Value::Array(
+        record
+            .applied
+            .iter()
+            .map(|application| application_json_scoped(view, application))
+            .collect(),
+    );
+    value
+}
+
+/// Reads one Work's journal. This is the acquisition every decision
+/// path reaches another Work through, so it is where the journal lock
+/// discipline (ruling 0119) is asserted.
+fn replay_events(state: &Arc<WirkdState>, work_id: &WorkId) -> Option<Vec<Event>> {
+    no_journal_guard_held("replay_events");
+    let journal = journal_for(state, work_id).ok().flatten()?;
+    let journal = lock_journal(&journal);
+    journal.replay().ok()
+}
+
+fn fold_work(state: &Arc<WirkdState>, work_id: &WorkId) -> Option<Work> {
+    let events = replay_events(state, work_id)?;
+    if events.is_empty() {
+        return None;
+    }
+    Some(fold(&events))
+}
+
+/// §3's "journal kinship is not universal evidence access": a Journal
+/// evidence reference is admitted only when its named Work is the
+/// raising Work itself or lies on that Work's own parent/child lineage —
+/// walked upward through `Work.parent` and downward through every
+/// journaled `ChildWorkSpawned.child`, recursively. A sibling or
+/// unrelated Work is never in lineage, however same-estate it is.
+///
+/// `own_events` is the raising Work's own already-replayed journal,
+/// handed in rather than re-read: every caller of this function
+/// (`handle_finding_raise`, via `admit_evidence`) is already holding
+/// that Work's own journal lock at the moment it calls this — `Mutex`
+/// is not reentrant, so re-locking the same journal here (as an earlier
+/// draft's `replay_events(state, &raising.id)` did on the very first
+/// BFS step) deadlocks every self-referencing evidence token, which is
+/// the overwhelmingly common case. Every *other* Work's journal is a
+/// different lock and is read normally.
+/// The full set of Works `raising` is entitled to treat as its own
+/// lineage: itself, every ancestor, and every descendant, recursively
+/// (§3's "journal kinship is not universal evidence access" — this is
+/// the exact boundary, computed once so every caller — raise-time
+/// evidence admission, `finding list`'s own requester scoping — draws
+/// the identical set rather than re-deriving it (W-B-CORRECT.md defect
+/// 2: "selecting an origin Work id is not a general evidence grant").
+fn lineage_of(
+    state: &Arc<WirkdState>,
+    raising: &Work,
+    own_events: &[Event],
+) -> std::collections::HashSet<WorkId> {
+    let mut lineage = std::collections::HashSet::new();
+    lineage.insert(raising.id.clone());
+    let mut ancestor = raising.parent.clone();
+    while let Some(binding) = ancestor {
+        if !lineage.insert(binding.work.clone()) {
+            break;
+        }
+        ancestor = fold_work(state, &binding.work).and_then(|work| work.parent);
+    }
+    let mut frontier = vec![raising.id.clone()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(work_id) = frontier.pop() {
+        if !seen.insert(work_id.clone()) {
+            continue;
+        }
+        let events = if work_id == raising.id {
+            own_events.to_vec()
+        } else {
+            let Some(events) = replay_events(state, &work_id) else {
+                continue;
+            };
+            events
+        };
+        for event in &events {
+            if let EventKind::ChildWorkSpawned { child, .. } = &event.kind {
+                lineage.insert(child.clone());
+                frontier.push(child.clone());
+            }
+        }
+    }
+    lineage
+}
+
+/// §3: admits one list of evidence tokens against `raising`'s own scope.
+/// A `Source` coordinate must resolve inside a membership this Work's
+/// own `repositories` grant; a `Journal` reference must name an event on
+/// this Work's own lineage. Either kind of authority violation refuses
+/// the *whole* raise with `InadmissibleEvidence` (§3: "refuse the whole
+/// raise... naming which entry"); a resolvable-but-absent/forged/drifted
+/// entry is recorded `Unavailable` and never promoted later.
+fn admit_evidence(
+    state: &Arc<WirkdState>,
+    raising: &Work,
+    own_events: &[Event],
+    tokens: &[String],
+) -> Result<Vec<AdmittedEvidence>, (&'static str, String)> {
+    let mut out = Vec::new();
+    // Computed once for the whole call: `lineage_of` walks every
+    // ancestor and descendant journal, and the recursive admission below
+    // consults the same set at every hop.
+    let lineage = lineage_of(state, raising, own_events);
+    for token in tokens {
+        let reference = match parse_evidence_token(token) {
+            Ok(reference) => reference,
+            // A *form* error, not an authority one: the token could not
+            // name anything, so nothing was looked up and nothing about
+            // the estate is disclosed by saying so.
+            Err(detail) => return Err(("BadRequest", format!("{token}: {detail}"))),
+        };
+        match reference {
+            EvidenceRef::Source(encoded) => {
+                let coordinate = decode_coordinate(&encoded)
+                    .map_err(|detail| ("InadmissibleEvidence", format!("{token}: {detail}")))?;
+                let atlas = state
+                    .atlas
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let scope = wirk_atlas::QueryScope::Work(raising.repositories.clone());
+                let Some(membership) =
+                    admitted_membership_for(&atlas, &scope, &coordinate.membership)
+                else {
+                    return Err((
+                        "InadmissibleEvidence",
+                        format!("{token}: membership is not admitted by this Work's own bindings"),
+                    ));
+                };
+                match atlas.resolve_exact(&membership, &coordinate) {
+                    Ok(wirk_atlas::ResolveOutcome::Resolved(_)) => out.push(AdmittedEvidence {
+                        reference: EvidenceRef::Source(encoded),
+                        outcome: EvidenceOutcome::Admitted {
+                            generation: coordinate.generation.0.clone(),
+                            object_id: coordinate.object_id.clone(),
+                        },
+                    }),
+                    Ok(other) => out.push(AdmittedEvidence {
+                        reference: EvidenceRef::Source(encoded),
+                        outcome: EvidenceOutcome::Unavailable {
+                            reason: format!("{other:?}"),
+                        },
+                    }),
+                    Err(err) => {
+                        return Err(("InadmissibleEvidence", format!("{token}: {err}")));
+                    }
+                }
+            }
+            EvidenceRef::Journal { work, event } => {
+                // The *reference route*, checked first and unchanged: a
+                // Work outside this one's own lineage refuses the whole
+                // raise, however admissible its sources might be. Source
+                // admission below is a second gate, never a replacement
+                // for this one.
+                if !lineage.contains(&work) {
+                    return Err((
+                        "InadmissibleEvidence",
+                        format!(
+                            "{token}: work {} is not this Work's own journal or its parent/child lineage",
+                            work.0
+                        ),
+                    ));
+                }
+                // The *disclosure* half: everything the referenced
+                // record structurally names, and everything each record
+                // it points at names in turn, must be admitted by this
+                // requesting Work's own bindings. A resolvable-but-denied
+                // reference is `Unavailable`, exactly like a
+                // resolvable-but-absent one — established
+                // denied-versus-absent semantics, with the reason
+                // carrying no alias, path, generation or token.
+                let mut walk = ReferenceWalk::new(&lineage);
+                let admission = journal_reference_admitted(
+                    state, raising, own_events, &mut walk, &work, &event,
+                );
+                let reference = EvidenceRef::Journal {
+                    work: work.clone(),
+                    event: event.clone(),
+                };
+                match admission {
+                    Ok(()) => out.push(AdmittedEvidence {
+                        reference,
+                        outcome: EvidenceOutcome::Admitted {
+                            generation: work.0.clone(),
+                            object_id: event.0.clone(),
+                        },
+                    }),
+                    Err(reason) => out.push(AdmittedEvidence {
+                        reference,
+                        outcome: EvidenceOutcome::Unavailable { reason },
+                    }),
+                }
+            }
+            EvidenceRef::Finding { work, finding } => {
+                // Every failure of this route — no such Work, no such
+                // Finding, the wrong pair, an id from another estate, a
+                // record this Work may not discover, one not settled,
+                // one whose own sources are denied — refuses the whole
+                // raise with one message. That is deliberate on two
+                // counts. It never records a relation to a target that
+                // was not there (the executed defect
+                // `NATIVE-CHAIN-ADJUDICATION.md` names: "recorded
+                // nonexistent event self as Unavailable evidence"), and
+                // one message for every failure means the refusal
+                // discloses nothing about which of them happened.
+                let mut walk = ReferenceWalk::new(&lineage);
+                let Ok((origin_event, route, standing)) = finding_reference_admitted(
+                    state, raising, own_events, &mut walk, &work, &finding,
+                ) else {
+                    return Err((
+                        "InadmissibleEvidence",
+                        format!("{token}: no such finding is admitted to this work"),
+                    ));
+                };
+                out.push(AdmittedEvidence {
+                    reference: EvidenceRef::Finding {
+                        work: work.clone(),
+                        finding,
+                    },
+                    outcome: EvidenceOutcome::Relation {
+                        work,
+                        origin_event,
+                        route,
+                        standing,
+                    },
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+// ---- The disclosure boundary (W-B-DISCLOSURE-REPAIR.md) -------------------
+//
+// One sentence governs every surface below: **lineage grants permission
+// to *reference* another Work's journal; it never grants *disclosure* of
+// that journal's sources.**
+//
+// The two halves are checked separately and neither substitutes for the
+// other. The reference route is `lineage_of` — unchanged, and still a
+// whole-raise `InadmissibleEvidence` when it fails. Source disclosure is
+// the requesting Work's *own* `repositories` bindings, applied to
+// whatever the referenced record structurally names, however many
+// journal hops away it is.
+//
+// **What "structurally names" means, exactly.** A record part is
+// source-disclosing when it carries an Atlas source identity — a source
+// or membership alias, a generation id, an object id, an encoded exact
+// coordinate — or content read out of a source checkout: a resolved
+// path, an artifact digest, a compiled World's worktree, argv or
+// environment, a base SHA. A part carrying only journal identities
+// (Work, Run, Claim, Event, Finding, Waypoint, role, attempt), policy
+// identities, Route-authored prose, timestamps or content-addressed
+// basis/World hashes is not source-disclosing, and is returned on
+// reference permission alone. That is what keeps settled EstateLocal
+// learning genuinely reusable by a later admitted Work rather than
+// solving disclosure by banning cross-Work evidence.
+//
+// **The honest limit.** This is a *structural* provenance boundary, not
+// semantic censorship. A Finding's own `claim` sentence, a Route's
+// `intent`, a `proposed_change`, a `WorkCanceled` reason and the
+// `--reason` an operator types at `wirk work fail` are free prose
+// *authored by a person about the work*: a proposer that copies an
+// embargoed path into its own English claim has disclosed it, and
+// nothing here inspects prose to prevent that.
+//
+// Free prose is decided by **which producer writes the field**, never
+// by reading the string. A `LifecycleObserved` `detail` is not in that
+// list and never was: `RunLoop` fills it with the actor's own captured
+// pane screen (`HerdrClient::read_pane` on the `Blocked` transition) —
+// execution output read out of the producing Work's own checkout, not
+// an authored sentence — and `RunFailed.cause.detail` likewise carries
+// launch and transport diagnostics that name real filesystem paths.
+// Both are classified below by content presence, exactly like launch
+// metadata (`W-B-DISCLOSURE-RESPONSE-REPAIR.md`: "the free-prose limit
+// does not make captured pane text safe source content; it means
+// semantic censorship was not promised").
+//
+// Nor does any of this authenticate a caller: the same OS
+// uid runs an honest operator's terminal and an actor's shell
+// (`PeerIdentity`'s own doc), so `--admin` is an explicitly *named*
+// surface, never a proven one.
+
+/// Everything one journal event structurally discloses, and everything
+/// it points at. Built per event by `event_source_disclosure`, which is
+/// an exhaustive match over `EventKind` on purpose: a new variant must
+/// be classified here before it can be referenced as evidence, rather
+/// than defaulting to "discloses nothing" the way the base's own
+/// `FindingRaised`-only check did.
+#[derive(Default)]
+struct SourceDisclosure {
+    /// Source/membership aliases this record names or is derived from.
+    aliases: BTreeSet<String>,
+    /// Encoded exact Atlas coordinates embedded in this record.
+    coordinates: Vec<String>,
+    /// Journal references embedded in this record, followed recursively
+    /// — a wrapper is not a wall.
+    journal_refs: Vec<(WorkId, EventId)>,
+    /// Finding references embedded in this record, followed recursively
+    /// through their own admission route for exactly the same reason: a
+    /// relation is a wrapper too, and a reader that may not reach the
+    /// named record may not reach it by reading someone's disagreement
+    /// with it either.
+    finding_refs: Vec<(WorkId, FindingId)>,
+}
+
+/// `producing` is the referenced Work's own `repositories`, used for the
+/// records whose content comes out of that Work's checkout without
+/// naming an alias of its own to check more narrowly: an artifact's
+/// resolved path and digest, a Deterministic World's cwd/argv/env, a
+/// historical settlement's unread fields. Those disclose the producing
+/// Work's binding set as a set, because the record itself offers nothing
+/// finer to bind them to.
+/// Whether a resolved launch selection carries any operator-authored
+/// content at all. All three fields travel the same way — `wirk run`
+/// reads `--actor-model`/`--actor-effort` through the same unvalidated
+/// `flag_value` that fills `args`, and a Route file's `AuthoredSelection`
+/// carries all three verbatim — so all three answer together. There is
+/// deliberately no vocabulary check anywhere in this product to lean on:
+/// the user owns their harness configuration (0106) and any string is a
+/// legal model or effort.
+fn selection_carries_content(selection: &ActorSelection) -> bool {
+    selection.model.is_some() || selection.effort.is_some() || !selection.args.is_empty()
+}
+
+fn event_source_disclosure(event: &Event, producing: &[RepositoryBinding]) -> SourceDisclosure {
+    let mut out = SourceDisclosure::default();
+    // Set by the arms whose content is read out of the producing Work's
+    // own checkout rather than named against a specific source.
+    let mut from_producing_checkout = false;
+
+    match &event.kind {
+        // Journal identities only: a vanished Run, a Claim id, a Run
+        // identity, a container activation, a hold's own unmet
+        // declared-output *names*, a child spawn's role, an unverified
+        // human assertion. None carries a source coordinate, a path or
+        // a checkout-derived digest.
+        //
+        // `WorkFailed` and `WorkCanceled` stay here on the *producer*
+        // test this whole classification runs on, not on a reading of
+        // their strings. Both are written only by an operator verb —
+        // `handle_work_fail` puts `wirk work fail --reason <text>`
+        // straight into `cause.detail`, and `WorkCanceled.reason` is
+        // `wirk work cancel --reason` — so their text is authored prose
+        // about the Work, the named free-prose limit above. Their
+        // sibling `RunFailed` is classified separately below precisely
+        // because *its* producers are execution paths, not a person.
+        EventKind::RunVanished
+        | EventKind::ClaimFiled { .. }
+        | EventKind::RunOpened { .. }
+        | EventKind::WorkFailed { .. }
+        | EventKind::WorkCanceled { .. }
+        | EventKind::ContainerActivated { .. }
+        | EventKind::StageHeld { .. }
+        | EventKind::ChildWorkSpawned { .. }
+        | EventKind::FindingAsserted { .. } => {}
+
+        // The two execution-output events (the independent launch
+        // review's F-B). Neither is authored by a person and neither
+        // names an alias or a coordinate, so both take the identical
+        // content-present/content-absent answer the launch events take
+        // below:
+        //
+        // - `LifecycleObserved.detail` is `RunLoop`'s own capture. On
+        //   the `Blocked` transition it is literally the actor's pane
+        //   screen (`read_pane`), which is whatever the actor printed
+        //   out of the producing Work's checkout; on a pane release it
+        //   names the pane and Run it closed. `None` for every other
+        //   status this loop journals, which is the overwhelming
+        //   majority of lifecycle events — so the useful positive a
+        //   narrowed child keeps is the whole `Working`/`Idle`/
+        //   `Claimed` lifecycle stream, unchanged.
+        // - `RunFailed.cause.detail` is the launch/transport diagnostic
+        //   (`RunLoop::record_run_failed`, the stuck observation,
+        //   `handle_fail`'s own executor report). Those strings carry
+        //   real filesystem paths in practice — a blocked `wirk run`
+        //   produces `connecting to <path>/.herdr/herdr.sock: ...`. A
+        //   `RunFailed` with no detail (`status` alone, an HTTP-shaped
+        //   failure, the retry supersession's own journal-identity
+        //   text) still discloses nothing.
+        EventKind::LifecycleObserved { detail, .. } => {
+            from_producing_checkout = detail.is_some();
+        }
+        EventKind::RunFailed { cause } => {
+            from_producing_checkout = cause.detail.is_some();
+        }
+
+        // The producing Work's whole binding set, verbatim on the wire —
+        // the broadest single disclosure in the journal, and the one the
+        // base returned unconditionally.
+        EventKind::WorkSubmitted { repositories, .. } => {
+            for binding in repositories {
+                out.aliases.insert(binding.name.clone());
+            }
+        }
+        EventKind::WorktreeCreated { repo, .. } => {
+            out.aliases.insert(repo.clone());
+        }
+        // The compiled World. An `ActorWorld` names its own repository
+        // and freezes its review targets against named sources, so both
+        // are checkable exactly; a `DeterministicWorld` carries cwd,
+        // argv and env with no alias at all, so it discloses the
+        // producing Work's bindings.
+        EventKind::WaypointReserved { world, .. } => match world {
+            World::Actor(actor) => {
+                out.aliases.insert(actor.repository.clone());
+                for target in &actor.review_targets {
+                    out.aliases.insert(target.source.clone());
+                }
+            }
+            World::Deterministic(_) => from_producing_checkout = true,
+        },
+        // P3 native launch, one classification across all three events
+        // (the independent currentness verification's V-2, corrected by
+        // the launch review's F-A). What is *mechanism* here is decided
+        // by who mints the field, not by what its string looks like:
+        //
+        // - `actor_kind` is a closed harness identity this product
+        //   resolves itself, and `holder`'s pid and start token are
+        //   kernel facts `wirkd` reads off `SO_PEERCRED` and `/proc`
+        //   and discards whatever a client sent. Neither can carry
+        //   checkout content, so both disclose nothing.
+        // - everything else on these three events is an unvalidated
+        //   operator-authored launch input, or Herdr's echo of one:
+        //   `selection.args`, `selection.model` and `selection.effort`
+        //   are read by the identical `flag_value` call at `wirk run`
+        //   (`--actor-model`/`--actor-effort`/raw args) with no
+        //   vocabulary check and no validation of any kind, or come
+        //   verbatim off a Route file; `launch_argv` is Herdr's own
+        //   reply about what it submitted, containing those same
+        //   tokens plus the harness wrapper's; `destination` is a
+        //   filesystem path, the client's own canonicalized Herdr
+        //   socket.
+        //
+        // The launch review executed the counterexample the earlier
+        // "model and effort name no source" comment ruled out by
+        // assertion: a `RunLaunchRequested` whose only source-derived
+        // content is `selection.model = <a denied checkout>/embargoed.md`,
+        // with `args`, `launch_argv` and `destination` all empty. It
+        // was admitted to a narrowed child. Keeping arbitrary model and
+        // effort strings executable is deliberate (ruling 0106: the
+        // user owns their harness configuration, and this product
+        // holds no model catalogue and adds no permission gate) — so
+        // the classification, not the input, is what has to be honest.
+        //
+        // None of these fields carries an alias or an Atlas coordinate,
+        // so none can be checked more narrowly than the Work that
+        // produced it. That is exactly the case `World::Deterministic`
+        // (cwd, argv, env, no alias) and `ClaimRecorded` (artifact
+        // paths) already answer with the producing Work's own binding
+        // set, and it is the answer here: content present -> the
+        // producer's bindings; content absent -> nothing to disclose.
+        //
+        // What the empty case means, exactly. It means the record
+        // carries no launch content for this daemon to disclose — and
+        // that is *all* it means. It is **not** evidence that the Run
+        // launched bare: a `RunLaunched` written before these fields
+        // existed folds through `#[serde(default)]` to the same empty
+        // shape, and the estate's own pre-field launch path really did
+        // pass `--model sonnet` plus a `--settings <estate root>/…`
+        // pair for every claude Run. Those launches had arguments; the
+        // journal simply never recorded them. Absent is unrecorded,
+        // never none (the launch review's F-D).
+        //
+        // Cost, recorded rather than hidden (F-E), stated as the
+        // launch code actually behaves (the integration review's V-3).
+        // Every real *attempt* has a destination, and a launch that
+        // resolves any of model, effort or args carries content — so
+        // after this correction a narrowed child can cite another
+        // Work's launch event only when its own bindings already cover
+        // that Work's whole binding set. A model is *not* always
+        // resolved: `HerdrExecutor::start_actor_agent` adds no flag at
+        // all when model and effort are absent and the harness's own
+        // native default runs, so a Run submitted with no
+        // `--actor-model`/`--actor-effort` against a Route authoring no
+        // selection produces a live `RunLaunchRequested` with an empty
+        // selection, which stays admissible. The preserved
+        // content-absent positive is therefore two records, not one:
+        // the unrecorded pre-field launch, and the live launch that
+        // genuinely resolved nothing to record. Both are honest —
+        // neither carries launch content for this daemon to disclose —
+        // and neither is evidence about the other. (In this estate's
+        // own Routes model, effort and args are authored, so its real
+        // launches do carry content; that is a fact about these Routes,
+        // not about the product.) Fail-closed is the right default for
+        // opaque
+        // source-bearing content with no finer provenance, and no
+        // narrower projection of these fields exists to name; if one is
+        // ever wanted it must say exactly what it reveals and be tested
+        // as such, never be justified as "mechanism" over a record that
+        // carries content.
+        EventKind::RunLaunchRequested { selection, .. } => {
+            from_producing_checkout = selection_carries_content(selection);
+        }
+        EventKind::RunLaunched {
+            selection,
+            launch_argv,
+            ..
+        } => {
+            from_producing_checkout =
+                selection_carries_content(selection) || !launch_argv.is_empty();
+        }
+        EventKind::RunLaunchAttempted { destination, .. } => {
+            from_producing_checkout = !destination.is_empty();
+        }
+        EventKind::ClaimRecorded { artifacts, .. } => {
+            from_producing_checkout = !artifacts.is_empty();
+        }
+        EventKind::StageClosed { receipts, .. } => {
+            from_producing_checkout = receipts.iter().any(receipt_carries_artifacts);
+        }
+        EventKind::FindingRaised { finding } => {
+            for item in finding
+                .evidence
+                .iter()
+                .chain(finding.contradicts.iter())
+                .chain(finding.applies_to.iter())
+            {
+                match &item.reference {
+                    EvidenceRef::Source(encoded) => out.coordinates.push(encoded.clone()),
+                    EvidenceRef::Journal { work, event } => {
+                        out.journal_refs.push((work.clone(), event.clone()))
+                    }
+                    EvidenceRef::Finding { work, finding } => {
+                        out.finding_refs.push((work.clone(), finding.clone()))
+                    }
+                }
+            }
+        }
+        EventKind::FindingSettled { settlement, .. } => {
+            settlement_source_disclosure(settlement, &mut out, &mut from_producing_checkout);
+        }
+        EventKind::FindingApplied { application, .. } => {
+            out.aliases.insert(application.source.clone());
+        }
+    }
+
+    if from_producing_checkout {
+        for binding in producing {
+            out.aliases.insert(binding.name.clone());
+        }
+    }
+    out
+}
+
+/// A container receipt is satisfied by nested receipts; a leaf's own
+/// `artifacts` are the checkout-derived part, at whatever depth.
+fn receipt_carries_artifacts(receipt: &OutcomeReceipt) -> bool {
+    match receipt {
+        OutcomeReceipt::Leaf { artifacts, .. } => !artifacts.is_empty(),
+        OutcomeReceipt::Child { .. } => false,
+        OutcomeReceipt::Container { receipts, .. } => {
+            receipts.iter().any(receipt_carries_artifacts)
+        }
+    }
+}
+
+/// A settlement's own source-disclosing parts. `ChildProof` and
+/// `SupersededBy` carry only journal identities and content-addressed
+/// bases, which is why a narrowed child can still be told *that* its
+/// sibling's role settled. `UnreadFields` are arbitrary historical JSON
+/// — the intermediate revision wrote artifact paths there — so a record
+/// carrying any is treated as checkout-derived rather than inspected
+/// field by field.
+fn settlement_source_disclosure(
+    settlement: &Settlement,
+    out: &mut SourceDisclosure,
+    from_producing_checkout: &mut bool,
+) {
+    match &settlement.check {
+        SettlementCheck::ValidatedClaim { proof, unread, .. } => {
+            if !unread.is_empty()
+                || proof
+                    .as_ref()
+                    .is_some_and(|proof| !proof.artifacts.is_empty())
+            {
+                *from_producing_checkout = true;
+            }
+        }
+        SettlementCheck::ActorReview { proof, .. } => {
+            for target in &proof.targets {
+                out.aliases.insert(target.source.clone());
+            }
+            if !proof.report.is_empty() {
+                *from_producing_checkout = true;
+            }
+        }
+        SettlementCheck::ChildReceipt { unread, .. } => {
+            if !unread.is_empty() {
+                *from_producing_checkout = true;
+            }
+        }
+        SettlementCheck::SupersededBy { .. } => {}
+    }
+}
+
+/// Whether `requester`'s own bindings admit every source `disclosure`
+/// names. An alias is matched against the requester's own
+/// `repositories` (the identical rule `admitted_membership_for` applies
+/// to a scope, at the alias level); a coordinate goes through
+/// `admitted_membership_for` itself, so the catalog — never the caller's
+/// token — decides which membership it names.
+fn disclosure_admitted(
+    state: &Arc<WirkdState>,
+    requester: &Work,
+    disclosure: &SourceDisclosure,
+) -> bool {
+    if !disclosure
+        .aliases
+        .iter()
+        .all(|alias| requester_grants_alias(requester, alias))
+    {
+        return false;
+    }
+    if disclosure.coordinates.is_empty() {
+        return true;
+    }
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let scope = wirk_atlas::QueryScope::Work(requester.repositories.clone());
+    disclosure.coordinates.iter().all(|encoded| {
+        decode_coordinate(encoded).is_ok_and(|coordinate| {
+            admitted_membership_for(&atlas, &scope, &coordinate.membership).is_some()
+        })
+    })
+}
+
+fn requester_grants_alias(requester: &Work, alias: &str) -> bool {
+    requester
+        .repositories
+        .iter()
+        .any(|binding| binding.name == alias)
+}
+
+/// The most references one admission walk follows. A journal graph is
+/// append-only and finite, and `seen` already collapses cycles and
+/// repetition, so this is a denial-of-service bound on a deliberately
+/// wide fan-out, not a correctness mechanism — which is why exceeding it
+/// is an honest refusal rather than a silent truncation that would
+/// admit the very reference it stopped short of checking.
+const EVIDENCE_REFERENCE_BUDGET: usize = 512;
+
+/// One recursive admission walk over the evidence reference graph.
+struct ReferenceWalk<'a> {
+    lineage: &'a HashSet<WorkId>,
+    /// `(work, event)` pairs already admitted on this walk. A repeated
+    /// or cyclic reference discloses nothing new and must not be
+    /// followed again.
+    seen: HashSet<(String, String)>,
+    steps: usize,
+}
+
+impl<'a> ReferenceWalk<'a> {
+    fn new(lineage: &'a HashSet<WorkId>) -> Self {
+        Self {
+            lineage,
+            seen: HashSet::new(),
+            steps: 0,
+        }
+    }
+}
+
+/// Admits one journal reference for `requester`, recursively.
+///
+/// The referenced event must lie on `requester`'s own lineage, and
+/// everything it structurally discloses must be admitted by
+/// `requester`'s own bindings — and then the same two questions are
+/// asked of every reference *it* embeds, to any depth. That recursion is
+/// the whole point: the base checked a `FindingRaised`'s direct `Source`
+/// coordinates and dropped its `Journal` ones on the floor, so wrapping
+/// an embargoed coordinate in one extra finding laundered it past a
+/// check the direct citation already refused.
+///
+/// `requester_events` is the requester's own already-replayed journal,
+/// handed in for the same reason `lineage_of` takes it: `Mutex` is not
+/// reentrant and `admit_evidence`'s caller is holding that journal's
+/// lock. Every other Work's journal is a different lock and is read
+/// normally.
+///
+/// Every `Err` names the *requester's own* event id and nothing else. A
+/// reason that quoted the alias, path, generation, object id or encoded
+/// token it refused would disclose exactly what it denied.
+fn journal_reference_admitted(
+    state: &Arc<WirkdState>,
+    requester: &Work,
+    requester_events: &[Event],
+    walk: &mut ReferenceWalk,
+    work: &WorkId,
+    event_id: &EventId,
+) -> Result<(), String> {
+    if !walk.seen.insert((work.0.clone(), event_id.0.clone())) {
+        return Ok(());
+    }
+    walk.steps += 1;
+    if walk.steps > EVIDENCE_REFERENCE_BUDGET {
+        return Err(format!(
+            "{}: this reference's own graph is wider than this daemon follows in one admission",
+            event_id.0
+        ));
+    }
+    if !walk.lineage.contains(work) {
+        return Err(format!(
+            "{}: it references a work outside the requesting work's own parent/child lineage",
+            event_id.0
+        ));
+    }
+    // Borrowed, never cloned: a self-referencing chain would otherwise
+    // copy the requester's whole journal once per hop, and this
+    // recursion is bounded by step count rather than by journal size.
+    let replayed;
+    let events: &[Event] = if work == &requester.id {
+        requester_events
+    } else {
+        let Some(events) = replay_events(state, work) else {
+            return Err(format!(
+                "{}: it references a work with no readable journal",
+                event_id.0
+            ));
+        };
+        replayed = events;
+        &replayed
+    };
+    let Some(event) = events.iter().find(|candidate| &candidate.id == event_id) else {
+        return Err(format!("no event {} in work {}", event_id.0, work.0));
+    };
+    let producing = fold(events).repositories;
+    let disclosure = event_source_disclosure(event, &producing);
+    if !disclosure_admitted(state, requester, &disclosure) {
+        return Err(format!(
+            "{}: its own sources are not admitted by the requesting work's own bindings",
+            event_id.0
+        ));
+    }
+    for (nested_work, nested_event) in &disclosure.journal_refs {
+        journal_reference_admitted(
+            state,
+            requester,
+            requester_events,
+            walk,
+            nested_work,
+            nested_event,
+        )?;
+    }
+    for (nested_work, nested_finding) in &disclosure.finding_refs {
+        finding_reference_admitted(
+            state,
+            requester,
+            requester_events,
+            walk,
+            nested_work,
+            nested_finding,
+        )
+        .map_err(|()| {
+            format!(
+                "{}: it references a finding this work is not admitted to",
+                event_id.0
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Admits one `EvidenceRef::Finding` for `requester`, and reports what
+/// it resolved to.
+///
+/// Two routes, and no third. **Journal kinship**, which is the existing
+/// `Journal` rule reached through the record's own `FindingRaised`
+/// event, so a relation to a family record admits exactly what citing
+/// that event already admits — same recursion, same source-disclosure
+/// half, same cycle budget. **Settled estate publication**, for a Work
+/// with no kinship at all: the named record must be one the estate
+/// findings index would already publish to this very requester, decided
+/// by `published_row_scoped` itself rather than by a second rule
+/// alongside it — one gate, so "which records may I name" and "which
+/// records may I discover" cannot drift apart and turn a relation into a
+/// way of learning that something exists.
+///
+/// The four conditions that gate carries (a policy receipt not an
+/// opinion, no `SupersededBy`, the producing and publishing checkouts
+/// both admitted, every frozen review target admitted) are
+/// `LATER-DISCOVERY-ADJUDICATION.md`'s, unchanged and not restated here.
+/// What this adds is the scope check `all_finding_rows` performs before
+/// a row exists at all: a `WorkLocal` finding is never published and is
+/// never nameable off lineage.
+///
+/// Every failure returns the same `Err(())`. The caller turns it into
+/// one message for all of them, so a Work cannot learn from a refusal
+/// whether the record it named exists.
+///
+/// `requester_events` is handed in for the reason `lineage_of` and
+/// `journal_reference_admitted` both state: the raise-time caller holds
+/// the requester's own journal lock and `Mutex` is not reentrant. Every
+/// read of the requester's own journal below goes through that slice,
+/// and the off-lineage route — where the named Work is by definition not
+/// the requester — is the only place another journal is folded.
+fn finding_reference_admitted(
+    state: &Arc<WirkdState>,
+    requester: &Work,
+    requester_events: &[Event],
+    walk: &mut ReferenceWalk,
+    work: &WorkId,
+    finding: &FindingId,
+) -> Result<(EventId, RelationRoute, RelationStanding), ()> {
+    let replayed;
+    let events: &[Event] = if work == &requester.id {
+        requester_events
+    } else {
+        let Some(events) = replay_events(state, work) else {
+            return Err(());
+        };
+        replayed = events;
+        &replayed
+    };
+    let holder = fold(events);
+    let Some(record) = holder.findings.get(finding) else {
+        return Err(());
+    };
+    let Some((origin_event, _)) = find_raised_finding(events, finding) else {
+        return Err(());
+    };
+    let standing = match &record.state {
+        FindingState::Settled(_) => RelationStanding::Settled,
+        _ => RelationStanding::Unsettled,
+    };
+    if walk.lineage.contains(work) {
+        journal_reference_admitted(
+            state,
+            requester,
+            requester_events,
+            walk,
+            work,
+            &origin_event,
+        )
+        .map_err(|_| ())?;
+        let route = if work == &requester.id {
+            RelationRoute::OwnJournal
+        } else {
+            RelationRoute::Lineage
+        };
+        return Ok((origin_event, route, standing));
+    }
+    // Off lineage. Only a settled EstateLocal publication, and only the
+    // one this requester could already have discovered.
+    if record.finding.scope != FindingScope::EstateLocal {
+        return Err(());
+    }
+    let FindingState::Settled(settlement) = &record.state else {
+        return Err(());
+    };
+    // The publication gate folds the producing Work's own journal. Off
+    // lineage the *holder* is never the requester, and a producer that
+    // were the requester would put the holder on the requester's own
+    // lineage and never reach here — so this guard is unreachable in
+    // practice and fails closed rather than risk re-locking a journal
+    // this call already holds.
+    if settlement_producing_work(&settlement.check) == Some(&requester.id) {
+        return Err(());
+    }
+    let Some(row_event) = events.iter().find_map(|event| match &event.kind {
+        EventKind::FindingSettled {
+            finding: settled, ..
+        } if settled == finding => Some(event.id.clone()),
+        _ => None,
+    }) else {
+        return Err(());
+    };
+    let row = wirk_atlas::FindingRow {
+        id: wirk_atlas::FindingRowId::compute(
+            finding,
+            wirk_atlas::FindingRowKind::Settled,
+            &row_event,
+        ),
+        kind: wirk_atlas::FindingRowKind::Settled,
+        finding: record.finding.clone(),
+        origin: wirk_atlas::FindingOrigin {
+            work: work.clone(),
+            raised_event: origin_event.clone(),
+            row_event,
+        },
+        settlement: Some((**settlement).clone()),
+        assertion: None,
+        applied: None,
+        superseded_by: match &settlement.check {
+            SettlementCheck::SupersededBy { finding, .. } => Some(finding.clone()),
+            _ => None,
+        },
+    };
+    let mut view = DisclosureView::new(requester, requester_events, walk.lineage);
+    if published_row_scoped(state, &mut view, &row).is_none() {
+        return Err(());
+    }
+    Ok((
+        origin_event,
+        RelationRoute::SettledEstatePublication,
+        standing,
+    ))
+}
+
+/// A Finding's own owning Work, found by the estate-wide directory scan
+/// every other cross-Work sweep in this file already uses
+/// (`reevaluate_waiting_works`'s own convention) — a `FindingId` alone
+/// names no journal directly, so `finding assert`/`settle`/`applied`
+/// (none of which carry a triple) resolve it this way.
+fn find_finding_owner(
+    state: &Arc<WirkdState>,
+    finding_id: &FindingId,
+) -> Option<(WorkId, Vec<Event>)> {
+    let works_dir = state.estate_root.join("works");
+    let entries = std::fs::read_dir(&works_dir).ok()?;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(journal) = Journal::open(&dir) else {
+            continue;
+        };
+        let Ok(events) = journal.replay() else {
+            continue;
+        };
+        if events.is_empty() {
+            continue;
+        }
+        let work = fold(&events);
+        if work.findings.contains_key(finding_id) {
+            return Some((work.id.clone(), events));
+        }
+    }
+    None
+}
+
+/// `<id>@<edition>` — the two coordinates that *name* a verification
+/// obligation. Neither half may be empty and `@` must appear exactly
+/// once, so `security-audit` (no edition) and `a@b@c` are refused at the
+/// wire rather than silently never matching anything.
+fn parse_obligation_ref(token: &str) -> Result<ObligationRef, String> {
+    let mut parts = token.split('@');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(id), Some(edition), None) if !id.is_empty() && !edition.is_empty() => {
+            Ok(ObligationRef {
+                id: id.to_string(),
+                edition: edition.to_string(),
+            })
+        }
+        _ => Err(format!(
+            "--obligation must be <id>@<edition>, got {token:?}"
+        )),
+    }
+}
+
+/// `work/<work-id>/finding/<finding-id>` — the same
+/// `work/<id>/event/<id>` shape a `Journal` evidence token already uses,
+/// one noun over.
+fn parse_confirmed_by(token: &str) -> Result<ConfirmedBy, String> {
+    let parts: Vec<&str> = token.split('/').collect();
+    match parts.as_slice() {
+        ["work", work, "finding", finding] if !work.is_empty() && !finding.is_empty() => {
+            Ok(ConfirmedBy {
+                work: WorkId(work.to_string()),
+                finding: FindingId(finding.to_string()),
+            })
+        }
+        _ => Err(format!(
+            "--confirmed-by must be work/<work-id>/finding/<finding-id>, got {token:?}"
+        )),
+    }
+}
+
+fn handle_finding_raise(state: &Arc<WirkdState>, payload: super::FindingRaisePayload) -> Reply {
+    let work_id = payload.triple.work_id.clone();
+    let run_id = payload.triple.run_id.clone();
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the claim's estate root does not identify this daemon's estate",
+        );
+    }
+    let journal_handle = match journal_for(state, &work_id) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    // Payload shape, decided before anything is observed: these depend
+    // on nothing but the request, so they never need re-deciding when
+    // the loop below re-reads.
+    //
+    // W-B obligation proof: `obligation` and `confirmed_by` are both
+    // pointers the caller names and wirkd re-derives everything about
+    // later (`deterministic_verified_readiness`, `child_investigation_ready`).
+    // Only their *shape* is checked here, so a malformed token is a
+    // `BadRequest` at the wire rather than a silently unsettleable
+    // Finding.
+    let kind = match parse_finding_kind(&payload.kind) {
+        Ok(kind) => kind,
+        Err(message) => return err_reply("BadRequest", &message),
+    };
+    let scope = match parse_finding_scope(&payload.scope) {
+        Ok(scope) => scope,
+        Err(message) => return err_reply("BadRequest", &message),
+    };
+    let obligation = match payload.obligation.as_deref().map(parse_obligation_ref) {
+        Some(Ok(obligation)) => Some(obligation),
+        Some(Err(message)) => return err_reply("BadRequest", &message),
+        None => None,
+    };
+    let confirmed_by = match payload.confirmed_by.as_deref().map(parse_confirmed_by) {
+        Some(Ok(reference)) => Some(reference),
+        Some(Err(message)) => return err_reply("BadRequest", &message),
+        None => None,
+    };
+    let supersedes = payload.supersedes.clone().map(FindingId);
+    // Ruling 0119, the journal lock discipline: `admit_evidence` reads
+    // whichever Works the evidence names — an ancestor, a descendant, or
+    // any estate publisher at all — so it runs with **no** journal guard
+    // held. Observe this Work's own journal, release it, decide, then
+    // re-acquire and re-check that nothing was appended in between
+    // before appending. That is `cancel_work`'s pattern one verb over
+    // ("re-check terminality under this Work's own lock"), and the
+    // re-check is what keeps a decision from resting on authority that
+    // has since moved: the Run retried, the Work canceled or completed,
+    // a child spawned. All of those are events on this same journal, so
+    // an unmoved journal is an unchanged decision, and appending under
+    // the guard the check ran under is what makes a concurrent raise a
+    // loser that re-reads rather than a lost update.
+    let mut attempt = 0usize;
+    let (mut journal, run, evidence, contradicts, applies_to) = loop {
+        attempt += 1;
+        let events = {
+            let journal = lock_journal(&journal_handle);
+            match journal.replay() {
+                Ok(events) => events,
+                Err(err) => return err_reply("JournalError", &err.to_string()),
+            }
+        };
+        let Some(run) = find_run(&events, &run_id) else {
+            return err_reply("TripleMismatch", "no such run");
+        };
+        let work = fold(&events);
+        if work.id != work_id {
+            return err_reply("TripleMismatch", "triple does not match this work");
+        }
+        if work.state.is_terminal() {
+            return err_reply(
+                "WorkTerminal",
+                "the Work is already terminal: no further Finding can be raised against it",
+            );
+        }
+        // §5.2: "wirkd refuses a Run that is not current for its Waypoint" —
+        // the same currency check `record`/`spawn_child_on_parent` already
+        // apply, so a superseded (retried) Run's actor cannot backdate
+        // evidence onto a generation that has already moved on. It is
+        // re-asked below, under the guard, against the same journal this
+        // observation read: a retry that lands mid-admission moves the
+        // journal and loses this lap rather than backdating a Finding.
+        if latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
+            != Some(run_id.clone())
+        {
+            return err_reply("TripleMismatch", "the run is not current for its waypoint");
+        }
+        // No guard is held here, by construction, and this is the whole
+        // reason the loop exists.
+        let evidence = match admit_evidence(state, &work, &events, &payload.evidence) {
+            Ok(evidence) => evidence,
+            Err((code, message)) => return err_reply(code, &message),
+        };
+        let contradicts = match admit_evidence(state, &work, &events, &payload.contradicts) {
+            Ok(evidence) => evidence,
+            Err((code, message)) => return err_reply(code, &message),
+        };
+        let applies_to = match admit_evidence(state, &work, &events, &payload.applies_to) {
+            Ok(evidence) => evidence,
+            Err((code, message)) => return err_reply(code, &message),
+        };
+        // §3: "an EstateLocal finding must have at least one Admitted
+        // entry; one whose every entry is Unavailable is refused" — this
+        // closes the hole a parseable-but-unresolvable coordinate plus a
+        // granted alias would otherwise open.
+        if scope == FindingScope::EstateLocal
+            && !evidence
+                .iter()
+                .any(|item| matches!(item.outcome, EvidenceOutcome::Admitted { .. }))
+        {
+            return err_reply(
+                "NoAdmittedEvidence",
+                "an EstateLocal finding needs at least one admitted evidence entry",
+            );
+        }
+        if let Some(target) = &supersedes
+            && !work.findings.contains_key(target)
+        {
+            return err_reply(
+                "UnknownFinding",
+                "supersedes names no finding raised in this Work",
+            );
+        }
+        // Re-acquire and re-check. An unmoved journal means every check
+        // above still holds — they are all folded from these events —
+        // and the append below happens under this same guard.
+        let journal = lock_journal(&journal_handle);
+        let events_now = match journal.replay() {
+            Ok(events_now) => events_now,
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        };
+        if same_observation(&events, &events_now) {
+            break (journal, run, evidence, contradicts, applies_to);
+        }
+        drop(journal);
+        if attempt >= JOURNAL_OBSERVATION_ATTEMPTS {
+            return err_reply(
+                "Conflict",
+                "this Work's journal moved under every attempt to admit this evidence: retry the raise",
+            );
+        }
+    };
+    let finding = Finding {
+        id: FindingId(mint_id("finding")),
+        work: work_id.clone(),
+        run: run_id.clone(),
+        waypoint: run.waypoint.clone(),
+        kind,
+        scope,
+        claim: payload.claim,
+        evidence,
+        contradicts,
+        applies_to,
+        supersedes,
+        proposed_change: payload.proposed_change,
+        obligation,
+        confirmed_by,
+    };
+    let event = new_event(
+        &work_id,
+        Some(run_id.clone()),
+        EventKind::FindingRaised {
+            finding: finding.clone(),
+        },
+    );
+    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    let events_now = match journal.replay() {
+        Ok(events) => events,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let record = fold(&events_now)
+        .findings
+        .get(&finding.id)
+        .cloned()
+        .expect("the finding just folded from the event this call just appended");
+    drop(journal);
+    if let Err(err) = settle_ready(state, &work_id, false) {
+        eprintln!(
+            "wirkd: settlement evaluation after raise failed for {}: {err}",
+            work_id.0
+        );
+    }
+    // Re-read once more: `settle_ready` may have just settled this very
+    // finding (`deterministic-verified` naming an already-Claimed leaf).
+    let record = fold_work(state, &work_id)
+        .and_then(|work| work.findings.get(&finding.id).cloned())
+        .unwrap_or(record);
+    ok_reply(finding_json(&work_id, &finding.id, &record))
+}
+
+/// §2.5: the complete, usable human/client path. Never sets a Finding
+/// `Settled` and never suppresses it from later consultation
+/// (`fold`'s own rule) — this verb only ever appends `FindingAsserted`.
+///
+/// W-B disclosure response repair (`loop-b-disclosure-verify/VERDICT.md`
+/// C2): this verb *writes* to the target finding's own Work, so scope
+/// admission is checked before the append, not laundered into a scoped
+/// reply after an unscoped write. `--requesting-work`/`--admin` is the
+/// same exclusive pair `finding list` carries; a non-admin requester off
+/// the target Work's own lineage is refused outright — the journal is
+/// left unchanged, never written and then hidden.
+fn handle_finding_assert(
+    state: &Arc<WirkdState>,
+    payload: super::FindingAssertPayload,
+    peer: PeerIdentity,
+) -> Reply {
+    if payload.admin == payload.requester.is_some() {
+        return err_reply(
+            "BadRequest",
+            "name exactly one of --requesting-work <id> (scoped) or --admin (unscoped)",
+        );
+    }
+    let finding_id = FindingId(payload.finding.clone());
+    let Some((work_id, _events)) = find_finding_owner(state, &finding_id) else {
+        return err_reply("NotFound", "no such finding");
+    };
+    // Scope admission is a read boundary, never proof that a human
+    // approved the assertion and never settlement permission
+    // (W-B-AUTHORITY-ADJUDICATION.md) — it only decides whether this
+    // requester may reference and write to this Work's own journal at
+    // all, exactly as a Journal evidence reference does at raise time.
+    let requester_view = if payload.admin {
+        None
+    } else {
+        let requester_id = payload
+            .requester
+            .as_ref()
+            .expect("the exclusivity check above admitted a requester");
+        let Some(requester_events) = replay_events(state, requester_id) else {
+            return err_reply("NotFound", "no such requesting work");
+        };
+        let requester = fold(&requester_events);
+        let lineage = lineage_of(state, &requester, &requester_events);
+        if !lineage.contains(&work_id) {
+            return err_reply(
+                "InadmissibleEvidence",
+                "the target finding's own work is not the requesting work's own journal or its parent/child lineage",
+            );
+        }
+        Some((requester, requester_events, lineage))
+    };
+    let decision = match parse_decision(
+        &payload.decision,
+        payload.reason.clone(),
+        payload.superseded_by,
+    ) {
+        Ok(decision) => decision,
+        Err(message) => return err_reply("BadRequest", &message),
+    };
+    // `ASSERTION-AUTHOR-ADJUDICATION.md`: the admission decided just
+    // above is the only trustworthy statement of who wrote this
+    // sentence, and this is the one moment it exists. The record it is
+    // appended to belongs to `work_id`, which — on every cross-Work
+    // assertion this verb deliberately admits — is somebody else.
+    let author = Some(match payload.requester.as_ref() {
+        Some(requester_id) => AssertingAuthor::Work(requester_id.clone()),
+        None => AssertingAuthor::Administrator,
+    });
+    let assertion = Assertion {
+        decision,
+        by: payload.by,
+        reason: payload.reason,
+        peer,
+        at: now_ts(),
+        author,
+    };
+    let journal = match journal_for(state, &work_id) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let mut journal = lock_journal(&journal);
+    let event = new_event(
+        &work_id,
+        None,
+        EventKind::FindingAsserted {
+            finding: finding_id.clone(),
+            assertion,
+        },
+    );
+    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    let events_now = match journal.replay() {
+        Ok(events) => events,
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    // `finding_json_scoped` below may need to fold *this same* work's
+    // journal again — a self-citing evidence token, or a settlement
+    // whose producing Work is this one — and `Mutex` is not reentrant
+    // (`lineage_of`'s own doc comment states the identical hazard).
+    // Dropped here exactly where `handle_finding_raise` drops its own
+    // journal guard before its own further state reads.
+    drop(journal);
+    // Ruling 0114's second carried gap, the same repair `settle_ready`
+    // and `handle_finding_applied` already carry: the append above is
+    // durable, and until this sweep ran the new row reached `atlas
+    // findings` only at the next daemon start or an administrative
+    // `--rebuild` — so the estate index disagreed with `finding list`
+    // about a record both were reading from the same journal. Journal
+    // first, index second, through the same idempotent
+    // content-addressed sweep; never a second append protocol, and
+    // never a query that writes. A failure here is reported by the
+    // sweep itself and does not unmake the journal fact.
+    reconcile_findings_index(state);
+    let Some(record) = fold(&events_now).findings.get(&finding_id).cloned() else {
+        return err_reply("Internal", "finding vanished after assert");
+    };
+    let result = match requester_view {
+        None => finding_json(&work_id, &finding_id, &record),
+        Some((requester, requester_events, lineage)) => {
+            let mut view = DisclosureView::new(&requester, &requester_events, &lineage);
+            finding_json_scoped(state, &mut view, &work_id, &finding_id, &record)
+        }
+    };
+    ok_reply(result)
+}
+
+/// §2.4, construction review's own corrected verb: never a client
+/// decision. Requests wirkd evaluate the named finding's settlement
+/// readiness right now and reports the real outcome — `settled: {...}`
+/// once an admitted policy class's check actually holds, or `pending`
+/// naming why, never a forged success.
+fn handle_finding_settle(state: &Arc<WirkdState>, payload: super::FindingSettlePayload) -> Reply {
+    if payload.admin == payload.requester.is_some() {
+        return err_reply(
+            "BadRequest",
+            "name exactly one of --requesting-work <id> (scoped) or --admin (unscoped)",
+        );
+    }
+    let finding_id = FindingId(payload.finding);
+    let Some((work_id, _events)) = find_finding_owner(state, &finding_id) else {
+        return err_reply("NotFound", "no such finding");
+    };
+    if let Err(err) = settle_ready(state, &work_id, false) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    let Some(work) = fold_work(state, &work_id) else {
+        return err_reply("JournalError", "work journal vanished during settlement");
+    };
+    let Some(record) = work.findings.get(&finding_id) else {
+        return err_reply("NotFound", "no such finding");
+    };
+    // W-B disclosure response repair
+    // (`loop-b-disclosure-verify/VERDICT.md` C1): naming a requester
+    // here bounds only what this reply discloses. The evaluation above
+    // already ran identically regardless of who asked — requester scope
+    // is not settlement permission (W-B-AUTHORITY-ADJUDICATION.md).
+    let mut result = if payload.admin {
+        finding_json(&work_id, &finding_id, record)
+    } else {
+        let requester_id = payload
+            .requester
+            .as_ref()
+            .expect("the exclusivity check above admitted a requester");
+        let Some(requester_events) = replay_events(state, requester_id) else {
+            return err_reply("NotFound", "no such requesting work");
+        };
+        let requester = fold(&requester_events);
+        let lineage = lineage_of(state, &requester, &requester_events);
+        let mut view = DisclosureView::new(&requester, &requester_events, &lineage);
+        finding_json_scoped(state, &mut view, &work_id, &finding_id, record)
+    };
+    if !matches!(record.state, FindingState::Settled(_))
+        && let Value::Object(map) = &mut result
+    {
+        let reason = match read_settlement_policy(state) {
+            PolicyState::Absent => "no-policy-file",
+            PolicyState::Unreadable => "policy-unreadable",
+            // W-B obligation proof: distinguish "this estate has not
+            // admitted the obligation you named" from "the check has not
+            // held yet", so an operator reading a pending reply is told
+            // which of the two it is rather than guessing.
+            PolicyState::Loaded(policy) => {
+                // The obligation this finding's own *ready* check would
+                // discharge, if any check holds at all — so a basis the
+                // estate never admitted is reported as exactly that
+                // rather than as "the check has not held yet", which is a
+                // different fact entirely.
+                let candidate_basis = fold_work(state, &work_id)
+                    .and_then(|work| {
+                        let events = replay_events(state, &work_id)?;
+                        settlement_candidates(state, &events, &work)
+                            .into_iter()
+                            .find(|ready| ready.finding == finding_id)
+                    })
+                    .and_then(|ready| match obligation_admission(&ready.check) {
+                        Some(Admission::Required(obligation, basis, _)) => {
+                            Some((obligation.clone(), basis.to_string()))
+                        }
+                        _ => None,
+                    });
+                match (&record.finding.obligation, candidate_basis) {
+                    (None, _) if record.finding.kind == FindingKind::VerifiedOutcome => {
+                        "no-obligation-named"
+                    }
+                    (Some(named), _)
+                        if !policy.classes.iter().any(|entry| {
+                            entry.obligations.iter().any(|admitted| {
+                                admitted.id == named.id && admitted.edition == named.edition
+                            })
+                        }) =>
+                    {
+                        "obligation-not-admitted"
+                    }
+                    (Some(_), Some((obligation, basis)))
+                        if !policy.classes.iter().any(|entry| {
+                            entry.obligations.iter().any(|admitted| {
+                                admitted.id == obligation.id
+                                    && admitted.edition == obligation.edition
+                                    && admitted.basis == basis
+                            })
+                        }) =>
+                    {
+                        "obligation-basis-not-admitted"
+                    }
+                    (Some(named), _) if review_selectors_unresolved(state, &work_id, named) => {
+                        "review-targets-unresolved"
+                    }
+                    _ => "no-admitted-check-holds-yet",
+                }
+            }
+        };
+        map.insert("pending".to_string(), json!({"reason": reason}));
+    }
+    ok_reply(result)
+}
+
+/// Whether the Actor Waypoint declaring `named` in this Work reserved
+/// fewer frozen review targets than its contract declares — the one
+/// pending case the vaguer "no admitted check holds yet" hid, which an
+/// operator who has already admitted the basis cannot otherwise diagnose
+/// (the independent review's L1).
+///
+/// Deliberately narrow: it answers a count question about the Work's own
+/// Route and its own reserved World, and the reply is a fixed reason
+/// string. No source alias, path, membership or generation is disclosed,
+/// so this adds no disclosure surface — the wider consultation repair
+/// stays a separate stage.
+fn review_selectors_unresolved(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    named: &ObligationRef,
+) -> bool {
+    let Some(events) = replay_events(state, work_id) else {
+        return false;
+    };
+    let defs = waypoint_defs_for(&events);
+    flatten_leaves(&defs).iter().any(|waypoint| {
+        let Some(def) = find_definition(&defs, waypoint) else {
+            return false;
+        };
+        if def.kind != WaypointKind::Actor {
+            return false;
+        }
+        let Some(obligation) = def.verifies.as_ref() else {
+            return false;
+        };
+        if obligation.id != named.id || obligation.edition != named.edition {
+            return false;
+        }
+        let Some(review) = obligation.review.as_ref() else {
+            return false;
+        };
+        match latest_reservation_for_waypoint(&events, waypoint) {
+            Some((_, World::Actor(actor))) => actor.review_targets.len() != review.targets.len(),
+            _ => false,
+        }
+    })
+}
+
+/// `wirk work obligations` (`loop-b-basis-access`; the integrated
+/// review's §5.1). **Read-only.** Nothing here appends an event, writes
+/// the findings index, mints a settlement, or touches
+/// `policy/settlement.json`: it replays journals, re-derives the
+/// canonical `wirk_core::obligation_basis` for what is actually
+/// reserved, and reports what this estate's policy currently admits.
+///
+/// The gap it closes, stated exactly by the independent review that
+/// found it: an operator who must write `policy/settlement.json` needs
+/// the obligation's content `basis`, and for an `Actor` or
+/// `Deterministic` Waypoint that value binds the **reserved World
+/// hash**, which does not exist until the Work is submitted. It was
+/// rendered only inside an *already settled* record, and a `pending`
+/// reply said `obligation-basis-not-admitted` without ever naming the
+/// value — so the only way to configure the policy was to reimplement
+/// the hash out of band. That is a usability defect, not a policy one,
+/// and it is fixed by *disclosing* the value, never by admitting it.
+///
+/// Five things this reply keeps apart, because conflating any two of
+/// them is how a digest becomes a proof:
+///
+/// 1. `obligation` — what the Route **authored**. Authored content is
+///    never authority (`VerificationObligation`'s own doc).
+/// 2. `basis` — the content address of that authored obligation bound
+///    to the **execution basis** actually reserved. Present only when
+///    something really is reserved; otherwise it names why not.
+/// 3. `admission` — whether **this estate's own policy file** already
+///    admits that exact `(id, edition, basis)`. This verb never writes
+///    that file and never behaves as though it did.
+/// 4. `findings[].ready` — whether the class's check **currently holds**
+///    for a Finding naming this obligation. Readiness is not admission
+///    and admission is not readiness; a settlement needs both.
+/// 5. `findings[].settled` — the receipt, if one was already minted.
+///
+/// Supported bounds, and the reason for each: every Waypoint kind
+/// `obligation_basis` computes a basis for is reported —
+/// `Deterministic` and `Actor` (both bind their reserved `WorldHash`)
+/// and `Container` (no World of its own; its basis content-addresses
+/// its outcome contract and its declared `requires` mechanism, whose
+/// own basis is admitted separately as a `mechanism` and is read off
+/// the *child* Work's own obligations). A Waypoint declaring no
+/// obligation is counted and not listed. An `Actor` obligation with no
+/// `review` contract, or a `Container` obligation with no `requires`,
+/// is listed with its mechanism reported absent, because those
+/// discharge nothing by construction.
+///
+/// Disclosure: the lineage gate and the checkout rule are `status`'s
+/// own, unchanged. An off-lineage requester is refused with the
+/// identical `InadmissibleEvidence` message and learns nothing. A
+/// requester on the lineage whose own bindings do not cover this Work's
+/// gets the journal-identity half — Waypoint, kind, obligation *name*,
+/// reserved World hash, the content-addressed basis, the admission
+/// state and the Finding identities — and the authored content half
+/// (`proves`, `outputs`, the `review` contract) is withheld whole,
+/// exactly as `settlement_json_scoped` withholds `proves` and the proof
+/// half of a settled check. Frozen review targets are never rendered
+/// here at all, in any scope: only how many were declared and how many
+/// resolved. This verb therefore adds no new source-disclosing surface.
+fn handle_work_obligations(
+    state: &Arc<WirkdState>,
+    payload: super::WorkObligationsPayload,
+) -> Reply {
+    if payload.admin == payload.requester.is_some() {
+        return err_reply(
+            "BadRequest",
+            "name exactly one of --requesting-work <id> (scoped) or --admin (unscoped)",
+        );
+    }
+    // `status`'s own gate, verbatim in effect: a named requester sees
+    // this Work only if it is on that requester's own lineage.
+    let scoped: Option<(Work, Vec<Event>, HashSet<WorkId>)> = match &payload.requester {
+        None => None,
+        Some(requester_id) => {
+            let Some(requester_events) = replay_events(state, requester_id) else {
+                return err_reply("NotFound", "no such requesting work");
+            };
+            let requester = fold(&requester_events);
+            let lineage = lineage_of(state, &requester, &requester_events);
+            if !lineage.contains(&payload.work_id) {
+                return err_reply(
+                    "InadmissibleEvidence",
+                    "the named work is not the requesting work's own journal or its parent/child lineage",
+                );
+            }
+            Some((requester, requester_events, lineage))
+        }
+    };
+
+    let Some(events) = replay_events(state, &payload.work_id) else {
+        return err_reply("NotFound", "no such work");
+    };
+    if events.is_empty() {
+        return err_reply("NotFound", "no such work");
+    }
+    let work = fold(&events);
+    let defs = waypoint_defs_for(&events);
+
+    // Every Waypoint of the Route, containers included — a container
+    // obligation is declared on the container itself, which
+    // `flatten_leaves` deliberately does not return.
+    let mut all: Vec<&WaypointDefinition> = Vec::new();
+    fn walk<'a>(nodes: &'a [WaypointDefinition], out: &mut Vec<&'a WaypointDefinition>) {
+        for node in nodes {
+            out.push(node);
+            walk(&node.leaves, out);
+        }
+    }
+    walk(&defs, &mut all);
+
+    if let Some(named) = &payload.waypoint {
+        // An unmatched `--waypoint` is refused, never answered with an
+        // empty list: "this Route has no such Waypoint" and "this
+        // Waypoint declares no obligation" are different facts and a
+        // typo must not read as the second.
+        if !all.iter().any(|def| def.id.0 == *named) {
+            return err_reply("NotFound", "no such waypoint on this work's route");
+        }
+    }
+
+    let policy = read_settlement_policy(state);
+    let policy_json = match &policy {
+        PolicyState::Absent => json!({"state": "absent", "path": "policy/settlement.json"}),
+        PolicyState::Unreadable => json!({"state": "unreadable", "path": "policy/settlement.json"}),
+        PolicyState::Loaded(loaded) => json!({
+            "state": "loaded",
+            "path": "policy/settlement.json",
+            "version": loaded.version,
+            "digest": loaded.digest,
+        }),
+    };
+
+    // Readiness, read-only: the identical list `finding settle` names a
+    // pending reason from, never `settle_ready`, which appends.
+    let candidates = settlement_candidates(state, &events, &work);
+
+    let mut obligations = Vec::new();
+    let mut declaring = 0usize;
+    for def in &all {
+        let Some(obligation) = def.verifies.as_ref() else {
+            continue;
+        };
+        declaring += 1;
+        if let Some(named) = &payload.waypoint
+            && def.id.0 != *named
+        {
+            continue;
+        }
+        let reservation = latest_reservation_for_waypoint(&events, &def.id);
+        let world_hash = reservation.as_ref().map(|(hash, _)| hash.clone());
+        let basis = obligation_basis(def, world_hash.as_ref());
+
+        // Why a basis is unavailable, in the Waypoint's own terms —
+        // never a bare `null` an operator has to guess at.
+        let basis_json = match (&basis, def.kind) {
+            (Some(value), _) => json!({"state": "available", "basis": value}),
+            (None, WaypointKind::Actor) if obligation.review.is_none() => json!({
+                "state": "no-mechanism",
+                "basis": Value::Null,
+                "reason": "this Actor obligation declares no `review` contract, so it discharges nothing and has no basis to admit",
+            }),
+            (None, WaypointKind::Actor | WaypointKind::Deterministic) => json!({
+                "state": "not-reserved",
+                "basis": Value::Null,
+                "reason": "this Waypoint's World has not been reserved yet, and the basis binds it; it becomes available once the Work reserves this Waypoint",
+            }),
+            (None, WaypointKind::Container) => json!({
+                "state": "unavailable",
+                "basis": Value::Null,
+                "reason": "no basis could be derived for this container obligation",
+            }),
+        };
+
+        // The mechanism half, kept explicit: a Container obligation
+        // without `requires`, and an Actor obligation without `review`,
+        // oblige nothing however well-formed the rest is.
+        let mechanism = match def.kind {
+            WaypointKind::Deterministic => json!({
+                "kind": "deterministic_command",
+                "present": true,
+            }),
+            WaypointKind::Container => match &obligation.requires {
+                Some(required) => json!({
+                    "kind": "required_child_obligation",
+                    "present": true,
+                    "requires": {"id": required.id, "edition": required.edition},
+                    "note": "the policy entry admitting this obligation must also list the child obligation's own basis under `mechanisms`; read that value from the child Work's own `work obligations`",
+                }),
+                None => json!({
+                    "kind": "required_child_obligation",
+                    "present": false,
+                    "reason": "a container obligation naming no `requires` obliges nothing and can discharge nothing",
+                }),
+            },
+            WaypointKind::Actor => match &obligation.review {
+                Some(review) => {
+                    let frozen = match reservation.as_ref() {
+                        Some((_, World::Actor(actor))) => Some(actor.review_targets.len()),
+                        _ => None,
+                    };
+                    json!({
+                        "kind": "actor_review",
+                        "present": true,
+                        // Counts only. The frozen targets themselves
+                        // carry membership, generation and object
+                        // identity, and this verb deliberately opens no
+                        // new window onto them.
+                        "review_targets": {
+                            "declared": review.targets.len(),
+                            "frozen": frozen,
+                            "resolved": frozen == Some(review.targets.len()),
+                        },
+                    })
+                }
+                None => json!({
+                    "kind": "actor_review",
+                    "present": false,
+                    "reason": "an Actor obligation declaring no `review` contract obliges nothing and can discharge nothing",
+                }),
+            },
+        };
+
+        let admission = admission_json(
+            &policy,
+            &obligation.id,
+            &obligation.edition,
+            basis.as_deref(),
+        );
+
+        let findings: Vec<Value> = work
+            .findings
+            .iter()
+            .filter(|(_, record)| {
+                record.finding.obligation.as_ref().is_some_and(|named| {
+                    named.id == obligation.id && named.edition == obligation.edition
+                })
+            })
+            .map(|(id, record)| {
+                let ready = candidates.iter().find(|ready| &ready.finding == id);
+                let settled = match &record.state {
+                    FindingState::Settled(settlement) => json!({
+                        "state": "settled",
+                        "class": settlement_class_str(settlement.authority.class),
+                    }),
+                    _ => json!({"state": "not-settled"}),
+                };
+                json!({
+                    "finding": id.0,
+                    "kind": finding_kind_str(record.finding.kind),
+                    "scope": finding_scope_str(record.finding.scope),
+                    "waypoint": record.finding.waypoint.0,
+                    // Readiness is the class's own check holding right
+                    // now against this journal — separate from, and
+                    // never a substitute for, the policy admission
+                    // above.
+                    "ready": match ready {
+                        // A settled Finding is not "not ready": its
+                        // check already held and was minted. Saying
+                        // `not-ready` beside `settled` would read as a
+                        // contradiction, so the settled case names
+                        // itself and readiness stays a statement about
+                        // findings that could still settle.
+                        _ if matches!(record.state, FindingState::Settled(_)) =>
+                            json!({"state": "already-settled"}),
+                        Some(ready) => json!({
+                            "state": "ready",
+                            "class": settlement_class_str(ready.class),
+                            "basis": match obligation_admission(&ready.check) {
+                                Some(Admission::Required(_, basis, _)) => json!(basis),
+                                _ => Value::Null,
+                            },
+                        }),
+                        None => json!({"state": "not-ready"}),
+                    },
+                    "settled": settled,
+                })
+            })
+            .collect();
+
+        obligations.push(json!({
+            "waypoint": def.id.0,
+            "waypoint_kind": waypoint_kind_str(def.kind),
+            "obligation": {
+                "id": obligation.id,
+                "edition": obligation.edition,
+                "proves": obligation.proves,
+                "outputs": obligation.outputs,
+                "review": obligation.review.as_ref().map(|review| json!({
+                    "recipe": review.recipe,
+                    "targets": review.targets.iter()
+                        .map(|target| json!({"source": target.source, "path": target.path}))
+                        .collect::<Vec<Value>>(),
+                    "decisions": review.decisions.iter()
+                        .map(|kind| finding_kind_str(*kind))
+                        .collect::<Vec<&str>>(),
+                })),
+                "requires": obligation.requires.as_ref()
+                    .map(|required| json!({"id": required.id, "edition": required.edition})),
+            },
+            "reservation": match &world_hash {
+                Some(hash) => json!({"state": "reserved", "world_hash": hash.0}),
+                None => json!({"state": "not-reserved", "world_hash": Value::Null}),
+            },
+            "mechanism": mechanism,
+            "basis": basis_json,
+            "admission": admission,
+            "findings": findings,
+        }));
+    }
+
+    let mut result = json!({
+        "work": payload.work_id.0,
+        "policy": policy_json,
+        "route": {"waypoints": all.len(), "declaring_obligation": declaring},
+        "obligations": obligations,
+    });
+
+    match scoped {
+        None => {
+            result["scope"] = json!("administrative");
+            ok_reply(result)
+        }
+        Some((requester, requester_events, lineage)) => {
+            let mut view = DisclosureView::new(&requester, &requester_events, &lineage);
+            if !view.admits_work_checkout(state, &payload.work_id) {
+                view.withheld += withhold_obligation_content(&mut result);
+            }
+            result["scope"] = json!("requester");
+            result["work_id"] = json!(payload.work_id.0);
+            result["disclosure"] = json!({"withheld": view.withheld});
+            ok_reply(result)
+        }
+    }
+}
+
+/// The authored-content half of a `work obligations` reply, withheld as
+/// whole objects for a requester whose own bindings do not cover this
+/// Work's — the same rule and the same `withheld_json()` marker
+/// `withhold_status_content` and `settlement_json_scoped` already apply,
+/// so two withheld parts stay indistinguishable and no alias, path or
+/// sentence travels in the marker.
+///
+/// Withheld: the Route-authored `proves` sentence, the obligated
+/// `outputs` names, and the whole `review` contract (whose `targets`
+/// name a source alias and a resource path). Withholding `review` as an
+/// object rather than field by field means a contract that gains a
+/// field is withheld by default.
+///
+/// Kept: journal and content-address identity only — the Waypoint, its
+/// kind, the obligation's `id`/`edition`, the reserved `world_hash`, the
+/// content-addressed `basis`, the mechanism's presence and target
+/// counts, the policy admission state, and the Finding identities and
+/// their readiness. Every one of those is a value `status` already
+/// discloses to exactly this requester (`world_hash`) or a count
+/// (`review_targets`), and none of them names a source, a path, a
+/// generation, an object or a digest of any artifact.
+fn withhold_obligation_content(result: &mut Value) -> usize {
+    let mut withheld = 0usize;
+    let Some(entries) = result.get_mut("obligations").and_then(Value::as_array_mut) else {
+        return withheld;
+    };
+    for entry in entries {
+        let Some(obligation) = entry.get_mut("obligation") else {
+            continue;
+        };
+        for field in ["proves", "outputs", "review"] {
+            if let Some(slot) = obligation.get_mut(field)
+                && !slot.is_null()
+            {
+                *slot = withheld_json();
+                withheld += 1;
+            }
+        }
+    }
+    withheld
+}
+
+/// What this estate's settlement policy currently says about one
+/// obligation at one basis — and nothing more. It reports; it never
+/// admits.
+///
+/// The four states an operator actually has to tell apart:
+///
+/// - `unknown-basis`: nothing is reserved yet, so there is no value to
+///   admit and no admission question to answer. Reported before the
+///   policy is consulted at all, so an unreserved obligation can never
+///   read as admitted.
+/// - `no-policy-file` / `policy-unreadable`: the same two fail-closed
+///   states `read_settlement_policy` already distinguishes.
+/// - `obligation-not-admitted`: no entry names this `id`/`edition`.
+/// - `basis-not-admitted`: an entry names it, at a **different** basis
+///   — the exact case the reviewer hit, and the one that used to leave
+///   an operator with a reason string and no value.
+/// - `admitted`: an entry names this id, edition and basis. Every such
+///   entry is listed with its class, scope and kinds, because
+///   `try_mint_settlement` also matches the Finding's own scope and
+///   kind against them — an entry admitting the basis under the wrong
+///   scope settles nothing, and the operator can see that here rather
+///   than discovering it as a pending reason.
+fn admission_json(policy: &PolicyState, id: &str, edition: &str, basis: Option<&str>) -> Value {
+    let Some(basis) = basis else {
+        return json!({
+            "state": "unknown-basis",
+            "reason": "no basis is derivable yet, so this obligation is neither admitted nor admissible; nothing may be read as admitted here",
+            "admitted_by": [],
+        });
+    };
+    let loaded = match policy {
+        PolicyState::Absent => {
+            return json!({"state": "no-policy-file", "admitted_by": []});
+        }
+        PolicyState::Unreadable => {
+            return json!({"state": "policy-unreadable", "admitted_by": []});
+        }
+        PolicyState::Loaded(loaded) => loaded,
+    };
+    let mut admitted_by = Vec::new();
+    let mut names_obligation = false;
+    for entry in &loaded.classes {
+        for admitted in &entry.obligations {
+            if admitted.id != id || admitted.edition != edition {
+                continue;
+            }
+            names_obligation = true;
+            if admitted.basis != basis {
+                continue;
+            }
+            admitted_by.push(json!({
+                "class": settlement_class_str(entry.class),
+                "scope": finding_scope_str(entry.scope),
+                "kinds": entry.kinds.iter().map(|kind| finding_kind_str(*kind)).collect::<Vec<&str>>(),
+                "mechanisms": admitted.mechanisms,
+            }));
+        }
+    }
+    let state = if !admitted_by.is_empty() {
+        "admitted"
+    } else if names_obligation {
+        "basis-not-admitted"
+    } else {
+        "obligation-not-admitted"
+    };
+    json!({"state": state, "admitted_by": admitted_by})
+}
+
+/// The wire name of a `WaypointKind`, so a reply says which of the three
+/// obligation mechanisms applies without the reader inferring it.
+fn waypoint_kind_str(kind: WaypointKind) -> &'static str {
+    match kind {
+        WaypointKind::Deterministic => "deterministic",
+        WaypointKind::Container => "container",
+        WaypointKind::Actor => "actor",
+    }
+}
+
+/// §4: the mechanical proof of changed bytes, split from the always-
+/// asserted judgement that they implement the finding. Every refusal
+/// named in §4 is checked in the same order the design states it.
+fn handle_finding_applied(
+    state: &Arc<WirkdState>,
+    payload: super::FindingAppliedPayload,
+    peer: PeerIdentity,
+) -> Reply {
+    // W-B-CORRECT.md defect 3: the caller's own producer identity is
+    // checked exactly like `handle_finding_raise` checks its own raising
+    // Run — never a bare `--by` string from an arbitrary shell with no
+    // Work, Run, or checkout at all (the authority review's own executed
+    // counterexample).
+    //
+    // W-B Application repair: that check is now ruling 0095's own
+    // `current_producing_action`, the identical reducer `atlas relate`
+    // already uses, instead of this verb's private "latest attempt for
+    // its Waypoint" approximation. The candidate's approximation
+    // admitted a *spent* Run (one whose own Validated Done Claim is
+    // already recorded), a failed Run, a vanished Run and a Run on a
+    // completed, failed or canceled Work — every one of which is still
+    // the latest attempt for its Waypoint, and none of which is
+    // producing anything now. The reason the candidate had to allow
+    // them is recorded in `FindingAppliedPayload::claim_run`'s own doc:
+    // it conflated the caller with the historical Claim it cites. Those
+    // are now two separate identities, so the caller can be held to the
+    // real currency rule while a closing Claim stays usable as history.
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the claim's estate root does not identify this daemon's estate",
+        );
+    }
+    let producer_work_id = payload.triple.work_id.clone();
+    let producer_run_id = payload.triple.run_id.clone();
+    let Some(producer_events) = replay_events(state, &producer_work_id) else {
+        return err_reply("NotFound", "no such work");
+    };
+    let action = match current_producing_action(&producer_events) {
+        Ok(action) => action,
+        Err(reply) => return reply,
+    };
+    if action.run != producer_run_id {
+        return err_reply(
+            "ProducingActionMismatch",
+            "the calling run is not this Work's current producing action: a spent, failed, vanished or superseded attempt records no new assertion",
+        );
+    }
+    // W-B disclosure response repair (`loop-b-disclosure-verify/VERDICT.md`
+    // C3): folded once, before `producer_work_id` is possibly moved into
+    // the `Attribution::Asserted` arm below, so the final reply can be
+    // scoped by the caller's own already-checked identity with no new
+    // flag — `applied` never lets a caller name a different requester.
+    let producer = fold(&producer_events);
+
+    let finding_id = FindingId(payload.finding);
+    let Some((work_id, events)) = find_finding_owner(state, &finding_id) else {
+        return err_reply("NotFound", "no such finding");
+    };
+    let work = fold(&events);
+    let Some(record) = work.findings.get(&finding_id) else {
+        return err_reply("NotFound", "no such finding");
+    };
+    // W-B Application repair, the journal-write boundary ruling 0101
+    // already settled for `finding assert`: this verb *writes* into the
+    // target finding's own Work, and the candidate let any Work in the
+    // estate do it. The identical `lineage_of` set `handle_finding_assert`
+    // checks is applied here — no second, looser rule, and no new flag:
+    // `applied` never lets a caller name a requester other than itself,
+    // so its own already-checked triple is the requester.
+    let lineage = lineage_of(state, &producer, &producer_events);
+    if !lineage.contains(&work_id) {
+        return err_reply(
+            "InadmissibleEvidence",
+            "the finding's own work is not this producing work's own journal or its parent/child lineage",
+        );
+    }
+    // 1. The finding's own admitted source coordinate.
+    let Some((encoded, before_generation, before_object_id)) = record
+        .finding
+        .applies_to
+        .iter()
+        .find_map(|item| match (&item.reference, &item.outcome) {
+            (
+                EvidenceRef::Source(encoded),
+                EvidenceOutcome::Admitted {
+                    generation,
+                    object_id,
+                },
+            ) => Some((encoded.clone(), generation.clone(), object_id.clone())),
+            _ => None,
+        })
+    else {
+        return err_reply(
+            "NoOwningSource",
+            "the finding names no admitted source coordinate to apply against",
+        );
+    };
+    let coordinate = match decode_coordinate(&encoded) {
+        Ok(coordinate) => coordinate,
+        Err(detail) => return err_reply("InadmissibleEvidence", &detail),
+    };
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let scope = wirk_atlas::QueryScope::Work(work.repositories.clone());
+    let Some(membership) = admitted_membership_for(&atlas, &scope, &coordinate.membership) else {
+        return err_reply(
+            "InadmissibleEvidence",
+            "the finding's own source membership is not admitted by this Work's own bindings",
+        );
+    };
+    // W-B Application repair: and admitted by the *caller's* own
+    // bindings too. The candidate resolved the membership only against
+    // the finding-owning Work's grants, so a producing Work with no
+    // binding at all on the changed source recorded a durable
+    // Application against it — an origin Work's broader admission is
+    // not the caller's grant. Same `admitted_membership_for`, same
+    // `QueryScope::Work`, the caller's own repository set.
+    if admitted_membership_for(
+        &atlas,
+        &wirk_atlas::QueryScope::Work(producer.repositories.clone()),
+        &coordinate.membership,
+    )
+    .is_none()
+    {
+        return err_reply(
+            "InadmissibleEvidence",
+            "the changed source is not admitted by this producing work's own bindings",
+        );
+    }
+    if membership.alias != payload.source {
+        return err_reply(
+            "BadRequest",
+            "--source does not name the finding's own applies_to membership",
+        );
+    }
+    // 2. Publication currency.
+    let after_generation = match atlas.current(&membership) {
+        Ok(Some(generation)) => generation,
+        Ok(None) => {
+            return err_reply(
+                "SourceNotPublished",
+                "no published generation for this source",
+            );
+        }
+        Err(err) => return err_reply("AtlasError", &err.to_string()),
+    };
+    if after_generation.revision != payload.revision {
+        return err_reply(
+            "RevisionNotCurrent",
+            "the named revision is not the currently published one",
+        );
+    }
+    if after_generation.id == coordinate.generation {
+        return err_reply(
+            "GenerationUnchanged",
+            "the published generation is unchanged: a republication is not an application",
+        );
+    }
+    // 3. Mechanical proof: the before state still resolves, and the
+    // same path names a different (or absent) object in the after
+    // generation.
+    match atlas.resolve_exact(&membership, &coordinate) {
+        Ok(wirk_atlas::ResolveOutcome::Resolved(_)) => {}
+        _ => {
+            return err_reply(
+                "InadmissibleEvidence",
+                "the finding's own before state no longer resolves",
+            );
+        }
+    }
+    // W-B Application repair, "deletion has explicit absence rather
+    // than a fabricated object id" — and, distinctly, is not the same
+    // fact as a resource Atlas recorded with no object id at all. The
+    // candidate collapsed both into one `None`, so a record whose bytes
+    // this daemon simply cannot identify was published as a deletion.
+    // Refusing the uninterpretable case here makes `after.object_id ==
+    // None` mean exactly one thing downstream: the path is absent from
+    // the after generation. An emptied file is *not* that — it keeps a
+    // real, zero-byte Git object id and reads as present.
+    let after_resource = after_generation
+        .resources
+        .iter()
+        .find(|resource| resource.path == coordinate.path);
+    let after_object_id = match after_resource {
+        None => None,
+        Some(resource) => match &resource.object_id {
+            Some(object_id) => Some(object_id.clone()),
+            None => {
+                return err_reply(
+                    "UnknownAfterObject",
+                    "the after generation records this resource with no object id: its bytes cannot be identified, and absence must not be inferred from that",
+                );
+            }
+        },
+    };
+    if after_object_id.as_deref() == Some(before_object_id.as_str()) {
+        return err_reply(
+            "CoordinatesUnchanged",
+            "the finding's own coordinates carry the identical object id in both generations",
+        );
+    }
+    // 4-5. Attribution and the judgement. `Attribution::Asserted`
+    // (ruling 0077: permitted regardless of the membership's Read/Write
+    // binding — a durable, evidenced assertion is distinct from source
+    // mutation authority) stays the default, now always naming the
+    // real, already-checked `producer` above — never a bare `--by`
+    // string standing in for identity. `--claim-run` requests the
+    // exact, checked `Attribution::Claim` path over a *historical*
+    // Validated Done Claim instead (W-B-CORRECT.md defect 3).
+    //
+    // Which Work's journal that cited Claim lives in is decided here,
+    // out of the locks, because the answer decides *which* journals the
+    // append below must hold. The Claim itself is resolved under those
+    // locks, not here.
+    let claim_citation = payload.claim_run.as_ref().map(|claim_run| {
+        // The cited Claim is evidence read out of another journal, so
+        // it goes through the same reference rule every other journal
+        // reference in this file obeys (`admit_evidence`'s own Journal
+        // branch, `handle_finding_assert`): the caller's own lineage.
+        let claim_work = payload
+            .claim_work
+            .clone()
+            .map(WorkId)
+            .unwrap_or_else(|| producer_work_id.clone());
+        (claim_work, RunId(claim_run.clone()))
+    });
+    if let Some((claim_work, _)) = &claim_citation
+        && claim_work != &producer_work_id
+        && !lineage.contains(claim_work)
+    {
+        drop(atlas);
+        return err_reply(
+            "InadmissibleEvidence",
+            "the cited claim's work is not this producing work's own journal or its parent/child lineage",
+        );
+    }
+    // Atlas is released before any journal lock is taken. Route
+    // advancement holds a Work's journal lock and then reaches for the
+    // Atlas: `reserve_next_leaf` is called with the Work's journal
+    // guard held (`handle_claim`'s auto-advance and `close_cascade`)
+    // and freezes the next leaf's review targets through
+    // `freeze_review_targets`, which locks the Atlas itself. So
+    // journal-then-Atlas is this daemon's established direction, and
+    // taking them the other way round here would be the classic
+    // inversion.
+    //
+    // (Corrected by the independent currentness verification, V-1: this
+    // comment used to cite `actor_reviewed_readiness`, which takes no
+    // Atlas lock at all — its body is `let _ = state;`. The ordering
+    // constraint is real; the site named for it was not.)
+    drop(atlas);
+
+    // ---- The mutation's linearization boundary (F-1) ----------------
+    //
+    // The independent Application verification (`APPLICATION-VERDICT.md`
+    // F-1) executed what the earlier shape allowed: `current_producing_
+    // action` was read from an unlocked `replay_events` at the top of
+    // this function, and the append happened much later under a
+    // *different* Work's lock. One thread per connection (`run`'s own
+    // accept loop) meant a concurrent `fail`, `cancel`, `retry` or
+    // `claim` on the producer's Work landed inside that window: in 15 of
+    // 39 racers a `FindingApplied` was appended *after* the `RunFailed`
+    // that superseded its own producer, minting exactly the assertion
+    // this verb refuses when it arrives a millisecond later.
+    //
+    // A stale pre-read followed by a second unlocked check is not
+    // atomic, so the fix is neither. Every journal whose facts decide
+    // this append is locked *before* the decision and stays locked
+    // *through* it: the producer's (its current producing action), the
+    // cited Claim's (its own currency and receipts), and the finding
+    // owner's (the one actually written). Whatever a concurrent request
+    // does to any of them either lands entirely before this decision —
+    // and is seen by it — or entirely after this append. A racer is now
+    // indistinguishable from a caller that simply arrived late, which is
+    // why the refusals below are the identical refusals the sequential
+    // path returns rather than a new race-only code.
+    //
+    // Ordering. Several of those journals are frequently distinct, so an
+    // order is required or two requests deadlock head-on. `journal_lock_
+    // order` supplies one estate-wide order that the daemon's existing
+    // multi-journal sites already obey: an ancestor is locked before its
+    // descendant (`settle_ready` holds a Work's own lock while
+    // `child_investigation_ready` reads a child's; `close_cascade` the
+    // same), ties broken by `WorkId`. Distinct Works with no ancestry
+    // between them simply need *some* total order, and the id gives one.
+    // It is computed before any lock is taken, because computing it
+    // reads journals.
+    //
+    // Self-locking. The overwhelmingly common Application is a Work
+    // applying its own finding, citing its own Claim — one Work, one
+    // journal, and `Mutex` is not reentrant. The set below is
+    // deduplicated by `WorkId` for exactly that reason, the same
+    // discipline `lineage_of` states for its own `own_events`.
+    let mut needed: Vec<WorkId> = vec![work_id.clone()];
+    if producer_work_id != work_id {
+        needed.push(producer_work_id.clone());
+    }
+    if let Some((claim_work, _)) = &claim_citation
+        && !needed.contains(claim_work)
+    {
+        needed.push(claim_work.clone());
+    }
+    let mut handles: Vec<(WorkId, Arc<Mutex<Journal>>)> = Vec::new();
+    for id in &needed {
+        match journal_for(state, id) {
+            Ok(Some(journal)) => handles.push((id.clone(), journal)),
+            Ok(None) => return err_reply("NotFound", "no such work"),
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        }
+    }
+    handles.sort_by_cached_key(|(id, _)| journal_lock_order(state, id));
+
+    let mut guards: Vec<(WorkId, JournalGuard<'_>)> = Vec::new();
+    for (id, journal) in &handles {
+        guards.push((id.clone(), lock_journal(journal)));
+    }
+    // Read every locked journal once, here, so the checks below and the
+    // append itself all see one consistent snapshot taken inside the
+    // locks — never the pre-read from the top of this function.
+    let mut replayed: Vec<(WorkId, Vec<Event>)> = Vec::new();
+    for (id, guard) in &guards {
+        match guard.replay() {
+            Ok(events) => replayed.push((id.clone(), events)),
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        }
+    }
+    let events_for = |id: &WorkId| -> &[Event] {
+        replayed
+            .iter()
+            .find(|(held, _)| held == id)
+            .map(|(_, events)| events.as_slice())
+            .unwrap_or(&[])
+    };
+
+    // The producer's authority, re-derived under its own lock and held
+    // there until this append is durable. A `fail`, `cancel`, `retry` or
+    // closing `claim` that won the race is already in these events and
+    // refuses the assertion with the sequential path's own words; one
+    // that lost it cannot append until this journal lock is released.
+    let action_now = match current_producing_action(events_for(&producer_work_id)) {
+        Ok(action) => action,
+        Err(reply) => return reply,
+    };
+    if action_now != action {
+        return err_reply(
+            "ProducingActionMismatch",
+            "the calling run is not this Work's current producing action: a spent, failed, vanished or superseded attempt records no new assertion",
+        );
+    }
+
+    // And the cited Claim, resolved under the same held locks for the
+    // same reason: `resolve_claim_attribution`'s own "current for its
+    // waypoint" test is a journal fact a concurrent `retry` on the cited
+    // Work can invalidate between a read and this append.
+    let attribution = match &claim_citation {
+        Some((claim_work, claim_run)) => {
+            match resolve_claim_attribution(
+                &membership,
+                &coordinate,
+                &after_object_id,
+                events_for(claim_work),
+                claim_work,
+                claim_run,
+            ) {
+                Ok(attribution) => attribution,
+                Err((code, message)) => return err_reply(code, &message),
+            }
+        }
+        None => Attribution::Asserted {
+            by: payload.by.clone(),
+            peer,
+            producer: ApplicationProducer {
+                work: producer_work_id.clone(),
+                run: producer_run_id.clone(),
+                world_hash: action_now.world_hash.clone(),
+            },
+        },
+    };
+    let application = ApplicationRef {
+        source: membership.alias.clone(),
+        before: GenerationPoint {
+            generation: before_generation,
+            object_id: Some(before_object_id),
+        },
+        after: GenerationPoint {
+            generation: after_generation.id.0.clone(),
+            object_id: after_object_id,
+        },
+        revision: after_generation.revision.clone(),
+        attribution,
+        implements_finding: AssertedJudgement {
+            by: payload.by,
+            peer,
+            at: now_ts(),
+        },
+    };
+    let events_now = {
+        let Some((_, owner_guard)) = guards.iter_mut().find(|(held, _)| held == &work_id) else {
+            return err_reply("Internal", "the finding's own journal was not locked");
+        };
+        let event = new_event(
+            &work_id,
+            None,
+            EventKind::FindingApplied {
+                finding: finding_id.clone(),
+                application,
+            },
+        );
+        if let Err(err) = append_event(state, owner_guard, &work_id, &event) {
+            return err_reply("JournalError", &err.to_string());
+        }
+        match owner_guard.replay() {
+            Ok(events) => events,
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        }
+    };
+    // `reconcile_findings_index`, `lineage_of` and `finding_json_scoped`
+    // below all fold journals of their own — including these — and
+    // `Mutex` is not reentrant, so every guard is released first,
+    // exactly as `handle_finding_assert` does before its own scoped
+    // reply. The append is already durable; nothing after this point
+    // decides anything.
+    drop(guards);
+    // W-B-AUTHORITY-ADJUDICATION.md, "immediate journal-first index
+    // reconciliation after settle/application": `settle_ready` already
+    // does this after minting a settlement, and the candidate never did
+    // it here — an applied row was invisible to `atlas findings` until
+    // the next restart or an explicit administrative `--rebuild`.
+    // Journal first (the append above already succeeded), index second,
+    // through the same idempotent content-addressed sweep, never a
+    // second append protocol.
+    reconcile_findings_index(state);
+    let Some(record) = fold(&events_now).findings.get(&finding_id).cloned() else {
+        return err_reply("Internal", "finding vanished after applied");
+    };
+    let mut view = DisclosureView::new(&producer, &producer_events, &lineage);
+    ok_reply(finding_json_scoped(
+        state,
+        &mut view,
+        &work_id,
+        &finding_id,
+        &record,
+    ))
+}
+
+/// W-B-CORRECT.md defect 3 ("complete Application"): the checked
+/// `Attribution::Claim` path. Every refusal here is a distinct, real
+/// authority failure, never a bare id match:
+/// - the named Run must be *current* for its own Waypoint — a stale or
+///   superseded attempt's identity confers nothing (`TripleMismatch`);
+/// - it must carry a real Validated Done `ClaimRecorded`, not merely
+///   exist (`WrongClaim`);
+/// - that Claim's own Work must hold a `Write` binding on the named
+///   source — a Read-only membership's mutation credit is refused
+///   (`ReadOnlyMutationCredit`), unlike `Attribution::Asserted`'s own
+///   ruling-0077 allowance;
+/// - that Claim's own artifact receipt must name this Finding's exact
+///   path (`ChangedClaimedArtifact`) and its own recorded digest must
+///   match the after-generation's actual bytes, read fresh from the
+///   source's own Git object store, never only a declared path or a
+///   Write label (`DifferentAfterBytes`).
+///
+/// `claim_events` is the cited Work's journal, replayed by the caller
+/// rather than read here: `handle_finding_applied` evaluates this
+/// function *under* the journal locks it appends beneath (F-1), and
+/// `Mutex` is not reentrant, so a `replay_events` of its own would
+/// deadlock the ordinary case where the cited Claim lives in the
+/// caller's own Work. The same discipline `lineage_of` already states
+/// for its own `own_events`.
+fn resolve_claim_attribution(
+    membership: &wirk_atlas::Membership,
+    coordinate: &wirk_atlas::ExactCoordinate,
+    after_object_id: &Option<String>,
+    claim_events: &[Event],
+    claim_work: &WorkId,
+    claim_run: &RunId,
+) -> Result<Attribution, (&'static str, String)> {
+    let Some(run) = find_run(claim_events, claim_run) else {
+        return Err((
+            "NotFound",
+            "no such claim run in the named claim work".to_string(),
+        ));
+    };
+    if latest_run_for_waypoint(claim_events, &run.waypoint).map(|entry| entry.0)
+        != Some(claim_run.clone())
+    {
+        return Err((
+            "TripleMismatch",
+            "the claim's own run is not current for its waypoint: a stale or superseded attempt confers no attribution".to_string(),
+        ));
+    }
+    let Some((claim_event_id, claim_id)) = claim_events.iter().rev().find_map(|event| {
+        if event.run.as_ref() != Some(claim_run) {
+            return None;
+        }
+        match &event.kind {
+            EventKind::ClaimRecorded {
+                claim,
+                claim_kind: ClaimKind::Done,
+                verdict: ClaimVerdict::Validated,
+                ..
+            } => Some((event.id.clone(), claim.clone())),
+            _ => None,
+        }
+    }) else {
+        return Err((
+            "WrongClaim",
+            "the named claim run carries no Validated Done Claim".to_string(),
+        ));
+    };
+    let claim_work_folded = fold(claim_events);
+    let has_write = claim_work_folded
+        .repositories
+        .iter()
+        .any(|binding| binding.name == membership.alias && binding.access == Access::Write);
+    if !has_write {
+        return Err((
+            "ReadOnlyMutationCredit",
+            "the claim's own work holds no Write binding on this source: a Read-only membership confers no mutation credit".to_string(),
+        ));
+    }
+    // W-B Application repair: a `Write` binding is a *declared* grant
+    // carrying an alias and an access level and nothing else, so the
+    // candidate's alias equality credited a Work that really executed
+    // in some other repository — or another estate's same-named source
+    // — with mutating this one. Ruling 0090 already resolved this exact
+    // class for child bindings: `canonical_repository_identity` (`git
+    // rev-parse --git-common-dir`, canonicalized) tells two worktrees
+    // of one repository apart from two unrelated repositories sharing a
+    // name. The Work's own recorded `execution_identity` is what wirkd
+    // verified at submit time, never a caller string.
+    let membership_identity =
+        canonical_repository_identity(&membership.locator).map_err(|err| ("AtlasError", err))?;
+    match claim_work_folded.execution_identity.as_deref() {
+        Some(identity) if identity == membership_identity => {}
+        Some(_) => {
+            return Err((
+                "DifferentExecutionSource",
+                "the claim's own work executed in a different repository than this source: a shared --repo alias is not the same checkout".to_string(),
+            ));
+        }
+        None => {
+            return Err((
+                "DifferentExecutionSource",
+                "the claim's own work recorded no verified execution repository, so its Claim cannot be bound to this source".to_string(),
+            ));
+        }
+    }
+    let receipts = claim_artifact_receipts(claim_events, &claim_id);
+    let coordinate_path = String::from_utf8_lossy(&coordinate.path).into_owned();
+    let Some(receipt) = receipts
+        .iter()
+        .find(|receipt| receipt.path == coordinate_path)
+    else {
+        return Err((
+            "ChangedClaimedArtifact",
+            "the claim's own receipts name no artifact at this finding's own path".to_string(),
+        ));
+    };
+    // An absent resource is a real, recorded Application outcome
+    // (`Attribution::Asserted` records it as explicit absence), but an
+    // artifact receipt attests the digest of bytes that exist. There is
+    // nothing to compare, and saying so is a different fact from "the
+    // bytes differ".
+    let Some(after_object_id) = after_object_id else {
+        return Err((
+            "DeletedResource",
+            "the resource is absent from the after generation: an artifact receipt's digest cannot attest a deletion".to_string(),
+        ));
+    };
+    let bytes =
+        read_blob(&membership.locator, after_object_id).map_err(|err| ("AtlasError", err))?;
+    let after_digest = sha256_hex(&bytes);
+    if after_digest != receipt.digest {
+        return Err((
+            "DifferentAfterBytes",
+            "the claim's own artifact digest does not match the after-generation's actual bytes"
+                .to_string(),
+        ));
+    }
+    Ok(Attribution::Claim {
+        work: claim_work.clone(),
+        run: claim_run.clone(),
+        claim: claim_id,
+        claim_event: claim_event_id,
+    })
+}
+
+/// R2/R5: the identical `git -C <repo> ...` subprocess convention
+/// `wirk-atlas/src/git.rs`'s own private `git()` helper already uses —
+/// no new Atlas API surface, since `Membership.locator` (a canonicalized
+/// filesystem path, `wirk_atlas::store::register_git`) is already a
+/// public field wirkd can read directly. `cat-file -p` reads content by
+/// its already-resolved, content-addressed blob id alone — no ref or
+/// commit needed.
+fn read_blob(repo: &str, object_id: &str) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .arg("-C")
+        .arg(repo)
+        .arg("cat-file")
+        .arg("-p")
+        .arg(object_id)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// §3/W-B-CORRECT.md defect 2: a `work` selection is never itself an
+/// evidence grant. `admin` is the one explicit, separately-named path
+/// that keeps the old unscoped behavior (every Work in the estate, or
+/// any named Work, no lineage check) — real administrative inspection,
+/// not the default. Every other call must name its own `requester` Work
+/// and only ever sees that Work's own effective lineage (itself, its
+/// ancestors, its descendants) — reusing `lineage_of`, the identical set
+/// `admit_evidence`'s Journal branch already computes at raise time,
+/// never a second, looser rule for consultation.
+fn handle_finding_list(state: &Arc<WirkdState>, payload: super::FindingListPayload) -> Reply {
+    let mut findings = Vec::new();
+    if payload.admin {
+        match &payload.work {
+            Some(work_id) => {
+                let Some(work) = fold_work(state, work_id) else {
+                    return err_reply("NotFound", "no such work");
+                };
+                for (id, record) in &work.findings {
+                    findings.push(finding_json(work_id, id, record));
+                }
+            }
+            None => {
+                let works_dir = state.estate_root.join("works");
+                if let Ok(entries) = std::fs::read_dir(&works_dir) {
+                    for entry in entries.flatten() {
+                        let dir = entry.path();
+                        if !dir.is_dir() {
+                            continue;
+                        }
+                        let Ok(journal) = Journal::open(&dir) else {
+                            continue;
+                        };
+                        let Ok(events) = journal.replay() else {
+                            continue;
+                        };
+                        if events.is_empty() {
+                            continue;
+                        }
+                        let work = fold(&events);
+                        for (id, record) in &work.findings {
+                            findings.push(finding_json(&work.id, id, record));
+                        }
+                    }
+                }
+            }
+        }
+        return ok_reply(json!({ "findings": findings }));
+    }
+    let Some(requester_id) = &payload.requester else {
+        return err_reply(
+            "BadRequest",
+            "a non-administrative finding list requires --requesting-work",
+        );
+    };
+    let Some(requester_events) = replay_events(state, requester_id) else {
+        return err_reply("NotFound", "no such requesting work");
+    };
+    let requester = fold(&requester_events);
+    let lineage = lineage_of(state, &requester, &requester_events);
+    // Lineage decides *which journals* may be listed at all; the view
+    // decides *how much of each record* this requester may be shown.
+    // The base drew only the first line and then rendered every
+    // coordinate, proof target, artifact path and Application source in
+    // full — a `--requesting-work` that selected its parent read the
+    // parent's embargoed sources straight off the wire.
+    let mut view = DisclosureView::new(&requester, &requester_events, &lineage);
+    if let Some(work_id) = &payload.work {
+        if !lineage.contains(work_id) {
+            return err_reply(
+                "InadmissibleEvidence",
+                "the named work is not the requesting work's own journal or its parent/child lineage",
+            );
+        }
+        let Some(work) = fold_work(state, work_id) else {
+            return err_reply("NotFound", "no such work");
+        };
+        for (id, record) in &work.findings {
+            findings.push(finding_json_scoped(state, &mut view, work_id, id, record));
+        }
+    } else {
+        for work_id in &lineage {
+            let Some(work) = fold_work(state, work_id) else {
+                continue;
+            };
+            for (id, record) in &work.findings {
+                findings.push(finding_json_scoped(state, &mut view, work_id, id, record));
+            }
+        }
+    }
+    ok_reply(json!({
+        "findings": findings,
+        // Honest, and honestly bounded: how many record parts were
+        // withheld, never which. Same discipline as `atlas search`'s own
+        // `admission.denied` count.
+        "disclosure": {"withheld": view.withheld},
+    }))
+}
+
+// ---- Settlement policy (§2.4) --------------------------------------------
+
+struct SettlementPolicyClass {
+    class: SettlementClass,
+    scope: FindingScope,
+    kinds: Vec<FindingKind>,
+    /// W-B obligation proof (`W-B-OBLIGATION-BUILD.md`): which
+    /// verification obligations this class may discharge, each admitted
+    /// by name **and** by content basis. `deterministic_verified` +
+    /// scope + kind is no longer an admission of anything: without a
+    /// matching entry here, nothing settles under this class.
+    obligations: Vec<AdmittedObligation>,
+}
+
+/// One obligation the estate's own policy file pre-admits. `basis` is
+/// `wirk_core::obligation_basis` — the content address of the authored
+/// obligation *inseparably bound to* the execution basis that discharges
+/// it. Admitting by name alone would let any proposer author a Route
+/// Waypoint claiming the admitted check identity while running something
+/// else entirely; admitting the basis pins the command, the source
+/// basis, the expected artifacts, the proven statement and the obligated
+/// outputs together.
+struct AdmittedObligation {
+    id: String,
+    edition: String,
+    basis: String,
+    /// The verification-execution bases this estate admits as
+    /// *discharging* this obligation. A `Container` obligation has no
+    /// World of its own, so its own `basis` content-addresses prose and
+    /// an outcome contract; the execution it stands for lives in the
+    /// child obligations its obligated roles actually settle. Admitting
+    /// those bases here is what ties the container obligation to a real,
+    /// immutable verification execution and exact source basis — and
+    /// what stops a changed repository generation, a changed child
+    /// verification command or a changed evidence target from silently
+    /// reusing an admission already granted.
+    ///
+    /// Empty for a `DeterministicVerified` entry, whose own `basis`
+    /// already binds its execution.
+    mechanisms: Vec<String>,
+}
+
+struct SettlementPolicy {
+    version: u32,
+    digest: String,
+    classes: Vec<SettlementPolicyClass>,
+}
+
+/// Absent ⇒ no class enabled ⇒ no EstateLocal finding is ever settled.
+/// Unreadable (malformed JSON, unknown version/class/kind name) ⇒ the
+/// same "no settlement minted at all" outcome, never a partial read
+/// (§2.4: "PolicyUnreadable, and no settlement is minted at all").
+enum PolicyState {
+    Absent,
+    Unreadable,
+    Loaded(SettlementPolicy),
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyClassRaw {
+    class: String,
+    scope: String,
+    kinds: Vec<String>,
+    obligations: Vec<PolicyObligationRaw>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyObligationRaw {
+    id: String,
+    edition: String,
+    basis: String,
+    #[serde(default)]
+    mechanisms: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PolicyFileRaw {
+    version: u32,
+    classes: Vec<PolicyClassRaw>,
+}
+
+/// Raised from 1 by the obligation-proof wave: a class entry now carries
+/// its admitted `obligations`, and a version-1 file (which admitted a
+/// class with no obligation at all) is `PolicyState::Unreadable` — the
+/// existing fail-closed outcome, never a silent reinterpretation of an
+/// old file as admitting the new contract. Already-minted settlements
+/// keep the `policy_version`/`policy_digest` they were minted under and
+/// are never recomputed (§6), so raising this revises what may settle
+/// *next*, and rewrites no existing decision.
+const SETTLEMENT_POLICY_VERSION: u32 = 2;
+
+fn read_settlement_policy(state: &Arc<WirkdState>) -> PolicyState {
+    let path = state.estate_root.join("policy").join("settlement.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return PolicyState::Absent;
+    };
+    let digest = sha256_hex(&bytes);
+    let Ok(raw) = serde_json::from_slice::<PolicyFileRaw>(&bytes) else {
+        return PolicyState::Unreadable;
+    };
+    if raw.version != SETTLEMENT_POLICY_VERSION {
+        return PolicyState::Unreadable;
+    }
+    let mut classes = Vec::new();
+    for entry in raw.classes {
+        let Some(class) = parse_settlement_class(&entry.class) else {
+            return PolicyState::Unreadable;
+        };
+        let scope = match entry.scope.as_str() {
+            "work_local" => FindingScope::WorkLocal,
+            "estate_local" => FindingScope::EstateLocal,
+            _ => return PolicyState::Unreadable,
+        };
+        let mut kinds = Vec::new();
+        for kind in &entry.kinds {
+            match parse_finding_kind(kind) {
+                Ok(kind) => kinds.push(kind),
+                Err(_) => return PolicyState::Unreadable,
+            }
+        }
+        let obligations = entry
+            .obligations
+            .into_iter()
+            .map(|raw| AdmittedObligation {
+                id: raw.id,
+                edition: raw.edition,
+                basis: raw.basis,
+                mechanisms: raw.mechanisms,
+            })
+            .collect();
+        classes.push(SettlementPolicyClass {
+            class,
+            scope,
+            kinds,
+            obligations,
+        });
+    }
+    PolicyState::Loaded(SettlementPolicy {
+        version: raw.version,
+        digest,
+        classes,
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The obligation a check must have pre-admitted, or `None` for a class
+/// that discharges no verification obligation.
+/// What a check demands of the estate's settlement policy.
+enum Admission<'a> {
+    /// This obligation, at this basis, resting on these mechanism bases.
+    Required(&'a ObligationRef, &'a str, Vec<&'a str>),
+    /// This reader cannot interpret the check's proof, so it cannot
+    /// establish what would have to be admitted — and therefore refuses
+    /// to mint anything from it (re-review L3).
+    Unreadable,
+}
+
+fn obligation_admission(check: &SettlementCheck) -> Option<Admission<'_>> {
+    match check {
+        SettlementCheck::ValidatedClaim { proof, .. } => match proof {
+            Some(proof) => Some(Admission::Required(
+                &proof.obligation,
+                proof.basis.as_str(),
+                Vec::new(),
+            )),
+            // Re-review L3: a proof this reader cannot interpret must
+            // never *weaken* admission. Before, `None` here meant "no
+            // obligation to admit", which let class + scope + kind alone
+            // authorise a mint. It is unreachable today — both readiness
+            // functions always construct `Some` — but the shape is the
+            // hazard, so it is closed rather than argued about: an
+            // unreadable proof is unmintable, full stop.
+            None => Some(Admission::Unreadable),
+        },
+        // An agentic review's own basis already binds its execution (the
+        // Actor World hash covers repository, branch, base_sha, source
+        // basis, intent, output contract and boundary), exactly as a
+        // deterministic check's does. It carries no further mechanism.
+        SettlementCheck::ActorReview { proof, .. } => Some(Admission::Required(
+            &proof.obligation,
+            proof.basis.as_str(),
+            Vec::new(),
+        )),
+        SettlementCheck::ChildReceipt { proof, .. } => match proof {
+            Some(proof) => Some(Admission::Required(
+                &proof.obligation,
+                proof.basis.as_str(),
+                proof
+                    .roles
+                    .iter()
+                    .map(|role| role.mechanism_basis.as_str())
+                    .collect(),
+            )),
+            None => Some(Admission::Unreadable),
+        },
+        SettlementCheck::SupersededBy { .. } => None,
+    }
+}
+
+fn try_mint_settlement(
+    policy: &PolicyState,
+    finding: &Finding,
+    ready: &ReadySettlement,
+    at_startup: bool,
+) -> Option<Settlement> {
+    let PolicyState::Loaded(policy) = policy else {
+        return None;
+    };
+    // W-B obligation proof: class + scope + kind selects *which* policy
+    // entry could apply; it admits nothing on its own. For the two
+    // classes that discharge a verification obligation, that entry must
+    // additionally have pre-admitted this exact obligation — by id,
+    // edition, **and** the content basis wirk itself re-derived from the
+    // Route definition and the immutable execution basis. `SupersededBy`
+    // discharges no verification obligation (it is a Work replacing its
+    // own provisional record, whose authority is same-Work authorship,
+    // already checked in `fold`), so it carries none and is admitted by
+    // class/scope/kind alone, exactly as before.
+    let required = obligation_admission(&ready.check);
+    let enabled = policy.classes.iter().any(|entry| {
+        entry.class == ready.class
+            && entry.scope == finding.scope
+            && entry.kinds.contains(&finding.kind)
+            && match &required {
+                // `SupersededBy` discharges no verification obligation.
+                None => true,
+                Some(Admission::Unreadable) => false,
+                Some(Admission::Required(obligation, basis, mechanisms)) => {
+                    entry.obligations.iter().any(|admitted| {
+                        admitted.id == obligation.id
+                            && admitted.edition == obligation.edition
+                            && admitted.basis == *basis
+                            // Every verification execution this
+                            // settlement actually rests on must itself
+                            // be admitted for this obligation.
+                            && mechanisms
+                                .iter()
+                                .all(|used| admitted.mechanisms.iter().any(|ok| ok == used))
+                    })
+                }
+            }
+    });
+    if !enabled {
+        return None;
+    }
+    let settled_by = match &ready.check {
+        SettlementCheck::ValidatedClaim { claim_event, .. }
+        | SettlementCheck::ActorReview { claim_event, .. } => claim_event.clone(),
+        SettlementCheck::ChildReceipt { closed_event, .. } => closed_event.clone(),
+        SettlementCheck::SupersededBy { raise_event, .. } => raise_event.clone(),
+    };
+    Some(Settlement {
+        authority: SettlementAuthority {
+            class: ready.class,
+            policy_version: policy.version,
+            policy_digest: policy.digest.clone(),
+        },
+        check: ready.check.clone(),
+        settled_by,
+        at: now_ts(),
+        minted_at_startup: at_startup,
+    })
+}
+
+// ---- Settlement: the daemon's cross-journal assembly ----------------------
+
+fn collect_child_receipts(receipts: &[OutcomeReceipt], out: &mut Vec<(String, WorkId, ClaimId)>) {
+    for receipt in receipts {
+        match receipt {
+            OutcomeReceipt::Child {
+                role, child, claim, ..
+            } => out.push((role.clone(), child.clone(), claim.clone())),
+            OutcomeReceipt::Container { receipts, .. } => collect_child_receipts(receipts, out),
+            OutcomeReceipt::Leaf { .. } => {}
+        }
+    }
+}
+
+fn find_stage_closed_event_id(events: &[Event], id: &WaypointId, attempt: u32) -> Option<EventId> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::StageClosed {
+            waypoint,
+            attempt: at,
+            ..
+        } if waypoint == id && *at == attempt => Some(event.id.clone()),
+        _ => None,
+    })
+}
+
+/// W-B-AGENTIC-PROOF.md: the agentic sibling of
+/// `deterministic_verified_readiness`. A bounded independent Actor review
+/// discharges its own Waypoint's declared review obligation.
+///
+/// **Why this lives in the daemon and not in the pure fold.** Every other
+/// part of this check is a same-journal fact, but one is not: a declared
+/// review *target* is a resource path, and the reviewer's own admitted
+/// evidence carries an opaque, already-encoded `ExactCoordinate`
+/// (`EvidenceRef::Source`). Decoding it is an Atlas concept, and
+/// `wirk-core` deliberately does not depend on `wirk-atlas` (0022 D71).
+/// So the daemon assembles this candidate, exactly as it already
+/// assembles `child_investigation_ready` — the pure fold keeps reading
+/// only what it was handed.
+///
+/// **What the previous revision got wrong.** It required every child
+/// verification mechanism to be a `Deterministic` obligation, on the
+/// stated ground that wirk "cannot content-address an Actor
+/// investigation". That conflated two different things: an Actor's
+/// *reasoning* is not deterministic, but its *execution inputs* have had
+/// a content identity all along — `WorldHash::of`'s own `Actor` arm
+/// covers repository, branch, `base_sha`, source basis, **intent**,
+/// output contract and boundary. `raw/00-red-actor-review-refused.txt`
+/// records the consequence on the frozen `fad933dd`: a real, materialized,
+/// claimed, target-applied review that the operator had no value to admit
+/// and that settled nothing.
+///
+/// **What is bound here**, all re-derived from the journal:
+///
+/// 1. The Finding names an obligation, and some `Actor` Waypoint in this
+///    Work's own frozen Route declares exactly that obligation *with a
+///    review contract*. An Actor obligation without one declares no
+///    mechanism and discharges nothing.
+/// 2. The reviewer's own **structured decision** — the Finding's `kind` —
+///    is one of the closed set the contract declares. Prose is never the
+///    decision; a copied sentence discharges nothing, and the reviewer's
+///    own sentence stays a recorded, unverified claim.
+/// 3. The Finding cites, as evidence, that Waypoint's own Run's Validated
+///    `Done` `ClaimRecorded` — the completed review's receipt, not a
+///    neighbouring success.
+/// 4. **Current activation, both axes**: that Run is the current one for
+///    its Waypoint and was opened against the currently reserved World.
+/// 5. The obligated `outputs` (the review report) are present in that
+///    Claim's own receipt with real recorded digests. A generic `Done`
+///    artifact is not a report.
+/// 6. Every declared **target** is covered by an entry on the reviewer's
+///    own Finding that this daemon already **admitted** against the
+///    reviewing Work's own source bindings, and whose decoded coordinate
+///    path is that exact target. Unrelated admitted evidence covers
+///    nothing, and an `Unavailable` entry counts for nothing. The exact
+///    generation and object id are recorded in the proof, so the reviewed
+///    source basis stays explicit.
+/// 7. `obligation_basis` over the whole authored obligation — including
+///    the recipe, the targets and the declared decision set — bound to
+///    that Actor World hash, which `try_mint_settlement` then requires the
+///    estate policy to have admitted. A changed intent, target, recipe,
+///    decision set or source generation of the reviewed checkout is a
+///    different basis and a fresh admission.
+///
+/// The Route-position narrowing the deterministic path uses is kept: a
+/// Finding cannot cite a Waypoint its own Route has not reached.
+fn actor_reviewed_readiness(
+    state: &Arc<WirkdState>,
+    events: &[Event],
+    work: &Work,
+    finding: &Finding,
+) -> Option<ReadySettlement> {
+    // (1)
+    let named = finding.obligation.as_ref()?;
+    let defs = waypoint_defs_for(events);
+    let sequence = flatten_leaves(&defs);
+    let finding_position = sequence.iter().position(|id| id == &finding.waypoint)?;
+
+    for item in &finding.evidence {
+        let EvidenceRef::Journal {
+            work: cited_work,
+            event: event_id,
+        } = &item.reference
+        else {
+            continue;
+        };
+        if cited_work != &work.id {
+            continue;
+        }
+        let Some(claim_event) = events.iter().find(|event| &event.id == event_id) else {
+            continue;
+        };
+        // (3)
+        let EventKind::ClaimRecorded {
+            claim,
+            claim_kind: ClaimKind::Done,
+            verdict: ClaimVerdict::Validated,
+            artifacts,
+        } = &claim_event.kind
+        else {
+            continue;
+        };
+        let Some(run_id) = &claim_event.run else {
+            continue;
+        };
+        let Some((waypoint, attempt, world_hash)) = run_opening_of(events, run_id) else {
+            continue;
+        };
+        let Some(claim_position) = sequence.iter().position(|id| id == &waypoint) else {
+            continue;
+        };
+        if claim_position > finding_position {
+            continue;
+        }
+        // (4)
+        if latest_run_for_waypoint(events, &waypoint).map(|entry| entry.0) != Some(run_id.clone()) {
+            continue;
+        }
+        let Some(reserved) = latest_reservation_for_waypoint(events, &waypoint) else {
+            continue;
+        };
+        if reserved.0 != world_hash {
+            continue;
+        }
+        let Some(def) = find_definition(&defs, &waypoint) else {
+            continue;
+        };
+        if def.kind != WaypointKind::Actor {
+            continue;
+        }
+        // (1), continued: the declared obligation and its review contract.
+        let Some(obligation) = def.verifies.as_ref() else {
+            continue;
+        };
+        if obligation.id != named.id || obligation.edition != named.edition {
+            continue;
+        }
+        let Some(review) = obligation.review.as_ref() else {
+            continue;
+        };
+        // (2) the structured decision, from the declared closed set.
+        if !review.decisions.contains(&finding.kind) {
+            continue;
+        }
+        // (5) the obligated report really validated.
+        if !obligation.outputs.iter().all(|name| {
+            artifacts
+                .iter()
+                .any(|receipt| &receipt.name == name && !receipt.digest.is_empty())
+        }) {
+            continue;
+        }
+        let World::Actor(actor) = &reserved.1 else {
+            continue;
+        };
+        // (6) the review's targets were frozen into this very World at
+        // reservation, one per declared selector; each must be covered by
+        // admitted evidence on the reviewer's own Finding, matched on the
+        // complete identity. A selector that failed to resolve froze
+        // nothing, so a short list refuses here as well.
+        if actor.review_targets.len() != review.targets.len() {
+            continue;
+        }
+        let Some(targets) = reviewed_targets(&actor.review_targets, finding) else {
+            continue;
+        };
+        // (7)
+        let Some(basis) = obligation_basis(def, Some(&world_hash)) else {
+            continue;
+        };
+        let report: Vec<ArtifactReceipt> = artifacts
+            .iter()
+            .filter(|receipt| obligation.outputs.contains(&receipt.name))
+            .cloned()
+            .collect();
+        let _ = state;
+        return Some(ReadySettlement {
+            finding: finding.id.clone(),
+            class: SettlementClass::ActorReviewed,
+            check: SettlementCheck::ActorReview {
+                work: work.id.clone(),
+                claim: claim.clone(),
+                claim_event: event_id.clone(),
+                proof: ActorReviewProof {
+                    obligation: ObligationRef {
+                        id: obligation.id.clone(),
+                        edition: obligation.edition.clone(),
+                    },
+                    basis,
+                    proves: obligation.proves.clone(),
+                    waypoint,
+                    attempt,
+                    world_hash,
+                    intent: actor.intent.clone(),
+                    recipe: review.recipe.clone(),
+                    targets,
+                    decision: finding.kind,
+                    report,
+                },
+            },
+        });
+    }
+    None
+}
+
+/// Every **frozen** review target, matched against the reviewer's own
+/// admitted `applies_to` entries — on the complete identity, not on a
+/// path.
+///
+/// The independent re-review's executed C1: when this compared the
+/// decoded coordinate's `path` to a declared string and ignored its
+/// membership, source and generation, an admitted review of `demo`'s
+/// current `socket.rs` was discharged equally by a coordinate in a
+/// *different admitted repository* and by an *earlier generation the
+/// reviewing World never opened against*, and the settled record could
+/// not tell the three apart. Path equality is not target identity.
+///
+/// Now every frozen target must be covered by an entry that is an
+/// `Admitted` `Source` reference whose decoded coordinate agrees on
+/// **estate, membership, source, generation, path and object id**. An
+/// `Unavailable` entry, a `Journal` reference, a same-path coordinate in
+/// another membership and a same-path coordinate at another generation
+/// all cover nothing. The reviewing World was frozen against these exact
+/// identities at reservation and `obligation_basis` binds them, so this
+/// is the same target the estate admitted, not merely a matching name.
+fn reviewed_targets(frozen: &[ReviewTarget], finding: &Finding) -> Option<Vec<ReviewTarget>> {
+    if frozen.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for target in frozen {
+        let matched = finding.applies_to.iter().any(|item| {
+            let EvidenceRef::Source(encoded) = &item.reference else {
+                return false;
+            };
+            if !matches!(item.outcome, EvidenceOutcome::Admitted { .. }) {
+                return false;
+            }
+            let Ok(coordinate) = decode_coordinate(encoded) else {
+                return false;
+            };
+            coordinate.estate.0 == target.estate
+                && coordinate.membership.0 == target.membership
+                && coordinate.source.0 == target.source_id
+                && coordinate.generation.0 == target.generation
+                && coordinate.object_id == target.object_id
+                && coordinate.path == target.path.as_bytes()
+        });
+        if !matched {
+            return None;
+        }
+        out.push(target.clone());
+    }
+    Some(out)
+}
+
+/// The Waypoint, attempt and World hash a Run was opened against — the
+/// daemon's own copy of `wirk-core`'s private `run_opening`, which the
+/// crate boundary keeps out of reach here.
+fn run_opening_of(events: &[Event], run: &RunId) -> Option<(WaypointId, u32, WorldHash)> {
+    events.iter().find_map(|event| match &event.kind {
+        EventKind::RunOpened {
+            run: id,
+            waypoint,
+            attempt,
+            world_hash,
+        } if id == run => Some((waypoint.clone(), *attempt, world_hash.clone())),
+        _ => None,
+    })
+}
+
+/// The World currently reserved for `waypoint`, with its hash — the
+/// reviewing World whose `intent` the proof records, and the currency
+/// check a superseded reservation fails.
+fn latest_reservation_for_waypoint(
+    events: &[Event],
+    waypoint: &WaypointId,
+) -> Option<(WorldHash, World)> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::WaypointReserved {
+            waypoint: id,
+            world_hash,
+            world,
+        } if id == waypoint => Some((world_hash.clone(), world.clone())),
+        _ => None,
+    })
+}
+
+/// The child settlement that discharged one obligated role: the named
+/// child's own `FindingSettled` for a `DeterministicVerified` check
+/// whose proof names exactly `requires`. This is the "actual immutable
+/// verification execution" a container obligation stands for — the
+/// child really ran a content-addressed check, and its own settlement
+/// already required this estate to admit that check's basis.
+fn role_discharge(
+    child_events: &[Event],
+    child: &WorkId,
+    role: &str,
+    claim: &ClaimId,
+    requires: &ObligationRef,
+    named_finding: Option<&FindingId>,
+) -> Option<DischargedRole> {
+    let child_work = fold(child_events);
+    for (finding_id, record) in &child_work.findings {
+        if let Some(named) = named_finding
+            && finding_id != named
+        {
+            continue;
+        }
+        let FindingState::Settled(settlement) = &record.state else {
+            continue;
+        };
+        // W-B-AGENTIC-PROOF.md: both mechanisms discharge a container's
+        // child obligation, and they stay distinct. A deterministic check
+        // and a bounded independent Actor review are different kinds of
+        // evidence with different standing; what they share is that each
+        // is an estate-admitted, content-addressed verification the child
+        // really settled. Neither is required to be dressed as the other,
+        // and in particular no synthetic deterministic step is needed to
+        // rubber-stamp a review.
+        let (discharged, mechanism_basis) = match (&settlement.authority.class, &settlement.check) {
+            (
+                SettlementClass::DeterministicVerified,
+                SettlementCheck::ValidatedClaim {
+                    proof: Some(proof), ..
+                },
+            ) => (&proof.obligation, &proof.basis),
+            (SettlementClass::ActorReviewed, SettlementCheck::ActorReview { proof, .. }) => {
+                (&proof.obligation, &proof.basis)
+            }
+            _ => continue,
+        };
+        if discharged != requires {
+            continue;
+        }
+        let Some(settled_event) = child_events.iter().rev().find_map(|event| {
+            matches!(&event.kind, EventKind::FindingSettled { finding, .. } if finding == finding_id)
+                .then(|| event.id.clone())
+        }) else {
+            continue;
+        };
+        return Some(DischargedRole {
+            role: role.to_string(),
+            child: child.clone(),
+            claim: claim.clone(),
+            finding: finding_id.clone(),
+            mechanism: discharged.clone(),
+            mechanism_basis: mechanism_basis.clone(),
+            settled_event,
+        });
+    }
+    None
+}
+
+/// W-B obligation proof for the child-investigation class
+/// (`W-B-OBLIGATION-CORRECT.md`; construction review "policy proves the
+/// named obligation"; authority adjudication "a child reference must be
+/// tied to the obligated outcome and current two-sided activation").
+///
+/// Rebuilt after the independent review executed two counterexamples
+/// against the previous revision:
+///
+/// - **C1**: a container's `obligation_basis` hashed prose and outcome
+///   shape only, so a rogue Route — different route id, waypoint id,
+///   repository and leaf command — collided to the admitted basis, and a
+///   child whose entire investigation was one Finding reading *"I did
+///   not investigate anything"*, citing its own submission event,
+///   settled a statement about a socket-mode investigation. "Any
+///   admitted evidence at all" is not an investigation.
+/// - **C2**: `VerificationObligation.outputs` was hashed and never read
+///   for containers, so `outputs: ["auditor"]` discharged through role
+///   `scribe` while the auditor role never existed.
+///
+/// What is bound now, all re-derived here:
+///
+/// 1. The parent names the obligation **and** names the confirming child
+///    Finding explicitly. Neither is inferred.
+/// 2. The container Waypoint declares exactly that obligation, and that
+///    obligation declares a **mechanism** (`requires`) and at least one
+///    **obligated role** (`outputs`). A container obligation with
+///    neither obliges nothing and discharges nothing.
+/// 3. The container's **current** activation (`container_attempt` at the
+///    Finding's own raise position) is closed.
+/// 4. **Every** obligated role in `outputs` has a Child receipt in that
+///    activation — partial completion is never full proof — and each
+///    such child has really **settled** a `DeterministicVerified`
+///    Finding discharging exactly `requires`. That child settlement's
+///    own basis content-addresses its command, source basis and expected
+///    artifacts, and `try_mint_settlement` requires this estate to have
+///    admitted it as a `mechanism` of this container obligation.
+/// 5. **Two-sided** attribution: the child's own `WorkSubmitted.parent`
+///    binding names this parent, container, activation and role. This
+///    re-verifies a fact the receipt was only minted after checking
+///    (`child_work_completed_receipt`) and that `work submit` refuses to
+///    create (`ChildParentMismatch`); it is defence in depth, and the
+///    real-service checks for both are recorded in `CONTRACT-CHECKS.md`.
+/// 6. The receipt's own `ClaimId` is a Validated `Done` Claim in the
+///    child's journal.
+/// 7. The explicitly named `confirmed_by` Finding is one of the role
+///    discharges — the parent cites a real confirmation, not a bystander.
+fn child_investigation_ready(
+    state: &Arc<WirkdState>,
+    parent_events: &[Event],
+    parent_work: &Work,
+    finding: &Finding,
+) -> Option<ReadySettlement> {
+    // (1)
+    let named_obligation = finding.obligation.as_ref()?;
+    let confirmed_by = finding.confirmed_by.as_ref()?;
+    let raise_index = parent_events.iter().position(|event| {
+        matches!(&event.kind, EventKind::FindingRaised { finding: raised } if raised.id == finding.id)
+    })?;
+    let defs = waypoint_defs_for(parent_events);
+    let mut containers: Vec<&WaypointDefinition> = Vec::new();
+    fn walk<'a>(nodes: &'a [WaypointDefinition], out: &mut Vec<&'a WaypointDefinition>) {
+        for node in nodes {
+            if matches!(node.kind, WaypointKind::Container) {
+                out.push(node);
+                walk(&node.leaves, out);
+            }
+        }
+    }
+    walk(&defs, &mut containers);
+
+    for container in containers {
+        // (2)
+        let Some(obligation) = container.verifies.as_ref() else {
+            continue;
+        };
+        if obligation.id != named_obligation.id || obligation.edition != named_obligation.edition {
+            continue;
+        }
+        let Some(requires) = obligation.requires.as_ref() else {
+            continue;
+        };
+        if obligation.outputs.is_empty() {
+            continue;
+        }
+        let Some(basis) = obligation_basis(container, None) else {
+            continue;
+        };
+        // (3)
+        let activation = container_attempt(&parent_events[..raise_index], &container.id);
+        let Some(StageOutcomeRef::Closed(receipts)) =
+            stage_outcome_at(parent_events, &container.id, activation)
+        else {
+            continue;
+        };
+        let mut children = Vec::new();
+        collect_child_receipts(&receipts, &mut children);
+
+        // (4) every obligated role, exactly matched against this
+        // activation's own current receipts.
+        let mut discharged: Vec<DischargedRole> = Vec::new();
+        for obligated_role in &obligation.outputs {
+            let mut found = None;
+            for (role, child, claim) in &children {
+                if role != obligated_role {
+                    continue;
+                }
+                let Some(child_events) = replay_events(state, child) else {
+                    continue;
+                };
+                // (5) the child's own half of the binding.
+                let child_work = fold(&child_events);
+                let bound = child_work.parent.as_ref().is_some_and(|binding| {
+                    binding.work == parent_work.id
+                        && binding.waypoint == container.id
+                        && binding.attempt_or_first() == activation
+                        && &binding.role == role
+                });
+                if !bound {
+                    continue;
+                }
+                // (6) the receipt's Claim is really that child's own
+                // Validated Done Claim.
+                let claim_validated = child_events.iter().any(|event| {
+                    matches!(
+                        &event.kind,
+                        EventKind::ClaimRecorded {
+                            claim: recorded,
+                            claim_kind: ClaimKind::Done,
+                            verdict: ClaimVerdict::Validated,
+                            ..
+                        } if recorded == claim
+                    )
+                });
+                if !claim_validated {
+                    continue;
+                }
+                // The role the parent explicitly cited must be
+                // discharged by the exact Finding it cited; any other
+                // obligated role is discharged by whichever of that
+                // child's settled Findings answers `requires`.
+                let named = (child == &confirmed_by.work).then_some(&confirmed_by.finding);
+                if let Some(entry) =
+                    role_discharge(&child_events, child, role, claim, requires, named)
+                {
+                    found = Some(entry);
+                    break;
+                }
+            }
+            let Some(entry) = found else {
+                break;
+            };
+            discharged.push(entry);
+        }
+        if discharged.len() != obligation.outputs.len() {
+            continue;
+        }
+        // (7) the named confirmation is one of the real discharges.
+        let Some(cited) = discharged.iter().find(|entry| {
+            entry.child == confirmed_by.work && entry.finding == confirmed_by.finding
+        }) else {
+            continue;
+        };
+        let (role, child, claim) = (cited.role.clone(), cited.child.clone(), cited.claim.clone());
+        let child_raise_event = replay_events(state, &child).and_then(|events| {
+            events.iter().find_map(|event| {
+                matches!(&event.kind, EventKind::FindingRaised { finding: raised }
+                    if raised.id == confirmed_by.finding)
+                .then(|| event.id.clone())
+            })
+        })?;
+        let Some(closed_event) =
+            find_stage_closed_event_id(parent_events, &container.id, activation)
+        else {
+            continue;
+        };
+        return Some(ReadySettlement {
+            finding: finding.id.clone(),
+            class: SettlementClass::ChildInvestigationConfirmed,
+            check: SettlementCheck::ChildReceipt {
+                parent: parent_work.id.clone(),
+                waypoint: container.id.clone(),
+                attempt: activation,
+                child,
+                role,
+                claim,
+                closed_event,
+                child_raise_event,
+                proof: Some(ChildProof {
+                    obligation: ObligationRef {
+                        id: obligation.id.clone(),
+                        edition: obligation.edition.clone(),
+                    },
+                    basis,
+                    proves: obligation.proves.clone(),
+                    confirmed_by: confirmed_by.finding.clone(),
+                    requires: requires.clone(),
+                    roles: discharged,
+                }),
+                unread: UnreadFields::default(),
+            },
+        });
+    }
+    None
+}
+
+/// The one function that actually mints `FindingSettled` (§2.4's own
+/// rule: "`FindingSettled` has exactly one producer"). Called after
+/// `handle_claim_inner` appends `ClaimRecorded`, after
+/// `reevaluate_parent_inner`'s own `close_cascade` appends `StageClosed`,
+/// after `handle_finding_raise`, on demand from `finding settle`, and at
+/// startup over every eligible journal (`settle_ready_findings`).
+/// Idempotent by construction: a finding already `Settled` is skipped
+/// (`FindingState::Proposed` guard), so calling this redundantly from
+/// several trigger points is always safe.
+/// Every settlement candidate for `work`, whatever its class: the pure,
+/// same-journal ones `fold` already derived (`DeterministicVerified`,
+/// `SupersededInOrigin`), plus the two the daemon assembles because they
+/// need something the core cannot see — `ActorReviewed` (decoding an
+/// Atlas coordinate to match a declared review target) and
+/// `ChildInvestigationConfirmed` (another Work's journal). Factored out
+/// of `settle_ready` so `finding settle` can name *why* a finding is
+/// still pending without a second, drifting copy of this list.
+fn settlement_candidates(
+    state: &Arc<WirkdState>,
+    events: &[Event],
+    work: &Work,
+) -> Vec<ReadySettlement> {
+    let mut candidates = work.settlement_ready.clone();
+    for (finding_id, record) in &work.findings {
+        if !matches!(record.state, FindingState::Proposed) {
+            continue;
+        }
+        if candidates.iter().any(|ready| &ready.finding == finding_id) {
+            continue;
+        }
+        // W-B-AGENTIC-PROOF.md: an agentic review is scope-agnostic like
+        // the deterministic class — `try_mint_settlement` is what matches
+        // scope against the policy — while `child_investigation_confirmed`
+        // stays `EstateLocal`, as it always was.
+        if let Some(ready) = actor_reviewed_readiness(state, events, work, &record.finding) {
+            candidates.push(ready);
+            continue;
+        }
+        if record.finding.scope != FindingScope::EstateLocal {
+            continue;
+        }
+        if let Some(ready) = child_investigation_ready(state, events, work, &record.finding) {
+            candidates.push(ready);
+        }
+    }
+    candidates
+}
+
+fn settle_ready(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    at_startup: bool,
+) -> Result<(), JournalError> {
+    let Some(journal_handle) = journal_for(state, work_id)? else {
+        return Ok(());
+    };
+    // Ruling 0119, the journal lock discipline: `settlement_candidates`
+    // assembles the cross-journal `ChildInvestigationConfirmed` class,
+    // which reads a child Work's journal, so it runs with no guard held.
+    // Same observe/decide/re-check shape as `handle_finding_raise`, and
+    // for the same reason: the settlement this mints must rest on a
+    // journal that has not moved since it was read, and the append must
+    // happen under the guard the check ran under.
+    let mut attempt = 0usize;
+    let (mut journal, work, policy, candidates) = loop {
+        attempt += 1;
+        let events = {
+            let journal = lock_journal(&journal_handle);
+            journal.replay()?
+        };
+        if events.is_empty() {
+            return Ok(());
+        }
+        let work = fold(&events);
+        let policy = read_settlement_policy(state);
+
+        // Pure, same-journal-derivable candidates (`DeterministicVerified`,
+        // `SupersededInOrigin`), plus cross-journal `ChildInvestigationConfirmed`
+        // candidates the daemon assembles here — the core `fold` never reads
+        // another journal (construction review's own rule).
+        let candidates = settlement_candidates(state, &events, &work);
+
+        let journal = lock_journal(&journal_handle);
+        if same_observation(&events, &journal.replay()?) {
+            break (journal, work, policy, candidates);
+        }
+        drop(journal);
+        if attempt >= JOURNAL_OBSERVATION_ATTEMPTS {
+            // Settlement is idempotent and re-triggered by every raise,
+            // claim, `finding settle` and daemon start, so a Work this
+            // busy is re-evaluated by the next trigger rather than
+            // spun on here.
+            eprintln!(
+                "wirkd: settlement evaluation for {} kept losing to concurrent appends; \
+                 the next trigger re-evaluates it",
+                work_id.0
+            );
+            return Ok(());
+        }
+    };
+
+    let mut settled_any = false;
+    for ready in candidates {
+        let Some(record) = work.findings.get(&ready.finding) else {
+            continue;
+        };
+        if !matches!(record.state, FindingState::Proposed) {
+            continue;
+        }
+        let Some(settlement) = try_mint_settlement(&policy, &record.finding, &ready, at_startup)
+        else {
+            continue;
+        };
+        let event = new_event(
+            work_id,
+            None,
+            EventKind::FindingSettled {
+                finding: ready.finding.clone(),
+                settlement,
+            },
+        );
+        append_event(state, &mut journal, work_id, &event)?;
+        settled_any = true;
+    }
+    // Authority review, §8 ("Real gap, executed"): a settled estate
+    // record must be visible to estate consultation immediately, not
+    // only after the next restart or an explicit `--rebuild`.
+    // `append_finding_row` is content-addressed and idempotent (§7), so
+    // reusing the same full sweep `reconcile_findings_index` already
+    // performs at startup here is exactly as safe, never a second
+    // protocol.
+    if settled_any {
+        drop(journal);
+        reconcile_findings_index(state);
+    }
+    Ok(())
+}
+
+/// Startup sweep (§6, mirroring `reevaluate_waiting_works`'s own
+/// once-at-startup convention): every eligible journal, **terminal
+/// included, no state or recency filter** — the terminal design's own
+/// defect (a completed Work missing its settlement would otherwise stay
+/// missing indefinitely).
+fn settle_ready_findings(state: &Arc<WirkdState>) {
+    let works_dir = state.estate_root.join("works");
+    let Ok(entries) = std::fs::read_dir(&works_dir) else {
+        return;
+    };
+    let mut work_ids = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(journal) = Journal::open(&dir) else {
+            continue;
+        };
+        let Ok(events) = journal.replay() else {
+            continue;
+        };
+        if let Some(event) = events.first() {
+            work_ids.push(event.work.clone());
+        }
+    }
+    for work_id in work_ids {
+        if let Err(err) = settle_ready(state, &work_id, true) {
+            eprintln!(
+                "wirkd: startup settlement evaluation failed for {}: {err}",
+                work_id.0
+            );
+        }
+    }
+}
+
+// ---- The estate Findings index (§7) ---------------------------------------
+
+fn find_raised_finding(events: &[Event], finding_id: &FindingId) -> Option<(EventId, Finding)> {
+    events.iter().find_map(|event| match &event.kind {
+        EventKind::FindingRaised { finding } if &finding.id == finding_id => {
+            Some((event.id.clone(), finding.clone()))
+        }
+        _ => None,
+    })
+}
+
+/// Every settled/asserted/applied row this estate's journals currently
+/// support, EstateLocal only (`work_local_finding... never indexed`,
+/// §5.4/§9) — the daemon's own journal walk, shared by `--rebuild` and
+/// by startup reconciliation.
+fn all_finding_rows(state: &Arc<WirkdState>) -> Vec<wirk_atlas::FindingRow> {
+    let mut rows = Vec::new();
+    let works_dir = state.estate_root.join("works");
+    let Ok(entries) = std::fs::read_dir(&works_dir) else {
+        return rows;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(journal) = Journal::open(&dir) else {
+            continue;
+        };
+        let Ok(events) = journal.replay() else {
+            continue;
+        };
+        let Some(work_id) = events.first().map(|event| event.work.clone()) else {
+            continue;
+        };
+        for event in &events {
+            let (kind, finding_id) = match &event.kind {
+                EventKind::FindingSettled { finding, .. } => {
+                    (wirk_atlas::FindingRowKind::Settled, finding)
+                }
+                EventKind::FindingAsserted { finding, .. } => {
+                    (wirk_atlas::FindingRowKind::Asserted, finding)
+                }
+                EventKind::FindingApplied { finding, .. } => {
+                    (wirk_atlas::FindingRowKind::Applied, finding)
+                }
+                _ => continue,
+            };
+            let Some((raised_event, finding)) = find_raised_finding(&events, finding_id) else {
+                continue;
+            };
+            if finding.scope != FindingScope::EstateLocal {
+                continue;
+            }
+            let superseded_by = match &event.kind {
+                EventKind::FindingSettled {
+                    settlement:
+                        Settlement {
+                            check: SettlementCheck::SupersededBy { finding, .. },
+                            ..
+                        },
+                    ..
+                } => Some(finding.clone()),
+                _ => None,
+            };
+            rows.push(wirk_atlas::FindingRow {
+                id: wirk_atlas::FindingRowId::compute(finding_id, kind, &event.id),
+                kind,
+                finding,
+                origin: wirk_atlas::FindingOrigin {
+                    work: work_id.clone(),
+                    raised_event,
+                    row_event: event.id.clone(),
+                },
+                settlement: match &event.kind {
+                    EventKind::FindingSettled { settlement, .. } => Some(settlement.clone()),
+                    _ => None,
+                },
+                assertion: match &event.kind {
+                    EventKind::FindingAsserted { assertion, .. } => Some(assertion.clone()),
+                    _ => None,
+                },
+                applied: match &event.kind {
+                    EventKind::FindingApplied { application, .. } => Some(application.clone()),
+                    _ => None,
+                },
+                superseded_by,
+            });
+        }
+    }
+    rows
+}
+
+/// Startup pass (§5.4): journal first (already true by construction —
+/// this reads what `settle_ready_findings` just minted), index second.
+/// Additive only (`append_finding_row`, idempotent) — never the
+/// destructive `--rebuild` overwrite.
+fn reconcile_findings_index(state: &Arc<WirkdState>) {
+    let rows = all_finding_rows(state);
+    let mut atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    for row in rows {
+        if let Err(err) = atlas.append_finding_row(&row) {
+            eprintln!(
+                "wirkd: findings index reconciliation failed for {}: {err}",
+                row.id.0
+            );
+        }
+    }
+}
+
+fn finding_row_json(row: &wirk_atlas::FindingRow) -> Value {
+    json!({
+        "id": row.id.0,
+        "kind": match row.kind {
+            wirk_atlas::FindingRowKind::Settled => "settled",
+            wirk_atlas::FindingRowKind::Asserted => "asserted",
+            wirk_atlas::FindingRowKind::Applied => "applied",
+        },
+        "finding": {
+            "id": row.finding.id.0,
+            "kind": finding_kind_str(row.finding.kind),
+            "scope": finding_scope_str(row.finding.scope),
+            // Same honesty as `finding_json`: the estate index is
+            // exactly where a settled row's free sentence used to read
+            // as the settled thing (the reproduced counterexample's own
+            // last step). `settlement.proves` carries what the check
+            // proves; this carries what was recorded.
+            "claim": format!("recorded claim: {}, unverified", row.finding.claim),
+            "claim_text": row.finding.claim,
+            "claim_verified": false,
+        },
+        "origin": {
+            "work": row.origin.work.0,
+            "raised_event": row.origin.raised_event.0,
+            "row_event": row.origin.row_event.0,
+        },
+        "settlement": row.settlement.as_ref().map(settlement_json),
+        "assertion": row.assertion.as_ref().map(assertion_json),
+        "applied": row.applied.as_ref().map(application_ref_json),
+        "superseded_by": row.superseded_by.as_ref().map(|id| id.0.clone()),
+    })
+}
+
+/// The estate Findings index, answered one of two explicitly named
+/// ways. There is no unnamed default: this index is a derived
+/// *disclosure* surface — a settled row carries its proof targets'
+/// exact membership/generation/object identities and its artifact paths,
+/// an applied row carries the changed source's alias, both generation
+/// points and the published revision — and the base returned all of it
+/// to any caller that reached the estate root, with no requester on the
+/// wire at all.
+///
+/// Administration is preserved, not removed: it is now *named*
+/// (`--admin`), which is honest about what it is. It remains
+/// attribution, never authentication — the same OS uid runs an
+/// operator's terminal and an actor's shell, and this daemon does not
+/// pretend otherwise (`PeerIdentity`'s own doc). `--rebuild` rewrites
+/// the index from every journal in the estate and is administrative on
+/// its own account.
+fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsPayload) -> Reply {
+    if payload.admin == payload.requester.is_some() {
+        return err_reply(
+            "BadRequest",
+            "the findings index answers a requesting work or an explicit administrative call, and needs exactly one of them named",
+        );
+    }
+    if payload.rebuild && !payload.admin {
+        return err_reply(
+            "BadRequest",
+            "rebuilding the index from every journal in the estate is an administrative call",
+        );
+    }
+    if payload.rebuild {
+        let rows = all_finding_rows(state);
+        let mut atlas = state
+            .atlas
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Err(err) = atlas.rebuild_finding_rows(rows) {
+            return err_reply("AtlasError", &err.to_string());
+        }
+    }
+    let rows = {
+        let atlas = state
+            .atlas
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match atlas.findings() {
+            Ok(rows) => rows,
+            Err(err) => return err_reply("AtlasError", &err.to_string()),
+        }
+    };
+    if payload.admin {
+        return ok_reply(json!({
+            "rows": rows.iter().map(finding_row_json).collect::<Vec<_>>(),
+        }));
+    }
+    let requester_id = payload
+        .requester
+        .as_ref()
+        .expect("the exclusivity check above admitted a requester");
+    let Some(requester_events) = replay_events(state, requester_id) else {
+        return err_reply("NotFound", "no such requesting work");
+    };
+    if requester_events.is_empty() {
+        return err_reply("NotFound", "no such requesting work");
+    }
+    let requester = fold(&requester_events);
+    let lineage = lineage_of(state, &requester, &requester_events);
+    let mut view = DisclosureView::new(&requester, &requester_events, &lineage);
+    // Two routes to a row, and one rendering.
+    //
+    // **On lineage**, unchanged: the row is this requester's own or its
+    // family's, and it is rendered through its own source grants, part
+    // by part, so an unadmitted half is withheld and counted.
+    //
+    // **Off lineage**, the estate-publication route
+    // (`LATER-DISCOVERY-ADJUDICATION.md`): a genuinely settled
+    // publication is admitted whole, to a requester whose own bindings
+    // effectively admit its content, or not at all. Never in halves —
+    // an off-lineage requester that may not see every part of a
+    // published row learns that the row exists at all only as one more
+    // number in `off_lineage`, exactly as a denied requester does.
+    let mut scoped = Vec::new();
+    let mut off_lineage = 0usize;
+    for row in &rows {
+        if lineage.contains(&row.origin.work) {
+            scoped.push(finding_row_json_scoped(state, &mut view, row));
+            continue;
+        }
+        match published_row_scoped(state, &mut view, row) {
+            Some(value) => scoped.push(value),
+            None => off_lineage += 1,
+        }
+    }
+    ok_reply(json!({
+        "rows": scoped,
+        // Counts, never identities — `wirk_atlas::AdmissionSummary`'s
+        // own established shape: how many rows lay off this requester's
+        // lineage and how many parts of the rows it did receive were
+        // withheld, and nothing about either. Every counted row is still
+        // off this requester's lineage; what the count no longer implies
+        // is that lineage alone decided it.
+        "disclosure": {"off_lineage": off_lineage, "withheld": view.withheld},
+    }))
+}
+
+/// One estate publication, rendered for a requester that is **not** on
+/// the producing lineage — or `None`, which the caller counts and says
+/// nothing else about.
+///
+/// The defect this closes (`later-discovery-probe/HANDOFF.md`, executed):
+/// the index gate was lineage and only lineage, so a later Work admitted
+/// to *exactly the same sources* as the settling Work — able to resolve
+/// the reviewed bytes itself, exit 0 — received the byte-identical empty
+/// reply a Work denied those sources received. A weaker child saw the
+/// row; a stronger independent Work did not. Source admission changed
+/// nothing, which made genuinely settled estate knowledge undiscoverable
+/// to every Work outside one family.
+///
+/// The correction is deliberately not "drop the gate". Four conditions,
+/// each for its own reason:
+///
+/// 1. **A policy receipt, not an opinion.** Only a `Settled` row
+///    carrying its `Settlement` publishes off lineage. An `Asserted` row
+///    is a recorded judgement and an `Applied` row is source-side
+///    history — `W-B-LATER-WORK-ADJUDICATION` is explicit that a
+///    reference never promotes a claim and that publication must
+///    preserve epistemic status, so neither crosses. This is a bound on
+///    *this* route, not a redefinition of the estate index: both kinds
+///    remain indexed and remain reachable on lineage and administratively
+///    exactly as before.
+/// 2. **`SupersededBy` never crosses.** It names no producing execution,
+///    so there is no checkout whose bindings could bound it.
+/// 3. **Producer bindings, conservatively.** A published row carries
+///    authored text — the recorded `claim`, and through the settlement
+///    the reviewing World's own `intent`, the recipe, `proves`, and the
+///    report artifacts' names and paths. Any of it can quote any source
+///    its author could read, and no narrower provenance for free prose
+///    exists to check. So the requester must independently admit *every*
+///    binding of both the Work whose journal raised and published the
+///    row and the Work whose checkout produced the receipt — the same
+///    `admits_work_checkout` rule `settlement_json_scoped` already
+///    applies to an artifact path, applied to the whole row.
+/// 4. **Narrower provenance wherever it resolves.** Admitting the
+///    producer's bindings as a set is the fallback, not the standard:
+///    every frozen review target names an exact membership, and each one
+///    goes through `admitted_membership_for` under this requester's own
+///    scope, plus the established alias-level `disclosure_admitted`.
+///
+/// Finally the rendered value must come back with **nothing withheld**.
+/// That is not belt and braces about the four checks above; it is what
+/// keeps a future field from leaking through this route by default — a
+/// new part that `finding_row_json_scoped` learns to withhold drops the
+/// whole row here instead of publishing it in halves.
+fn published_row_scoped(
+    state: &Arc<WirkdState>,
+    view: &mut DisclosureView,
+    row: &wirk_atlas::FindingRow,
+) -> Option<Value> {
+    if row.kind != wirk_atlas::FindingRowKind::Settled {
+        return None;
+    }
+    let settlement = row.settlement.as_ref()?;
+    let producer = settlement_producing_work(&settlement.check)?;
+    if !view.admits_work_checkout(state, &row.origin.work)
+        || !view.admits_work_checkout(state, producer)
+    {
+        return None;
+    }
+    if !review_targets_admitted(state, view.requester, &settlement.check) {
+        return None;
+    }
+    let mut disclosure = SourceDisclosure::default();
+    let mut from_producing_checkout = false;
+    settlement_source_disclosure(settlement, &mut disclosure, &mut from_producing_checkout);
+    if !disclosure_admitted(state, view.requester, &disclosure) {
+        return None;
+    }
+    let before = view.withheld;
+    let value = finding_row_json_scoped(state, view, row);
+    if view.withheld != before {
+        view.withheld = before;
+        return None;
+    }
+    Some(value)
+}
+
+/// Every frozen review target's exact membership, admitted under the
+/// requester's own scope through the catalog — never the record's own
+/// alias string alone. `settlement_source_disclosure` already checks the
+/// alias; this is the narrower identity beside it, and it is why
+/// admitting a source by name is not enough to publish a review of a
+/// membership within it that this requester is not bound to.
+fn review_targets_admitted(
+    state: &Arc<WirkdState>,
+    requester: &Work,
+    check: &SettlementCheck,
+) -> bool {
+    let SettlementCheck::ActorReview { proof, .. } = check else {
+        return true;
+    };
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let scope = wirk_atlas::QueryScope::Work(requester.repositories.clone());
+    proof.targets.iter().all(|target| {
+        admitted_membership_for(
+            &atlas,
+            &scope,
+            &wirk_atlas::MembershipId(target.membership.clone()),
+        )
+        .is_some()
+    })
+}
+
+/// `finding_row_json`, rendered for one requester. The row's own
+/// identity, kind and origin events are journal-side; its settlement and
+/// Application are the source-side, and its authored prose is bounded by
+/// the origin Work's own admission. All three go through the same view
+/// `finding list` uses, so the index and the list can never disagree
+/// about what one requester may see.
+fn finding_row_json_scoped(
+    state: &Arc<WirkdState>,
+    view: &mut DisclosureView,
+    row: &wirk_atlas::FindingRow,
+) -> Value {
+    let mut value = finding_row_json(row);
+    if !admits_authored_prose(state, view, &row.origin.work) {
+        view.withheld += withhold_authored_prose(&mut value["finding"]);
+    }
+    if let Some(assertion) = &row.assertion
+        && !admits_assertion_prose(state, view, assertion.author.as_ref())
+    {
+        view.withheld += withhold_assertion_prose(&mut value["assertion"]);
+    }
+    if let Some(settlement) = &row.settlement {
+        value["settlement"] = settlement_json_scoped(state, view, settlement);
+    }
+    if let Some(application) = &row.applied {
+        value["applied"] = application_json_scoped(view, application);
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    /// The journal lock discipline's own detector, watched failing
+    /// (`CLAUDE.md`: a test is deterministic and has been watched fail,
+    /// or it is not a test). `no_journal_guard_held` is what makes the
+    /// rule enforced rather than hoped, and a counter that never counted
+    /// would be silently inert — the discipline would then be a comment.
+    #[test]
+    #[should_panic(expected = "must not run under a journal guard")]
+    fn locking_a_second_journal_under_a_held_guard_is_refused_in_debug() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Mutex::new(Journal::open(dir.path()).unwrap());
+        let held = lock_journal(&journal);
+        no_journal_guard_held("this test");
+        drop(held);
+    }
+
+    /// And the counter is balanced: after the guard is dropped the same
+    /// call is fine, so the assertion above is about the guard being
+    /// held and not about having ever held one.
+    #[test]
+    fn the_guard_count_returns_to_zero_when_the_guard_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Mutex::new(Journal::open(dir.path()).unwrap());
+        {
+            let _held = lock_journal(&journal);
+        }
+        no_journal_guard_held("this test");
+    }
 
     fn work_submitted_event(waypoints: Vec<&str>) -> Event {
         Event {

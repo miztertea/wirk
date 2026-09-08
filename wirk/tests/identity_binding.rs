@@ -216,9 +216,7 @@ fn submit_deterministic_with(
 fn status(socket: &Path, work: &str) -> serde_json::Value {
     match wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work.to_owned()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work.to_owned()))),
     )
     .expect("status call")
     {
@@ -264,6 +262,7 @@ fn raw_work_submitted(waypoint: &str, repositories: Vec<RepositoryBinding>) -> E
             leaves: Vec::new(),
             required_child_outcomes: Vec::new(),
             selection: None,
+            verifies: None,
         }],
         parent: None,
         execution_repo: None,
@@ -885,6 +884,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
             required: true,
         }]),
         boundary: Boundary(vec!["**".to_string()]),
+        review_targets: Vec::new(),
     });
     let hash = WorldHash::of(&initial);
     let mut updated = initial.clone();
@@ -921,6 +921,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
                         leaves: Vec::new(),
                         required_child_outcomes: Vec::new(),
                         selection: None,
+                        verifies: None,
                     }],
                     parent: None,
                     execution_repo: None,

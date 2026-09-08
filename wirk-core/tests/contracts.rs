@@ -7,11 +7,12 @@
 //! stub")]`, per the W2 (p1-executor-design) build brief §3) is gone
 //! now that every number here is lifted.
 
+use std::path::PathBuf;
 use wirk_core::{
     Access, ActorWorld, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimVerdict,
     DeterministicWorld, Event, EventId, EventKind, ExecutionTriple, FailureCause, OutputContract,
-    RepositoryBinding, RouteId, Run, RunId, RunState, Timestamp, WaypointId, WorkId, WorkState,
-    World, WorldHash,
+    RepositoryBinding, ReviewTarget, RouteId, Run, RunId, RunState, SourceBasis, Timestamp,
+    WaypointId, WorkId, WorkState, World, WorldHash,
 };
 
 fn triple(run_id: &str) -> ExecutionTriple {
@@ -64,6 +65,7 @@ fn actor_world(repository: &str, branch: &str, base_sha: &str, worktree: &str) -
             required: true,
         }]),
         boundary: Boundary(vec!["src/**".to_string()]),
+        review_targets: Vec::new(),
     })
 }
 
@@ -324,6 +326,7 @@ fn d9_3_claim_missing_required_artifact_is_refused() {
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
         selection: None,
+        verifies: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -363,6 +366,7 @@ fn d9_4_fabricated_triple_is_recorded_not_honored() {
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
         selection: None,
+        verifies: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -400,6 +404,7 @@ fn claim_against_an_already_claimed_run_is_refused() {
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
         selection: None,
+        verifies: None,
     };
     let mut run = open_run("run-1");
     run.state = RunState::Claimed(ClaimId("claim-earlier".to_string()));
@@ -437,6 +442,7 @@ fn done_claim_with_required_artifact_present_is_validated() {
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
         selection: None,
+        verifies: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -474,6 +480,7 @@ fn question_claim_with_missing_artifact_is_validated() {
         leaves: Vec::new(),
         required_child_outcomes: Vec::new(),
         selection: None,
+        verifies: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -1075,4 +1082,113 @@ fn a_run_launch_attempted_without_its_fields_folds_to_an_empty_holder() {
     assert_eq!(attempt.holder.pid, 0);
     assert_eq!(attempt.holder.start_token, None);
     assert_eq!(attempt.destination, "");
+}
+
+/// The independent review's executed D1, closed in the hash itself.
+///
+/// `WorldHash::of` fell back to `WorldHash::legacy` for any
+/// `SourceBasis::Unknown` World, and `legacy` never hashed
+/// `review_targets`. The bare public Actor submit reserves exactly such a
+/// World, freezes its targets and settles a review — with the frozen
+/// identity provably outside the value the operator admits
+/// (`loop-b-legacy-target-binding/raw/00-red-d1-legacy-basis.txt`
+/// recomputes `legacy` without the targets and reproduces the journaled
+/// hash exactly).
+///
+/// A World that carries frozen targets is not a pre-v2 World, so it no
+/// longer takes the fallback. These are pure `WorldHash` cases: they
+/// prove the hash is *sensitive* to each frozen field on the
+/// `Unknown`-basis path, which is a different and stronger claim than any
+/// lifecycle state, and one the real-service probe then confirms
+/// end to end.
+#[test]
+fn an_unknown_basis_world_carrying_review_targets_hashes_its_targets() {
+    let target = |generation: &str, object: &str, source: &str, membership: &str| ReviewTarget {
+        source: source.to_string(),
+        path: "socket.rs".to_string(),
+        estate: "/estate".to_string(),
+        membership: membership.to_string(),
+        source_id: "src-1".to_string(),
+        generation: generation.to_string(),
+        object_id: object.to_string(),
+    };
+    let world = |targets: Vec<ReviewTarget>| {
+        World::Actor(ActorWorld {
+            repository: "/repo".to_string(),
+            worktree_path: PathBuf::from("/estate"),
+            branch: "wirk/work-1".to_string(),
+            base_sha: "HEAD".to_string(),
+            // The bare public Actor submit's own basis, verbatim.
+            source_basis: SourceBasis::Unknown,
+            triple: ExecutionTriple {
+                estate_root: "/estate".to_string(),
+                work_id: WorkId("work-1".to_string()),
+                run_id: RunId("run-1".to_string()),
+            },
+            intent: "review the socket boundary".to_string(),
+            output_contract: OutputContract(vec![ArtifactSpec {
+                name: "review.md".to_string(),
+                required: true,
+            }]),
+            boundary: Boundary(vec!["**".to_string()]),
+            review_targets: targets,
+        })
+    };
+
+    let base = target("g-1", "obj-1", "demo", "m-demo");
+    let bound = WorldHash::of(&world(vec![base.clone()]));
+
+    // Every field of the frozen identity moves the hash, with every
+    // other World input held constant.
+    for (label, changed) in [
+        ("generation", target("g-2", "obj-1", "demo", "m-demo")),
+        ("object id", target("g-1", "obj-2", "demo", "m-demo")),
+        ("source alias", target("g-1", "obj-1", "decoy", "m-demo")),
+        ("membership", target("g-1", "obj-1", "demo", "m-decoy")),
+    ] {
+        assert_ne!(
+            bound,
+            WorldHash::of(&world(vec![changed])),
+            "changing the frozen {label} must change the World hash, and so the admitted basis"
+        );
+    }
+    assert_ne!(
+        bound,
+        WorldHash::of(&world(vec![
+            base.clone(),
+            target("g-1", "obj-1", "helper", "m-helper")
+        ])),
+        "a second frozen target must change the World hash"
+    );
+
+    // And the historical no-target case is untouched: an Unknown-basis
+    // World that carries no frozen targets still takes the pre-v2
+    // encoding, byte for byte.
+    let historical = world(Vec::new());
+    assert_eq!(
+        WorldHash::of(&historical),
+        WorldHash::legacy_for_tests(&historical),
+        "a World with no frozen targets is still a pre-v2 World and keeps its historical hash"
+    );
+    assert_ne!(
+        WorldHash::of(&historical),
+        bound,
+        "and it is distinguishable from the same World once targets are frozen"
+    );
+
+    // A Deterministic World can carry no review targets at all, so its
+    // own Unknown-basis fallback is unaffected.
+    let deterministic = World::Deterministic(DeterministicWorld {
+        command: vec!["true".to_string()],
+        base_sha: "HEAD".to_string(),
+        source_basis: SourceBasis::Unknown,
+        cwd: PathBuf::from("/estate"),
+        env: std::collections::BTreeMap::new(),
+        expected_artifacts: OutputContract(Vec::new()),
+    });
+    assert!(!deterministic.carries_review_targets());
+    assert_eq!(
+        WorldHash::of(&deterministic),
+        WorldHash::legacy_for_tests(&deterministic)
+    );
 }

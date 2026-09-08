@@ -124,9 +124,7 @@ fn run_deterministic(estate: &Path, work_id: &str, executor: &str) -> (Option<i3
 fn status_state(socket: &Path, work_id: &str) -> String {
     let reply = wirkd::client::call(
         socket,
-        &Request::status(StatusPayload {
-            work_id: WorkId(work_id.to_string()),
-        }),
+        &Request::status(StatusPayload::admin(WorkId(work_id.to_string()))),
     )
     .expect("status call succeeds");
     match reply {
