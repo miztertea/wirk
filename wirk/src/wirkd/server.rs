@@ -13137,8 +13137,33 @@ fn apply_directory_durability(health: &mut IndexHealth, durability: DirectoryDur
 ///   projection to the walk that re-derives it — which is the ordinary
 ///   sweep that follows, never this stale record.
 /// * A stale **projection** still cannot overwrite a newer one: the
-///   guard is untouched, and `weakens` still admits only the one
-///   direction it ever admitted.
+///   guard *expression* is untouched, and `weakens` still admits only
+///   the one direction it ever admitted.
+///
+///   Said precisely, because the expression is not the whole of it
+///   (`index-sync-and-live-sweep-verify/VERDICT.md`, finding S1):
+///   `apply_directory_durability` runs **before** the guard and can
+///   move `health.projection`, which is one of the guard's own
+///   operands, so the comparison can be made against a different
+///   standing projection than it would have been. Exactly one case
+///   diverges — a stale observation, `Uncertain` durability, and a
+///   standing projection of `Synchronized`: `apply` has already moved
+///   the standing projection to `DurabilityUnconfirmed`, so `weakens`
+///   is now false where it used to be true and this function returns
+///   early instead of writing the record in full.
+///
+///   The direction is safe and the contract is not weakened: every
+///   `Uncertain` outcome of `apply` leaves a non-`Synchronized`
+///   projection, so `complete` cannot become `true` on this path in
+///   either version (ruling 0125). What the early return costs is
+///   narrow and transient — `health.preserved` and `last_attempt` are
+///   not refreshed, and the state is reported as
+///   `durability_unconfirmed` rather than `behind` with the preserved
+///   note folded in, and only when a preserved copy appeared between
+///   the newer walk's record and this one. The reconciliation that
+///   always follows restores it. Arguably it is the better behaviour:
+///   a walk judged stale no longer claims `last_attempt` or
+///   re-publishes its own `preserved` listing.
 /// * An attempt that wrote nothing (`Unestablished`) still establishes
 ///   nothing: it re-reads the standing field and carries it forward,
 ///   exactly as before, so a no-op sweep cannot resolve a window it
