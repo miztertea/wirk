@@ -250,7 +250,15 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Shared by exact resolution (`store.rs`) and the W2 path-lookup query
 /// (`query.rs`): committed byte bounds map to one-based inclusive lines.
-pub(crate) fn actual_line_bounds(bytes: &[u8], start: u64, end: u64) -> Option<(u64, u64)> {
+/// P3 W-C1: `pub` so the one product caller that builds an
+/// `ExactCoordinate` outside this crate — `wirkd`'s stage-projection
+/// assembler, resolving a path against an already-captured
+/// `SourceGeneration` rather than re-reading the catalog — computes the
+/// *same* line bounds `AtlasStore::resolve_exact` will later validate
+/// against the committed bytes. R2: one implementation of the
+/// arithmetic, not a second that can drift out of agreement with the
+/// resolver that checks it.
+pub fn actual_line_bounds(bytes: &[u8], start: u64, end: u64) -> Option<(u64, u64)> {
     let text = std::str::from_utf8(bytes).ok()?;
     let start = usize::try_from(start).ok()?;
     let end = usize::try_from(end).ok()?;

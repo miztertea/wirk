@@ -138,11 +138,83 @@ impl std::error::Error for FindingIndexUnwritten {
     }
 }
 
+/// What one read of the standing findings index found behind it.
+///
+/// Only the two states an ordinary read can *return*: a read that could
+/// not open the file for any other reason, and one whose lines did not
+/// all parse, are errors and never reach this type. There is deliberately
+/// no `Unknown` here — this describes what a read established, and a read
+/// that established nothing raised instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexBacking {
+    /// The file was opened and read. Its rows may legitimately be none.
+    Present,
+    /// There was no file to open. What it would have held is unknown to
+    /// this read, which is not the same fact as an index holding no rows.
+    Absent,
+}
+
+/// One read of the index: its rows, and the state of the file they came
+/// from, taken together by the same open.
+#[derive(Debug, Clone)]
+pub struct FindingIndexRead {
+    pub rows: Vec<FindingRow>,
+    pub backing: IndexBacking,
+}
+
+/// One successful append: how many rows it added, and the state of the
+/// index **file** this call itself established.
+///
+/// The same one fact `FindingIndexRead` keeps for a read (ruling 0137),
+/// kept for the write. An append reads the file before it appends and
+/// writes it when it has anything to add, so it always knows whether
+/// there was an index file — and a caller that recorded that fact from a
+/// directory listing taken *after* this call returned was recording a
+/// later observation of the same file, not this one's. When the two
+/// disagree the file changed in between, which is exactly the fact a
+/// caller must not read as "this estate never wrote an index".
+///
+/// Only on the success side, deliberately: a failed append leaves its
+/// caller's projection `Behind` on its own account, so nothing about
+/// completeness turns on what it saw, and `FindingIndexUnwritten` keeps
+/// the shape ruling 0130's evidence was taken against.
+#[derive(Debug, Clone, Copy)]
+pub struct FindingIndexAppend {
+    /// How many of the offered rows were actually appended. `0` is the
+    /// common case after the first mutation: the index already held
+    /// every offered row and not one byte was written.
+    pub appended: usize,
+    /// `Present` when this call read an index file or wrote one — a
+    /// successful `rewrite_rows` renames the file into place before it
+    /// returns, so a call that appended anything published one.
+    /// `Absent` only when this call read no file and wrote none, which
+    /// is the pre-publication estate.
+    pub backing: IndexBacking,
+}
+
 impl AtlasStore {
     /// Every row currently in the index. A malformed line is a hard
     /// error that blocks every read (`relationships()`'s own rule,
     /// reused verbatim) — never silently skipped, never a partial index.
     pub fn findings(&self) -> Result<Vec<FindingRow>, AtlasError> {
+        self.read_findings().map(|read| read.rows)
+    }
+
+    /// The same read, keeping the one fact `findings()` throws away:
+    /// whether there was a file to read at all.
+    ///
+    /// Ruling 0137. An index file that is **not there** and an index
+    /// file that is there and holds no rows are two different states of
+    /// the estate, and collapsing them to `Ok(vec![])` is what let a
+    /// caller pair an empty row list with a health record formed over a
+    /// file that had rows in it and call the pair complete. The
+    /// distinction costs nothing — it is the return of the open this
+    /// read already performs — and it establishes only what this read
+    /// saw: absence is *unknown*, never "known empty" and never, on its
+    /// own, evidence that anything was lost. Deciding which of those it
+    /// is belongs to the caller that also holds a record of what an
+    /// earlier observation saw.
+    pub fn read_findings(&self) -> Result<FindingIndexRead, AtlasError> {
         read_rows(self.root_path())
     }
 
@@ -186,16 +258,19 @@ impl AtlasStore {
     /// the order offered, which is the order the single-row loop
     /// produced.
     ///
-    /// Returns how many rows were actually appended. On failure the
-    /// error says how many rows the index does **not** hold as a result,
-    /// so a caller can report its own projection health honestly instead
-    /// of only naming the row it happened to be on.
+    /// Returns how many rows were actually appended, **and the state of
+    /// the index file this call established** (`FindingIndexAppend`):
+    /// the read below opens it, and a rewrite renames one into place, so
+    /// this call always knows which. On failure the error says how many
+    /// rows the index does **not** hold as a result, so a caller can
+    /// report its own projection health honestly instead of only naming
+    /// the row it happened to be on.
     pub fn append_finding_rows(
         &mut self,
         rows: &[FindingRow],
-    ) -> Result<usize, FindingIndexUnwritten> {
-        let mut existing = match self.findings() {
-            Ok(existing) => existing,
+    ) -> Result<FindingIndexAppend, FindingIndexUnwritten> {
+        let read = match self.read_findings() {
+            Ok(read) => read,
             // The read itself failed, so how many of `rows` are missing
             // is genuinely unknown — reported as unknown rather than
             // guessed at `rows.len()`, which would be a number nobody
@@ -207,6 +282,7 @@ impl AtlasStore {
                 });
             }
         };
+        let mut existing = read.rows;
         let before = existing.len();
         for row in rows {
             if existing.iter().any(|held| held.id == row.id) {
@@ -216,10 +292,20 @@ impl AtlasStore {
         }
         let appended = existing.len() - before;
         if appended == 0 {
-            return Ok(0);
+            // Nothing was written, so the file is exactly as this call's
+            // own read found it — including not being there at all.
+            return Ok(FindingIndexAppend {
+                appended,
+                backing: read.backing,
+            });
         }
         match self.rewrite_rows(&existing) {
-            Ok(()) => Ok(appended),
+            // The rename landed, so there is an index file now whatever
+            // this call's read found.
+            Ok(()) => Ok(FindingIndexAppend {
+                appended,
+                backing: IndexBacking::Present,
+            }),
             // `DurabilityUncertain` is raised *after* the atomic rename,
             // so every one of these rows is already in the file a fresh
             // reader opens: nothing is pending, and saying `appended`
@@ -242,8 +328,23 @@ impl AtlasStore {
     /// exactly `rows` — the recreation path from journals alone
     /// (`server.rs`'s own daemon-wide journal walk builds `rows`; this
     /// method only owns the atomic file replacement).
-    pub fn rebuild_finding_rows(&mut self, rows: Vec<FindingRow>) -> Result<(), AtlasError> {
-        self.rewrite_rows(&rows)
+    ///
+    /// Returns **the state of the index file this call established**,
+    /// the same one fact `FindingIndexAppend` carries for the append
+    /// (ruling 0137). The replacement here is unconditional: it renames
+    /// a file into place before it returns, whether `rows` is a whole
+    /// estate or empty, so a successful rebuild has *published* an index
+    /// file and this is that call's own answer — not a claim about any
+    /// later moment, and not an assumption that a directory listing
+    /// taken afterwards is atomic with the rename.
+    pub fn rebuild_finding_rows(
+        &mut self,
+        rows: Vec<FindingRow>,
+    ) -> Result<IndexBacking, AtlasError> {
+        // Only `Ok` says this: `rewrite_rows` returns it after the
+        // `rename` below, and every failure that precedes the rename
+        // returns through the `?`/`map_err` paths inside it instead.
+        self.rewrite_rows(&rows).map(|()| IndexBacking::Present)
     }
 
     fn rewrite_rows(&self, rows: &[FindingRow]) -> Result<(), AtlasError> {
@@ -273,6 +374,33 @@ impl AtlasStore {
                     rows.len()
                 ))
             })
+    }
+}
+
+/// What a **failed** index write nevertheless established about the
+/// index file (ruling 0137), or `None` when it established nothing.
+///
+/// One failure of `rewrite_rows` happens after the file exists:
+/// `DurabilityUncertain` is raised only by the `fsync` of the atlas
+/// directory, which is the last thing that function does and strictly
+/// after the atomic `rename` — the same fact `append_finding_rows`
+/// already reports as `pending: Some(0)`, since every offered row is
+/// visible to a fresh reader. So the call published an index file, and a
+/// caller recording what its own critical section saw of that file may
+/// say so.
+///
+/// Every other error returns before the rename — a serialisation
+/// failure, the temporary file's own `write_sync`, or the `rename`
+/// itself — so this call neither read a file nor wrote one, and `None`
+/// leaves the question exactly where it was rather than answering it in
+/// either direction. Deliberately not a claim about what the *read* at
+/// the start of an append found: a failed append is reported on its own
+/// account and `FindingIndexUnwritten` keeps the shape ruling 0130's
+/// evidence was taken against.
+pub fn backing_after_failed_index_write(error: &AtlasError) -> Option<IndexBacking> {
+    match error {
+        AtlasError::DurabilityUncertain(_) => Some(IndexBacking::Present),
+        _ => None,
     }
 }
 
@@ -465,8 +593,8 @@ impl AtlasStore {
     pub fn retire_preserved_unreadable_indexes(
         &self,
     ) -> Result<Vec<(String, String)>, Box<PreservedIndexRetirementFailed>> {
-        let names = match preserved_unreadable_index_names(self.root_path()) {
-            Ok(names) => names,
+        let names = match listing_of(self.root_path()) {
+            Ok(listing) => listing.preserved,
             Err(error) => {
                 return Err(Box::new(PreservedIndexRetirementFailed {
                     retired: Vec::new(),
@@ -660,31 +788,49 @@ impl std::error::Error for PreservedIndexRetirementFailed {
     }
 }
 
-/// The preserved copies an estate is currently holding, sorted, by name
-/// only. Takes the **estate** root so a caller outside the Atlas mutex
-/// can ask without holding it: this reads a directory listing and no
-/// index state at all.
-pub fn preserved_unreadable_indexes(
-    estate_root: &std::path::Path,
-) -> Result<Vec<String>, AtlasError> {
-    preserved_unreadable_index_names(&estate_root.join("atlas"))
+/// What one listing of an estate's `atlas/` directory establishes.
+///
+/// Two facts, from **one** `read_dir`: which preserved copies of an
+/// unreadable index are held, and whether the standing index file itself
+/// was there. They are answered together because they are answered by
+/// the same listing — a second `stat` would be a second moment, and the
+/// two halves of a health record could then disagree about an estate
+/// neither of them saw whole.
+#[derive(Debug, Clone, Default)]
+pub struct AtlasDirectoryListing {
+    /// Preserved copies actually listed, sorted, by name only.
+    pub preserved: Vec<String>,
+    /// Whether `findings.ndjson` was one of the entries.
+    pub index_present: bool,
 }
 
-fn preserved_unreadable_index_names(
-    atlas_root: &std::path::Path,
-) -> Result<Vec<String>, AtlasError> {
+/// The listing above. Takes the **estate** root so a caller outside the
+/// Atlas mutex can ask without holding it: this reads a directory
+/// listing and no index state at all.
+pub fn atlas_directory_listing(
+    estate_root: &std::path::Path,
+) -> Result<AtlasDirectoryListing, AtlasError> {
+    listing_of(&estate_root.join("atlas"))
+}
+
+fn listing_of(atlas_root: &std::path::Path) -> Result<AtlasDirectoryListing, AtlasError> {
+    let mut listing = AtlasDirectoryListing::default();
     if !atlas_root.exists() {
-        return Ok(Vec::new());
+        // No directory is not a failure to list one: an estate that has
+        // never written an atlas holds no preserved copy and no index,
+        // and both halves say exactly that.
+        return Ok(listing);
     }
-    let mut names: Vec<String> = Vec::new();
     for entry in fs::read_dir(atlas_root)? {
         let name = entry?.file_name().to_string_lossy().into_owned();
-        if name.starts_with(PRESERVED_INDEX_PREFIX) {
-            names.push(name);
+        if name == FINDINGS_INDEX_FILE {
+            listing.index_present = true;
+        } else if name.starts_with(PRESERVED_INDEX_PREFIX) {
+            listing.preserved.push(name);
         }
     }
-    names.sort();
-    Ok(names)
+    listing.preserved.sort();
+    Ok(listing)
 }
 
 /// The one parser. `findings()` stops at the first failure and
@@ -702,12 +848,26 @@ fn for_each_index_line(content: &str, mut visit: impl FnMut(usize, Result<Findin
     }
 }
 
-fn read_rows(root: &std::path::Path) -> Result<Vec<FindingRow>, AtlasError> {
+fn read_rows(root: &std::path::Path) -> Result<FindingIndexRead, AtlasError> {
     let path = root.join(FINDINGS_INDEX_FILE);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(&path)?;
+    // **One syscall decides it.** This used to be `!path.exists()` and
+    // then a separate `read_to_string`, and that pair had two different
+    // answers for the same disappearance: a file gone before the check
+    // came back as a legitimately empty index, and a file gone between
+    // the check and the open came back as an I/O error. Opening once and
+    // reading `NotFound` off the open itself is the snapshot the caller
+    // actually has — absence is reported as absence in both orderings,
+    // and nothing here ever turns a disappearance into "known empty".
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FindingIndexRead {
+                rows: Vec::new(),
+                backing: IndexBacking::Absent,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut out = Vec::new();
     let mut first_malformed = None;
     for_each_index_line(&content, |line, parsed| match parsed {
@@ -726,5 +886,8 @@ fn read_rows(root: &std::path::Path) -> Result<Vec<FindingRow>, AtlasError> {
             "findings.ndjson line {line} is malformed: {error}"
         )));
     }
-    Ok(out)
+    Ok(FindingIndexRead {
+        rows: out,
+        backing: IndexBacking::Present,
+    })
 }

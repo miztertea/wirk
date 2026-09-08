@@ -937,3 +937,179 @@ fn child_work_can_itself_spawn_a_child_and_the_full_chain_completes() {
 
     stop_wirkd(&estate, wirkd_child);
 }
+
+// ---- 13. a superseded grandchild receipt is refused, and stops there ----
+
+/// Attempt selection is a *per-generation* rule, and it composes: a
+/// receipt from a superseded attempt is refused at the level that owns
+/// the attempt, and the refusal is not routed around by the level above.
+///
+/// Test 6 pins the rule where the container and the retried leaf are in
+/// the same Work the assertion reads. That leaves the composition
+/// unpinned, and the composition is where the interesting failure lives:
+/// each level evaluates `valid_child_receipt` against *its own* journal,
+/// and a level above never re-derives the level below — G reads P's
+/// folded `WorkState` (`child_work_completed_receipt`), not P's spawn
+/// records. So an implementation that credited a superseded receipt one
+/// generation down would hand G a genuinely `Completed` P, and G would
+/// close on evidence no level ever actually admitted.
+///
+/// The shape, three real Works and one real retry two levels down:
+/// G's container holds for P; P claims its own leaf and holds for GC;
+/// GC is spawned against **P's first leaf Run**; P's leaf is then
+/// retried and re-claimed, superseding that Run; and only then does GC
+/// complete.
+///
+/// What must happen: GC really is `completed` — this is a live receipt
+/// being refused, not an absent one — P stays held on `helper`, and G
+/// stays held too, with nothing closed in either journal. The
+/// grandchild's completion stops at the level whose attempt it does not
+/// belong to.
+#[test]
+fn a_superseded_grandchild_receipt_is_refused_and_never_reaches_the_level_above() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    route_fixture::install_route_fixture(&estate, "wa_container_child_role");
+    route_fixture::install_route_fixture(&estate, "wa_simple_leaf");
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+
+    // G, the root of the chain. It carries every binding the chain will
+    // need explicitly (ruling 0090/0092: a name is narrowed down a
+    // chain, never invented partway along it).
+    let g_repo = dir.path().join("g-repo");
+    init_repo(&g_repo);
+    let grandparent = submit(
+        &estate,
+        "wa_container_child_role",
+        &g_repo,
+        &[
+            "demo:write",
+            "child-output:write",
+            "grandchild-output:write",
+        ],
+        None,
+    )
+    .expect("submit grandparent G");
+    write_file(&g_repo, "a.md", "a\n");
+    claim_ok(
+        &estate,
+        &grandparent.work_id,
+        &grandparent.run_id,
+        "a.md=a.md",
+    );
+    assert_eq!(state_of(&pointer.socket, &grandparent.work_id), "waiting");
+
+    // P, G's child, itself a container needing a child of its own.
+    let p_repo = dir.path().join("p-repo");
+    init_repo(&p_repo);
+    let parent = submit(
+        &estate,
+        "wa_container_child_role",
+        &p_repo,
+        &["child-output:write", "grandchild-output:write"],
+        Some(ParentRef {
+            work: &grandparent.work_id,
+            waypoint: "outer",
+            run: &grandparent.run_id,
+            role: "helper",
+            attempt: None,
+        }),
+    )
+    .expect("submit middle child P");
+    let p_first_run = parent.run_id.clone();
+    write_file(&p_repo, "a.md", "a\n");
+    claim_ok(&estate, &parent.work_id, &p_first_run, "a.md=a.md");
+    assert_eq!(
+        state_of(&pointer.socket, &parent.work_id),
+        "waiting",
+        "P holds for its own `helper` role before any grandchild exists"
+    );
+
+    // GC, spawned against P's *first* leaf Run.
+    let gc_repo = dir.path().join("gc-repo");
+    init_repo(&gc_repo);
+    let grandchild = submit(
+        &estate,
+        "wa_simple_leaf",
+        &gc_repo,
+        &["grandchild-output:write"],
+        Some(ParentRef {
+            work: &parent.work_id,
+            waypoint: "outer",
+            run: &p_first_run,
+            role: "helper",
+            attempt: None,
+        }),
+    )
+    .expect("submit grandchild GC against P's first attempt");
+
+    // P retries its own leaf. Its first Run is now superseded, and the
+    // spawn record GC was admitted under names it.
+    let (code, out) = retry_cli(&estate, &parent.work_id);
+    assert_eq!(code, Some(0), "retry P: {out}");
+    let p_second_run = status(&pointer.socket, &parent.work_id)["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        p_second_run, p_first_run,
+        "the retry must really open a second Run of P's leaf"
+    );
+    write_file(&p_repo, "a.md", "a again\n");
+    claim_ok(&estate, &parent.work_id, &p_second_run, "a.md=a.md");
+    assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
+
+    // Only now does GC complete — for real.
+    write_file(&gc_repo, "helper.md", "helper\n");
+    claim_ok(
+        &estate,
+        &grandchild.work_id,
+        &grandchild.run_id,
+        "helper.md=helper.md",
+    );
+    assert_eq!(
+        state_of(&pointer.socket, &grandchild.work_id),
+        "completed",
+        "the receipt being refused below is a live one, not a missing one"
+    );
+
+    // P refuses it: the spawn it was admitted under names a Run that is
+    // no longer P's leaf's current one.
+    let p_after = status(&pointer.socket, &parent.work_id);
+    assert_eq!(
+        p_after["state"].as_str().unwrap(),
+        "waiting",
+        "a superseded attempt's grandchild receipt must never close P's container: {p_after}"
+    );
+    assert!(
+        p_after["held"]["missing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|role| role.as_str().unwrap().contains("helper")),
+        "{p_after}"
+    );
+
+    // And the refusal stops there. G reads P's own state, so an
+    // implementation that credited the superseded receipt one level down
+    // would close G too — on evidence no level admitted.
+    let g_after = status(&pointer.socket, &grandparent.work_id);
+    assert_eq!(
+        g_after["state"].as_str().unwrap(),
+        "waiting",
+        "a grandchild's completion never reaches the level above the one that refused it: \
+         {g_after}"
+    );
+    for (label, work) in [("P", &parent.work_id), ("G", &grandparent.work_id)] {
+        assert!(
+            !journal_events(&estate, work).iter().any(
+                |event| matches!(&event.kind, EventKind::StageClosed { waypoint, .. }
+                    if waypoint.0 == "outer")
+            ),
+            "{label}'s container must record no closure at all"
+        );
+    }
+
+    stop_wirkd(&estate, wirkd_child);
+}

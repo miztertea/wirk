@@ -164,6 +164,18 @@ pub enum Verb {
     /// `policy/settlement.json` by hand, which before this verb existed
     /// only inside an already-settled record.
     WorkObligations,
+    /// P3 W-C1: the delivered stage projection for the Run named by the
+    /// caller's own injected execution triple. Read-only: it mints
+    /// nothing, appends nothing, and takes no Work argument at all —
+    /// there is deliberately no surface on which one Work asks for
+    /// another's delivered context.
+    WorldShow,
+    /// `wirk world expand` (W-C3): the actor of the current Run adds a
+    /// revision to the context it was delivered. Same triple-only door
+    /// as `WorldShow` — nothing on this surface names a Work, a Run or a
+    /// projection, so an expansion can only ever be of the caller's own
+    /// delivered context.
+    WorldExpand,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -380,6 +392,22 @@ impl Request {
         Request {
             verb: Verb::AtlasFindings,
             payload: serde_json::to_value(payload).expect("AtlasFindingsPayload always serializes"),
+        }
+    }
+
+    /// `world expand`'s request (W-C3).
+    pub fn world_expand(payload: WorldExpandPayload) -> Self {
+        Request {
+            verb: Verb::WorldExpand,
+            payload: serde_json::to_value(payload).expect("WorldExpandPayload always serializes"),
+        }
+    }
+
+    /// `world show`'s request (W-C1): the injected triple, nothing else.
+    pub fn world_show(payload: WorldShowPayload) -> Self {
+        Request {
+            verb: Verb::WorldShow,
+            payload: serde_json::to_value(payload).expect("WorldShowPayload always serializes"),
         }
     }
 
@@ -1044,4 +1072,38 @@ pub struct WirkdPointer {
     pub socket: PathBuf,
     pub pid: u32,
     pub protocol_version: u32,
+}
+
+/// `world show`'s payload (W-C1): the injected execution triple and
+/// nothing else.
+///
+/// Authority is the journal line, never an id. This verb resolves the
+/// Work and the Run from the triple the daemon itself injected into the
+/// pane env; there is no `--work`, no `--run` and no projection-id
+/// lookup path, so naming another Work's ids is not a way to read its
+/// context — there is nothing to name them to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldShowPayload {
+    pub triple: wirk_core::ExecutionTriple,
+    /// Which revision of this Run's own projection chain to read.
+    /// `None` — and, on the wire, absent — means the latest, so a client
+    /// written before this field existed asks exactly the question it
+    /// always asked: "what is my context now".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+}
+
+/// `world expand`'s request (W-C3): the injected triple, plus what the
+/// actor authored. At least one of `question`/`reference` must be
+/// present; `reason` is the actor's own sentence and is never invented
+/// for them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldExpandPayload {
+    pub triple: wirk_core::ExecutionTriple,
+    #[serde(default)]
+    pub question: Option<String>,
+    #[serde(default)]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }

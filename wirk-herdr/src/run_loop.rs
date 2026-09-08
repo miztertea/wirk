@@ -1791,6 +1791,7 @@ fn fake_run_states(events: &[Event]) -> Vec<RunStatusEntry> {
                 launch_requested: false,
                 launch_attempt: None,
                 launch_argv: Vec::new(),
+                expansions: Vec::new(),
             });
         }
         for run in runs.iter_mut() {

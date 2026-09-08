@@ -752,6 +752,7 @@ fn historical_opencode_actor_kind_replays_to_the_current_launch_spelling() {
         launch_requested: false,
         launch_argv: Vec::new(),
         launch_attempt: None,
+        expansions: Vec::new(),
     };
     for event in &replayed {
         run.apply(event);

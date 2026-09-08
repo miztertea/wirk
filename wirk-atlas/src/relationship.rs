@@ -1,8 +1,8 @@
 use crate::admission::{QueryScope, admit};
 use crate::domain::now_unix_millis;
 use crate::{
-    AtlasError, AtlasStore, ExactCoordinate, Relationship, RelationshipId, RelationshipKind,
-    ResolveOutcome,
+    AtlasError, AtlasStore, ExactCoordinate, GenerationId, MembershipId, Relationship,
+    RelationshipId, RelationshipKind, ResolveOutcome,
 };
 use thiserror::Error;
 
@@ -94,27 +94,148 @@ pub fn relationships_for(
     requested_source: Option<&str>,
     coordinate: &ExactCoordinate,
 ) -> Result<Vec<RelationshipView>, AtlasError> {
-    let (admitted, _) = admit(store.memberships(), scope, requested_source);
-    let admitted_ids: std::collections::BTreeSet<_> = admitted
-        .iter()
-        .map(|source| source.membership.id.clone())
-        .collect();
-    let mut views = Vec::new();
+    let admitted_ids = admitted_memberships(store, scope, requested_source);
+    Ok(store
+        .relationships()?
+        .into_iter()
+        .filter(|relationship| relationship.from == *coordinate || relationship.to == *coordinate)
+        .map(|relationship| disclose(&admitted_ids, relationship))
+        .collect())
+}
+
+/// One resource, addressed the way a delivered coordinate addresses it:
+/// a membership, the generation that membership was read at, and the
+/// path. Deliberately not a whole `ExactCoordinate` — a bound item's
+/// byte and line span is the span the assembler chose to deliver, and an
+/// edge is about the resource, not about that window.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ResourceKey {
+    pub membership: MembershipId,
+    pub generation: GenerationId,
+    pub path: Vec<u8>,
+}
+
+impl ResourceKey {
+    fn matches(&self, coordinate: &ExactCoordinate) -> bool {
+        self.names_resource(coordinate) && coordinate.generation == self.generation
+    }
+
+    /// The same resource — this source, this path — at whatever edition
+    /// the coordinate was recorded against.
+    ///
+    /// This is deliberately *not* what an edge is followed on. It is
+    /// what lets a caller tell "this estate admitted nothing about this
+    /// resource" apart from "this estate admitted something about this
+    /// resource, at an edition you did not capture" without following a
+    /// single one of them (ruling 0128 F1).
+    fn names_resource(&self, coordinate: &ExactCoordinate) -> bool {
+        coordinate.membership == self.membership && coordinate.path == self.path
+    }
+}
+
+/// What one pass of the relationship log found for a whole frontier.
+///
+/// Two separate facts, because they are read for two different reasons.
+/// `views` is what may be followed: edges admitted against exactly the
+/// generations the caller captured, each already through the disclosure
+/// gate. `admitted_at_another_edition` is what may not be followed and
+/// must still not vanish: disclosable edges whose `from` end names one
+/// of `resources` by source and path at a *different* generation.
+///
+/// The count is only ever of edges this caller could have been shown
+/// whole. An edge whose far end or evidence lies outside admission is
+/// not counted here at all — saying "there is one you may not see, at an
+/// edition you did not capture" about a resource the caller cannot see
+/// either would be a leak dressed as honesty, and the whole point of the
+/// existing `Filtered` marker is that a hidden side is described by
+/// nothing.
+pub struct FrontierRelationships {
+    pub views: Vec<RelationshipView>,
+    pub admitted_at_another_edition: usize,
+}
+
+/// Every stored relationship whose `from` end names one of `resources`,
+/// under exactly the disclosure gate `relationships_for` applies —
+/// **one** pass over the relationship log for the whole set, rather than
+/// one pass per coordinate.
+///
+/// The batching is the point: a stage projection follows governance out
+/// of every bound item it holds, and re-reading and re-admitting the
+/// whole relationship log once per item is the shape that does not
+/// survive a real estate. Admission is computed once here and applied to
+/// every candidate, so what a caller can see is identical to what
+/// `relationships_for` would have shown it, edge for edge.
+///
+/// The generation is part of the match. An edge admitted against a
+/// superseded generation is evidence about bytes this caller is not
+/// pinned to, and silently treating it as current would be exactly the
+/// substituted provenance ruling 0126 refuses. Callers that want such an
+/// edge must re-admit it against the generation they actually read.
+pub fn relationships_from_resources(
+    store: &AtlasStore,
+    scope: &QueryScope,
+    requested_source: Option<&str>,
+    resources: &[ResourceKey],
+) -> Result<FrontierRelationships, AtlasError> {
+    let mut found = FrontierRelationships {
+        views: Vec::new(),
+        admitted_at_another_edition: 0,
+    };
+    if resources.is_empty() {
+        return Ok(found);
+    }
+    let admitted_ids = admitted_memberships(store, scope, requested_source);
     for relationship in store.relationships()? {
-        if relationship.from != *coordinate && relationship.to != *coordinate {
+        if resources
+            .iter()
+            .any(|resource| resource.matches(&relationship.from))
+        {
+            found.views.push(disclose(&admitted_ids, relationship));
             continue;
         }
-        let endpoints_ok = admitted_ids.contains(&relationship.from.membership)
-            && admitted_ids.contains(&relationship.to.membership);
-        let evidence_ok = relationship
-            .evidence
+        if resources
             .iter()
-            .all(|coordinate| admitted_ids.contains(&coordinate.membership));
-        if endpoints_ok && evidence_ok {
-            views.push(RelationshipView::Disclosed(Box::new(relationship)));
-        } else {
-            views.push(RelationshipView::Filtered);
+            .any(|resource| resource.names_resource(&relationship.from))
+            && matches!(
+                disclose(&admitted_ids, relationship),
+                RelationshipView::Disclosed(_)
+            )
+        {
+            found.admitted_at_another_edition += 1;
         }
     }
-    Ok(views)
+    Ok(found)
+}
+
+fn admitted_memberships(
+    store: &AtlasStore,
+    scope: &QueryScope,
+    requested_source: Option<&str>,
+) -> std::collections::BTreeSet<MembershipId> {
+    let (admitted, _) = admit(store.memberships(), scope, requested_source);
+    admitted
+        .iter()
+        .map(|source| source.membership.id.clone())
+        .collect()
+}
+
+/// The one disclosure decision, shared by both selectors: an edge is
+/// disclosed only when both endpoints *and* every evidence coordinate
+/// are admissible, and is otherwise an opaque marker naming nothing
+/// about the hidden side.
+fn disclose(
+    admitted_ids: &std::collections::BTreeSet<MembershipId>,
+    relationship: Relationship,
+) -> RelationshipView {
+    let endpoints_ok = admitted_ids.contains(&relationship.from.membership)
+        && admitted_ids.contains(&relationship.to.membership);
+    let evidence_ok = relationship
+        .evidence
+        .iter()
+        .all(|coordinate| admitted_ids.contains(&coordinate.membership));
+    if endpoints_ok && evidence_ok {
+        RelationshipView::Disclosed(Box::new(relationship))
+    } else {
+        RelationshipView::Filtered
+    }
 }

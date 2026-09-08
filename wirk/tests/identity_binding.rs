@@ -263,6 +263,7 @@ fn raw_work_submitted(waypoint: &str, repositories: Vec<RepositoryBinding>) -> E
             required_child_outcomes: Vec::new(),
             selection: None,
             verifies: None,
+            orient: None,
         }],
         parent: None,
         execution_repo: None,
@@ -885,6 +886,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
         }]),
         boundary: Boundary(vec!["**".to_string()]),
         review_targets: Vec::new(),
+        evidence: None,
     });
     let hash = WorldHash::of(&initial);
     let mut updated = initial.clone();
@@ -922,6 +924,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
                         required_child_outcomes: Vec::new(),
                         selection: None,
                         verifies: None,
+                        orient: None,
                     }],
                     parent: None,
                     execution_repo: None,

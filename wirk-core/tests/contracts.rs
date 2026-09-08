@@ -36,6 +36,7 @@ fn open_run(run_id: &str) -> Run {
         launch_requested: false,
         launch_argv: Vec::new(),
         launch_attempt: None,
+        expansions: Vec::new(),
     }
 }
 
@@ -66,6 +67,7 @@ fn actor_world(repository: &str, branch: &str, base_sha: &str, worktree: &str) -
         }]),
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
+        evidence: None,
     })
 }
 
@@ -327,6 +329,7 @@ fn d9_3_claim_missing_required_artifact_is_refused() {
         required_child_outcomes: Vec::new(),
         selection: None,
         verifies: None,
+        orient: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -367,6 +370,7 @@ fn d9_4_fabricated_triple_is_recorded_not_honored() {
         required_child_outcomes: Vec::new(),
         selection: None,
         verifies: None,
+        orient: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -405,6 +409,7 @@ fn claim_against_an_already_claimed_run_is_refused() {
         required_child_outcomes: Vec::new(),
         selection: None,
         verifies: None,
+        orient: None,
     };
     let mut run = open_run("run-1");
     run.state = RunState::Claimed(ClaimId("claim-earlier".to_string()));
@@ -443,6 +448,7 @@ fn done_claim_with_required_artifact_present_is_validated() {
         required_child_outcomes: Vec::new(),
         selection: None,
         verifies: None,
+        orient: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -481,6 +487,7 @@ fn question_claim_with_missing_artifact_is_validated() {
         required_child_outcomes: Vec::new(),
         selection: None,
         verifies: None,
+        orient: None,
     };
     let run = open_run("run-1");
     let claim = Claim {
@@ -1132,6 +1139,7 @@ fn an_unknown_basis_world_carrying_review_targets_hashes_its_targets() {
             }]),
             boundary: Boundary(vec!["**".to_string()]),
             review_targets: targets,
+            evidence: None,
         })
     };
 

@@ -17,10 +17,12 @@ pub use admission::{AdmissionSummary, AdmittedSource, QueryScope};
 pub use domain::*;
 pub use extract::ExtractorPolicy;
 pub use findings::{
-    FINDINGS_INDEX_FILE, FindingIndexUnwritten, FindingRow, FindingRowId, FindingRowKind,
+    AtlasDirectoryListing, FINDINGS_INDEX_FILE, FindingIndexAppend, FindingIndexRead,
+    FindingIndexUnwritten, FindingRow, FindingRowId, FindingRowKind, IndexBacking,
     MalformedFindingLine, Origin as FindingOrigin, PRESERVED_INDEX_PREFIX,
     PreservedIndexRetirementFailed, RETIRED_INDEX_PREFIX, SalvagedFindingIndex,
-    UnaccountedFindingRow, preserved_unreadable_indexes, unaccounted_finding_rows,
+    UnaccountedFindingRow, atlas_directory_listing, backing_after_failed_index_write,
+    unaccounted_finding_rows,
 };
 pub use query::{
     AnswerBudget, AnswerCoverage, EvidenceHit, HitGenerationIdentity, PathLookupOutcome,
@@ -28,7 +30,8 @@ pub use query::{
     SemanticStatus, resolve_path, search,
 };
 pub use relationship::{
-    RelationshipError, RelationshipView, admit_relationship, relationships_for,
+    FrontierRelationships, RelationshipError, RelationshipView, ResourceKey, admit_relationship,
+    relationships_for, relationships_from_resources,
 };
 pub use retrieval::{RankingMode, SemanticApplication, SemanticQueryConfig};
 pub use semantic::{

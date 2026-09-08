@@ -4520,3 +4520,820 @@ fn an_occupied_retired_name_is_never_overwritten() {
 
     estate.stop();
 }
+
+// ---- 21. A backing file that is not there is not an empty index -------
+
+/// Ruling 0137, executed: **an index file that is not on disk cannot
+/// answer `complete: true` with no rows.**
+///
+/// The window this closes was reproduced on a real daemon with one real
+/// asserted row: deleting `atlas/findings.ndjson` left the *recorded*
+/// health saying `synchronized`, while the read beside it took
+/// `read_rows`' old `!path.exists() -> Ok(vec![])` branch. The same
+/// daemon, in the same second, then answered "the index is complete and
+/// holds nothing" to `atlas findings` and "here is the Finding" to
+/// `finding list` — and the reply's own `observed` sentence claimed the
+/// two halves were one snapshot. Missing was indistinguishable from
+/// legitimately empty, which is the exact inference the rebuild path
+/// already refuses to make in the other direction ("an index that could
+/// not be opened is not an index known to hold no rows").
+///
+/// What is asserted here is the whole shape of the repair, including the
+/// things that must **not** change: the read still writes nothing and
+/// re-scans no journal, the canonical journals are byte-identical
+/// afterwards, a scoped requester learns the state and not one
+/// administrative fact about it, unreadable and corrupt keep failing
+/// honestly rather than being folded into this, and a real restart still
+/// recovers the exact row from the journals.
+///
+/// The positive control that keeps this from becoming "absent means
+/// broken" lives in
+/// `a_legally_empty_estate_and_irrelevant_entries_are_a_complete_observation`:
+/// an estate that never wrote an index has no file either, and is
+/// complete and empty. The distinction this test turns on is not
+/// absence — it is absence *against a reconciliation that read a file
+/// which was there*.
+#[test]
+fn a_missing_index_file_is_never_answered_as_a_complete_empty_projection() {
+    let mut estate = build_estate();
+    let finding = estate.raise("a record the journals keep");
+    let (code, _reply, stderr) = estate.assert_on(&finding, "the only assertion");
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let healthy = estate.admin_index();
+    assert_eq!(healthy["index"]["projection"], "synchronized");
+    assert!(indexes_finding(&healthy, &finding), "{healthy}");
+    let row_before = row_ids(&healthy);
+    assert_eq!(row_before.len(), 1, "{row_before:?}");
+    let journals_before = journal_state(&estate);
+
+    // The file goes, and nothing else does. The journals, the atlas
+    // directory and the daemon are all untouched.
+    fs::remove_file(estate.index_path()).unwrap();
+
+    // The third line is the one that settles it: the same daemon, in the
+    // same window, still holds the Finding canonically.
+    let (code, listed, stderr) = finding_cli(&estate.estate, &["list", "--admin"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        lists_finding(&listed, &finding),
+        "the journals still hold the Finding: {listed}"
+    );
+
+    for round in 0..3 {
+        let admin = estate.admin_index();
+        assert_eq!(
+            admin["index"]["complete"], false,
+            "round {round}: a read from a file that is not there is not a complete projection: {}",
+            admin["index"]
+        );
+        assert_eq!(admin["index"]["projection"], "behind", "{}", admin["index"]);
+        assert!(
+            admin["rows"].as_array().unwrap().is_empty(),
+            "the read genuinely has no rows to show — it is the completeness claim beside them \
+             that was false: {admin}"
+        );
+        // Unknown, never zero: what the file held is exactly what this
+        // read cannot establish.
+        assert!(
+            admin["index"]["pending_rows"].is_null(),
+            "{}",
+            admin["index"]
+        );
+        let detail = admin["index"]["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("was not there when these rows were read"),
+            "the administrator is told which fact this is: {detail:?}"
+        );
+        assert!(
+            admin["index"]["recovery"].is_string(),
+            "and what clears it: {}",
+            admin["index"]
+        );
+
+        let (scoped, scoped_stderr) = estate.scoped_index();
+        assert_eq!(
+            scoped["index"]["complete"], false,
+            "round {round}: a scoped reader is told the same state: {}",
+            scoped["index"]
+        );
+        assert_eq!(scoped["index"]["projection"], "behind");
+        assert!(scoped["rows"].as_array().unwrap().is_empty(), "{scoped}");
+        // The state and nothing else: no count, no detail, no path, no
+        // file name (ruling 0135 R11, unchanged by this repair).
+        assert!(
+            scoped["index"]["pending_rows"].is_null(),
+            "{}",
+            scoped["index"]
+        );
+        assert!(
+            scoped["index"].get("detail").is_none(),
+            "{}",
+            scoped["index"]
+        );
+        assert!(
+            scoped["index"].get("preserved_index_copies").is_none(),
+            "{}",
+            scoped["index"]
+        );
+        assert_discloses_nothing(
+            "a scoped read of an absent index",
+            &scoped,
+            &scoped_stderr,
+            &[
+                "findings.ndjson".to_string(),
+                estate.estate.display().to_string(),
+            ],
+        );
+    }
+
+    // Six queries wrote nothing: the file the reads reported absent is
+    // still absent, and no journal moved.
+    assert!(
+        !estate.index_path().exists(),
+        "a query never writes the index it read"
+    );
+    assert_eq!(
+        journals_before,
+        journal_state(&estate),
+        "and never re-scans or rewrites the canonical journals"
+    );
+
+    // The two states that were already honest stay exactly as honest,
+    // and are **not** folded into the new one: an unreadable and a
+    // corrupt index each still refuse the read outright.
+    fs::write(estate.index_path(), "not json at all\n").unwrap();
+    let (code, _value, stderr) = atlas(&estate.estate, &["findings", "--admin"]);
+    assert_eq!(code, Some(2), "a corrupt index still refuses: {stderr}");
+    assert!(stderr.contains("malformed"), "{stderr}");
+    estate.set_index_readable(false);
+    let (code, _value, stderr) = atlas(&estate.estate, &["findings", "--admin"]);
+    assert_eq!(code, Some(2), "an unreadable index still refuses: {stderr}");
+    assert!(
+        stderr.contains("Permission denied"),
+        "and for its own reason: {stderr}"
+    );
+    estate.set_index_readable(true);
+    fs::remove_file(estate.index_path()).unwrap();
+
+    // A real restart re-projects the exact row from the journals that
+    // never stopped holding it — 0130's "recovers what the estate still
+    // knows", unweakened by any of the above.
+    estate.restart(&[]);
+    let recovered = estate.admin_index();
+    assert_eq!(
+        recovered["index"]["projection"], "synchronized",
+        "{}",
+        recovered["index"]
+    );
+    assert_eq!(recovered["index"]["complete"], true);
+    assert_eq!(
+        row_ids(&recovered),
+        row_before,
+        "the same row, by its own content-addressed id: {recovered}"
+    );
+    assert!(indexes_finding(&recovered, &finding), "{recovered}");
+    estate.stop();
+}
+
+/// What a read may say about an absent index file, asserted for both
+/// surfaces at once: the row list is empty and it is the completeness
+/// claim beside it that must not be made, the administrator is told
+/// which fact this is and how it clears, and the scoped reader is told
+/// the state and nothing else (ruling 0135 R11).
+fn assert_an_absent_index_is_not_a_complete_projection(estate: &Estate, finding: &str, when: &str) {
+    let admin = estate.admin_index();
+    assert_eq!(
+        admin["index"]["complete"], false,
+        "{when}: a read from a file that is not there is not a complete projection: {}",
+        admin["index"]
+    );
+    assert_eq!(
+        admin["index"]["projection"], "behind",
+        "{when}: {}",
+        admin["index"]
+    );
+    assert!(
+        admin["rows"].as_array().unwrap().is_empty(),
+        "{when}: the read genuinely has no rows to show: {admin}"
+    );
+    assert!(
+        admin["index"]["pending_rows"].is_null(),
+        "{when}: unknown, never zero: {}",
+        admin["index"]
+    );
+    let detail = admin["index"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("was not there when these rows were read"),
+        "{when}: the administrator is told which fact this is: {detail:?}"
+    );
+    assert!(
+        admin["index"]["recovery"].is_string(),
+        "{when}: and what clears it: {}",
+        admin["index"]
+    );
+
+    let (scoped, scoped_stderr) = estate.scoped_index();
+    assert_eq!(
+        scoped["index"]["complete"], false,
+        "{when}: a scoped reader is told the same state: {}",
+        scoped["index"]
+    );
+    assert_eq!(scoped["index"]["projection"], "behind", "{when}: {scoped}");
+    assert!(
+        scoped["rows"].as_array().unwrap().is_empty(),
+        "{when}: {scoped}"
+    );
+    assert!(
+        scoped["index"]["pending_rows"].is_null(),
+        "{when}: {}",
+        scoped["index"]
+    );
+    assert!(
+        scoped["index"].get("detail").is_none(),
+        "{when}: {}",
+        scoped["index"]
+    );
+    assert_discloses_nothing(
+        "a scoped read of an index deleted inside a reconciliation's own window",
+        &scoped,
+        &scoped_stderr,
+        &[
+            "findings.ndjson".to_string(),
+            estate.estate.display().to_string(),
+        ],
+    );
+
+    // The line that settles what the completeness claim would have been
+    // about: the same daemon, in the same window, still holds the
+    // Finding canonically.
+    let (code, listed, stderr) = finding_cli(&estate.estate, &["list", "--admin"]);
+    assert_eq!(code, Some(0), "{when}: {stderr}");
+    assert!(
+        lists_finding(&listed, finding),
+        "{when}: the journals still hold the Finding: {listed}"
+    );
+}
+
+/// Ruling 0137 at the **recorded** half of the pair — the seam
+/// `loop-c3-index-read-verify/VERDICT.md` §4 executed on a real daemon
+/// and left standing by the read-side repair.
+///
+/// A read's own backing is decided by one `read_to_string` whose
+/// `NotFound` *is* the absence, so no schedule can turn a disappearance
+/// into a known empty *there*. The record's backing was decided
+/// somewhere else entirely: a listing of `atlas/` taken inside
+/// `record_index_projection`, which runs after `append_finding_rows` has
+/// already published. Delete the file inside that window — the product
+/// names it itself, `checkpoint("findings-index-published")`, "between
+/// the publication and the record, with the lock held" — and the record
+/// written a moment later says `Synchronized` with `index_backing:
+/// Absent`. Every later read then finds no file, compares absent-now
+/// against absent-then, reads the pair as "an estate that never wrote an
+/// index", and answers `complete: true` with no rows to the admin and
+/// the scoped surface alike, while the same daemon's journals still hold
+/// the Finding. That is 0137's own prohibition, through the one door the
+/// read cannot see, and it stands until the next reconciliation.
+///
+/// The repair is the fact the reconciliation already established and
+/// threw away: its own append read the index file, or wrote it, and
+/// knows which. A listing taken afterwards is a *later* observation of
+/// the same file, and a later absence is not evidence that the estate
+/// never wrote one. No new store, no timer, no journal re-scan, and
+/// nothing here re-reads the estate.
+///
+/// Everything in this test is real: a real assertion in a real daemon,
+/// parked on a real socket rendezvous by the product's own barrier and
+/// released by a peer disappearing — no injected failure, and nothing
+/// paced by time (ruling 0044 D134).
+#[test]
+fn an_index_deleted_after_its_own_sweep_published_it_is_never_a_known_empty() {
+    let mut estate = build_estate();
+    let kept = estate.raise("the record the journals keep across the whole window");
+    let (code, _reply, stderr) = estate.assert_on(&kept, "the assertion that publishes the index");
+    assert_eq!(code, Some(0), "{stderr}");
+    let healthy = estate.admin_index();
+    assert_eq!(healthy["index"]["projection"], "synchronized", "{healthy}");
+    let rows_before = row_ids(&healthy);
+    assert_eq!(rows_before.len(), 1, "{rows_before:?}");
+    let journals_before = journal_state(&estate);
+
+    let mut window = Window::new(estate.dir.path(), "published");
+    estate.restart(&[(
+        "WIRK_ATLAS_BARRIER",
+        &window.env("findings-index-published"),
+    )]);
+
+    // A second real assertion: its sweep has a row to add, so its append
+    // really writes the file, and it parks after publishing it and
+    // before the record is formed.
+    let second = estate.raise("the record whose own sweep is held at the published window");
+    window.arm();
+    let estate_root = estate.estate.clone();
+    let parent = estate.parent.work_id.clone();
+    let parked_finding = second.clone();
+    let parked = std::thread::spawn(move || {
+        finding_cli(
+            &estate_root,
+            &[
+                "assert",
+                "--finding",
+                &parked_finding,
+                "--decision",
+                "deferred",
+                "--by",
+                "a reviewer",
+                "--reason",
+                "the sweep that publishes the index and is held before it records",
+                "--requesting-work",
+                &parent,
+            ],
+        )
+    });
+    window.wait_parked();
+
+    // The publication really happened: the file the record is about to
+    // describe is on disk, holding the row this sweep just appended.
+    assert!(
+        estate.index_path().exists(),
+        "the sweep parks after its own publication"
+    );
+    assert_eq!(
+        estate.index_rows_on_disk(),
+        2,
+        "and the row it appended is in the file"
+    );
+
+    // The external deletion, inside the window: nothing else in the
+    // estate is touched, and the daemon is not told.
+    fs::remove_file(estate.index_path()).unwrap();
+    window.release();
+    let (code, reply, stderr) = parked.join().unwrap();
+    assert_eq!(code, Some(0), "the assertion is journaled: {stderr}");
+    // Its own record is the one its own walk and its own append made,
+    // and that is not what this repair changes: the sweep did publish a
+    // complete index, and the deletion is not its to observe. What must
+    // not happen is a later *read* of the missing file inheriting that
+    // completeness.
+    assert_eq!(
+        reply["index"]["projection"], "synchronized",
+        "the mutating reply still reports the reconciliation it really made: {reply}"
+    );
+    assert!(
+        !estate.index_path().exists(),
+        "and the file is gone before any read"
+    );
+
+    for round in 0..3 {
+        assert_an_absent_index_is_not_a_complete_projection(
+            &estate,
+            &kept,
+            &format!("round {round} after a deletion inside the publish-to-record window"),
+        );
+    }
+
+    // Six reads wrote nothing and re-scanned nothing.
+    assert!(
+        !estate.index_path().exists(),
+        "a query never writes the index it read"
+    );
+    assert_eq!(
+        journals_before.len(),
+        journal_state(&estate).len(),
+        "and never creates a canonical journal"
+    );
+
+    // Not latched, and cleared by exactly what the surface says clears
+    // it: the next real reconciliation re-projects the rows from the
+    // journals that never stopped holding them.
+    let (code, _reply, stderr) =
+        estate.assert_on(&kept, "the mutation that repairs the projection");
+    assert_eq!(code, Some(0), "{stderr}");
+    let recovered = estate.admin_index();
+    assert_eq!(
+        recovered["index"]["projection"], "synchronized",
+        "{}",
+        recovered["index"]
+    );
+    assert_eq!(recovered["index"]["complete"], true, "{recovered}");
+    for row in &rows_before {
+        assert!(
+            row_ids(&recovered).contains(row),
+            "every earlier row is back by its own content-addressed id: {recovered}"
+        );
+    }
+    assert!(indexes_finding(&recovered, &second), "{recovered}");
+    estate.stop();
+}
+
+/// The same seam through a sweep that **wrote nothing at all**, and the
+/// legitimate case it must not swallow.
+///
+/// A repair that only trusted an append which actually wrote would leave
+/// the common case standing: after the first mutation, a sweep offers
+/// rows the file already holds, `append_finding_rows` returns `Ok(0)`
+/// "without a byte", and the file it read is exactly as real as one it
+/// rewrote. `--retire-preserved-index` is that sweep on demand — it
+/// re-observes the estate through the same reconciliation with nothing
+/// to append — and it is used here for both directions:
+///
+/// * **Never written** (no index file, and this sweep did not make one):
+///   the estate's empty projection of an estate with no findings really
+///   is complete, and a read must go on saying so. Reading absence as
+///   loss here would invent a lost row out of a healthy estate.
+/// * **Read, then deleted inside the record's own window**: the file was
+///   there when the sweep looked at it, so a later read that finds none
+///   cannot call its emptiness known.
+///
+/// The two differ by one fact, and it is a fact the reconciliation
+/// already has.
+#[test]
+fn a_sweep_that_wrote_nothing_still_records_whether_the_file_it_read_was_there() {
+    let mut estate = build_estate();
+    assert!(
+        !estate.index_path().exists(),
+        "an estate that has raised nothing has never written an index"
+    );
+
+    let mut window = Window::new(estate.dir.path(), "published");
+    estate.restart(&[(
+        "WIRK_ATLAS_BARRIER",
+        &window.env("findings-index-published"),
+    )]);
+
+    // 1. The pre-publication control, through the same window: a real
+    // no-op sweep parks at the published checkpoint having written
+    // nothing, and the estate is still an honest known-empty afterwards.
+    window.arm();
+    let estate_root = estate.estate.clone();
+    let never_written = std::thread::spawn(move || {
+        atlas(
+            &estate_root,
+            &["findings", "--admin", "--retire-preserved-index"],
+        )
+    });
+    window.wait_parked();
+    assert!(
+        !estate.index_path().exists(),
+        "a sweep with nothing to append writes nothing at all"
+    );
+    window.release();
+    let (code, _reply, stderr) = never_written.join().unwrap();
+    assert_eq!(code, Some(0), "{stderr}");
+
+    let empty = estate.admin_index();
+    assert_eq!(
+        empty["index"]["projection"], "synchronized",
+        "an estate that never wrote an index is not behind: {}",
+        empty["index"]
+    );
+    assert_eq!(empty["index"]["complete"], true, "{empty}");
+    assert!(empty["rows"].as_array().unwrap().is_empty(), "{empty}");
+
+    // 2. Now the estate really does write one.
+    let finding = estate.raise("the record the index is published for");
+    let (code, _reply, stderr) =
+        estate.assert_on(&finding, "the assertion that publishes the index");
+    assert_eq!(code, Some(0), "{stderr}");
+    let healthy = estate.admin_index();
+    assert_eq!(healthy["index"]["projection"], "synchronized", "{healthy}");
+    assert_eq!(row_ids(&healthy).len(), 1, "{healthy}");
+    let published = fs::read(estate.index_path()).unwrap();
+
+    // 3. The same no-op sweep, parked in the same window, over a file
+    // that is there: it offers rows the index already holds, so it
+    // writes nothing — and the file it read is the one the record must
+    // describe.
+    window.arm();
+    let estate_root = estate.estate.clone();
+    let dedup = std::thread::spawn(move || {
+        atlas(
+            &estate_root,
+            &["findings", "--admin", "--retire-preserved-index"],
+        )
+    });
+    window.wait_parked();
+    assert_eq!(
+        fs::read(estate.index_path()).unwrap(),
+        published,
+        "this sweep appended nothing: the file is byte-for-byte the one it read"
+    );
+    fs::remove_file(estate.index_path()).unwrap();
+    window.release();
+    let (code, _reply, stderr) = dedup.join().unwrap();
+    assert_eq!(code, Some(0), "{stderr}");
+
+    assert_an_absent_index_is_not_a_complete_projection(
+        &estate,
+        &finding,
+        "a deletion inside a no-op sweep's own publish-to-record window",
+    );
+    estate.stop();
+}
+
+/// The same seam of ruling 0137 on the **rebuild** path — the one door
+/// the record-side repair deliberately left open.
+///
+/// `--rebuild` is a whole-file replacement: `rewrite_rows` renames a
+/// freshly written file into place and `fsync`s the atlas directory, so
+/// a rebuild that returns `Ok` has *published* an index file and knows
+/// it. Every one of its six record sites nonetheless passed
+/// `RecordedBacking::Unknown`, which hands the question to the listing
+/// taken afterwards inside `record_index_projection`. Delete the file
+/// between the rename and that listing — the product's own
+/// `checkpoint("findings-renamed")`, inside the replacement — and the
+/// record says `Synchronized` with `index_backing: Absent`, exactly the
+/// pair that makes every later read of the missing file answer
+/// `complete: true` with no rows while the journals still hold the
+/// Finding.
+///
+/// The fact that closes it is the writer's own: this call renamed a file
+/// into place. No listing is trusted to describe a moment it did not
+/// observe, no store, no timer, and no journal re-scan.
+///
+/// Real throughout: a real rebuild in a real daemon, parked on the
+/// product's own socket rendezvous and released by a peer disappearing
+/// (ruling 0044 D134).
+#[test]
+fn an_index_deleted_after_a_rebuild_republished_it_is_never_a_known_empty() {
+    let mut estate = build_estate();
+    let kept = estate.raise("the record the journals keep across the whole window");
+    let (code, _reply, stderr) = estate.assert_on(&kept, "the assertion that publishes the index");
+    assert_eq!(code, Some(0), "{stderr}");
+    let healthy = estate.admin_index();
+    assert_eq!(healthy["index"]["projection"], "synchronized", "{healthy}");
+    let rows_before = row_ids(&healthy);
+    assert_eq!(rows_before.len(), 1, "{rows_before:?}");
+    let journals_before = journal_state(&estate);
+
+    let mut window = Window::new(estate.dir.path(), "renamed");
+    estate.restart(&[("WIRK_ATLAS_BARRIER", &window.env("findings-renamed"))]);
+
+    // The rebuild parks inside its own replacement, after the atomic
+    // rename that publishes the file and before the record is formed.
+    window.arm();
+    let estate_root = estate.estate.clone();
+    let rebuild =
+        std::thread::spawn(move || atlas(&estate_root, &["findings", "--admin", "--rebuild"]));
+    window.wait_parked();
+
+    // The publication really happened: the file this rebuild's own
+    // record is about to describe is on disk, holding the walked row.
+    assert!(
+        estate.index_path().exists(),
+        "the rebuild parks after its own rename"
+    );
+    assert_eq!(
+        estate.index_rows_on_disk(),
+        1,
+        "and the row it walked is in the file it just renamed into place"
+    );
+
+    // The external deletion, inside the window: nothing else is touched
+    // and the daemon is not told.
+    fs::remove_file(estate.index_path()).unwrap();
+    window.release();
+    let (code, reply, stderr) = rebuild.join().unwrap();
+    assert_eq!(code, Some(0), "the rebuild itself succeeds: {stderr}");
+    // The replacement really did publish a complete index — the file
+    // above is the proof — and the deletion is not the rebuild's to
+    // observe. But this reply's own row list is read *after* it, from a
+    // file that is no longer there, so the reply is qualified by the
+    // very rule this test is about rather than certifying rows it could
+    // not read. Its record underneath is the one the later reads are
+    // paired with.
+    assert_eq!(
+        reply["index"]["projection"], "behind",
+        "the rebuild's own reply reads the file it no longer has: {reply}"
+    );
+    assert_eq!(reply["index"]["complete"], false, "{reply}");
+    assert!(
+        reply["rows"].as_array().unwrap().is_empty(),
+        "and has no rows to show: {reply}"
+    );
+    assert!(
+        !estate.index_path().exists(),
+        "and the file is gone before any read"
+    );
+
+    for round in 0..2 {
+        assert_an_absent_index_is_not_a_complete_projection(
+            &estate,
+            &kept,
+            &format!("round {round} after a deletion inside a rebuild's rename-to-record window"),
+        );
+    }
+
+    // The reads wrote nothing and re-scanned nothing.
+    assert!(
+        !estate.index_path().exists(),
+        "a query never writes the index it read"
+    );
+    assert_eq!(
+        journals_before.len(),
+        journal_state(&estate).len(),
+        "and never creates a canonical journal"
+    );
+
+    // Not latched: the next real reconciliation re-projects the rows
+    // from the journals that never stopped holding them.
+    let (code, _reply, stderr) = estate.rebuild();
+    assert_eq!(code, Some(0), "{stderr}");
+    let recovered = estate.admin_index();
+    assert_eq!(
+        recovered["index"]["projection"], "synchronized",
+        "{}",
+        recovered["index"]
+    );
+    assert_eq!(recovered["index"]["complete"], true, "{recovered}");
+    assert_eq!(
+        row_ids(&recovered),
+        rows_before,
+        "every earlier row is back by its own content-addressed id: {recovered}"
+    );
+    estate.stop();
+}
+
+/// The rebuild of an estate with **no findings at all**, and the
+/// legitimate known-empty it must not swallow.
+///
+/// The two states differ by one fact and it is the writer's:
+///
+/// * **Never written.** No rebuild has run, there is no index file, and
+///   an empty projection of an estate with no findings really is
+///   complete. A read must go on saying so.
+/// * **Written empty, then deleted inside the record's own window.**
+///   `rebuild_finding_rows(vec![])` still renames a real, empty file
+///   into place — the replacement is unconditional — so the estate did
+///   have an index file, and a later read that finds none cannot call
+///   its emptiness known. What that file held is what the *record*
+///   cannot establish from an absence observed later.
+#[test]
+fn a_rebuild_that_wrote_an_empty_index_still_records_the_file_it_renamed() {
+    let mut estate = build_estate();
+    assert!(
+        !estate.index_path().exists(),
+        "an estate that has raised nothing has never written an index"
+    );
+
+    // 1. The never-written control, before anything writes: complete,
+    // and it stays that way.
+    let empty = estate.admin_index();
+    assert_eq!(
+        empty["index"]["projection"], "synchronized",
+        "an estate that never wrote an index is not behind: {}",
+        empty["index"]
+    );
+    assert_eq!(empty["index"]["complete"], true, "{empty}");
+    assert!(empty["rows"].as_array().unwrap().is_empty(), "{empty}");
+
+    let mut window = Window::new(estate.dir.path(), "renamed-empty");
+    estate.restart(&[("WIRK_ATLAS_BARRIER", &window.env("findings-renamed"))]);
+    let after_restart = estate.admin_index();
+    assert_eq!(
+        after_restart["index"]["complete"], true,
+        "and a restart of it is still an honest known-empty: {}",
+        after_restart["index"]
+    );
+    assert!(
+        !estate.index_path().exists(),
+        "with still no index file anywhere"
+    );
+
+    // 2. A real rebuild of that same estate: zero rows, and a real file
+    // renamed into place all the same.
+    window.arm();
+    let estate_root = estate.estate.clone();
+    let rebuild =
+        std::thread::spawn(move || atlas(&estate_root, &["findings", "--admin", "--rebuild"]));
+    window.wait_parked();
+    assert!(
+        estate.index_path().exists(),
+        "an empty rebuild renames a real file into place"
+    );
+    assert_eq!(
+        estate.index_rows_on_disk(),
+        0,
+        "holding no rows, because the estate has no findings"
+    );
+
+    fs::remove_file(estate.index_path()).unwrap();
+    window.release();
+    let (code, _reply, stderr) = rebuild.join().unwrap();
+    assert_eq!(code, Some(0), "{stderr}");
+
+    // 3. The read after it: there was a file, and this read has none, so
+    // its emptiness is not the known-empty of section 1.
+    let admin = estate.admin_index();
+    assert_eq!(
+        admin["index"]["complete"], false,
+        "a rebuild published a file and it is not there now: {}",
+        admin["index"]
+    );
+    assert_eq!(admin["index"]["projection"], "behind", "{}", admin["index"]);
+    assert!(
+        admin["index"]["pending_rows"].is_null(),
+        "unknown, never zero: {}",
+        admin["index"]
+    );
+    let detail = admin["index"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("was not there when these rows were read"),
+        "the administrator is told which fact this is: {detail:?}"
+    );
+    let (scoped, scoped_stderr) = estate.scoped_index();
+    assert_eq!(
+        scoped["index"]["complete"], false,
+        "and the scoped reader is told the same state: {scoped}"
+    );
+    assert_discloses_nothing(
+        "a scoped read after an empty rebuild's file was deleted",
+        &scoped,
+        &scoped_stderr,
+        &[
+            "findings.ndjson".to_string(),
+            estate.estate.display().to_string(),
+        ],
+    );
+
+    // 4. And it clears the way the surface says it clears.
+    let (code, _reply, stderr) = estate.rebuild();
+    assert_eq!(code, Some(0), "{stderr}");
+    let recovered = estate.admin_index();
+    assert_eq!(recovered["index"]["complete"], true, "{recovered}");
+    assert_eq!(
+        recovered["index"]["projection"], "synchronized",
+        "{}",
+        recovered["index"]
+    );
+    assert!(
+        recovered["rows"].as_array().unwrap().is_empty(),
+        "{recovered}"
+    );
+    estate.stop();
+}
+
+/// The rebuild arm that fails **after** its rename: rows visible, the
+/// directory entry behind them unconfirmed.
+///
+/// `rewrite_rows` raises `DurabilityUncertain` only from the `fsync` of
+/// the atlas directory, which is the last thing it does and strictly
+/// after the atomic rename — so this call, too, published an index file
+/// and knows it, and the listing that runs afterwards (denied here by
+/// the very mode that makes the `fsync` fail) is in no position to say
+/// otherwise. Nothing is injected into the product: a real kernel denial
+/// of one syscall on a real directory.
+#[test]
+fn a_rebuild_whose_directory_sync_failed_still_recorded_the_file_it_renamed() {
+    let mut estate = build_estate();
+    let kept = estate.raise("the record the journals keep across the whole window");
+    let (code, _reply, stderr) = estate.assert_on(&kept, "the assertion that publishes the index");
+    assert_eq!(code, Some(0), "{stderr}");
+
+    // Write and execute but not read: the temp file is written and
+    // `fsync`ed, the rename lands, and only the directory `fsync` — and
+    // the listing that follows it — are denied.
+    estate.set_atlas_directory_syncable(false);
+    let (code, _reply, stderr) = estate.rebuild();
+    assert_ne!(
+        code,
+        Some(0),
+        "an administrator whose rebuild could not confirm its directory entry is told: {stderr}"
+    );
+    estate.set_atlas_directory_syncable(true);
+    assert_eq!(
+        estate.index_rows_on_disk(),
+        1,
+        "the rename landed all the same, which is the whole point of this window"
+    );
+
+    // The file that rebuild renamed into place, gone afterwards.
+    fs::remove_file(estate.index_path()).unwrap();
+    let admin = estate.admin_index();
+    assert_eq!(admin["index"]["complete"], false, "{}", admin["index"]);
+    let detail = admin["index"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("was not there when these rows were read"),
+        "a rebuild that renamed a file and then failed its directory sync still established \
+         that there was one: {detail:?}"
+    );
+    estate.stop();
+}
+
+/// Every canonical journal in the estate, by path and bytes — the thing
+/// a read must leave exactly as it found it.
+fn journal_state(estate: &Estate) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let works = estate.estate.join("works");
+    let Ok(entries) = fs::read_dir(&works) else {
+        return out;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path().join("journal.ndjson");
+        if let Ok(bytes) = fs::read(&path) {
+            out.push((path, bytes));
+        }
+    }
+    out.sort();
+    out
+}

@@ -27,6 +27,21 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// P3 W-C1: the stage projection — the delivered, immutable, inspectable
+/// context an orienting Waypoint received. Its own module because it is
+/// a self-contained content contract (types, canonical bytes, identity,
+/// write-once file) rather than another face of `Work`/`Run`/`Event`.
+mod projection;
+pub use projection::{
+    ASSEMBLY_POLICY, ASSEMBLY_POLICY_V1, CoverageReason, DeliveredContent, EvidenceCoverage,
+    EvidenceItem, EvidenceProjectionRef, ExpansionBasis, ExpansionRecord, ExpansionRequest,
+    ItemIdentity, Lifetime, ObservationId, ObservationReceipt, Omission, OrientationRequest,
+    PROJECTION_FORMAT, PROJECTION_FORMAT_V1, PresentationBudget, ProjectionContent,
+    ProjectionContentV1, ProjectionFile, ProjectionId, ProjectionUnavailable, ProjectionWriteError,
+    REACHABLE_DEFAULT, REFERENCED_DEFAULT, ReachableEntry, RetrievalNote, SemanticQueryRequest,
+    Statement, StatementOrigin, UnavailableReason, projection_path, projections_dir,
+};
+
 // ---- Identity ----------------------------------------------------------
 // Newtypes so a WorkId can't be handed where a RunId is expected
 // (core.md §1). R2: shape reused verbatim from orient/core.md.
@@ -113,7 +128,14 @@ impl WorldHash {
         // no historical hash moves: no World written before this wave
         // carries a frozen target, so every one of them still takes the
         // fallback and hashes exactly as it always did.
-        if world.source_basis() == &SourceBasis::Unknown && !world.carries_review_targets() {
+        // W-C1: a World that carries a stage projection is likewise
+        // never a pre-v2 World — nothing written before this wave carries
+        // one, so the fallback still covers every historical World exactly
+        // as it always did, and the predicate only ever narrows.
+        if world.source_basis() == &SourceBasis::Unknown
+            && !world.carries_review_targets()
+            && !world.carries_evidence()
+        {
             return Self::legacy(world);
         }
 
@@ -154,6 +176,21 @@ impl WorldHash {
                         hash_string(&mut hasher, &target.generation);
                         hash_string(&mut hasher, &target.object_id);
                     }
+                }
+                // W-C1 (BUILD.md §3.2): the delivered projection is part
+                // of this World's own content — it is what the stage was
+                // actually given. Appended under the existing `v2` tag,
+                // presence-gated, length-framed and behind its own marker
+                // byte, exactly the precedent `review_targets` set above,
+                // so no World written without a projection moves. The
+                // observation id is deliberately **not** covered:
+                // re-observing the identical delivered context must not
+                // change a stage's resume key.
+                if let Some(evidence) = &actor.evidence {
+                    hasher.update([0x03]);
+                    hash_string(&mut hasher, &evidence.projection.0);
+                    hasher.update(evidence.revision.to_be_bytes());
+                    hash_string(&mut hasher, &evidence.format);
                 }
             }
             World::Deterministic(det) => {
@@ -250,7 +287,7 @@ fn hash_source_basis(hasher: &mut Sha256, basis: &SourceBasis) {
 
 /// Lowercase hex encoding of a byte slice (stdlib `format!`, R3 — no hex
 /// crate needed for this one call site).
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -738,10 +775,36 @@ pub struct ReviewContract {
 /// The estate's settlement policy admits obligations by this basis, so
 /// nothing a proposer can author — a different command, a different
 /// source basis, a widened `proves` sentence, a dropped required output
-/// — leaves the admitted basis unchanged. `None` for a Waypoint that
-/// declares no obligation, and for an `Actor` Waypoint (no deterministic
-/// check exists there to be discharged; W-B settles only the two classes
-/// compiled in).
+/// — leaves the admitted basis unchanged.
+///
+/// `None` for a Waypoint that declares no obligation, and for an `Actor`
+/// obligation carrying no `review` contract — the one arm below that
+/// refuses on a missing mechanism (`obligation.review.as_ref()?`).
+///
+/// A `Container` obligation carrying no `requires` is **not** one of
+/// them: the `Container` arm hashes a `0u8` discriminator for the
+/// absent mechanism and returns a basis, so "no `requires`" changes the
+/// value rather than withholding it. Its fail-closed is real and lives
+/// somewhere else — a container obligation with no `requires` is
+/// skipped as a settlement candidate before its basis is ever asked for
+/// (`wirkd::server`'s readiness walk: `let Some(requires) =
+/// obligation.requires.as_ref() else { continue; }`). Executed both
+/// ways in `wirk-core/tests/findings.rs`. An earlier revision of this
+/// doc said `Container` refused here; it does not, and no arm below
+/// changes to make it. What is **not** true either, and what a still
+/// earlier
+/// revision of this doc said, is that an `Actor` never has a basis at
+/// all "because no deterministic check exists there to be discharged".
+/// An `Actor` carrying a `ReviewContract` has had a real basis since
+/// W-B-AGENTIC-PROOF.md — the `Actor` arm below hashes its World hash,
+/// which already covers repository, branch, `base_sha`, source basis,
+/// intent, output contract and boundary — and `wirk/tests/findings.rs`
+/// settles against exactly that value on a real estate. Ruling 0135
+/// records the old wording, and the "prior design limitation" it
+/// described, as stale. This is a correction to the description only;
+/// the three arms below are unchanged, and an `Actor` with a review
+/// contract has never been, and does not become, a way around a
+/// `Container`'s own explicit nested-mechanism requirement.
 pub fn obligation_basis(
     def: &WaypointDefinition,
     world_hash: Option<&WorldHash>,
@@ -817,7 +880,10 @@ pub fn obligation_basis(
         // A changed review intent is a changed World is a changed basis.
         WaypointKind::Actor => {
             // An Actor obligation with no review contract declares no
-            // mechanism, exactly as a Container with no `requires`.
+            // mechanism, and this is the only arm that refuses on that
+            // ground: the `Container` arm above hashes the absence of
+            // `requires` and returns a basis, and the estate refuses a
+            // mechanism-less container later, at readiness.
             obligation.review.as_ref()?;
             hasher.update([3u8]);
             hash_string(&mut hasher, &world_hash?.0);
@@ -900,6 +966,22 @@ pub struct WaypointDefinition {
     /// discharges no obligation and can therefore settle nothing.
     #[serde(default)]
     pub verifies: Option<VerificationObligation>,
+    /// W-C1: the orientation this Waypoint asks for. `None` — the
+    /// default, and every Route written before this wave — means the
+    /// reservation does exactly what it always did: no Atlas work, no
+    /// projection, a byte-identical World and World hash.
+    ///
+    /// `Actor` only. A `Deterministic` or `Container` Waypoint opens no
+    /// actor Run to hand a projection to, so an `orient` block there
+    /// would be authored and silently unused; `validate_tree` refuses it
+    /// (`RouteError::OrientationOnNonActor`), the same posture
+    /// `ActorSelectionOnNonActor` already takes.
+    ///
+    /// `skip_serializing_if` so a Route without orientation journals its
+    /// `waypoint_defs` byte-for-byte as before — which is also what keeps
+    /// `route_edition_of` stable for every Route written before this wave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orient: Option<OrientationRequest>,
 }
 
 /// The workflow-authored half of P3 native launch selection (`WaypointDefinition.selection`).
@@ -1091,6 +1173,12 @@ pub enum RouteError {
     /// already takes for the reverse mismatch.
     #[error("non-actor waypoint {} carries an actor-only selection", id.0)]
     ActorSelectionOnNonActor { id: WaypointId },
+    /// W-C1: a `Deterministic`/`Container` Waypoint hands its World to no
+    /// actor, so an authored `orient` block there would assemble a
+    /// projection nothing ever reads — refused at load rather than
+    /// silently ignored.
+    #[error("non-actor waypoint {} carries an actor-only orientation request", id.0)]
+    OrientationOnNonActor { id: WaypointId },
 }
 
 /// Reads and validates a Route file (format.md §3, R2 co-located with
@@ -1181,6 +1269,11 @@ fn validate_tree(
                         id: waypoint.id.clone(),
                     });
                 }
+                if waypoint.orient.is_some() {
+                    return Err(RouteError::OrientationOnNonActor {
+                        id: waypoint.id.clone(),
+                    });
+                }
             }
             WaypointKind::Container => {
                 if waypoint.intent.is_some()
@@ -1198,6 +1291,11 @@ fn validate_tree(
                 }
                 if waypoint.selection.is_some() {
                     return Err(RouteError::ActorSelectionOnNonActor {
+                        id: waypoint.id.clone(),
+                    });
+                }
+                if waypoint.orient.is_some() {
+                    return Err(RouteError::OrientationOnNonActor {
                         id: waypoint.id.clone(),
                     });
                 }
@@ -1390,6 +1488,34 @@ pub struct ActorWorld {
     /// because this field exists.
     #[serde(default)]
     pub review_targets: Vec<ReviewTarget>,
+    /// W-C1: when this Waypoint declares an `orient` block, the stage
+    /// projection actually assembled and durably written for this
+    /// reservation — the reference, never the content. The content lives
+    /// in `works/<work>/projections/<observation>.json`, written and
+    /// fsynced *before* this event is appended, so a reference always
+    /// names a file that was durable first.
+    ///
+    /// `None` for every Waypoint that declares no orientation request,
+    /// which is every Waypoint written before this wave.
+    /// `#[serde(default)]`, and `WorldHash::of` hashes it **only when
+    /// present**, so no historical Actor World hash moves because this
+    /// field exists.
+    ///
+    /// Only an `ActorWorld` carries one: a projection is context for an
+    /// actor to read, and `validate_tree` refuses an `orient` block on a
+    /// Waypoint that opens no actor Run rather than accepting authored
+    /// configuration nothing consumes.
+    ///
+    /// `skip_serializing_if` so a World without a projection serializes
+    /// to exactly the bytes it always did — a journal line, and not only
+    /// a hash, is unchanged by this field existing. `Box`ed so the field
+    /// costs one pointer rather than eighty bytes on every `World` ever
+    /// moved: `World` is an enum whose two variants must not drift far
+    /// apart in size (`clippy::large_enum_variant`), and a `Box`
+    /// serializes transparently, so nothing on the wire or in a journal
+    /// sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Box<EvidenceProjectionRef>>,
 }
 
 /// World handed to a deterministic (child/docker) Waypoint. Same
@@ -1437,6 +1563,23 @@ impl World {
         match self {
             World::Actor(actor) => !actor.review_targets.is_empty(),
             World::Deterministic(_) => false,
+        }
+    }
+
+    /// Whether this World carries a stage projection — the second fact
+    /// that disqualifies it from the pre-v2 `WorldHash::legacy` encoding.
+    pub fn carries_evidence(&self) -> bool {
+        match self {
+            World::Actor(actor) => actor.evidence.is_some(),
+            World::Deterministic(_) => false,
+        }
+    }
+
+    /// The projection this World was reserved with, if any.
+    pub fn evidence(&self) -> Option<&EvidenceProjectionRef> {
+        match self {
+            World::Actor(actor) => actor.evidence.as_deref(),
+            World::Deterministic(_) => None,
         }
     }
 
@@ -1575,6 +1718,22 @@ pub struct Run {
     /// already-launched Run.
     #[serde(default)]
     pub launch_attempt: Option<LaunchAttempt>,
+    /// W-C3: the projection revisions this Run's own actor expanded its
+    /// delivered context into, oldest first, folded from this Run's own
+    /// `ProjectionExpanded` events.
+    ///
+    /// Revision 0 is **not** here: it lives in the reserved World, which
+    /// expansion never touches. This is the tail of the chain whose head
+    /// is `World::evidence()`, and it is per-Run by construction —
+    /// `apply` ignores any event whose `run` is not this Run's id — so a
+    /// retry's new Run starts at revision 0 with an empty tail and the
+    /// superseded Run keeps every revision it was actually delivered.
+    ///
+    /// `#[serde(default)]`: a `Run` reconstructed from a journal written
+    /// before this field existed folds with an empty tail, which is the
+    /// literal truth for every one of them.
+    #[serde(default)]
+    pub expansions: Vec<EvidenceProjectionRef>,
 }
 
 /// Reshaped hard from sergeant's `StageStatus` (domain/workflow.rs:561-578,
@@ -1657,6 +1816,13 @@ impl Run {
                 (ClaimVerdict::Refused(_), _) => {}
             },
             EventKind::WorktreeCreated { .. } => {}
+            // W-C3: the delivered context grew a revision. Appended,
+            // never replaced — the chain is what the actor was
+            // successively given, and a lost intermediate revision would
+            // make a later one's `parent_projection` name nothing.
+            EventKind::ProjectionExpanded { reference, .. } => {
+                self.expansions.push(reference.as_ref().clone());
+            }
             // W1 (0041 D129): the one place a Run's `kind` moves after
             // being seeded (at `RunOpened`, before `--actor-kind` is
             // known) to the kind `wirk run` actually launched —
@@ -2640,6 +2806,34 @@ pub enum EventKind {
         world_hash: WorldHash,
         world: World,
     },
+    /// W-C3: this Run's actor expanded its delivered context, and the
+    /// projection revision it was given is durable.
+    ///
+    /// The reserved World is untouched — expansion adds a revision, it
+    /// does not edit one — so `world_hash` never moves and the stage's
+    /// resume key is unchanged by a stage having asked a second
+    /// question. The file this reference names is fsynced and renamed
+    /// before this event is appended, exactly as the initial
+    /// reservation's is.
+    ///
+    /// `parent` is the observation of the revision this one expands, so
+    /// the chain is verifiable from the journal alone: the first
+    /// expansion's parent is the World's own reference, and each later
+    /// one's parent is its predecessor. wirkd appends this event under
+    /// the same journal guard the parent was read under, so two
+    /// concurrent expansions produce two ordered revisions or an
+    /// explicit `Conflict`, never a lost update.
+    ///
+    /// There is no client-callable producer: `record` refuses it, and
+    /// `world expand` is the only verb that mints one.
+    ProjectionExpanded {
+        waypoint: WaypointId,
+        parent: ObservationId,
+        /// `Box`ed for the same reason `ActorWorld::evidence` is: an
+        /// `EventKind` variant must not drag every other variant's size
+        /// up with it (`clippy::large_enum_variant`).
+        reference: Box<EvidenceProjectionRef>,
+    },
     /// Creates the Run's own record; distinct from `WaypointReserved`
     /// because one reservation (one World, one hash) can back several
     /// attempts (fold.md §2, R6; ruling 0044: no policy governs how
@@ -3289,6 +3483,12 @@ pub fn fold(events: &[Event]) -> Work {
                     record.applied.push(application.clone());
                 }
             }
+            // W-C3: a projection revision is a fact about one Run's
+            // delivered context, not about the Work's state. It folds on
+            // `Run` (`Run::apply`) and is deliberately inert here: no
+            // Work state, no current Waypoint, no leaf decision moves
+            // because a stage asked its own context a second question.
+            EventKind::ProjectionExpanded { .. } => {}
         }
 
         // Current-vs-historical contract (loop-a-reverify

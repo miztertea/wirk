@@ -114,6 +114,7 @@ fn deterministic_leaf(id: &str) -> WaypointDefinition {
         required_child_outcomes: Vec::new(),
         selection: None,
         verifies: None,
+        orient: None,
     }
 }
 
@@ -722,13 +723,58 @@ fn obligation_basis_covers_every_authored_field_and_the_execution_basis() {
 
     let mut actor = obliged_leaf("leaf");
     actor.kind = WaypointKind::Actor;
+    // Not "an Actor can have no basis" — it can, and `wirk`'s own
+    // findings suite settles one. What this fixture lacks is the
+    // declared mechanism: `obligation()` carries no `review` contract,
+    // and the `Actor` arm is the one that refuses without it. A
+    // `Container` carrying no `requires` is the contrast, not the
+    // parallel — it still gets a basis, and is refused as a settlement
+    // candidate at readiness instead (asserted just below).
+    assert!(
+        actor.verifies.as_ref().unwrap().review.is_none(),
+        "the fixture this turns on declares no review contract"
+    );
     assert!(
         obligation_basis(&actor, Some(&world)).is_none(),
-        "an Actor Waypoint has no deterministic check to be discharged"
+        "an Actor obligation that declares no review mechanism has no basis to admit"
     );
     assert!(
         obligation_basis(&deterministic_leaf("leaf"), Some(&world)).is_none(),
         "a Waypoint declaring no obligation has no basis"
+    );
+
+    // The contrast, executed rather than asserted in prose: a
+    // `Container` obligation declaring no `requires` still gets a basis
+    // — the arm hashes the absence and carries on — and the absence
+    // changes that value rather than withholding it. The estate's
+    // fail-closed for a mechanism-less container is a readiness
+    // refusal, not a missing basis, and reading this function's return
+    // as that refusal is the doc error ruling 0137 carried.
+    let mut container = obliged_leaf("leaf");
+    container.kind = WaypointKind::Container;
+    assert!(
+        container.verifies.as_ref().unwrap().requires.is_none(),
+        "the fixture this turns on declares no required child obligation"
+    );
+    let without_requires = obligation_basis(&container, Some(&world))
+        .expect("a Container obligation with no `requires` still has a basis");
+    let mut required = container.clone();
+    required.verifies = Some(VerificationObligation {
+        requires: Some(ObligationRef {
+            id: "child-out".to_string(),
+            edition: "1".to_string(),
+        }),
+        ..obligation()
+    });
+    assert_ne!(
+        without_requires,
+        obligation_basis(&required, Some(&world)).unwrap(),
+        "declaring the required child obligation changes the admitted basis"
+    );
+    assert_eq!(
+        without_requires,
+        obligation_basis(&container, None).unwrap(),
+        "and a Container's basis never reads the World hash, with or without `requires`"
     );
 }
 

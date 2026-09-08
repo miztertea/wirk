@@ -15,7 +15,7 @@ use crate::wirkd::{
     AtlasRelatePayload, AtlasResolvePayload, AtlasSearchPayload, AtlasSemanticBuildPayload,
     AtlasSemanticSelectPayload, AtlasStatusPayload, Reply, Request,
 };
-use crate::{flag_value, warn_if_index_incomplete, wirkd_client_call};
+use crate::{ActorContext, actor_context, flag_value, warn_if_index_incomplete, wirkd_client_call};
 use wirk_core::WorkId;
 
 pub fn atlas_command(rest: &[String]) -> ExitCode {
@@ -42,7 +42,7 @@ fn atlas_usage() -> ExitCode {
          | wirk atlas refresh --estate <root> --source <name> --revision <ref> [--json] \
          | wirk atlas publish --estate <root> --source <name> --generation <id> [--json] \
          | wirk atlas status --estate <root> [--source <name>] [--work <id>] [--json] \
-         | wirk atlas resolve --estate <root> [--work <id>] --coordinate <encoded> [--json] \
+         | wirk atlas resolve [--estate <root>] [--work <id>] --coordinate <encoded> [--json] \
          | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--semantic-backend <path>] [--semantic-backend-arg <arg>...] [--semantic-model <dir>] [--family code|knowledge|config]... [--limit <n>] [--continue <token>] [--json] \
          | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--chunker units|native] [--json] \
          | wirk atlas semantic select --estate <root> --source <name> --edition <id> [--json] \
@@ -407,12 +407,38 @@ fn search_command(rest: &[String]) -> ExitCode {
     ) {
         return code;
     }
-    let (Some(estate), Some(query)) = (flag_value(rest, "--estate"), flag_value(rest, "--query"))
-    else {
+    let Some(query) = flag_value(rest, "--query") else {
         return atlas_usage();
     };
+    // The same fallback `resolve` runs on (ruling 0126 F3, ruling 0117):
+    // `--estate`/`--work` come from the injected triple when they are not
+    // named, so the `fetch` line a stage projection prints under every
+    // reachable handle runs verbatim inside a pane. An explicit
+    // `--estate` is an operator invocation and keeps the operator's
+    // meaning for an omitted `--work`; a half-injected environment is
+    // refused rather than widened; outside an actor context nothing
+    // changes. Scope is still decided daemon-side.
+    let named_work = flag_value(rest, "--work").map(WorkId);
+    let (estate, work) = match flag_value(rest, "--estate") {
+        Some(estate) => (estate, named_work),
+        None => match actor_context() {
+            ActorContext::Present {
+                estate_root,
+                work_id,
+            } => (estate_root, named_work.or(Some(WorkId(work_id)))),
+            ActorContext::Partial { missing } => {
+                eprintln!(
+                    "wirk atlas search: --estate was not given and the injected context is \
+                     incomplete ({}); name --estate <root> explicitly, or run inside a complete \
+                     execution context",
+                    missing.join(", ")
+                );
+                return ExitCode::from(1);
+            }
+            ActorContext::Absent => return atlas_usage(),
+        },
+    };
     let json = is_json(rest);
-    let work = flag_value(rest, "--work").map(WorkId);
     let source = flag_value(rest, "--source");
     let semantic = flag_value(rest, "--semantic");
     let families = flag_values(rest, "--family");
@@ -775,6 +801,26 @@ fn semantic_select_command(rest: &[String]) -> ExitCode {
     )
 }
 
+/// `wirk atlas resolve [--estate <root>] [--work <id>] --coordinate
+/// <encoded>`: the verb `wirk world show` prints under every bound item,
+/// and the one instruction W-C1 gives a fresh actor for closing the
+/// loop.
+///
+/// It closes it because `--estate` and `--work` fall back to the
+/// injected triple, by exactly the rule `status`/`watch` already run on
+/// (`resolve_scope`, ruling 0117): the actor's own context resolves the
+/// pair, an explicit flag always wins over it, a half-injected
+/// environment is refused rather than widened, and outside an actor
+/// context nothing changes at all. Before this, the printed command
+/// failed with the usage banner inside a valid pane (ruling 0126, F3).
+///
+/// The fallback supplies the **pair**. `--estate` named explicitly is an
+/// operator invocation and keeps the operator's meaning for an omitted
+/// `--work`, so no existing command line changes what it asks for; and
+/// when the triple is what resolved the estate, `--work` is always the
+/// triple's Work, never the administrative read. Scope itself is still
+/// decided daemon-side: a coordinate this Work may not read is refused
+/// there, and possessing one confers nothing.
 fn resolve_command(rest: &[String]) -> ExitCode {
     if let Err(code) = check_flags(
         "resolve",
@@ -783,14 +829,32 @@ fn resolve_command(rest: &[String]) -> ExitCode {
     ) {
         return code;
     }
-    let (Some(estate), Some(coordinate)) = (
-        flag_value(rest, "--estate"),
-        flag_value(rest, "--coordinate"),
-    ) else {
+    let Some(coordinate) = flag_value(rest, "--coordinate") else {
         return atlas_usage();
     };
+    let named_work = flag_value(rest, "--work").map(WorkId);
+    let (estate, work) = match flag_value(rest, "--estate") {
+        Some(estate) => (estate, named_work),
+        None => match actor_context() {
+            ActorContext::Present {
+                estate_root,
+                work_id,
+            } => (estate_root, named_work.or(Some(WorkId(work_id)))),
+            // Half a triple names no identity, and reading it as "no
+            // context" is the wider reading. Refused, never widened.
+            ActorContext::Partial { missing } => {
+                eprintln!(
+                    "wirk atlas resolve: --estate was not given and the injected context is \
+                     incomplete ({}); name --estate <root> explicitly, or run inside a complete \
+                     execution context",
+                    missing.join(", ")
+                );
+                return ExitCode::from(1);
+            }
+            ActorContext::Absent => return atlas_usage(),
+        },
+    };
     let json = is_json(rest);
-    let work = flag_value(rest, "--work").map(WorkId);
     call_expecting_outcome(
         &estate,
         &Request::atlas_resolve(AtlasResolvePayload { work, coordinate }),

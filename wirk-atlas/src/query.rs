@@ -586,7 +586,9 @@ fn semantic_attempt(
         return Ok(Err(
             "no semantic query backend is configured for this request; a backend \
              executable and an offline model directory are the caller's explicit configuration, \
-             and this product ships neither"
+             and this request named neither. That is a fact about this request only: it says \
+             nothing about whether this estate holds semantic editions, and nothing about what \
+             this product can run"
                 .to_owned(),
         ));
     };

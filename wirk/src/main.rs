@@ -101,9 +101,10 @@ fn main() -> ExitCode {
         Some("plugin") => plugin_command(&args[2..]),
         Some("atlas") => atlas::atlas_command(&args[2..]),
         Some("finding") => finding::finding_command(&args[2..]),
+        Some("world") => world_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ..."
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json]"
             );
             ExitCode::FAILURE
         }
@@ -266,6 +267,515 @@ fn fetch_output_contract_names(socket: &Path, work_id: &WorkId) -> Result<Vec<St
     Ok(contract.0.into_iter().map(|spec| spec.name).collect())
 }
 
+// ---- wirk world (P3 W-C1) ------------------------------------------
+
+/// `wirk world show [--json]`: the delivered stage projection for this
+/// Run, read from inside the pane.
+///
+/// Reads the injected triple exactly as `wirk claim` does (0001 D3, D5)
+/// and takes no `--work`, `--run` or `--estate` argument: an actor
+/// inspects the context *it* was delivered, and there is no surface here
+/// on which one Work asks for another's. A fresh actor with no
+/// transcript can therefore recover what its stage was actually given,
+/// with every coordinate resolvable through `wirk atlas resolve`.
+fn world_command(rest: &[String]) -> ExitCode {
+    match rest.first().map(String::as_str) {
+        Some("show") => world_show_command(&rest[1..]),
+        Some("expand") => world_expand_command(&rest[1..]),
+        _ => world_usage(),
+    }
+}
+
+/// The injected triple, or the exact names that are missing. The same
+/// read `wirk claim` does (0001 D3, D5).
+fn world_triple() -> Result<BTreeMap<&'static str, String>, Vec<&'static str>> {
+    let mut missing = Vec::new();
+    let mut triple: BTreeMap<&str, String> = BTreeMap::new();
+    for name in TRIPLE_VARS {
+        match env::var(name).ok().filter(|v| !v.trim().is_empty()) {
+            Some(value) => {
+                triple.insert(name, value);
+            }
+            None => missing.push(name),
+        }
+    }
+    if missing.is_empty() {
+        Ok(triple)
+    } else {
+        Err(missing)
+    }
+}
+
+fn world_show_command(rest: &[String]) -> ExitCode {
+    let mut json_out = false;
+    let mut revision: Option<u64> = None;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json_out = true,
+            "--revision" => match args.next().map(|value| value.parse::<u64>()) {
+                Some(Ok(value)) => revision = Some(value),
+                _ => {
+                    eprintln!("wirk world show: --revision takes a revision number");
+                    return ExitCode::from(1);
+                }
+            },
+            _ => return world_usage(),
+        }
+    }
+
+    let triple = match world_triple() {
+        Ok(triple) => triple,
+        Err(missing) => {
+            for name in &missing {
+                eprintln!("wirk world show: missing {name}");
+            }
+            return ExitCode::from(1);
+        }
+    };
+    let estate_root = triple["WIRK_ESTATE_ROOT"].clone();
+    let pointer = match wirkd::client::locate(Path::new(&estate_root)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk world show: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let payload = wirkd::WorldShowPayload {
+        triple: ExecutionTriple {
+            estate_root,
+            work_id: WorkId(triple["WIRK_WORK_ID"].clone()),
+            run_id: RunId(triple["WIRK_RUN_ID"].clone()),
+        },
+        revision,
+    };
+    let result = match wirkd::client::call(&pointer.socket, &Request::world_show(payload)) {
+        Ok(Reply::Ok { result, .. }) => result,
+        Ok(Reply::Err { error, .. }) => {
+            eprintln!("wirk world show: {} {}", error.code, error.message);
+            return ExitCode::from(3);
+        }
+        Err(err) => {
+            eprintln!("wirk world show: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+        );
+        return ExitCode::SUCCESS;
+    }
+    print_world_show(&result);
+    ExitCode::SUCCESS
+}
+
+/// `wirk world expand --question TEXT | --reference HANDLE [--reason
+/// TEXT] [--json]`: the actor of this Run adds a revision to the context
+/// it was delivered.
+///
+/// The same triple-only door `world show` uses, for the same reason: an
+/// actor expands the context *it* was given, and there is no argument
+/// here that names a Work, a Run or a revision. `--reference` takes a
+/// handle this Run's own context printed under `reachable`; a handle
+/// from anywhere else addresses nothing.
+fn world_expand_command(rest: &[String]) -> ExitCode {
+    let mut json_out = false;
+    let mut question: Option<String> = None;
+    let mut reference: Option<String> = None;
+    let mut reason: Option<String> = None;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        let mut take = |slot: &mut Option<String>, name: &str| -> bool {
+            match args.next() {
+                Some(value) => {
+                    *slot = Some(value.clone());
+                    true
+                }
+                None => {
+                    eprintln!("wirk world expand: {name} takes a value");
+                    false
+                }
+            }
+        };
+        match arg.as_str() {
+            "--json" => json_out = true,
+            "--question" => {
+                if !take(&mut question, "--question") {
+                    return ExitCode::from(1);
+                }
+            }
+            "--reference" => {
+                if !take(&mut reference, "--reference") {
+                    return ExitCode::from(1);
+                }
+            }
+            "--reason" => {
+                if !take(&mut reason, "--reason") {
+                    return ExitCode::from(1);
+                }
+            }
+            _ => return world_usage(),
+        }
+    }
+    if question.is_none() && reference.is_none() {
+        eprintln!(
+            "wirk world expand: an expansion asks for something: give --question, --reference, \
+             or both"
+        );
+        return ExitCode::from(1);
+    }
+
+    let triple = match world_triple() {
+        Ok(triple) => triple,
+        Err(missing) => {
+            for name in &missing {
+                eprintln!("wirk world expand: missing {name}");
+            }
+            return ExitCode::from(1);
+        }
+    };
+    let estate_root = triple["WIRK_ESTATE_ROOT"].clone();
+    let pointer = match wirkd::client::locate(Path::new(&estate_root)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk world expand: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let payload = wirkd::WorldExpandPayload {
+        triple: ExecutionTriple {
+            estate_root,
+            work_id: WorkId(triple["WIRK_WORK_ID"].clone()),
+            run_id: RunId(triple["WIRK_RUN_ID"].clone()),
+        },
+        question,
+        reference,
+        reason,
+    };
+    let result = match wirkd::client::call(&pointer.socket, &Request::world_expand(payload)) {
+        Ok(Reply::Ok { result, .. }) => result,
+        Ok(Reply::Err { error, .. }) => {
+            eprintln!("wirk world expand: {} {}", error.code, error.message);
+            return ExitCode::from(3);
+        }
+        Err(err) => {
+            eprintln!("wirk world expand: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "expanded to revision {} from observation {}",
+        result
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        result
+            .get("parent")
+            .and_then(|value| value.as_str())
+            .unwrap_or("-")
+    );
+    print_world_show(&result);
+    ExitCode::SUCCESS
+}
+
+/// The plain-text rendering. Every line is a fact the JSON also carries;
+/// nothing is summarized away, and an unavailable or unoriented stage
+/// says so in a sentence rather than by printing nothing.
+fn print_world_show(result: &serde_json::Value) {
+    let text = |key: &str| -> String {
+        result
+            .get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    println!(
+        "waypoint {} run {} current {}",
+        text("waypoint"),
+        text("run"),
+        result
+            .get("current")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    );
+    // The chain, before anything about one revision of it. A fresh actor
+    // that has never seen this Run's transcript learns from this line
+    // that its context has a history, how long it is, and which revision
+    // the document below is — and, when there is more than one, the
+    // exact command that reads any earlier one.
+    if let Some(revisions) = result.get("revisions").and_then(|v| v.as_array()) {
+        let latest = result
+            .get("latest_revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        println!(
+            "context revisions {} (initial 0 .. latest {})",
+            revisions.len(),
+            latest
+        );
+        if revisions.len() > 1 {
+            println!("      read an earlier one with: wirk world show --revision <n>");
+        }
+        // Advertised only where the verb would actually run: `world
+        // expand` refuses a Run that is not the current Run of its own
+        // Waypoint, so printing this line for a superseded Run would be
+        // a command that cannot work. An honest absence, not a menu.
+        if result
+            .get("current")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            && result.get("projection").is_some()
+        {
+            println!("      add to it with: wirk world expand --question <text>");
+        }
+    }
+    match text("orientation").as_str() {
+        "none" | "unavailable" => {
+            println!("orientation {}: {}", text("orientation"), text("detail"));
+            if !text("reason").is_empty() {
+                println!("reason {}", text("reason"));
+            }
+            return;
+        }
+        _ => {}
+    }
+    let Some(projection) = result.get("projection") else {
+        return;
+    };
+    let string = |value: &serde_json::Value, key: &str| -> String {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    println!("question {}", string(projection, "question"));
+    println!(
+        "policy {} route_edition {} revision {}",
+        string(projection, "compilation_policy"),
+        string(projection, "route_edition"),
+        projection
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    if let Some(expansion) = projection.get("expansion") {
+        println!(
+            "expands revision's observation {} (basis {})",
+            string(expansion, "parent_observation"),
+            string(expansion, "basis")
+        );
+        if let Some(request) = expansion.get("request") {
+            println!(
+                "      asked [{}] {}",
+                if request
+                    .get("authored_question")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "authored question"
+                } else {
+                    "this stage's own question, carried over"
+                },
+                string(request, "question")
+            );
+            if let Some(handle) = request.get("reference").and_then(|v| v.as_str()) {
+                println!("      inside delivered handle {handle}");
+            }
+            if let Some(reason) = request.get("reason").and_then(|v| v.as_str()) {
+                println!("      because {reason}");
+            }
+        }
+        // Said in a line, not left to be reconstructed from two `bound`
+        // lists: a revision that added nothing is a real and useful
+        // answer, and a reader must not have to infer it from the
+        // revision number going up.
+        let count = |key: &str| -> u64 {
+            expansion
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        println!(
+            "      added {} item(s); {} candidate(s) were already bound here at the same \
+             coordinate",
+            count("delivered"),
+            count("already_bound")
+        );
+    }
+    if let Some(coverage) = projection.get("coverage") {
+        println!("coverage {coverage}");
+    }
+    if let Some(generations) = projection.get("generations").and_then(|v| v.as_array()) {
+        println!(
+            "generations {} at publication revision {}",
+            generations.len(),
+            projection
+                .get("publication_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+    }
+    // The reason first, the coordinate second. The coordinate is an
+    // opaque encoded `ExactCoordinate` — the thing an actor pastes into
+    // `wirk atlas resolve` — and leading with it buries the one line
+    // that says what was bound and why.
+    for (label, key) in [("bound", "bound"), ("referenced", "referenced")] {
+        let Some(items) = projection.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for item in items {
+            println!(
+                "{label} [{}] {}",
+                item.get("lifetime")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("working"),
+                string(item, "reason")
+            );
+            // A prior-stage artifact is addressed by this Work's own
+            // Claim and the declared output name, not by an Atlas
+            // coordinate, so the line that would resolve it is the
+            // digest it was verified against — printing an `atlas
+            // resolve` for it would print a command that cannot run.
+            match item.get("identity").and_then(|value| value.get("kind")) {
+                Some(kind) if kind == "artifact_digest" => println!(
+                    "      claim {} digest {}",
+                    string(&item["identity"], "claim"),
+                    string(&item["identity"], "digest")
+                ),
+                _ => println!(
+                    "      resolve with: wirk atlas resolve --coordinate {}",
+                    string(item, "coordinate")
+                ),
+            }
+        }
+    }
+    // A discovery handle is only useful if the line under it runs. The
+    // `fetch` string is the projection's own; `wirk atlas search` takes
+    // its estate and Work from the injected triple, so this is the whole
+    // command an actor types.
+    if let Some(items) = projection.get("reachable").and_then(|v| v.as_array()) {
+        for item in items {
+            println!(
+                "reachable {} — {} indexed {} resource(s) in source {}",
+                string(item, "handle"),
+                item.get("resources")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                string(item, "family"),
+                string(item, "source")
+            );
+            println!("      discover with: {}", string(item, "fetch"));
+            // A handle is usable because *this* context delivered it, so
+            // the line that binds it is printed exactly where the
+            // evidence for it is.
+            if result
+                .get("current")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!(
+                    "      bind it into this context with: wirk world expand --reference {}",
+                    string(item, "handle")
+                );
+            }
+        }
+    }
+    if let Some(retrieval) = projection.get("retrieval") {
+        println!(
+            "retrieval mode {} semantic {} candidates {} shown {}",
+            string(retrieval, "mode"),
+            string(retrieval, "semantic"),
+            retrieval
+                .get("total_candidates")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            retrieval
+                .get("returned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+        if let Some(reason) = retrieval.get("semantic_reason").and_then(|v| v.as_str()) {
+            println!("      semantic reason {reason}");
+        }
+        if let Some(degraded) = retrieval.get("degraded").and_then(|v| v.as_array())
+            && !degraded.is_empty()
+        {
+            println!(
+                "      degraded {}",
+                serde_json::Value::Array(degraded.clone())
+            );
+        }
+    }
+    for (label, key) in [("assumption", "assumptions"), ("unknown", "unknowns")] {
+        let Some(items) = projection.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for item in items {
+            println!(
+                "{label} [{}] {}",
+                item.get("attributed_to")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                string(item, "text")
+            );
+        }
+    }
+    if let Some(items) = projection.get("omitted").and_then(|v| v.as_array()) {
+        for item in items {
+            println!("omitted {item}");
+        }
+    }
+    // Presentation and fact, said separately: `truncated` is about what
+    // was rendered, `coverage` above is about what was found, and
+    // `next_action` reads only the second.
+    println!(
+        "truncated {}",
+        projection
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    );
+    if !string(projection, "next_action").is_empty() {
+        println!("next {}", string(projection, "next_action"));
+    }
+    if let Some(receipt) = result.get("receipt") {
+        println!(
+            "observed {} over {}ms in {} lap(s), observation {}",
+            receipt
+                .get("observed_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            receipt
+                .get("observation_window_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            receipt
+                .get("laps")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            string(receipt, "observation")
+        );
+    }
+}
+
+fn world_usage() -> ExitCode {
+    eprintln!(
+        "usage: wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | \
+         --reference HANDLE) [--reason TEXT] [--json]"
+    );
+    ExitCode::from(1)
+}
+
 fn claim_usage() -> ExitCode {
     eprintln!("usage: wirk claim [--artifact NAME=PATH]... [--question TEXT]");
     ExitCode::from(1)
@@ -368,7 +878,7 @@ fn wirkd_command(rest: &[String]) -> ExitCode {
 
 /// What the injected triple (`TRIPLE_VARS`) says about the process
 /// running this command.
-enum ActorContext {
+pub(crate) enum ActorContext {
     /// No part of the triple is set: the operator's own shell.
     Absent,
     /// Part of it is set and part is not. This names no valid identity,
@@ -386,7 +896,7 @@ enum ActorContext {
 /// Reads `TRIPLE_VARS` from the environment. A variable set to blank or
 /// whitespace counts as unset (an exported-but-empty var is the common
 /// shape of a half-inherited environment, not an identity).
-fn actor_context() -> ActorContext {
+pub(crate) fn actor_context() -> ActorContext {
     let values: Vec<Option<String>> = TRIPLE_VARS
         .iter()
         .map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
@@ -1772,6 +2282,7 @@ fn reserved_deterministic(status: &serde_json::Value) -> Result<(Run, World), St
         launched: false,
         launch_requested: false,
         launch_argv: Vec::new(),
+        expansions: Vec::new(),
         // Attempt admission is the Actor launch path's own
         // (`RunLaunchAttempted`); a Deterministic Run never takes one.
         launch_attempt: None,
@@ -2208,6 +2719,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::FindingSettled { .. } => "FindingSettled",
         EventKind::FindingAsserted { .. } => "FindingAsserted",
         EventKind::FindingApplied { .. } => "FindingApplied",
+        EventKind::ProjectionExpanded { .. } => "ProjectionExpanded",
     }
 }
 

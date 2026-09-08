@@ -4261,6 +4261,7 @@ fn restart_settles_and_indexes_a_terminal_works_missing_finding() {
         // names; the policy admitting its basis is written after this
         // journal exists, exactly as an estate operator admits a check.
         verifies: Some(leaf_obligation),
+        orient: None,
     };
     let manual_basis = wirk_core::obligation_basis(&leaf, Some(&WorldHash("manual".to_string())))
         .expect("the hand-built leaf's own admitted basis");
@@ -4427,6 +4428,7 @@ fn a_settlement_journaled_by_the_previous_revision_stays_readable_and_reads_as_h
         // A base-era Route declared no obligation, because the concept
         // did not exist yet.
         verifies: None,
+        orient: None,
     };
     raw_append(
         &estate,

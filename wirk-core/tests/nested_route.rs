@@ -30,6 +30,7 @@ fn actor(id: &str, outputs: &[&str]) -> WaypointDefinition {
         required_child_outcomes: Vec::new(),
         selection: None,
         verifies: None,
+        orient: None,
     }
 }
 
@@ -62,6 +63,7 @@ fn container(
             })
             .collect(),
         selection: None,
+        orient: None,
     }
 }
 

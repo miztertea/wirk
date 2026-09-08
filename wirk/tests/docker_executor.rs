@@ -51,6 +51,7 @@ fn open_run(run_id: &str) -> Run {
         launch_requested: false,
         launch_argv: Vec::new(),
         launch_attempt: None,
+        expansions: Vec::new(),
     }
 }
 
@@ -335,6 +336,7 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         launch_requested: false,
         launch_argv: Vec::new(),
         launch_attempt: None,
+        expansions: Vec::new(),
     };
     let artifacts = OutputContract(vec![wirk_core::ArtifactSpec {
         name: "report.md".to_string(),

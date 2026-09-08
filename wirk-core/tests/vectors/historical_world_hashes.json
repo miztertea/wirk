@@ -1,0 +1,90 @@
+[
+ {
+  "note": "pre-source_basis Actor World, estate /var/tmp/wirk-p2-routes, 2026-09-04",
+  "journal": "knowledge/evidence/p2-route-files-2026-09-04/journal.ndjson",
+  "world_hash": "019e063eb04f5fd0d9c0582e22980332e1ab1c1b86e38a2dbf78c6f7eb1c0b0d",
+  "legacy_encoding": true,
+  "world": {
+   "Actor": {
+    "repository": "/home/miztertea/wirk-workspace/repos/wirk",
+    "worktree_path": "",
+    "branch": "wirk/work-18d235a747af5c17-0",
+    "base_sha": "0d05acc94bb60ce8c5d68cc1a1c87f0cffe0f84d",
+    "triple": {
+     "estate_root": "/var/tmp/wirk-p2-routes",
+     "work_id": "work-18d235a747af5c17-0",
+     "run_id": "run-18d235a747af80a4-1"
+    },
+    "intent": "You are in a git worktree of the wirk product repository on your own branch. Work only inside this directory. Export CARGO_TARGET_DIR=/var/tmp/wirk-target before any cargo command. 1. Read wirk/tests/route_files.rs and its support helper to see how a test starts wirkd in a temp estate and submits a Work. 2. Add a test route_file_bare_name_with_no_file_is_refused_no_journal to wirk/tests/route_files.rs: a temp estate whose routes/ directory has no proving.json, a submit with --route proving --kind actor --repo demo:write --base <sha> --repo-path <the temp repo>, asserting a non-zero exit, a message naming the missing file, and no journal file created under the estate's works/ directory. 3. Run cargo test --offline -p wirk --test route_files and confirm it passes; then run cargo test --offline --workspace: all green. 4. Commit the test on this branch with a message naming the coverage gap. Write the commit SHA as one line into report.md at the worktree root. Run wirk claim --artifact report.md=<absolute path>.",
+    "output_contract": [
+     {
+      "name": "report.md",
+      "required": true
+     }
+    ],
+    "boundary": [
+     "/home/miztertea/wirk-workspace/repos/wirk"
+    ]
+   }
+  }
+ },
+ {
+  "note": "pre-source_basis Deterministic World, same journal",
+  "journal": "knowledge/evidence/p2-route-files-2026-09-04/journal.ndjson",
+  "world_hash": "c286df15762eef725f396aa266f4bda0043e4f7895b7e29d39e29f739616a414",
+  "legacy_encoding": true,
+  "world": {
+   "Deterministic": {
+    "command": [
+     "sh",
+     "-c",
+     "CARGO_TARGET_DIR=/var/tmp/wirk-target cargo test --offline -p wirk > summary.md 2>&1"
+    ],
+    "base_sha": "0d05acc94bb60ce8c5d68cc1a1c87f0cffe0f84d",
+    "cwd": "/var/tmp/wirk-p2-routes/worktrees/work-18d235a747af5c17-0",
+    "env": {
+     "CARGO_TARGET_DIR": "/var/tmp/wirk-target"
+    },
+    "expected_artifacts": [
+     {
+      "name": "summary.md",
+      "required": true
+     }
+    ]
+   }
+  }
+ },
+ {
+  "note": "Git-basis Actor World, P3 W3 useful-scenario estate, 2026-09-05",
+  "journal": "knowledge/work/p3-sources/source-public-w3-useful/raw/native-two-actor-useful/works/work-18d2d39e20d03cb1-0/journal.ndjson",
+  "world_hash": "709517b9a013b172ac28a27e7edced484b58315b4cdb7480e8c15c4a1513ac04",
+  "legacy_encoding": false,
+  "world": {
+   "Actor": {
+    "repository": "/var/tmp/wirk-p3-public-atlas/useful-scenario/output-repo",
+    "worktree_path": "",
+    "branch": "wirk/work-18d2d39e20d03cb1-0",
+    "base_sha": "f19d69ab12c107b1de5c431f394393a79aabb327",
+    "source_basis": {
+     "kind": "git",
+     "base": "f19d69ab12c107b1de5c431f394393a79aabb327"
+    },
+    "triple": {
+     "estate_root": "/var/tmp/wirk-p3-public-atlas/useful-scenario/estate",
+     "work_id": "work-18d2d39e20d03cb1-0",
+     "run_id": "run-18d2d39e20d05490-1"
+    },
+    "intent": "You are assessing the actual current Wirk source code and this project's workspace knowledge base using wirk's own public Atlas CLI commands (wirk atlas search / wirk atlas resolve). Two sources are already registered and published in this estate: alias 'wirk' is the current candidate product source (a real branch, path /home/tchawes/wirk-workspace/worktrees/p3-public-atlas), and alias 'workspace' is this project's real knowledge/decision repository (/home/tchawes/wirk-workspace, containing knowledge/rulings/*.md). Use the environment variables WIRK_ESTATE_ROOT and WIRK_WORK_ID already set in your shell as the --estate and --work arguments on every 'wirk atlas' command you run. Investigate this concrete question and answer it only from what you actually retrieve: (1) In the current wirk/src/wirkd/server.rs, which exact function decides whether a Claim is refused for a changed path outside the declared boundary when the Work's execution repository has Access::Read, and how does it choose which of the Work's repository bindings is 'the execution one' when more than one --repo binding is declared? (2) Which exact function in the same file verifies that a required child Work's own repository is genuinely the same repository as its parent's own execution repository, not merely the same alias (ruling 0090)? (3) Find ruling 0090 and ruling 0092 in the 'workspace' source under knowledge/rulings/ and quote their actual decision sentences. (4) Based only on what you actually read in the current source (not speculation), name one concrete open question or limitation about this mechanism that a future builder should know about; if you find none, say so honestly rather than inventing one. For every finding, actually run 'wirk atlas search' or 'wirk atlas resolve' and cite the exact source alias, path, and line range each finding came from - never state a coordinate you did not actually retrieve from a real command this turn. Write your findings, each with its exact coordinate citation, plus a short 'Open questions' section at the end, into a new file named findings-report.md in the current directory. Be concrete, factual, and specific: another engineer will independently check every claim you make against the real source.",
+    "output_contract": [
+     {
+      "name": "findings-report.md",
+      "required": true
+     }
+    ],
+    "boundary": [
+     "**"
+    ]
+   }
+  }
+ }
+]

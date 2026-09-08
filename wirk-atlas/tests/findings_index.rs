@@ -9,7 +9,7 @@ use std::os::unix::net::UnixListener;
 use std::process::Command;
 
 use tempfile::TempDir;
-use wirk_atlas::{AtlasStore, FindingOrigin, FindingRow, FindingRowKind};
+use wirk_atlas::{AtlasStore, FindingOrigin, FindingRow, FindingRowKind, IndexBacking};
 use wirk_core::{
     AdmittedEvidence, ApplicationRef, Assertion, Attribution, ClaimId, Decision, EventId, Finding,
     FindingId, FindingKind, FindingScope, GenerationPoint, ObligationRef, PeerIdentity, RunId,
@@ -393,7 +393,7 @@ fn one_sweep_rewrites_the_index_once_not_once_per_row() {
         .collect();
 
     let before = write_chars();
-    assert_eq!(atlas.append_finding_rows(&rows).unwrap(), 60);
+    assert_eq!(atlas.append_finding_rows(&rows).unwrap().appended, 60);
     let batch_bytes = write_chars() - before;
 
     let file = estate.path().join("atlas").join("findings.ndjson");
@@ -410,7 +410,7 @@ fn one_sweep_rewrites_the_index_once_not_once_per_row() {
     // after the first re-offers everything already indexed.
     let before = write_chars();
     assert_eq!(
-        atlas.append_finding_rows(&rows).unwrap(),
+        atlas.append_finding_rows(&rows).unwrap().appended,
         0,
         "an already-complete index needs no rewrite"
     );
@@ -453,7 +453,7 @@ fn a_batch_append_dedupes_against_the_file_and_against_itself() {
         asserted_row("finding-1", "e-b"),
     ];
     assert_eq!(
-        atlas.append_finding_rows(&offered).unwrap(),
+        atlas.append_finding_rows(&offered).unwrap().appended,
         2,
         "the row already held and the repeat inside the batch are both dropped"
     );
@@ -470,8 +470,57 @@ fn a_batch_append_dedupes_against_the_file_and_against_itself() {
     assert_eq!(ids.len(), 3, "no row is written twice: {rows:?}");
 
     // Offering the whole set again appends nothing and changes nothing.
-    assert_eq!(atlas.append_finding_rows(&offered).unwrap(), 0);
+    assert_eq!(atlas.append_finding_rows(&offered).unwrap().appended, 0);
     assert_eq!(atlas.findings().unwrap(), rows);
+}
+
+/// Ruling 0137 on the write side: an append reports the index **file**
+/// it read or wrote, not only how many rows it added.
+///
+/// The caller that records projection health used to take that fact from
+/// a directory listing made after this call returned, which is a
+/// different moment and, when the file is deleted in between, a
+/// different answer — recorded, it became "this estate never wrote an
+/// index" and a later read of the missing file answered complete. The
+/// append is the observation that actually looked: it opens the file
+/// before it appends, and it renames one into place when it writes.
+#[test]
+fn an_append_reports_the_index_file_it_read_or_wrote() {
+    let estate = TempDir::new().unwrap();
+    let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
+    let file = estate.path().join("atlas").join("findings.ndjson");
+
+    // Nothing offered to an estate that never published: no file read,
+    // none written, and that is the fact reported.
+    let empty = atlas.append_finding_rows(&[]).unwrap();
+    assert_eq!(empty.appended, 0);
+    assert_eq!(empty.backing, IndexBacking::Absent);
+    assert!(!file.exists(), "and nothing was created to say it");
+
+    // The first real append publishes the file.
+    let rows = vec![settled_row("finding-1")];
+    let published = atlas.append_finding_rows(&rows).unwrap();
+    assert_eq!(published.appended, 1);
+    assert_eq!(published.backing, IndexBacking::Present);
+
+    // The common case after the first mutation: every offered row is
+    // already held, not one byte is written — and the file this call
+    // read is every bit as real as one it rewrote.
+    let dedup = atlas.append_finding_rows(&rows).unwrap();
+    assert_eq!(dedup.appended, 0);
+    assert_eq!(
+        dedup.backing,
+        IndexBacking::Present,
+        "a sweep that wrote nothing still read the file"
+    );
+
+    // And the pre-publication state again, from the other side: the file
+    // goes, and the very next append says what it found rather than what
+    // it found last time.
+    std::fs::remove_file(&file).unwrap();
+    let republished = atlas.append_finding_rows(&rows).unwrap();
+    assert_eq!(republished.appended, 1, "the row is written again");
+    assert_eq!(republished.backing, IndexBacking::Present);
 }
 
 /// A failed batch says how many rows the index does **not** hold, which
@@ -610,4 +659,102 @@ fn a_batch_whose_rows_are_visible_reports_nothing_pending() {
     // reason nothing is pending.
     let atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     assert_eq!(atlas.findings().unwrap().len(), 2);
+}
+
+/// Ruling 0137, at the read that decides it: **the four backing states
+/// are four different answers, and absence is not one of the empties.**
+///
+/// `read_rows` used to answer a missing file with `Ok(vec![])`, the same
+/// value it answers a present-and-empty file with, and the caller that
+/// paired that list with a health record could not tell them apart. The
+/// four states are asserted here against a real store on a real
+/// directory, in the one place the distinction is made.
+#[test]
+fn a_missing_index_is_not_a_present_and_empty_one() {
+    let estate = TempDir::new().unwrap();
+    let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
+    let index = estate.path().join("atlas").join("findings.ndjson");
+
+    // 1. Missing: no file has ever been written here.
+    assert!(!index.exists());
+    let read = atlas.read_findings().unwrap();
+    assert!(read.rows.is_empty());
+    assert_eq!(
+        read.backing,
+        wirk_atlas::IndexBacking::Absent,
+        "a file that is not there is reported as absent, not as an empty index"
+    );
+
+    // 2. Present and empty: a real file holding no rows.
+    atlas.rebuild_finding_rows(Vec::new()).unwrap();
+    assert!(index.exists(), "a rebuild of nothing still writes the file");
+    let read = atlas.read_findings().unwrap();
+    assert!(read.rows.is_empty());
+    assert_eq!(
+        read.backing,
+        wirk_atlas::IndexBacking::Present,
+        "an index that was opened and holds no rows is a measured empty"
+    );
+
+    // 3. Present with rows, then taken away underneath the store: the
+    //    read reports absence rather than the rows it saw a moment ago,
+    //    and never an error about a file it was not asked to require.
+    atlas.append_finding_row(&settled_row("finding-1")).unwrap();
+    let read = atlas.read_findings().unwrap();
+    assert_eq!(read.rows.len(), 1);
+    assert_eq!(read.backing, wirk_atlas::IndexBacking::Present);
+    let kept = std::fs::read(&index).unwrap();
+    std::fs::remove_file(&index).unwrap();
+    let read = atlas.read_findings().unwrap();
+    assert!(read.rows.is_empty());
+    assert_eq!(read.backing, wirk_atlas::IndexBacking::Absent);
+
+    // 4. The two that were already errors stay errors, and are not
+    //    folded into absence by any of the above.
+    std::fs::write(&index, b"not json at all\n").unwrap();
+    let err = atlas.read_findings().unwrap_err();
+    assert!(err.to_string().contains("malformed"), "{err}");
+    std::fs::write(&index, &kept).unwrap();
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let err = atlas.read_findings().unwrap_err();
+    assert!(
+        err.to_string().contains("Permission denied"),
+        "an unreadable index is its own refusal, never an absent one: {err}"
+    );
+    std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        atlas.findings().unwrap().len(),
+        1,
+        "and the row is still there"
+    );
+}
+
+/// The listing the health record is formed from answers both of its
+/// questions from one `read_dir`, and neither of them by guessing.
+#[test]
+fn one_atlas_listing_answers_preserved_copies_and_the_index_file() {
+    let estate = TempDir::new().unwrap();
+    let listing = wirk_atlas::atlas_directory_listing(estate.path()).unwrap();
+    assert!(!listing.index_present, "no atlas directory, no index file");
+    assert!(listing.preserved.is_empty());
+
+    let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
+    atlas.append_finding_row(&settled_row("finding-1")).unwrap();
+    let listing = wirk_atlas::atlas_directory_listing(estate.path()).unwrap();
+    assert!(listing.index_present);
+    assert!(listing.preserved.is_empty());
+
+    let atlas_dir = estate.path().join("atlas");
+    std::fs::write(
+        atlas_dir.join("findings.ndjson.unreadable-01"),
+        b"kept bytes\n",
+    )
+    .unwrap();
+    std::fs::remove_file(atlas_dir.join("findings.ndjson")).unwrap();
+    let listing = wirk_atlas::atlas_directory_listing(estate.path()).unwrap();
+    assert!(
+        !listing.index_present,
+        "a preserved copy is not the standing index"
+    );
+    assert_eq!(listing.preserved, vec!["findings.ndjson.unreadable-01"]);
 }

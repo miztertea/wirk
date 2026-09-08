@@ -877,6 +877,7 @@ mod tests {
             launch_requested: true,
             launch_argv: Vec::new(),
             launch_attempt: None,
+            expansions: Vec::new(),
         }
     }
 

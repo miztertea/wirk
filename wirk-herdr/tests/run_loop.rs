@@ -49,6 +49,7 @@ fn open_run(run_id: &str) -> Run {
         launch_requested: false,
         launch_argv: Vec::new(),
         launch_attempt: None,
+        expansions: Vec::new(),
     }
 }
 
@@ -73,6 +74,7 @@ fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
         }]),
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
+        evidence: None,
     })
 }
 

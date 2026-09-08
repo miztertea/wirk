@@ -324,6 +324,36 @@ enum DirectoryDurability {
     Unestablished,
 }
 
+/// What the observation that recorded a health record saw of the index
+/// **file** — the other half of "is this projection complete", and the
+/// half a later read can compare its own open against.
+///
+/// Ruling 0137: an index file that is not there answers a read with no
+/// rows, and that is a truthful answer for an estate that never wrote
+/// one. It is not a truthful answer beside a health record formed over a
+/// file that *was* there, because then what the file held is exactly what
+/// this read cannot establish. One fact, taken from what the recording
+/// attempt itself established about the file — its own append's read or
+/// its own publication — resolved against the same listing of `atlas/`
+/// the preserved-copy question is already answered by (`recorded_backing`).
+/// No second store, no count, no timer, and nothing remembered across a
+/// restart that the estate itself does not still show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedBacking {
+    /// No observation has recorded here yet, or the one that did could
+    /// not list the estate's atlas directory. Never evidence of anything:
+    /// a read that finds no file is not entitled to call it a loss.
+    Unknown,
+    /// The recording observation found an index file: its own append
+    /// read one or published one, or the listing at the end of it saw
+    /// one.
+    Present,
+    /// The recording observation found none: its own append neither read
+    /// nor wrote a file, and the listing did not see one either. The
+    /// estate that has never published a row.
+    Absent,
+}
+
 #[derive(Debug, Clone)]
 struct IndexHealth {
     projection: IndexProjection,
@@ -357,6 +387,14 @@ struct IndexHealth {
     /// they have reviewed the preserved bytes
     /// (`--retire-preserved-index`).
     preserved: PreservedIndexCopies,
+    /// Whether the observation that recorded this found an index file on
+    /// disk — what its own append established about the file, resolved
+    /// against the listing of `atlas/` taken at the end of it
+    /// (`recorded_backing`). Read by a later *query* to tell "this
+    /// estate holds no findings" from "the file this record was formed
+    /// over is gone" — the two states ruling 0137 found collapsed into
+    /// one silent `complete: true`.
+    index_backing: RecordedBacking,
     /// A write or rename this daemon already reported as landed whose
     /// containing directory's `fsync` did not succeed, as the failing
     /// call described it.
@@ -444,6 +482,7 @@ impl IndexHealth {
             last_attempt: None,
             observation: 0,
             preserved: PreservedIndexCopies::default(),
+            index_backing: RecordedBacking::Unknown,
             unconfirmed_directory: None,
         }
     }
@@ -554,6 +593,19 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
     // pass.
     settle_ready_findings(&state);
     reconcile_findings_index(&state);
+
+    // W-C1 (BUILD.md §5.1): a crash between a projection's temp write
+    // and its rename leaves a `.tmp-` file that nothing can ever
+    // reference — the reference names the *renamed* path, so an
+    // un-renamed temp is unreachable by construction. Swept here, at
+    // startup, before the listener accepts a connection, which is the
+    // one moment this daemon is provably the only writer of these
+    // directories. Nothing else is swept: a *renamed* projection file
+    // that no event names is left exactly where it is, permanently. Age
+    // is not evidence of orphanhood (ruling 0124: no mtime heuristic
+    // deletes an unreferenced projection artifact), and harmless residue
+    // is cheaper than a wrong deletion.
+    sweep_projection_temporaries(&state);
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -1426,6 +1478,18 @@ fn dispatch(
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
+        Verb::WorldExpand => {
+            match serde_json::from_value::<super::WorldExpandPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_world_expand(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::WorldShow => {
+            match serde_json::from_value::<super::WorldShowPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_world_show(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
         // `handle_connection` intercepts `watch` before ever calling
         // `dispatch` (its own long-lived, many-lines-out shape does not
@@ -1718,6 +1782,10 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 leaves: Vec::new(),
                 required_child_outcomes: Vec::new(),
                 selection: None,
+                // Nor an orientation request: there is no authored Route
+                // here to have written one, and a Deterministic Waypoint
+                // could not carry one anyway (`validate_tree`).
+                orient: None,
                 // The ad hoc, Route-less single-Waypoint shape declares
                 // no verification obligation: there is no authored Route
                 // edition here for a policy to have admitted.
@@ -1905,9 +1973,36 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // W-B target binding: freeze the declared review
                 // selectors here, before the review can run.
                 review_targets: freeze_review_targets(state, &payload.repositories, &first_def),
+                // W-C1: the reference is filled in below, once the
+                // Work's own directory exists and the projection file
+                // has been written into it durably. Assembling here,
+                // before the World is built, keeps the whole of it
+                // outside any journal guard — this Work has no journal
+                // yet, and no other Work's is touched.
+                evidence: None,
             })
         }
         WaypointKind::Actor => {
+            // W-C1 (BUILD.md §3.3), the refusal aimed where `Unknown` is
+            // minted: this bare arm reserves an Actor World with
+            // `SourceBasis::Unknown`, and a World whose source inspection
+            // contract is unrecorded may not carry a stage projection —
+            // the projection's coordinates would name generations no
+            // recorded basis binds. Refused *before* anything is
+            // journaled, naming the Waypoint and the submit shape that
+            // works. The positive control is the sibling arm above:
+            // `--kind actor --repo-path <p>` needs no `--source-basis` at
+            // all and resolves a Git basis from the checkout.
+            if first_def.orient.is_some() {
+                return err_reply(
+                    "UnsupportedAssembly",
+                    &format!(
+                        "waypoint {} declares an orientation request, which needs a recorded \
+                         source basis: submit it with --kind actor --repo-path <checkout>",
+                        first_def.id.0
+                    ),
+                );
+            }
             // P3 W3 (ruling 0090): the resolved execution binding's
             // name, never `repositories.first()` — a Work declaring
             // more than one `--repo` binding without saying which is
@@ -1935,6 +2030,13 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // review obligation here can never discharge — the same
                 // fail-closed outcome an unresolvable selector reaches.
                 review_targets: freeze_review_targets(state, &payload.repositories, &first_def),
+                // W-C1 (BUILD.md §3.3): this is the one writer that mints
+                // `SourceBasis::Unknown` for an Actor World, and a World
+                // may not carry a projection while its source inspection
+                // contract is unrecorded — so this arm refuses an
+                // orienting Waypoint outright, above, rather than
+                // reserving one whose evidence could never be trusted.
+                evidence: None,
             })
         }
         // `waypoint_id` is `all_waypoints[0]`, drawn from `flatten_leaves`
@@ -1943,7 +2045,19 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             unreachable!("the flattened waypoint sequence names only executable leaves")
         }
     };
-    let world_hash = WorldHash::of(&world);
+    // W-C1: assemble this Work's first stage projection here — before
+    // its journal exists, so no guard of any kind is held, and no other
+    // Work's journal is read. The Atlas publication revision is
+    // re-checked inside `prepared_without_journal`; the journal half of
+    // BUILD.md §4.6's re-check is vacuous at submit because there is no
+    // journal to have moved.
+    let mut world = world;
+    let prepared = prepared_without_journal(
+        state,
+        &payload.repositories,
+        &first_def,
+        &route_edition_of(&waypoint_defs),
+    );
 
     // W-A (§3.3): a child submission is checked and, if admitted,
     // journaled on the *parent's* journal (`ChildWorkSpawned`) before
@@ -1979,6 +2093,23 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         Err(err) => return err_reply("JournalError", &err.to_string()),
     };
     let mut journal = lock_journal(&journal);
+
+    // W-C1 (BUILD.md §5.1): the file is serialized, fsynced and renamed
+    // into place **before** the event that names it exists. A crash
+    // between the two leaves a projection no event references, which
+    // nothing reads and nothing deletes; the reverse order would leave a
+    // journaled reference to a file that never existed.
+    if let Some(prepared) = &prepared {
+        match prepared.commit(state, &work_id) {
+            Ok(reference) => {
+                if let World::Actor(actor) = &mut world {
+                    actor.evidence = Some(Box::new(reference));
+                }
+            }
+            Err((code, detail)) => return err_reply(code, &detail),
+        }
+    }
+    let world_hash = WorldHash::of(&world);
 
     // W-A (§3.1): explicit journaled identity for every container this
     // first reservation newly enters (BUILD-AMENDMENTS.md: "name it and
@@ -2398,6 +2529,13 @@ fn handle_record(
             | EventKind::FindingSettled { .. }
             | EventKind::FindingAsserted { .. }
             | EventKind::FindingApplied { .. }
+            // W-C3: a projection revision is minted only by
+            // `world expand`, which assembles it, writes it durably and
+            // appends this under the guard it read the parent under. A
+            // raw `record` could otherwise hand a Run a reference to a
+            // file it never wrote, or a parent that is not the chain's
+            // tail.
+            | EventKind::ProjectionExpanded { .. }
     ) {
         return err_reply(
             "Forbidden",
@@ -2732,7 +2870,8 @@ fn handle_record(
         | EventKind::FindingRaised { .. }
         | EventKind::FindingSettled { .. }
         | EventKind::FindingAsserted { .. }
-        | EventKind::FindingApplied { .. } => unreachable!(),
+        | EventKind::FindingApplied { .. }
+        | EventKind::ProjectionExpanded { .. } => unreachable!(),
     };
     let event = new_event(&payload.work_id, Some(run_id.clone()), kind);
     if let Err(err) = append_event(state, &mut journal, &payload.work_id, &event) {
@@ -3352,20 +3491,92 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             return reply;
         }
 
-        if !is_last
-            && let Err((code, message)) = reserve_next_leaf(
+        if !is_last {
+            // W-C1: an orienting next leaf reads the Atlas, and nothing
+            // that reads outside this Work may run under this Work's own
+            // journal guard (0119, 0124). Drop it, assemble, and let
+            // `advance_to_next_leaf` re-take the guard for the append;
+            // `reserve_next_leaf` re-derives the next leaf and every
+            // authority fact under that guard, exactly as it always has,
+            // so nothing is carried across but the projection itself —
+            // and that only if it was assembled for the very Waypoint
+            // being reserved.
+            //
+            // A next leaf that declares no orientation never takes this
+            // branch: it keeps the original single-guard advance, atomic
+            // with the claim, byte for byte the behaviour it had.
+            let orients = next_leaf_after(&events_now, &run.waypoint)
+                .and_then(|next| find_definition(&journaled_defs, &next))
+                .is_some_and(|def| def.orient.is_some());
+            if orients {
+                drop(journal);
+                if let Err((code, message)) =
+                    advance_to_next_leaf(state, &work_id, &journaled_defs, &run.waypoint)
+                {
+                    return err_reply(code, &message);
+                }
+                return reply;
+            }
+            if let Err((code, message)) = reserve_next_leaf(
                 state,
                 &work_id,
                 &mut journal,
                 &journaled_defs,
                 &run.waypoint,
-            )
-        {
-            return err_reply(code, &message);
+                None,
+            ) {
+                return err_reply(code, &message);
+            }
         }
     }
 
     reply
+}
+
+/// The Waypoint that follows `after_leaf` in this Work's own flattened
+/// Route order, derived from the journal exactly as `reserve_next_leaf`
+/// derives it — extracted so the *decision* can be taken on a
+/// dropped-guard observation and then re-taken under the commit guard,
+/// rather than existing in two spellings that could drift.
+fn next_leaf_after(events: &[Event], after_leaf: &WaypointId) -> Option<WaypointId> {
+    let waypoints = route_waypoints(events);
+    let position = waypoints.iter().position(|w| w == after_leaf)?;
+    waypoints.get(position + 1).cloned()
+}
+
+/// The orienting auto-advance: assemble with **no** journal guard held,
+/// then take the guard and reserve.
+///
+/// Callers reach this only when the next leaf declares an `orient`
+/// block. A Waypoint that declares none never comes here at all, keeps
+/// the original in-guard reservation, does no Atlas work and journals a
+/// byte-identical World — which is precisely the compatibility this wave
+/// owes every Route written before it.
+fn advance_to_next_leaf(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    journaled_defs: &[WaypointDefinition],
+    after_leaf: &WaypointId,
+) -> Result<(), (&'static str, String)> {
+    no_journal_guard_held("orienting auto-advance");
+    let after = after_leaf.clone();
+    let prepared = prepared_for_waypoint(state, work_id, move |events| {
+        next_leaf_after(events, &after)
+    });
+    let handle = match journal_for(state, work_id) {
+        Ok(Some(handle)) => handle,
+        Ok(None) => return Ok(()),
+        Err(err) => return Err(("JournalError", err.to_string())),
+    };
+    let mut journal = lock_journal(&handle);
+    reserve_next_leaf(
+        state,
+        work_id,
+        &mut journal,
+        journaled_defs,
+        after_leaf,
+        prepared,
+    )
 }
 
 /// Reserves the next leaf after `after_leaf` in this Work's own
@@ -3386,6 +3597,7 @@ fn reserve_next_leaf(
     journal: &mut Journal,
     journaled_defs: &[WaypointDefinition],
     after_leaf: &WaypointId,
+    prepared: Option<PreparedProjection>,
 ) -> Result<(), (&'static str, String)> {
     let events = journal
         .replay()
@@ -3545,6 +3757,20 @@ fn reserve_next_leaf(
                         &fold(&events).repositories,
                         next_def,
                     ),
+                    // W-C1: the projection this reservation delivers,
+                    // resolved under the commit guard. `next_id` is
+                    // re-derived here, from this Work's journal as it
+                    // stands *now*; a projection prepared for any other
+                    // Waypoint is discarded rather than attached, so a
+                    // lost re-check degrades the evidence and never the
+                    // authority (ruling 0124).
+                    evidence: reservation_evidence(
+                        state,
+                        work_id,
+                        next_def,
+                        journaled_defs,
+                        prepared,
+                    )?,
                 }))
             }
             // `waypoints` (`route_waypoints`) names only executable
@@ -3621,6 +3847,55 @@ fn reserve_next_leaf(
         }
     }
     Ok(())
+}
+
+/// Resolves the projection reference a reservation journals, under the
+/// commit guard.
+///
+/// Three outcomes, and no fourth: a Waypoint that declares no
+/// orientation gets `None` and does no Atlas work at all; a Waypoint
+/// whose prepared projection was assembled for exactly this Waypoint
+/// gets it, written durably first; and a Waypoint whose preparation was
+/// missing or was assembled for a different Waypoint gets an explicitly
+/// degraded projection, minted here without taking any lock. An
+/// orienting reservation therefore always carries a projection, and it
+/// is never one prepared for something else.
+fn reservation_evidence(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    def: &WaypointDefinition,
+    journaled_defs: &[WaypointDefinition],
+    prepared: Option<PreparedProjection>,
+) -> Result<Option<Box<wirk_core::EvidenceProjectionRef>>, (&'static str, String)> {
+    let Some(orient) = def.orient.as_ref() else {
+        return Ok(None);
+    };
+    let prepared = match prepared {
+        Some(prepared) if prepared.waypoint == def.id => prepared,
+        // The observation that happened is the one this receipt reports.
+        // A preparation made for another Waypoint still cost its laps and
+        // its wall-clock; no preparation at all cost neither, and saying
+        // "eight laps" there would be a fabricated, now integrity-covered
+        // provenance claim (ruling 0126, F1).
+        other => {
+            let span = other
+                .as_ref()
+                .map_or_else(ObservationSpan::none, |stale| ObservationSpan {
+                    laps: stale.file.receipt.laps,
+                    window_ms: stale.file.receipt.observation_window_ms,
+                });
+            degraded_projection(
+                def,
+                orient,
+                &route_edition_of(journaled_defs),
+                span,
+                DegradedCause::PreparationDiscarded,
+            )
+        }
+    };
+    prepared
+        .commit(state, work_id)
+        .map(|reference| Some(Box::new(reference)))
 }
 
 /// One Claim's recorded outcome: its minted id, its verb, the verdict
@@ -3749,6 +4024,30 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         .filter_map(|run_id| {
             let run = find_run(&events, &run_id)?;
             let binding = resolve_run_binding(&events, &state.estate_root, &work.id, &run_id);
+            // W-C3: the ordered chain of projection revisions this Run
+            // was delivered — the initial reservation's, then each one
+            // its own actor expanded. Identity only: a revision number,
+            // an observation, a content id and a format tag. No
+            // coordinate, no summary, no source alias; the delivered
+            // content is reachable only through `wirk world show` under
+            // this Run's own triple. Taken before `binding_status`
+            // consumes the binding.
+            let orientation: Vec<Value> = binding
+                .as_ref()
+                .ok()
+                .map(|binding| projection_chain(binding, &run))
+                .unwrap_or_default()
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "revision": entry.revision,
+                        "observation": entry.observation.0,
+                        "projection": entry.projection.0,
+                        "format": entry.format,
+                        "initial": entry.revision == 0,
+                    })
+                })
+                .collect();
             let (world, world_binding) = binding_status(binding);
             // P3 native launch selection (BUILD-BRIEF.md item 1): the
             // Route-authored default for this Run's own Waypoint —
@@ -3766,6 +4065,7 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
                 "world": world,
                 "world_binding": world_binding,
                 "selection": selection,
+                "orientation": orientation,
             }))
         })
         .collect();
@@ -3950,6 +4250,21 @@ fn withhold_status_content(result: &mut Value) -> usize {
         }
     }
 
+    /// For a list field: an empty list is not content, and marking it
+    /// withheld would tell a narrowed caller that something is being
+    /// kept from them when nothing is. The count this function feeds is
+    /// read as "how much was hidden", so it must not be inflated by
+    /// fields that were empty.
+    fn hide_if_present(parent: &mut Value, key: &str, withheld: &mut usize) {
+        if parent
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty())
+        {
+            hide(parent, key, withheld);
+        }
+    }
+
     hide(result, "world", &mut withheld);
     hide(result, "world_binding", &mut withheld);
     hide(result, "failure_detail", &mut withheld);
@@ -3966,7 +4281,16 @@ fn withhold_status_content(result: &mut Value) -> usize {
             hide(entry, "world", &mut withheld);
             hide(entry, "world_binding", &mut withheld);
             hide(entry, "selection", &mut withheld);
+            // W-C3: a narrowed reader learns *that* this Run's context
+            // has a history and that it is not being shown it, the same
+            // answer `world` already gives. The chain is hidden in both
+            // places it appears — the summary this handler builds, and
+            // the `Run`'s own folded tail — because withholding one and
+            // serializing the other would be a hidden field and a
+            // published copy of it.
+            hide_if_present(entry, "orientation", &mut withheld);
             if let Some(run) = entry.get_mut("run") {
+                hide_if_present(run, "expansions", &mut withheld);
                 hide(run, "selection", &mut withheld);
                 hide(run, "launch_argv", &mut withheld);
                 hide(run, "launch_attempt", &mut withheld);
@@ -4169,6 +4493,26 @@ fn handle_fail(state: &Arc<WirkdState>, payload: FailPayload) -> Reply {
 /// replay — this handler never sets `Work.state` itself, the journal
 /// is the only truth (D9#1).
 fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
+    // W-C1: a retried Waypoint that declares an `orient` block gets a
+    // freshly assembled projection — revision 0, its own observation,
+    // its own file. It is assembled here, with **no** journal guard
+    // held, and used inside only if the Waypoint being re-reserved is
+    // still the one it was assembled for; otherwise the retry proceeds
+    // with an explicitly degraded projection. A Waypoint with no
+    // `orient` block observes nothing and the whole retry path is
+    // unchanged.
+    let run_id = payload.triple.run_id.clone();
+    let prepared = prepared_for_waypoint(state, &payload.triple.work_id, move |events| {
+        find_run(events, &run_id).map(|run| run.waypoint)
+    });
+    handle_retry_inner(state, payload, prepared)
+}
+
+fn handle_retry_inner(
+    state: &Arc<WirkdState>,
+    payload: RetryPayload,
+    prepared: Option<PreparedProjection>,
+) -> Reply {
     let work_id = payload.triple.work_id.clone();
     let run_id = payload.triple.run_id.clone();
 
@@ -4281,6 +4625,20 @@ fn handle_retry(state: &Arc<WirkdState>, payload: RetryPayload) -> Reply {
                     estate_root: state.estate_root.display().to_string(),
                     work_id: work_id.clone(),
                     run_id: new_run_id.clone(),
+                },
+                // W-C1: a retry re-orients rather than inheriting. The
+                // prior Run's projection stays on its own historical
+                // World, on disk and readable; this Run gets its own
+                // file at its own observation, so "written once, never
+                // rewritten" holds across retries too.
+                evidence: match find_definition(&waypoint_defs, &run.waypoint) {
+                    Some(def) => {
+                        match reservation_evidence(state, &work_id, def, &waypoint_defs, prepared) {
+                            Ok(evidence) => evidence,
+                            Err((code, detail)) => return err_reply(code, &detail),
+                        }
+                    }
+                    None => None,
                 },
                 ..actor.clone()
             })
@@ -4551,6 +4909,27 @@ fn resolve_run_binding(
             match &actor.source_basis {
                 SourceBasis::Git { base } if base == &actor.base_sha => {}
                 SourceBasis::Unknown => {
+                    // W-C1 (BUILD.md §3.3): refuse the *journaled
+                    // combination* `Unknown` basis plus a stage
+                    // projection, evaluated **before** the legacy
+                    // upgrade below — not a blanket refusal of an
+                    // Unknown Actor basis, which would make every
+                    // pre-`source_basis` journal unreplayable. No legal
+                    // writer produces this pair (the one arm that mints
+                    // `Unknown` for an Actor refuses an orienting
+                    // Waypoint outright) and no legacy World carries a
+                    // projection, so this branch only ever stops a
+                    // hand-edited or corrupted journal replaying into a
+                    // launch. The positive control is the very next
+                    // statement: a legacy Unknown World with no evidence
+                    // still resolves exactly as it always has, with
+                    // `legacy_basis` set.
+                    if actor.evidence.is_some() {
+                        return Err(
+                            "Actor World carries a stage projection with no recorded source basis"
+                                .to_string(),
+                        );
+                    }
                     // The canonical Actor reservation/open writer resolves the
                     // submitted revision before writing and carries the exact
                     // triple. Preserve that old writer sequence as Git without
@@ -4985,6 +5364,7 @@ fn find_run(events: &[Event], run_id: &RunId) -> Option<Run> {
                 launch_requested: false,
                 launch_attempt: None,
                 launch_argv: Vec::new(),
+                expansions: Vec::new(),
             });
         }
         if let Some(run) = run.as_mut() {
@@ -5588,10 +5968,10 @@ fn reevaluate_parent_inner(
     state: &Arc<WirkdState>,
     parent: &ParentBinding,
 ) -> Result<(), JournalError> {
-    let Some(journal) = journal_for(state, &parent.work)? else {
+    let Some(journal_handle) = journal_for(state, &parent.work)? else {
         return Ok(());
     };
-    let mut journal = lock_journal(&journal);
+    let mut journal = lock_journal(&journal_handle);
     let events = journal.replay()?;
     if events.is_empty() || fold(&events).state.is_terminal() {
         return Ok(());
@@ -5623,17 +6003,43 @@ fn reevaluate_parent_inner(
     // just closed, reserve its next leaf here; otherwise the Work sits
     // `Active` on a closed container with no open Run and nothing to
     // claim or retry.
+    // W-C1: the same split the claim path draws. An orienting next leaf
+    // is reserved through `advance_to_next_leaf`, with this Work's
+    // journal guard **dropped** for the assembly and re-taken for the
+    // append; a next leaf that declares no orientation keeps the
+    // original in-guard reservation unchanged.
+    let mut orienting_advance: Option<WaypointId> = None;
     if let Some(container) = find_definition(&defs, &closed)
         && let Some(last_leaf) = flatten_leaves(std::slice::from_ref(container))
             .last()
             .cloned()
-        && let Err((code, message)) =
-            reserve_next_leaf(state, &parent.work, &mut journal, &defs, &last_leaf)
     {
-        eprintln!(
-            "wirkd: advancing {} past its closed container failed: {code} {message}",
-            parent.work.0
-        );
+        let orients = journal
+            .replay()
+            .ok()
+            .and_then(|events| next_leaf_after(&events, &last_leaf))
+            .and_then(|next| find_definition(&defs, &next))
+            .is_some_and(|def| def.orient.is_some());
+        if orients {
+            orienting_advance = Some(last_leaf);
+        } else if let Err((code, message)) =
+            reserve_next_leaf(state, &parent.work, &mut journal, &defs, &last_leaf, None)
+        {
+            eprintln!(
+                "wirkd: advancing {} past its closed container failed: {code} {message}",
+                parent.work.0
+            );
+        }
+    }
+    if let Some(last_leaf) = orienting_advance {
+        drop(journal);
+        if let Err((code, message)) = advance_to_next_leaf(state, &parent.work, &defs, &last_leaf) {
+            eprintln!(
+                "wirkd: advancing {} past its closed container failed: {code} {message}",
+                parent.work.0
+            );
+        }
+        journal = lock_journal(&journal_handle);
     }
     let events_now = journal.replay()?;
     let parent_work = fold(&events_now);
@@ -7448,6 +7854,7 @@ fn current_producing_action(events: &[Event]) -> Result<ProducingAction, Reply> 
             launch_requested: false,
             launch_argv: Vec::new(),
             launch_attempt: None,
+            expansions: Vec::new(),
         };
         for later in events {
             folded.apply(later);
@@ -9031,6 +9438,15 @@ fn event_source_disclosure(event: &Event, producing: &[RepositoryBinding]) -> So
         | EventKind::ContainerActivated { .. }
         | EventKind::StageHeld { .. }
         | EventKind::ChildWorkSpawned { .. }
+        // W-C3: a Waypoint id, an observation id, a content id, a format
+        // tag and two digests. No alias, no coordinate, no path, no
+        // checkout-derived content — the same answer `WaypointReserved`
+        // already gives for the *reference* half of its own World (its
+        // alias comes from `repository`, not from the projection it
+        // carries). The delivered content itself is reachable only
+        // through `world show` under the triple, which is a different
+        // surface with its own gate.
+        | EventKind::ProjectionExpanded { .. }
         | EventKind::FindingAsserted { .. } => {}
 
         // The two execution-output events (the independent launch
@@ -12839,11 +13255,15 @@ fn reconcile_findings_index(state: &Arc<WirkdState>) {
         scan.account(&wirk_atlas::unaccounted_finding_rows(held, &scan.rows));
     }
     let durability = directory_durability_of(&outcome);
+    // The other fact this critical section established, and the one the
+    // record used to take from a listing made after it: whether there
+    // was an index file here. `established_backing` has the argument.
+    let established = established_backing(&outcome);
     let projection = projection_of(&scan, outcome);
     // The window a verifier parks at to prove the two are one operation:
     // between the publication and the record, with the lock held.
     wirk_atlas::checkpoint("findings-index-published");
-    record_index_projection(state, observation, projection, durability);
+    record_index_projection(state, observation, projection, durability, established);
     drop(atlas);
 }
 
@@ -12858,16 +13278,101 @@ fn reconcile_findings_index(state: &Arc<WirkdState>) {
 /// never opened the directory. A failure before the rename is
 /// `Unestablished` for the same reason — it did not get that far.
 fn directory_durability_of(
-    outcome: &Result<usize, wirk_atlas::FindingIndexUnwritten>,
+    outcome: &Result<wirk_atlas::FindingIndexAppend, wirk_atlas::FindingIndexUnwritten>,
 ) -> DirectoryDurability {
     match outcome {
-        Ok(0) => DirectoryDurability::Unestablished,
+        Ok(append) if append.appended == 0 => DirectoryDurability::Unestablished,
         Ok(_) => DirectoryDurability::Confirmed,
         Err(unwritten) => match &unwritten.error {
             wirk_atlas::AtlasError::DurabilityUncertain(detail) => {
                 DirectoryDurability::Uncertain(detail.clone())
             }
             _ => DirectoryDurability::Unestablished,
+        },
+    }
+}
+
+/// What an `append_finding_rows` outcome establishes about the index
+/// **file**, as opposed to the directory entry behind it.
+///
+/// Ruling 0137's recorded half. `RecordedBacking` is what the
+/// observation behind a health record saw of the file, and a later read
+/// that finds no file compares its own open against it; the whole
+/// question is therefore *which* observation that was. It used to be a
+/// listing of `atlas/` taken inside `record_index_projection` — after
+/// this append had already returned, and after the checkpoint a verifier
+/// can park the sweep at. An external deletion in that window recorded
+/// `Absent` beside a `Synchronized` projection, and every later read of
+/// the now-missing file read absent-now against absent-then as "an
+/// estate that never wrote an index" and answered `complete: true` with
+/// no rows (`loop-c3-index-read-verify/VERDICT.md` §4, executed on a
+/// real daemon through this product's own barrier).
+///
+/// The append is the observation that actually looked. It opens the file
+/// before it appends, and a rewrite renames one into place before it
+/// returns, so `FindingIndexAppend::backing` is this critical section's
+/// own answer — not a claim about any later moment, and not an
+/// assumption that a listing taken afterwards is atomic with the write.
+///
+/// A **failed** append establishes nothing here on purpose — with the
+/// one exception the writer itself can prove. Its read may have found a
+/// file, but its projection is `Behind` on its own account either way,
+/// so no completeness claim rests on it, and `FindingIndexUnwritten`
+/// keeps the shape ruling 0130's evidence was taken against. `Unknown`
+/// is exactly right for it: not evidence in either direction.
+///
+/// The exception is `DurabilityUncertain`, which is raised only *after*
+/// the atomic rename (`backing_after_failed_index_write`, next to the
+/// rename it is a fact about): that call really did publish an index
+/// file, and a deletion in the window before the listing must not be
+/// allowed to record the estate as one that never wrote one. Nothing
+/// else is read out of a failure.
+fn established_backing(
+    outcome: &Result<wirk_atlas::FindingIndexAppend, wirk_atlas::FindingIndexUnwritten>,
+) -> RecordedBacking {
+    match outcome {
+        Ok(append) => recorded_from(append.backing),
+        Err(unwritten) => match wirk_atlas::backing_after_failed_index_write(&unwritten.error) {
+            Some(backing) => recorded_from(backing),
+            None => RecordedBacking::Unknown,
+        },
+    }
+}
+
+/// What a write's own observation of the index **file** is, said in the
+/// record's vocabulary. The one translation between the two types, so a
+/// second caller cannot spell it differently.
+fn recorded_from(backing: wirk_atlas::IndexBacking) -> RecordedBacking {
+    match backing {
+        wirk_atlas::IndexBacking::Present => RecordedBacking::Present,
+        wirk_atlas::IndexBacking::Absent => RecordedBacking::Absent,
+    }
+}
+
+/// The same fact for the **rebuild**, whose write is a whole-file
+/// replacement rather than an append.
+///
+/// `rebuild_finding_rows` renames a file into place before it can return
+/// `Ok`, whatever the walk held — an estate with no findings included —
+/// so a successful rebuild published an index file and says so. A
+/// failure says nothing, except the one that happens *after* that rename
+/// (`backing_after_failed_index_write`): rows visible, directory entry
+/// unconfirmed, and a file that is demonstrably there.
+///
+/// The three refusals earlier on this path do not come through here at
+/// all. They are decided before a byte is written — an unreadable
+/// standing index, a partial walk, a preservation that failed — and each
+/// passes `RecordedBacking::Unknown` explicitly, because a rebuild that
+/// refused neither read the file nor wrote one and its own projection is
+/// `Behind` on its own account.
+fn rebuild_established_backing(
+    outcome: &Result<wirk_atlas::IndexBacking, wirk_atlas::AtlasError>,
+) -> RecordedBacking {
+    match outcome {
+        Ok(backing) => recorded_from(*backing),
+        Err(error) => match wirk_atlas::backing_after_failed_index_write(error) {
+            Some(backing) => recorded_from(backing),
+            None => RecordedBacking::Unknown,
         },
     }
 }
@@ -12891,7 +13396,7 @@ fn next_index_observation(state: &Arc<WirkdState>) -> u64 {
 /// that ("unknown, not zero"), and not a number nobody measured.
 fn projection_of(
     scan: &CanonicalScan,
-    outcome: Result<usize, wirk_atlas::FindingIndexUnwritten>,
+    outcome: Result<wirk_atlas::FindingIndexAppend, wirk_atlas::FindingIndexUnwritten>,
 ) -> IndexProjection {
     if !scan.complete() {
         // Kept from the write path and extended to the read of the
@@ -13168,18 +13673,30 @@ fn apply_directory_durability(health: &mut IndexHealth, durability: DirectoryDur
 ///   nothing: it re-reads the standing field and carries it forward,
 ///   exactly as before, so a no-op sweep cannot resolve a window it
 ///   never touched (ruling 0130).
+///
+/// **And a third fact, on the same principle: the index file itself.**
+/// `established` is what this attempt's own critical section saw of the
+/// file — its append's read, or its own publication of one — and
+/// `RecordedBacking::Unknown` is a caller that established nothing and
+/// leaves the question to the listing, exactly as every caller did
+/// before. The listing below is still taken, still on the path that is
+/// already writing the directory, and still answers the preserved-copy
+/// question; what it is no longer allowed to do is contradict an
+/// observation this attempt actually made (`recorded_backing`).
 fn record_index_projection(
     state: &Arc<WirkdState>,
     observation: u64,
     projection: IndexProjection,
     durability: DirectoryDurability,
+    established: RecordedBacking,
 ) {
     let at = now_ts();
     // Read from the estate on every attempt rather than remembered in
     // this process, so it survives a restart and so an administrator who
     // retires the preserved bytes is believed by the very next
     // reconciliation without a second mechanism.
-    let preserved = preserved_unreadable_indexes(state);
+    let (preserved, listed) = atlas_listing(state);
+    let backing = recorded_backing(established, listed);
     let mut health = state
         .index_health
         .lock()
@@ -13220,6 +13737,9 @@ fn record_index_projection(
         health.projection = projection;
     }
     health.preserved = preserved;
+    // Belongs to the observation whose record was kept, exactly as
+    // `preserved` does — an attempt discarded above contributes neither.
+    health.index_backing = backing;
     health.last_attempt = Some(at);
     health.observation = std::cmp::max(health.observation, observation);
 }
@@ -13268,8 +13788,50 @@ fn qualified_by_unconfirmed_directory(
     }
 }
 
-/// The preserved copies this estate is currently holding, as the health
-/// record renders them.
+/// The one backing fact this observation records, from the two halves of
+/// it that looked at the file: what the attempt's own critical section
+/// established, and what the listing taken at the end of it saw.
+///
+/// They are two observations of the same file at two different moments,
+/// and the later one is not the more authoritative one. The listing runs
+/// after `append_finding_rows` has returned — the product's own
+/// `findings-index-published` checkpoint is that window — so an external
+/// deletion inside it makes the listing report `Absent` about a file the
+/// append had just read or just written. Recorded, that `Absent` is
+/// indistinguishable from the pre-publication estate, and a later read
+/// of the missing file answers `complete: true` with no rows while the
+/// journals still hold the row (ruling 0137, and the seam
+/// `loop-c3-index-read-verify/VERDICT.md` §4 executed).
+///
+/// So `Present` is the fact that decides it, from whichever half saw it:
+/// there *was* a file, and a read that later finds none cannot call its
+/// emptiness known. `Absent` is recorded only when nothing this attempt
+/// looked at held one — which is the estate that has never published a
+/// row, whose empty projection really is complete and must go on saying
+/// so. Anything else stays `Unknown`, the state that is evidence in
+/// neither direction: a listing that failed, or a caller (the
+/// `--rebuild` arms, whose behaviour is unchanged here) that established
+/// nothing of its own and leaves the answer to the listing.
+///
+/// Nothing is remembered between calls and nothing is latched: this is
+/// one attempt's two observations, resolved once, and the next
+/// reconciliation records its own.
+fn recorded_backing(established: RecordedBacking, listed: RecordedBacking) -> RecordedBacking {
+    match (established, listed) {
+        (RecordedBacking::Present, _) | (_, RecordedBacking::Present) => RecordedBacking::Present,
+        (RecordedBacking::Absent, RecordedBacking::Absent) => RecordedBacking::Absent,
+        // `established` is `Unknown` (nothing established, so the
+        // listing decides, including its own `Absent`), or the listing
+        // failed over an attempt that found no file — unknown either
+        // way, and never read as a known empty.
+        (RecordedBacking::Unknown, listed) => listed,
+        (RecordedBacking::Absent, RecordedBacking::Unknown) => RecordedBacking::Unknown,
+    }
+}
+
+/// What one listing of `atlas/` establishes for the health record: the
+/// preserved copies this estate is currently holding, and whether the
+/// standing index file was there when this observation looked.
 ///
 /// One directory listing of `atlas/`, taken on the reconciliation path
 /// that is already writing that directory — no new store, no registry,
@@ -13279,16 +13841,30 @@ fn qualified_by_unconfirmed_directory(
 /// error is carried as the finding it is rather than flattened to "none
 /// preserved" — and carried *as an error*, in its own field, rather than
 /// as an invented file name in the list of names.
-fn preserved_unreadable_indexes(state: &Arc<WirkdState>) -> PreservedIndexCopies {
-    match wirk_atlas::preserved_unreadable_indexes(&state.estate_root) {
-        Ok(names) => PreservedIndexCopies {
-            names,
-            unknown: None,
-        },
-        Err(error) => PreservedIndexCopies {
-            names: Vec::new(),
-            unknown: Some(error.to_string()),
-        },
+fn atlas_listing(state: &Arc<WirkdState>) -> (PreservedIndexCopies, RecordedBacking) {
+    match wirk_atlas::atlas_directory_listing(&state.estate_root) {
+        Ok(listing) => (
+            PreservedIndexCopies {
+                names: listing.preserved,
+                unknown: None,
+            },
+            if listing.index_present {
+                RecordedBacking::Present
+            } else {
+                RecordedBacking::Absent
+            },
+        ),
+        // The one listing answered neither question, so neither is
+        // claimed: the preserved half is carried as the error it is, and
+        // the backing half stays `Unknown` rather than being read as
+        // "there was no index file".
+        Err(error) => (
+            PreservedIndexCopies {
+                names: Vec::new(),
+                unknown: Some(error.to_string()),
+            },
+            RecordedBacking::Unknown,
+        ),
     }
 }
 
@@ -13318,20 +13894,27 @@ fn qualified_by_preserved(
     if !preserved.qualifies() {
         return projection;
     }
-    let note = preserved.note();
+    qualified_by(projection, &preserved.note())
+}
+
+/// A fact the walk could not see, applied to the walk's own finding
+/// rather than folded into it — the one shape every such qualification
+/// takes, held in one place so two of them cannot drift apart.
+///
+/// The count always goes to unknown, because that is what a fact from
+/// outside the walk leaves it at: a durability window reports `0` pending
+/// because every offered row is visible, and that says nothing about rows
+/// nobody could parse or about a file nobody could open.
+fn qualified_by(projection: IndexProjection, note: &str) -> IndexProjection {
     match projection {
-        // Nothing has checked *and* bytes are held: still unreconciled,
-        // which is already not complete, and saying `behind` would claim
-        // an observation this process has not made.
+        // Nothing has checked at all: already not complete, and saying
+        // `behind` would claim an observation this process has not made.
         IndexProjection::Unreconciled => IndexProjection::Unreconciled,
         IndexProjection::Synchronized => IndexProjection::Behind {
             pending: None,
-            detail: note,
+            detail: note.to_string(),
         },
-        // Both facts, and the more serious one decides the state. The
-        // count goes to unknown: a durability window is `0` pending
-        // because every offered row is visible, and that says nothing
-        // about rows nobody could parse.
+        // Both facts, and the more serious one decides the state.
         IndexProjection::DurabilityUnconfirmed { detail } => IndexProjection::Behind {
             pending: None,
             detail: format!("{note}; {detail}"),
@@ -13341,6 +13924,78 @@ fn qualified_by_preserved(
             detail: format!("{note}; {detail}"),
         },
     }
+}
+
+/// The sentence a read may say about its own backing file, and the one
+/// state that earns it.
+///
+/// It says "observed", and not "listed", because the record's
+/// `Present` has three sources and only one of them is a listing: the
+/// append's own read of the file, the rename a successful write or
+/// rebuild performed, and — when the attempt established nothing of its
+/// own — the listing of `atlas/` taken inside `record_index_projection`
+/// (`recorded_backing`). Naming a listing that may never have seen the
+/// file, and in the deletion window this note exists for typically did
+/// not, would put a fact in front of an administrator that this daemon
+/// never observed.
+const ABSENT_INDEX_NOTE: &str = "the standing findings index file was not there when these rows \
+     were read, and the reconciliation this health record came from observed one that was: what \
+     that file held is not established by this read, so the row list beside this health is not a \
+     complete projection of this estate's journals";
+
+/// Ruling 0137. **A read qualifies its own answer from the backing state
+/// it just observed**, and from nothing else.
+///
+/// `read` is what this call's own open of the index found; `recorded` is
+/// what the observation behind `health` saw of the same file. Exactly one
+/// pair is a finding: this read had no file to open, and the record it is
+/// about to be paired with was formed over one that was there. Then the
+/// rows are not a subset that was measured, they are the absence of a
+/// measurement, and `complete` may not describe them.
+///
+/// Every other pair is left alone, deliberately:
+///
+/// - **Absent now, absent then** is an estate that never wrote an index,
+///   whose empty projection of an empty estate really is complete
+///   (`a_legally_empty_estate_and_irrelevant_entries_are_a_complete_observation`).
+///   Reading absence as loss here would invent a lost row out of a
+///   healthy pre-publication estate.
+/// - **Absent now, unknown then** is a listing that failed. That already
+///   stops this estate certifying its projection, through
+///   `qualified_by_preserved`, and it is not evidence about the index
+///   file either way.
+/// - **Present now** is an ordinary read, whose rows are the file's.
+///
+/// What this does **not** do: re-scan a journal, write anything, mint or
+/// alter a canonical record, keep a store, or touch the recorded health
+/// this daemon holds. It qualifies the copy being rendered, from an
+/// observation this very read made, and the next real reconciliation —
+/// which recreates the file additively from the journals — clears it
+/// without anything here being latched.
+fn qualified_by_absent_index(
+    mut health: IndexHealth,
+    read: wirk_atlas::IndexBacking,
+) -> IndexHealth {
+    if read != wirk_atlas::IndexBacking::Absent || health.index_backing != RecordedBacking::Present
+    {
+        return health;
+    }
+    let projection = qualified_by(health.projection.clone(), ABSENT_INDEX_NOTE);
+    // `since` on the copy this read renders is **this read's own
+    // observation of the absence**, and not when the absence began.
+    // Nothing here is persisted, so each read re-derives it and three
+    // consecutive reads of the same missing file report three different
+    // values; an administrator cannot read how long the window has stood
+    // off it. That is the honest limit of a qualification made from one
+    // read, and the alternative — remembering when a read first saw the
+    // file gone — is the new store, latch and cross-read state ruling
+    // 0137 refused. The recorded `since` underneath is untouched and
+    // returns intact when the file does.
+    if projection != health.projection {
+        health.since = now_ts();
+        health.projection = projection;
+    }
+    health
 }
 
 /// Whether an older observation is allowed to land anyway, and it is
@@ -13806,6 +14461,7 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
                     detail: detail.clone(),
                 },
                 DirectoryDurability::Unestablished,
+                RecordedBacking::Unknown,
             );
             drop(atlas);
             return err_reply("IndexBasisUnreadable", &detail);
@@ -13845,6 +14501,7 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
                     detail: detail.clone(),
                 },
                 DirectoryDurability::Unestablished,
+                RecordedBacking::Unknown,
             );
             drop(atlas);
             return err_reply(
@@ -13878,6 +14535,7 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
                             detail: detail.clone(),
                         },
                         DirectoryDurability::Unestablished,
+                        RecordedBacking::Unknown,
                     );
                     drop(atlas);
                     return err_reply("AtlasError", &detail);
@@ -13885,6 +14543,11 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
             }
         }
         let outcome = atlas.rebuild_finding_rows(scan.rows);
+        // The index **file** this replacement established, taken from
+        // the replacement itself and not from the listing
+        // `record_index_projection` makes afterwards — ruling 0137's
+        // recorded half on this path (`rebuild_established_backing`).
+        let established = rebuild_established_backing(&outcome);
         // `--rebuild` writes exactly the full journal walk, so its
         // outcome *is* a reconciliation outcome and is recorded as one:
         // a rebuild that succeeds clears a `behind` window that the
@@ -13896,17 +14559,27 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
         // same hold as the replacement, for the same reason the sweep
         // records under its own.
         match outcome {
-            Ok(()) => {
+            Ok(_backing) => {
                 // A whole-file replacement that returned `Ok` ran
                 // `rewrite_rows` to its end, and its last act is a
                 // successful `fsync` of the atlas directory — which is
                 // why `--rebuild` is what the durability window's own
                 // recovery sentence tells an operator to run.
+                //
+                // It also renamed a file into place on the way there,
+                // and `backing` is that call's own answer about the
+                // index file (ruling 0137's recorded half, exactly as
+                // the sweep's append reports it). Recorded here rather
+                // than left to the listing `record_index_projection`
+                // takes afterwards: a deletion between this rename and
+                // that listing is a later observation of the same file,
+                // never evidence that the estate never wrote one.
                 record_index_projection(
                     state,
                     observation,
                     IndexProjection::Synchronized,
                     DirectoryDurability::Confirmed,
+                    established,
                 );
                 drop(atlas);
             }
@@ -13918,6 +14591,7 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
                         detail: detail.clone(),
                     },
                     DirectoryDurability::Uncertain(detail.clone()),
+                    established,
                 );
                 drop(atlas);
                 return err_reply(
@@ -13943,6 +14617,11 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
                     // The replacement failed before its rename, so the
                     // directory was never synced by this call.
                     DirectoryDurability::Unestablished,
+                    // And for the same reason it neither read an index
+                    // file nor wrote one, so it establishes nothing
+                    // about one: `established` is `Unknown` on every
+                    // failure but the post-rename window above.
+                    established,
                 );
                 drop(atlas);
                 return err_reply("AtlasError", &err.to_string());
@@ -13960,11 +14639,18 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
             .atlas
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let rows = match atlas.findings() {
-            Ok(rows) => rows,
+        let read = match atlas.read_findings() {
+            Ok(read) => read,
             Err(err) => return err_reply("AtlasError", &err.to_string()),
         };
-        (rows, index_health_snapshot(state))
+        // The health this reply renders is qualified by the backing
+        // state this very read observed, inside the same hold of the
+        // mutex that took the rows (ruling 0137). Nothing recorded is
+        // changed: `index_health` still holds this daemon's own last
+        // reconciliation outcome, and what is qualified is the copy that
+        // is about to be paired with these rows and called complete.
+        let health = qualified_by_absent_index(index_health_snapshot(state), read.backing);
+        (read.rows, health)
     };
     // The window a verifier parks at to prove the snapshot is one: after
     // the pair is captured and the lock released, before a single row is
@@ -14181,6 +14867,279 @@ fn finding_row_json_scoped(
 }
 
 #[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    fn orienting_def(id: &str) -> WaypointDefinition {
+        WaypointDefinition {
+            id: WaypointId(id.to_string()),
+            kind: WaypointKind::Actor,
+            declared_outputs: Vec::new(),
+            intent: Some("investigate reserve_next_leaf".to_string()),
+            command: None,
+            boundary: Boundary(Vec::new()),
+            leaves: Vec::new(),
+            required_child_outcomes: Vec::new(),
+            selection: None,
+            verifies: None,
+            orient: Some(wirk_core::OrientationRequest {
+                question: "which function reserves the next leaf?".to_string(),
+                sources: Vec::new(),
+                budget: wirk_core::PresentationBudget::default(),
+                semantic: None,
+            }),
+        }
+    }
+
+    /// Bounded Conflict is honest: when the estate moves under the
+    /// assembler on every lap, the reservation still proceeds and the
+    /// projection says so — an explicit `Degraded` coverage, no captured
+    /// vector, no bound evidence, and an assumption naming what happened.
+    /// It never claims the estate holds nothing.
+    #[test]
+    fn the_degraded_projection_claims_nothing_and_says_why() {
+        let def = orienting_def("r/leaf");
+        let orient = def.orient.clone().unwrap();
+        let prepared = degraded_projection(
+            &def,
+            &orient,
+            "edition-1",
+            ObservationSpan {
+                laps: 8,
+                window_ms: 137,
+            },
+            DegradedCause::PublicationChurn,
+        );
+        let content = prepared
+            .file
+            .content
+            .v2()
+            .expect("this wave writes v2 content");
+        assert!(matches!(
+            content.coverage,
+            wirk_core::EvidenceCoverage::Degraded {
+                reason: wirk_core::CoverageReason::ConcurrentPublication
+            }
+        ));
+        assert!(content.bound.is_empty());
+        assert!(content.generations.is_empty());
+        assert_eq!(content.question, orient.question);
+        assert_eq!(content.waypoint, def.id);
+        assert_eq!(prepared.file.receipt.laps, 8);
+        // The window the assembly actually spent, not a zero standing in
+        // for one: the first candidate reported 0ms for eight laps
+        // (ruling 0126, F1).
+        assert_eq!(prepared.file.receipt.observation_window_ms, 137);
+        assert!(
+            content.assumptions.iter().any(|statement| statement
+                .text
+                .contains("Nothing here is a statement that the estate holds nothing")),
+            "{:?}",
+            content.assumptions
+        );
+        // It is a real projection: its own id, over its own content.
+        assert_eq!(prepared.reference.projection, content.projection_id());
+    }
+
+    /// Ruling 0124, the rule this wave must not break: a failed re-check
+    /// never falls through to a stale reservation. A projection prepared
+    /// for one Waypoint is discarded — not attached — when the Waypoint
+    /// actually being reserved is a different one, and what is journaled
+    /// instead is an honest degraded projection for the right Waypoint.
+    #[test]
+    fn a_projection_prepared_for_another_waypoint_is_discarded_not_attached() {
+        let dir = tempfile::tempdir().expect("temp estate");
+        let state = Arc::new(WirkdState {
+            estate_root: dir.path().to_path_buf(),
+            journals: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
+            atlas: Mutex::new(
+                wirk_atlas::AtlasStore::open(dir.path(), dir.path().display().to_string())
+                    .expect("atlas"),
+            ),
+            continuation_key: [0u8; 32],
+            index_health: Mutex::new(IndexHealth::unreconciled()),
+            // Integration seam: the index-recovery wave gave `WirkdState`
+            // its own per-daemon observation ticket, and a state built
+            // here is a fresh daemon's. Zero is what `WirkdState::new`
+            // and the index suite's own `state_over` both start it at,
+            // and nothing in these two tests takes a ticket.
+            index_observations: AtomicU64::new(0),
+        });
+        let reserving = orienting_def("r/leaf-b");
+        let stale = degraded_projection(
+            &orienting_def("r/leaf-a"),
+            &orienting_def("r/leaf-a").orient.clone().unwrap(),
+            "edition-1",
+            ObservationSpan {
+                laps: 1,
+                window_ms: 42,
+            },
+            DegradedCause::PublicationChurn,
+        );
+        let stale_observation = stale.reference.observation.clone();
+        let work = WorkId("work-1".to_string());
+        let reference = reservation_evidence(&state, &work, &reserving, &[], Some(stale))
+            .expect("evidence resolves")
+            .expect("an orienting reservation always carries a projection");
+        assert_ne!(
+            reference.observation, stale_observation,
+            "the stale preparation must not be journaled"
+        );
+        let file = wirk_core::ProjectionFile::read_referenced(dir.path(), &work, &reference)
+            .expect("the journaled reference names a written file");
+        assert_eq!(
+            file.content.waypoint(),
+            &reserving.id,
+            "the journaled projection names the Waypoint actually being reserved"
+        );
+        assert!(matches!(
+            file.content.v2().expect("v2 content").coverage,
+            wirk_core::EvidenceCoverage::Degraded { .. }
+        ));
+        // And a Waypoint that declares no orientation gets nothing at
+        // all, from the same call.
+        let mut plain = orienting_def("r/leaf-c");
+        plain.orient = None;
+        assert!(
+            reservation_evidence(&state, &work, &plain, &[], None)
+                .expect("no evidence to resolve")
+                .is_none()
+        );
+    }
+
+    /// Ruling 0126, F1, at the reservation site: the receipt is now
+    /// integrity-covered, so a lap count or a window it reports is a
+    /// checkable claim about what happened rather than a decoration. A
+    /// preparation discarded for naming the wrong Waypoint really did
+    /// cost its laps and its wall-clock, and that is what the degraded
+    /// receipt reports; a reservation that reached the commit guard with
+    /// nothing prepared spent no observation lap at all, and says zero
+    /// rather than the loop's maximum.
+    #[test]
+    fn a_degraded_receipt_reports_the_observation_that_actually_happened() {
+        let dir = tempfile::tempdir().expect("temp estate");
+        let state = Arc::new(WirkdState {
+            estate_root: dir.path().to_path_buf(),
+            journals: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
+            atlas: Mutex::new(
+                wirk_atlas::AtlasStore::open(dir.path(), dir.path().display().to_string())
+                    .expect("atlas"),
+            ),
+            continuation_key: [0u8; 32],
+            index_health: Mutex::new(IndexHealth::unreconciled()),
+            // Integration seam: the index-recovery wave gave `WirkdState`
+            // its own per-daemon observation ticket, and a state built
+            // here is a fresh daemon's. Zero is what `WirkdState::new`
+            // and the index suite's own `state_over` both start it at,
+            // and nothing in these two tests takes a ticket.
+            index_observations: AtomicU64::new(0),
+        });
+        let work = WorkId("work-1".to_string());
+        let reserving = orienting_def("r/leaf-b");
+        let elsewhere = orienting_def("r/leaf-a");
+        let stale = degraded_projection(
+            &elsewhere,
+            &elsewhere.orient.clone().unwrap(),
+            "edition-1",
+            ObservationSpan {
+                laps: 5,
+                window_ms: 2_471,
+            },
+            DegradedCause::PublicationChurn,
+        );
+
+        let discarded = reservation_evidence(&state, &work, &reserving, &[], Some(stale))
+            .expect("evidence resolves")
+            .expect("an orienting reservation always carries a projection");
+        let file = wirk_core::ProjectionFile::read_referenced(dir.path(), &work, &discarded)
+            .expect("the journaled reference names a written file");
+        assert_eq!(file.receipt.laps, 5);
+        assert_eq!(
+            file.receipt.observation_window_ms, 2_471,
+            "the laps the discarded preparation really spent, not a zero"
+        );
+
+        let nothing = reservation_evidence(&state, &work, &reserving, &[], None)
+            .expect("evidence resolves")
+            .expect("an orienting reservation always carries a projection");
+        let file = wirk_core::ProjectionFile::read_referenced(dir.path(), &work, &nothing)
+            .expect("the journaled reference names a written file");
+        assert_eq!(
+            (file.receipt.laps, file.receipt.observation_window_ms),
+            (0, 0),
+            "no observation lap ran here, and the receipt must not claim one did"
+        );
+        assert!(
+            file.content
+                .v2()
+                .expect("v2 content")
+                .assumptions
+                .iter()
+                .any(|statement| statement
+                    .text
+                    .contains("is not the one any prepared assembly was made for")),
+            "the degraded projection must name the race it actually lost: {:?}",
+            file.content.v2().expect("v2 content").assumptions
+        );
+    }
+
+    /// The token grammar, stated as behaviour rather than as prose: a
+    /// path and an identifier are references; an ordinary word is not,
+    /// and is therefore neither looked up nor reported as an unknown
+    /// fact (ruling 0124).
+    #[test]
+    fn ordinary_prose_is_not_a_reference_and_paths_and_identifiers_are() {
+        let references = authored_references(&[
+            "Which function in wirk/src/wirkd/server.rs:12326 decides whether reserve_next_leaf              refuses a claim outside the declared boundary? See WorldHash::of and notes/plan.md.",
+        ]);
+        let paths: Vec<&str> = references
+            .iter()
+            .filter_map(|reference| match reference {
+                Reference::Path(path) => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        let identifiers: Vec<&str> = references
+            .iter()
+            .filter_map(|reference| match reference {
+                Reference::Identifier(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["wirk/src/wirkd/server.rs", "notes/plan.md"]);
+        assert_eq!(identifiers, vec!["reserve_next_leaf", "WorldHash"]);
+        for prose in [
+            "Which", "function", "decides", "whether", "refuses", "claim", "outside", "the",
+            "declared", "boundary", "See", "and", "of", "in", "a",
+        ] {
+            assert!(
+                !references.iter().any(|reference| reference.text() == prose),
+                "{prose:?} is ordinary prose, not a reference"
+            );
+        }
+    }
+
+    /// Delivery order is first-appearance order, deduplicated — the one
+    /// order that is not an invention, and part of the fingerprint.
+    #[test]
+    fn references_are_deduplicated_in_first_appearance_order() {
+        let references = authored_references(&[
+            "check reserve_next_leaf then src/a.rs then reserve_next_leaf again",
+            "and src/a.rs once more",
+        ]);
+        assert_eq!(
+            references,
+            vec![
+                Reference::Identifier("reserve_next_leaf".to_string()),
+                Reference::Path("src/a.rs".to_string()),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Stdio;
@@ -14261,6 +15220,7 @@ mod tests {
             next_index_observation(&state),
             IndexProjection::Synchronized,
             DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+            RecordedBacking::Unknown,
         );
         assert!(
             matches!(
@@ -14278,6 +15238,7 @@ mod tests {
                 next_index_observation(&state),
                 IndexProjection::Synchronized,
                 DirectoryDurability::Unestablished,
+                RecordedBacking::Unknown,
             );
             assert!(
                 matches!(
@@ -14307,12 +15268,14 @@ mod tests {
             next_index_observation(&state),
             IndexProjection::Synchronized,
             DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+            RecordedBacking::Unknown,
         );
         record_index_projection(
             &state,
             next_index_observation(&state),
             IndexProjection::Synchronized,
             DirectoryDurability::Confirmed,
+            RecordedBacking::Unknown,
         );
         assert_eq!(projection(&state), IndexProjection::Synchronized);
         assert!(state.index_health.lock().unwrap().complete());
@@ -14341,6 +15304,7 @@ mod tests {
             next_index_observation(&state),
             IndexProjection::Synchronized,
             DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+            RecordedBacking::Unknown,
         );
         let IndexProjection::Behind { detail, .. } = projection(&state) else {
             panic!("a held preserved copy is `behind` whatever else is true");
@@ -14363,6 +15327,7 @@ mod tests {
             next_index_observation(&state),
             IndexProjection::Synchronized,
             DirectoryDurability::Unestablished,
+            RecordedBacking::Unknown,
         );
         assert!(
             matches!(
@@ -14413,6 +15378,7 @@ mod tests {
             b,
             IndexProjection::Synchronized,
             DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+            RecordedBacking::Unknown,
         );
         // A's sweep finds nothing to append, so it writes nothing and
         // establishes nothing.
@@ -14421,6 +15387,7 @@ mod tests {
             a,
             IndexProjection::Synchronized,
             DirectoryDurability::Unestablished,
+            RecordedBacking::Unknown,
         );
 
         assert!(
@@ -14455,6 +15422,7 @@ mod tests {
             b,
             IndexProjection::Synchronized,
             DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+            RecordedBacking::Unknown,
         );
         assert!(
             matches!(
@@ -14473,10 +15441,179 @@ mod tests {
             a,
             IndexProjection::Synchronized,
             DirectoryDurability::Unestablished,
+            RecordedBacking::Unknown,
         );
 
         assert_eq!(projection(&state), IndexProjection::Synchronized);
         assert!(state.index_health.lock().unwrap().complete());
+    }
+
+    /// The two observations of the index file one attempt makes, and the
+    /// one rule that resolves them (ruling 0137's recorded half).
+    #[test]
+    fn a_listing_taken_after_the_publication_cannot_unsay_what_the_append_saw() {
+        use RecordedBacking::{Absent, Present, Unknown};
+        // The seam: this attempt's own append read or wrote the file,
+        // and the listing a moment later did not see it. There was a
+        // file, and a read that later finds none may not call its
+        // emptiness known.
+        assert_eq!(recorded_backing(Present, Absent), Present);
+        assert_eq!(recorded_backing(Present, Unknown), Present);
+        assert_eq!(recorded_backing(Present, Present), Present);
+        // A file that appeared after an attempt that found none is still
+        // a file whose contents no later read establishes.
+        assert_eq!(recorded_backing(Absent, Present), Present);
+        // The one pair that is a known empty: nothing this attempt
+        // looked at held an index. The pre-publication estate, whose
+        // empty projection really is complete.
+        assert_eq!(recorded_backing(Absent, Absent), Absent);
+        // Evidence in neither direction.
+        assert_eq!(recorded_backing(Absent, Unknown), Unknown);
+        assert_eq!(recorded_backing(Unknown, Unknown), Unknown);
+        // A caller that established nothing of its own leaves the
+        // listing to decide — every caller's behaviour before this
+        // repair, and the `--rebuild` arms' behaviour after it.
+        assert_eq!(recorded_backing(Unknown, Absent), Absent);
+        assert_eq!(recorded_backing(Unknown, Present), Present);
+    }
+
+    /// Which outcomes of a write establish an index **file**, on both
+    /// write paths, including the failure that happens after the rename.
+    ///
+    /// The seam this closes on the rebuild path is the same one the
+    /// append closed: an `Ok` rebuild renamed a file into place, so a
+    /// listing taken afterwards that misses it is a later observation,
+    /// not evidence that the estate never wrote an index.
+    #[test]
+    fn a_write_that_renamed_a_file_establishes_one_even_when_it_then_failed() {
+        use wirk_atlas::IndexBacking;
+        // A rebuild is an unconditional replacement: it publishes a file
+        // whether the walk held rows or none at all.
+        assert_eq!(
+            rebuild_established_backing(&Ok(IndexBacking::Present)),
+            RecordedBacking::Present
+        );
+        // Raised only after the atomic rename: the rows are visible, so
+        // there is a file, and only the directory entry is in question.
+        assert_eq!(
+            rebuild_established_backing(&Err(wirk_atlas::AtlasError::DurabilityUncertain(
+                "findings index (1 rows) is visible; directory sync failed".into()
+            ))),
+            RecordedBacking::Present
+        );
+        // Every other failure returns before the rename: nothing read,
+        // nothing written, nothing established.
+        assert_eq!(
+            rebuild_established_backing(&Err(wirk_atlas::AtlasError::Catalog(
+                "no space left on device".into()
+            ))),
+            RecordedBacking::Unknown
+        );
+
+        // The append's own outcomes, unchanged but for the same
+        // post-rename window.
+        assert_eq!(
+            established_backing(&Ok(wirk_atlas::FindingIndexAppend {
+                appended: 0,
+                backing: IndexBacking::Absent,
+            })),
+            RecordedBacking::Absent,
+            "a sweep that read no file and wrote none is the pre-publication estate"
+        );
+        assert_eq!(
+            established_backing(&Ok(wirk_atlas::FindingIndexAppend {
+                appended: 2,
+                backing: IndexBacking::Present,
+            })),
+            RecordedBacking::Present
+        );
+        assert_eq!(
+            established_backing(&Err(wirk_atlas::FindingIndexUnwritten {
+                pending: Some(0),
+                error: wirk_atlas::AtlasError::DurabilityUncertain(
+                    "findings index (2 rows) is visible; directory sync failed".into()
+                ),
+            })),
+            RecordedBacking::Present,
+            "the append's post-rename failure published a file too"
+        );
+        assert_eq!(
+            established_backing(&Err(wirk_atlas::FindingIndexUnwritten {
+                pending: Some(2),
+                error: wirk_atlas::AtlasError::Catalog("no space left on device".into()),
+            })),
+            RecordedBacking::Unknown
+        );
+    }
+
+    /// The record and the read, joined: an attempt that established a
+    /// file records one even though the listing at the end of it found
+    /// none, and the next read of the missing file is therefore
+    /// qualified instead of certified.
+    #[test]
+    fn an_attempt_that_established_a_file_records_one_and_a_later_read_is_qualified() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_over(&dir.path().join("estate"));
+        // The estate's atlas directory is listable and holds no index
+        // file, which is exactly the listing the seam produces.
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Confirmed,
+            RecordedBacking::Present,
+        );
+        let health = state
+            .index_health
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        assert_eq!(
+            health.index_backing,
+            RecordedBacking::Present,
+            "the observation this attempt actually made is the one recorded"
+        );
+        assert!(
+            health.complete(),
+            "and the projection it recorded is its own: {:?}",
+            health.projection
+        );
+
+        let qualified = qualified_by_absent_index(health.clone(), wirk_atlas::IndexBacking::Absent);
+        assert!(
+            !qualified.complete(),
+            "a read with no file to open cannot inherit it: {:?}",
+            qualified.projection
+        );
+        assert!(
+            state
+                .index_health
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .complete(),
+            "and the read changed nothing in the record it rendered"
+        );
+
+        // The same record, made by an attempt that established no file:
+        // the estate that never wrote one, still complete.
+        let state = state_over(&dir.path().join("empty-estate"));
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Unestablished,
+            RecordedBacking::Absent,
+        );
+        let health = state
+            .index_health
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        assert_eq!(health.index_backing, RecordedBacking::Absent);
+        assert!(
+            qualified_by_absent_index(health, wirk_atlas::IndexBacking::Absent).complete(),
+            "reading absence as loss here would invent a lost row"
+        );
     }
 
     /// A failing retirement does not wait for its sweep to say so. The
@@ -14494,6 +15631,7 @@ mod tests {
             next_index_observation(&state),
             IndexProjection::Synchronized,
             DirectoryDurability::Confirmed,
+            RecordedBacking::Unknown,
         );
         assert_eq!(projection(&state), IndexProjection::Synchronized);
 
@@ -14514,6 +15652,7 @@ mod tests {
             next_index_observation(&state),
             IndexProjection::Synchronized,
             DirectoryDurability::Unestablished,
+            RecordedBacking::Unknown,
         );
         assert!(
             matches!(
@@ -14544,6 +15683,7 @@ mod tests {
                     detail: "one journal could not be read".to_string(),
                 },
                 uncertain(),
+                RecordedBacking::Unknown,
             );
             let IndexProjection::Behind { detail, .. } = projection(&state) else {
                 panic!("an unreadable journal is `behind`");
@@ -15056,4 +16196,2998 @@ mod tests {
             "materialization is not a launch outcome"
         );
     }
+}
+
+// ---- W-C1: stage projection assembly --------------------------------------
+//
+// One entry point (`prepare_projection`), one observe/assemble/re-check
+// wrapper (`prepared_for_reservation`), and the four reservation sites
+// that call it. Everything here obeys three rules, each of them a
+// ruling rather than a preference:
+//
+// * **No journal guard is held while a projection is assembled**
+//   (0119, and 0124's restatement). Assembly reads the Atlas and the
+//   filesystem; the reserving append happens afterwards, under the
+//   guard, and re-derives its own authority there.
+// * **A failed re-check never becomes a stale reservation** (0124). A
+//   prepared projection is used only if the Waypoint it was assembled
+//   for is still the Waypoint being reserved; otherwise the reservation
+//   proceeds with an explicitly degraded projection that claims nothing.
+// * **Reservation is never an availability risk** (BUILD.md §4.6). The
+//   estate publishing under the assembler costs laps, then honesty —
+//   never a refused stage.
+
+/// How many unresolved references one assembly *lists* before reporting
+/// a count instead.
+///
+/// This is the only cut left in the assembler, and it is a presentation
+/// cut in the strict sense ruling 0124 requires: every authored
+/// reference is resolved whatever this number is, an unresolved
+/// reference already forces `Partial` before any of them is rendered, and
+/// what this hides is reported as an `Omission::OverBudget` with the real
+/// total. Moving it changes what is shown and cannot change the coverage
+/// state — pinned by
+/// `the_unknown_presentation_cut_never_moves_factual_coverage`.
+///
+/// Its predecessor `ASSEMBLY_TOKEN_MAX = 64` was not that: it cut the
+/// reference list *before* resolution, which made a budget decide
+/// factual coverage. Removed (ruling 0126, F2).
+const ASSEMBLY_UNKNOWN_MAX: usize = 32;
+/// How many resources one authored reference may bind. A path token
+/// naming a file present in three admitted sources genuinely resolves
+/// three times; an identifier occurring in a hundred does not make a
+/// hundred of them the reference.
+const ASSEMBLY_HITS_PER_REFERENCE: usize = 3;
+/// How many ranked candidates an identifier reference examines before
+/// giving up on finding a literal occurrence.
+const ASSEMBLY_CANDIDATES_PER_REFERENCE: usize = 12;
+/// The bounded read behind a resolved path, and the bounded summary
+/// carried in the projection. Neither is a coverage fact.
+const ASSEMBLY_LOOKUP_BYTES: u64 = 65_536;
+const ASSEMBLY_SUMMARY_BYTES: usize = 320;
+
+/// A projection assembled outside the journal guard, together with the
+/// Waypoint it was assembled for and the Atlas publication revision it
+/// captured. Both are re-checked before it is used.
+struct PreparedProjection {
+    waypoint: WaypointId,
+    file: wirk_core::ProjectionFile,
+    reference: wirk_core::EvidenceProjectionRef,
+    publication_revision: u64,
+}
+
+impl PreparedProjection {
+    /// Writes the file durably and hands back the reference to journal.
+    /// The file is fsynced and renamed **before** the referencing event
+    /// exists, so a reference never names a file that was not durable
+    /// first (BUILD.md §5.1).
+    fn commit(
+        &self,
+        state: &Arc<WirkdState>,
+        work_id: &WorkId,
+    ) -> Result<wirk_core::EvidenceProjectionRef, (&'static str, String)> {
+        match self.file.write_new(&state.estate_root, work_id) {
+            Ok(_) => Ok(self.reference.clone()),
+            // The rename made it visible; only the directory sync after
+            // it failed. The file is there and re-hashes; reporting this
+            // as "never wrote" would be false.
+            Err(wirk_core::ProjectionWriteError::DurabilityUncertain(_, detail)) => {
+                eprintln!("wirkd: {detail}");
+                Ok(self.reference.clone())
+            }
+            Err(error) => Err(("ProjectionUnwritable", error.to_string())),
+        }
+    }
+}
+
+/// sha256 over the journaled Waypoint definitions this Work reserves
+/// against: which Route edition produced a projection, carried as
+/// content so a reader never has to join against the journal to learn it.
+fn route_edition_of(defs: &[WaypointDefinition]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"wirk.route-edition/v1\0");
+    hasher.update(serde_json::to_vec(defs).unwrap_or_default());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The projection a reservation falls back to when the estate moved
+/// under the assembler often enough that it stopped re-observing, or
+/// when a prepared projection turns out to have been assembled for a
+/// Waypoint that is no longer the one being reserved.
+///
+/// Pure: it takes no lock of any kind, which is exactly why it is
+/// always available under the commit guard. It claims nothing — no
+/// generations, no bound evidence, an explicit `Degraded` coverage and
+/// an assumption naming what happened. The stage runs and the actor is
+/// told the assembler lost the race, which is the honest outcome; a
+/// stale or invented projection would not be.
+fn degraded_projection(
+    def: &WaypointDefinition,
+    orient: &wirk_core::OrientationRequest,
+    route_edition: &str,
+    span: ObservationSpan,
+    cause: DegradedCause,
+) -> PreparedProjection {
+    let content = wirk_core::ProjectionContent {
+        format: wirk_core::PROJECTION_FORMAT.to_string(),
+        compilation_policy: wirk_core::ASSEMBLY_POLICY.to_string(),
+        route_edition: route_edition.to_string(),
+        waypoint: def.id.clone(),
+        revision: 0,
+        question: orient.question.clone(),
+        generations: Vec::new(),
+        publication_revision: 0,
+        // No query ran, and the note says exactly that rather than
+        // presenting a lexical default that never happened.
+        retrieval: wirk_core::RetrievalNote {
+            mode: "none".to_string(),
+            semantic: "disabled".to_string(),
+            semantic_reason: Some(
+                "no ranked query ran: this assembly took no source snapshot to rank over"
+                    .to_string(),
+            ),
+            editions: Vec::new(),
+            degraded: vec!["no_snapshot".to_string()],
+            total_candidates: 0,
+            returned: 0,
+        },
+        bound: Vec::new(),
+        referenced: Vec::new(),
+        reachable: Vec::new(),
+        assumptions: vec![wirk_core::Statement {
+            text: cause.text().to_string(),
+            attributed_to: wirk_core::StatementOrigin::Assembly,
+        }],
+        unknowns: Vec::new(),
+        omitted: Vec::new(),
+        next_action: next_action_for(
+            wirk_core::EvidenceCoverage::Degraded {
+                reason: wirk_core::CoverageReason::ConcurrentPublication,
+            },
+            true,
+        ),
+        coverage: wirk_core::EvidenceCoverage::Degraded {
+            reason: wirk_core::CoverageReason::ConcurrentPublication,
+        },
+        truncated: false,
+        // A degraded projection is an initial delivery that bound
+        // nothing; it expands nothing.
+        expansion: None,
+    };
+    finish_projection(content, span)
+}
+
+/// What the assembler actually observed, carried to the receipt. Two
+/// numbers that always travel together, and neither is ever a constant
+/// standing in for a measurement: the first candidate's degraded receipt
+/// reported `observation_window_ms: 0` for an assembly that really spent
+/// eight observation laps, and the receipt is now integrity-covered, so
+/// a fabricated span would be a signed falsehood rather than a slip
+/// (ruling 0126, F1).
+#[derive(Debug, Clone, Copy)]
+struct ObservationSpan {
+    laps: u32,
+    window_ms: u64,
+}
+
+impl ObservationSpan {
+    /// The span an observation loop actually spent, from the instant it
+    /// began to now.
+    fn measured(laps: u32, started: std::time::Instant) -> Self {
+        Self {
+            laps,
+            window_ms: started.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// No observation lap ran at all. Used only where that is the
+    /// literal truth: a reservation site that reaches the commit guard
+    /// with no preparation to use.
+    fn none() -> Self {
+        Self {
+            laps: 0,
+            window_ms: 0,
+        }
+    }
+}
+
+/// Why a degraded projection is being minted. Both are races and both
+/// bind nothing; they are not the same event, and a receipt that now
+/// carries a checked lap count must not describe one as the other.
+#[derive(Debug, Clone, Copy)]
+enum DegradedCause {
+    /// Every observation lap lost to a publish under the assembler.
+    PublicationChurn,
+    /// The reservation reached the commit guard with no projection
+    /// prepared for the Waypoint it is actually reserving — either none
+    /// was prepared, or the one prepared was assembled for a different
+    /// Waypoint and was discarded (ruling 0124).
+    PreparationDiscarded,
+}
+
+impl DegradedCause {
+    fn text(self) -> &'static str {
+        match self {
+            Self::PublicationChurn => {
+                "no source snapshot was taken: the estate's published sources changed under this \
+                 assembly on every observation attempt, so this projection reports no generation \
+                 vector and binds no evidence. Nothing here is a statement that the estate holds \
+                 nothing."
+            }
+            Self::PreparationDiscarded => {
+                "no source snapshot was taken: the Waypoint being reserved under the commit guard \
+                 is not the one any prepared assembly was made for, so nothing prepared was \
+                 attached and this projection reports no generation vector and binds no evidence. \
+                 Nothing here is a statement that the estate holds nothing."
+            }
+        }
+    }
+}
+
+/// Mints the observation, builds the receipt from the **measured** span,
+/// and derives the journal reference from both — the receipt first, so
+/// its digest is taken over the bytes that are actually written rather
+/// than over a value assembled twice.
+fn finish_projection(
+    content: wirk_core::ProjectionContent,
+    span: ObservationSpan,
+) -> PreparedProjection {
+    let observation = wirk_core::ObservationId(mint_id("obs"));
+    let receipt = wirk_core::ObservationReceipt {
+        observation: observation.clone(),
+        observed_at: now_ts().0.max(0) as u64,
+        observation_window_ms: span.window_ms,
+        laps: span.laps,
+    };
+    let reference = wirk_core::EvidenceProjectionRef {
+        observation,
+        projection: content.projection_id(),
+        revision: content.revision,
+        format: content.format.clone(),
+        receipt: receipt.digest(),
+    };
+    let waypoint = content.waypoint.clone();
+    let publication_revision = content.publication_revision;
+    PreparedProjection {
+        waypoint,
+        publication_revision,
+        file: wirk_core::ProjectionFile {
+            content: wirk_core::DeliveredContent::V2(Box::new(content)),
+            receipt,
+        },
+        reference,
+    }
+}
+
+/// One authored reference, classified by its own shape.
+///
+/// The grammar is deliberately narrow and deliberately *not* a
+/// judgement: a token that looks like a path or an identifier is looked
+/// up, and an ordinary prose word is neither looked up nor reported as
+/// an unknown fact (ruling 0124: "ordinary prose words are not
+/// automatically unknown facts"). An unresolved *reference* is an
+/// unknown; the word "boundary" in a sentence is not.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Reference {
+    Path(String),
+    Identifier(String),
+}
+
+impl Reference {
+    fn text(&self) -> &str {
+        match self {
+            Reference::Path(text) | Reference::Identifier(text) => text,
+        }
+    }
+}
+
+/// What an unresolved reference actually establishes — which is not the
+/// same observation for the two reference kinds, and ruling 0127 rejects
+/// saying it is.
+///
+/// A **path** is resolved by exact lookup: `resolve_path_reference` walks
+/// every admitted source's own captured generation manifest and compares
+/// the recorded path bytes. Nothing is ranked, nothing is sampled, and
+/// nothing is examined-up-to-a-limit, so "no admitted source records this
+/// path at the captured generations" is a complete statement about the
+/// captured manifests, and the projection may make it.
+///
+/// An **identifier** is resolved by ranked candidate discovery over the
+/// lexical index, then a literal byte check on the candidates that come
+/// back. That establishes exactly one thing: no candidate this assembly
+/// examined contained the name literally. It does **not** establish that
+/// the bytes do not occur in the admitted sources, and the executed case
+/// is why the distinction is written into the product rather than into a
+/// comment: `embedded_marker` inside the indexed token
+/// `wrapper_embedded_marker_tail` returns zero candidates
+/// (`loop-c1-reverify/raw/15`, `raw/16` — `total_candidates: 0` beside a
+/// `grep` proving the bytes are there), because the index tokenizes on
+/// non-alphanumerics and `_`, so a name embedded in a longer token is
+/// never its own term. The first wording called that "resolves to
+/// nothing in the admitted sources", which reads as byte absence the
+/// assembler never checked.
+fn unresolved_statement(reference: &Reference) -> String {
+    match reference {
+        Reference::Path(path) => format!(
+            "the authored text names the path `{path}`, which no admitted source records at the \
+             captured generations: every admitted source's own captured generation was examined \
+             and none carries this path. Whether it exists elsewhere, is misspelled, or was never \
+             there is not decided here."
+        ),
+        Reference::Identifier(name) => format!(
+            "the authored text names the identifier `{name}`, which was not found among the \
+             indexed candidates this assembly examined at the captured generations. That is what \
+             bounded, ranked candidate discovery returned; it is not a statement that these bytes \
+             are absent from the admitted sources, because a name that occurs only inside a \
+             longer indexed token is never itself a candidate. Whether it exists elsewhere, is \
+             misspelled, or was never there is not decided here."
+        ),
+    }
+}
+
+/// Splits authored text into candidate tokens and keeps the ones whose
+/// own shape makes them a reference.
+///
+/// Deduplicated, and returned in **first-appearance order**: delivery
+/// order is part of the projection's fingerprint, and the order an
+/// author wrote their references in is the one order that is not an
+/// invention.
+fn authored_references(texts: &[&str]) -> Vec<Reference> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for text in texts {
+        for raw in text.split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '(' | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | '"'
+                        | '\''
+                        | '`'
+                        | ','
+                        | ';'
+                        | '|'
+                )
+        }) {
+            for token in split_qualified(raw) {
+                let Some(reference) = classify_reference(&token) else {
+                    continue;
+                };
+                if seen.insert(reference.clone()) {
+                    out.push(reference);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `WorldHash::of` names two references, not one: a Rust path is a
+/// qualified name whose segments are each resolvable, and treating the
+/// whole string as one identifier would resolve neither.
+fn split_qualified(raw: &str) -> Vec<String> {
+    let trimmed = raw
+        .trim_matches(|c: char| matches!(c, '.' | ',' | ':' | ';' | '!' | '?' | '*' | '#' | '-'));
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed.contains("::") {
+        return trimmed
+            .split("::")
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    vec![trimmed.to_string()]
+}
+
+fn classify_reference(token: &str) -> Option<Reference> {
+    if token.len() < 3 || token.len() > 200 {
+        return None;
+    }
+    // `server.rs:12326` — a path with a line citation. The citation is
+    // presentation; the path is the reference.
+    let head = token.split(':').next().unwrap_or(token);
+    if head.contains('/') && head.bytes().all(is_path_byte) {
+        return Some(Reference::Path(head.trim_start_matches('/').to_string()));
+    }
+    if head.bytes().all(is_path_byte)
+        && let Some((stem, extension)) = head.rsplit_once('.')
+        && !stem.is_empty()
+        && (1..=6).contains(&extension.len())
+        && extension.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return Some(Reference::Path(head.to_string()));
+    }
+    // An identifier: a Rust/C-shaped name that an author would not have
+    // written by accident. `_` or an internal capital is what separates
+    // `reserve_next_leaf` and `WorldHash` from `the` and `boundary`.
+    let identifier = token;
+    let mut bytes = identifier.bytes();
+    let first = bytes.next()?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    if !identifier
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    let has_underscore = identifier.contains('_');
+    let has_internal_capital = identifier.bytes().skip(1).any(|b| b.is_ascii_uppercase());
+    (has_underscore || has_internal_capital).then(|| Reference::Identifier(identifier.to_string()))
+}
+
+fn is_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+}
+
+fn bounded_summary(bytes: &[u8]) -> String {
+    let mut cap = ASSEMBLY_SUMMARY_BYTES.min(bytes.len());
+    while cap > 0 && std::str::from_utf8(&bytes[..cap]).is_err() {
+        cap -= 1;
+    }
+    String::from_utf8_lossy(&bytes[..cap]).replace(['\n', '\r'], " ")
+}
+
+/// Assembles one stage projection: BUILD.md §4.3 steps 1-3, and no
+/// others.
+///
+/// Step 1, **admit**: the scope is `QueryScope::Work` over the Work's own
+/// journaled bindings, never a client-supplied grant set. `orient.sources`
+/// is *intersected* with those bindings; an alias the Work never bound is
+/// a count-only `Omission::Inadmissible` and no lookup at all — the
+/// projection never states whether such a source exists.
+///
+/// Step 2, **capture**: one Atlas window takes the admitted memberships,
+/// each one's currently published generation and the store's publication
+/// revision. Every later read in this assembly pins to that vector, so
+/// every coordinate the projection reports resolves at the generation the
+/// projection names it at. The Atlas guard is held across the read phase
+/// and no journal guard is held anywhere in it; nothing called here takes
+/// the Atlas lock again, so the non-reentrant `Mutex` is never re-entered
+/// (the reentrancy BUILD.md §4.2 warns about arrives with the
+/// consulted-findings step, which this wave does not implement).
+///
+/// Step 3, **resolve literal references**: path-shaped and
+/// identifier-shaped tokens out of the authored question and the
+/// Waypoint's own intent, each resolved through pinned exact path lookup
+/// and pinned exact search whose hits are verified to contain the token
+/// literally. A reference that resolves nowhere becomes an `unknowns`
+/// entry attributed to `Intent`. **This is the whole premise mechanism.**
+/// The assembler reports what it could not find. It never concludes the
+/// premise is false, never scores the intent and emits no judgement.
+fn prepare_projection(
+    state: &Arc<WirkdState>,
+    events: &[Event],
+    bindings: &[RepositoryBinding],
+    def: &WaypointDefinition,
+    route_edition: &str,
+    laps: u32,
+    started: std::time::Instant,
+) -> Option<PreparedProjection> {
+    let orient = def.orient.as_ref()?;
+    no_journal_guard_held("stage projection assembly");
+
+    let mut bound: Vec<wirk_core::EvidenceItem> = Vec::new();
+    let mut unknowns: Vec<wirk_core::Statement> = Vec::new();
+    let mut omitted: Vec<wirk_core::Omission> = Vec::new();
+    let mut assumptions: Vec<wirk_core::Statement> = Vec::new();
+
+    // Step 1: admission, before any content or metadata.
+    let scope = wirk_atlas::QueryScope::Work(bindings.to_vec());
+    let bound_aliases: HashSet<&str> = bindings
+        .iter()
+        .map(|binding| binding.name.as_str())
+        .collect();
+    // One count for everything this requester may not see: an alias the
+    // Work never bound, and a governance edge whose far side or evidence
+    // lies outside admission. A count, never a coordinate, an alias or an
+    // id — a caller learns "there is something here you may not see"
+    // without learning what (the shape `AdmissionSummary` and
+    // `DisclosureView::withheld` already use). Pushed once, at the end,
+    // so one projection carries one such fact.
+    let mut inadmissible = orient
+        .sources
+        .iter()
+        .filter(|alias| !bound_aliases.contains(alias.as_str()))
+        .count();
+
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    // Step 2: one captured vector, one publication revision.
+    let publication_revision = atlas.publication_revision();
+    let mut admitted: Vec<(wirk_atlas::Membership, wirk_atlas::SourceGeneration)> = Vec::new();
+    let mut memberships: Vec<wirk_atlas::Membership> = atlas
+        .memberships()
+        .filter(|member| bound_aliases.contains(member.alias.as_str()))
+        .filter(|member| orient.sources.is_empty() || orient.sources.contains(&member.alias))
+        .cloned()
+        .collect();
+    // Delivery order that is not an invention: membership id, which is
+    // stable across restarts and independent of catalog iteration.
+    memberships.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+    for membership in memberships {
+        match atlas.current(&membership) {
+            Ok(Some(generation)) => admitted.push((membership, generation)),
+            Ok(None) | Err(_) => {
+                omitted.push(wirk_core::Omission::Unavailable {
+                    coordinate: membership.alias.clone(),
+                    reason: wirk_core::UnavailableReason::GenerationUnavailable,
+                });
+            }
+        }
+    }
+    let pinned: BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId> = admitted
+        .iter()
+        .map(|(membership, generation)| (membership.id.clone(), generation.id.clone()))
+        .collect();
+    let generations: Vec<(String, String)> = admitted
+        .iter()
+        .map(|(membership, generation)| (membership.id.0.clone(), generation.id.0.clone()))
+        .collect();
+
+    // Step 3: literal references, resolved at the captured generations.
+    let intent = def.intent.clone().unwrap_or_default();
+    // Every authored reference, resolved. The set is bounded by the
+    // authored input — one question plus one intent, deduplicated — and
+    // by nothing else.
+    //
+    // The first candidate cut this list to 64 *before* resolution and
+    // then computed coverage without considering the cut, so 70 authored,
+    // indexed, entirely resolvable paths were delivered as 64 bound items
+    // with `coverage: complete`. Ruling 0126 rejects both that and the
+    // reviewer's proposed repair of calling it `Partial`: a token budget
+    // must not decide factual coverage in either direction. What is
+    // bounded is the work per reference (`ASSEMBLY_HITS_PER_REFERENCE`,
+    // `ASSEMBLY_CANDIDATES_PER_REFERENCE`) and the *presentation* of
+    // what could not be resolved (`ASSEMBLY_UNKNOWN_MAX`), never the
+    // question of whether a reference was looked up at all.
+    let references = authored_references(&[orient.question.as_str(), intent.as_str()]);
+    let references = references.as_slice();
+
+    // Identifiers first, in one shared corpus pass; then walk the
+    // references in **authored order**, because delivery order is part
+    // of the fingerprint and the order an author wrote their references
+    // in is the one order that is not an invention.
+    let identifiers: Vec<&str> = references
+        .iter()
+        .filter_map(|reference| match reference {
+            Reference::Identifier(name) => Some(name.as_str()),
+            Reference::Path(_) => None,
+        })
+        .collect();
+    let mut resolved_identifiers =
+        resolve_identifier_references(&atlas, &scope, &admitted, &pinned, &identifiers);
+
+    let mut unresolved: Vec<&Reference> = Vec::new();
+    for reference in references {
+        let hits = match reference {
+            Reference::Path(path) => resolve_path_reference(&admitted, path, &mut omitted),
+            Reference::Identifier(name) => resolved_identifiers
+                .remove(name.as_str())
+                .unwrap_or_default(),
+        };
+        if hits.is_empty() {
+            unresolved.push(reference);
+        }
+        bound.extend(hits);
+    }
+    let literal_bound = bound.len();
+
+    // Step 4: governance. Follow the `GovernedBy` edges the estate has
+    // actually admitted out of the resources step 3 bound, and keep
+    // following them out of what that reaches. The traversal is bounded
+    // by a visited set rather than by a depth cap or a count: a cycle
+    // terminates because a resource is delivered at most once, and
+    // nothing here decides that some number of governing records is
+    // enough (ruling 0124: bound is not budgeted).
+    let governance = follow_governance(&atlas, &scope, &admitted, &mut bound, &mut omitted);
+    inadmissible += governance.filtered;
+    let governance_bound = governance.delivered;
+    // Governance this estate really admitted about a resource bound
+    // here, at an edition this assembly did not capture. Not followed —
+    // the bytes it was admitted against are not the bytes delivered
+    // here, and reading today's under a historical coordinate is the
+    // substituted provenance ruling 0126 refuses. Not silent either:
+    // before this, a `GovernedBy` edge disappeared with `coverage:
+    // complete`, no count and no unknown the moment any byte anywhere in
+    // the governed source changed, so a stage was handed a projection
+    // that looked complete with the governing rule missing (ruling 0128
+    // F1). A count, exactly as the mirror case — a governing endpoint
+    // that no longer resolves — is already a count.
+    if governance.admitted_at_another_edition > 0 {
+        omitted.push(wirk_core::Omission::AdmittedAtAnotherEdition {
+            count: governance.admitted_at_another_edition,
+        });
+    }
+
+    // Step 7: ranked retrieval for the authored question, and the
+    // admitted places this stage may go looking that nothing named.
+    // Both are presentation-budgeted; neither can move `coverage`.
+    let budget = orient.budget;
+    let answer = ranked_answer(
+        &atlas,
+        &scope,
+        &pinned,
+        &orient.question,
+        budget.referenced(),
+        orient.semantic.as_ref(),
+    );
+    let retrieval = retrieval_note(answer.as_ref());
+    let referenced: Vec<wirk_core::EvidenceItem> = answer
+        .as_ref()
+        .map(|answer| {
+            answer
+                .hits
+                .iter()
+                .filter_map(|hit| ranked_item(&admitted, hit))
+                .collect()
+        })
+        .unwrap_or_default();
+    if retrieval.total_candidates > referenced.len() {
+        omitted.push(wirk_core::Omission::OverBudget {
+            of: "referenced".to_string(),
+            shown: referenced.len(),
+            total: retrieval.total_candidates,
+        });
+    }
+    let (reachable, reachable_total) = reachable_entries(&admitted, budget.reachable());
+    if reachable_total > reachable.len() {
+        omitted.push(wirk_core::Omission::OverBudget {
+            of: "reachable".to_string(),
+            shown: reachable.len(),
+            total: reachable_total,
+        });
+    }
+
+    // Every Atlas read is done. The prior-stage artifacts below are
+    // filesystem reads of this Work's own checkouts and take no Atlas
+    // lock, so the guard is dropped here rather than held across them.
+    drop(atlas);
+
+    // Step 5: this Work's own already-claimed stages, by exact recorded
+    // digest.
+    let artifacts = bind_prior_stage_artifacts(events, def, &mut bound, &mut omitted);
+
+    let shown_unknowns = unresolved.len().min(ASSEMBLY_UNKNOWN_MAX);
+    for reference in &unresolved[..shown_unknowns] {
+        unknowns.push(wirk_core::Statement {
+            text: unresolved_statement(reference),
+            attributed_to: wirk_core::StatementOrigin::Intent,
+        });
+    }
+    if unresolved.len() > shown_unknowns {
+        omitted.push(wirk_core::Omission::OverBudget {
+            of: "unknowns".to_string(),
+            shown: shown_unknowns,
+            total: unresolved.len(),
+        });
+    }
+
+    assumptions.push(wirk_core::Statement {
+        text: format!(
+            "assembled under compilation policy {} over {} admitted source(s), pinned to the \
+             generation vector this projection names, at Atlas publication revision {}.",
+            wirk_core::ASSEMBLY_POLICY,
+            admitted.len(),
+            publication_revision
+        ),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    assumptions.push(wirk_core::Statement {
+        text: format!(
+            "references were taken from the authored question and this Waypoint's own intent by \
+             literal shape alone: every distinct path-shaped and identifier-shaped token was \
+             resolved — {resolved} of them here — binding at most \
+             {ASSEMBLY_HITS_PER_REFERENCE} resources per reference. Ordinary prose words are \
+             neither resolved nor reported as unknown, and no token is scored, judged or \
+             interpreted.",
+            resolved = references.len()
+        ),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    assumptions.push(wirk_core::Statement {
+        text: format!(
+            "governance was followed out of the {literal_bound} literally-resolved item(s) \
+             through the `GovernedBy` edges this estate has admitted, and out of what those \
+             reached, until nothing new was reached — {governance_bound} further item(s). A \
+             resource already delivered is not delivered again, and its bytes are not read \
+             again, but the relationship that reached it is stated on the item that is already \
+             here: deduplicating a resource never drops why it governs another. An edge is \
+             followed only where it was admitted against the same generation this assembly \
+             captured; an edge recorded against another generation is evidence about bytes this \
+             projection is not pinned to and is not followed — {elsewhere} such edge(s) were \
+             admitted about a resource delivered here and are reported as a count, which says \
+             they exist at an edition this assembly did not capture and says nothing about \
+             whether they still hold. Being governing makes an item `Standing`, which is how \
+             long what it says stays true and confers no read at all.",
+            elsewhere = governance.admitted_at_another_edition
+        ),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    assumptions.push(wirk_core::Statement {
+        text: format!(
+            "{artifacts} artifact(s) of this Work's own already-claimed stages were bound from \
+             the current Run of each, by reading the claimed bytes once and hashing those same \
+             bytes against the digest the Claim recorded at validation. A rewritten, unreadable \
+             or digest-less artifact is reported as unavailable and is not bound: later bytes \
+             are never attributed to an earlier Claim, and a path beside a Claim id is not on \
+             its own historical evidence identity. This says nothing about the state of that \
+             path at any instant after the read."
+        ),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    if let Some(reason) = retrieval.semantic_reason.as_deref() {
+        assumptions.push(wirk_core::Statement {
+            text: format!(
+                "ranked retrieval for the question ran in `{}` mode and its semantic status is \
+                 `{}`: {reason}",
+                retrieval.mode, retrieval.semantic
+            ),
+            attributed_to: wirk_core::StatementOrigin::Assembly,
+        });
+    }
+    assumptions.push(wirk_core::Statement {
+        text: "the `referenced` list is what ranked retrieval returned for the question and the \
+               `bound` list is what the authored text named; an item can honestly appear in \
+               both, with its own reason in each, and neither list is deduplicated against the \
+               other so that every total stated here is the count the query actually reported. \
+               A `reachable` entry is an admitted place to look, not a claim about what is in \
+               it."
+        .to_string(),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    // Written once here and then carried verbatim by every expansion of
+    // this chain (`prepare_expansion` clones the parent's assumptions),
+    // so it must be true of whichever revision is reading it, not only
+    // of the one that wrote it. It said "this is revision 0" as a
+    // constant, and revision 1 of a real native Run therefore read as
+    // revision 0 of itself (ruling 0135, "expanded projections repeat
+    // the revision0 assumption"). The revision a reader is holding is
+    // already stated, exactly and per revision, by `reference.revision`;
+    // what this sentence is for is the disclosure and the verb, and both
+    // are revision-neutral facts.
+    assumptions.push(wirk_core::Statement {
+        text: "consulted estate findings and the findings-index health note are not assembled \
+               here: their absence from this projection is not evidence that the estate holds \
+               none. Expansion is: each revision is what one assembly delivered, and `wirk \
+               world expand` adds a later revision to this Run's own chain rather than editing \
+               this one or any before it."
+            .to_string(),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    if inadmissible > 0 {
+        omitted.push(wirk_core::Omission::Inadmissible {
+            count: inadmissible,
+        });
+    }
+
+    // Coverage comes only from admission denials, unavailability and
+    // unresolved references — never from a budget, a truncation, a retry
+    // count or a depth (ruling 0044).
+    let coverage = if omitted
+        .iter()
+        .any(|item| matches!(item, wirk_core::Omission::Unavailable { .. }))
+    {
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::EvidenceUnavailable,
+        }
+    } else if inadmissible > 0 {
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::InadmissibleSources,
+        }
+    } else if governance.admitted_at_another_edition > 0 {
+        // The same completeness fact the mirror case already moves
+        // coverage on. A governing record this estate admitted about a
+        // resource delivered here exists and was not delivered; silence
+        // would be read as "this estate governs nothing here" (ruling
+        // 0128 F1). This is not a budget and not a truncation: nothing a
+        // presentation number does can reach it.
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::GovernanceOutsideCapturedEditions,
+        }
+    } else if !unresolved.is_empty() {
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::UnresolvedReferences,
+        }
+    } else {
+        wirk_core::EvidenceCoverage::Complete
+    };
+
+    // Presentation, stated separately from fact: `truncated` and the
+    // `OverBudget` omissions say what was rendered, `coverage` above
+    // says what was found, and `next_action` below reads only the
+    // second. Conflating them is how a rendering budget becomes a
+    // completion oracle (BUILD.md §4.7).
+    let truncated = omitted
+        .iter()
+        .any(|item| matches!(item, wirk_core::Omission::OverBudget { .. }));
+    let content = wirk_core::ProjectionContent {
+        format: wirk_core::PROJECTION_FORMAT.to_string(),
+        compilation_policy: wirk_core::ASSEMBLY_POLICY.to_string(),
+        route_edition: route_edition.to_string(),
+        waypoint: def.id.clone(),
+        revision: 0,
+        question: orient.question.clone(),
+        generations,
+        publication_revision,
+        retrieval,
+        bound,
+        referenced,
+        reachable,
+        assumptions,
+        unknowns: unknowns.clone(),
+        omitted,
+        next_action: next_action_for(coverage, unknowns.is_empty()),
+        coverage,
+        truncated,
+        // Revision 0, which expands nothing — and, absent from the
+        // document, serializes to exactly the bytes a C2 binary wrote.
+        expansion: None,
+    };
+    Some(finish_projection(
+        content,
+        ObservationSpan::measured(laps, started),
+    ))
+}
+
+/// What step 4 found: how many governing items it delivered, how many
+/// edges this requester's scope refused to disclose, and how many the
+/// estate admitted about a bound resource at an edition this assembly
+/// did not capture.
+struct Governance {
+    delivered: usize,
+    filtered: usize,
+    admitted_at_another_edition: usize,
+}
+
+/// Step 4 (BUILD.md §4.3): follow the `GovernedBy` edges the estate has
+/// admitted out of the resources step 3 bound, and out of what those
+/// reach, until nothing new is reached.
+///
+/// Three properties, each of them a ruling rather than a preference:
+///
+/// * **No raw edge read.** The edges come back through
+///   `wirk_atlas::relationships_from_resources`, which applies exactly
+///   the disclosure gate `relationships_for` applies: an edge whose far
+///   end or whose evidence lies outside this Work's admitted memberships
+///   is an opaque `Filtered` marker, counted and never described. A
+///   coordinate confers no authority, so reaching one through an edge
+///   grants nothing the bindings did not already grant — every endpoint
+///   is re-resolved under the admitted membership before it is
+///   delivered.
+/// * **Pinned to the captured vector.** An endpoint is delivered only if
+///   its membership *and* its generation are in the vector this assembly
+///   captured. An edge admitted against a superseded generation is
+///   evidence about bytes this projection is not pinned to; it is
+///   reported as an unresolvable governing record rather than silently
+///   read at today's generation.
+/// * **Cycles and duplicates are safe without a cap.** Two sets, not
+///   one, both keyed by (membership, generation, path) and both seeded
+///   with everything step 3 already delivered: what has been
+///   *delivered*, so a resource's bytes are rendered at most once, and
+///   what has been *expanded*, so a cycle terminates. Separating them is
+///   the point (ruling 0128 F2): one visited set made the two decisions
+///   at once, so a governing record the authored question happened to
+///   name by path was already "visited" when its edge was read, and the
+///   edge — the whole reason step 4 exists — was skipped in silence.
+///   Deduplicating the *resource* is right; dropping the *relationship*
+///   is not. Nothing here decides that some number of governing records
+///   is enough: `bound` has no budget, and there is no depth cap.
+fn follow_governance(
+    atlas: &wirk_atlas::AtlasStore,
+    scope: &wirk_atlas::QueryScope,
+    admitted: &[(wirk_atlas::Membership, wirk_atlas::SourceGeneration)],
+    bound: &mut Vec<wirk_core::EvidenceItem>,
+    omitted: &mut Vec<wirk_core::Omission>,
+) -> Governance {
+    let mut governance = Governance {
+        delivered: 0,
+        filtered: 0,
+        admitted_at_another_edition: 0,
+    };
+    // Where a resource's bytes were rendered, so an edge reaching one
+    // that is already in `bound` can attribute the relationship onto the
+    // item that is already there instead of either delivering the bytes
+    // twice or — the defect — saying nothing.
+    let mut delivered_at: BTreeMap<wirk_atlas::ResourceKey, usize> = BTreeMap::new();
+    // What has been walked out of. This, and not delivery, is what
+    // terminates a cycle.
+    let mut expanded: BTreeSet<wirk_atlas::ResourceKey> = BTreeSet::new();
+    // Governing records already reported as unresolvable, so one missing
+    // record reached through two edges is one omission rather than two.
+    let mut unresolvable: BTreeSet<wirk_atlas::ResourceKey> = BTreeSet::new();
+    let mut frontier: Vec<wirk_atlas::ResourceKey> = Vec::new();
+    for (index, item) in bound.iter().enumerate() {
+        let Ok(coordinate) = decode_coordinate(&item.coordinate) else {
+            continue;
+        };
+        let key = resource_key(&coordinate);
+        delivered_at.entry(key.clone()).or_insert(index);
+        if expanded.insert(key.clone()) {
+            frontier.push(key);
+        }
+    }
+
+    while !frontier.is_empty() {
+        // One pass over the relationship log for the whole frontier, not
+        // one per item: a per-item pass is the shape that does not
+        // survive a real estate.
+        let Ok(found) = wirk_atlas::relationships_from_resources(atlas, scope, None, &frontier)
+        else {
+            // The relationship log could not be read at all. Said as an
+            // unavailability over the frontier rather than as "this
+            // estate governs nothing".
+            omitted.push(wirk_core::Omission::Unavailable {
+                coordinate: "governance".to_string(),
+                reason: wirk_core::UnavailableReason::GoverningRecordUnresolvable,
+            });
+            break;
+        };
+        governance.admitted_at_another_edition += found.admitted_at_another_edition;
+        let mut edges: Vec<wirk_atlas::Relationship> = Vec::new();
+        for view in found.views {
+            match view {
+                wirk_atlas::RelationshipView::Disclosed(relationship) => edges.push(*relationship),
+                wirk_atlas::RelationshipView::Filtered => governance.filtered += 1,
+            }
+        }
+        // Delivery order that is not an invention: the relationship id,
+        // which content-addresses the edge itself.
+        edges.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+        let mut next: Vec<wirk_atlas::ResourceKey> = Vec::new();
+        for edge in edges {
+            // The governed resource's own source, not the governing
+            // record's: an edge crosses sources, and naming the wrong
+            // side of it is a false statement about where the governed
+            // file lives (found by running this on a real two-source
+            // estate before it was written down).
+            let governed_alias = admitted
+                .iter()
+                .find(|(membership, _)| membership.id == edge.from.membership)
+                .map(|(membership, _)| membership.alias.as_str())
+                .unwrap_or("?");
+            let governed = display_path(&edge.from.path);
+            // The governing record first, then the evidence the edge was
+            // admitted on — the order an edge is read in.
+            let mut reached: Vec<(&wirk_atlas::ExactCoordinate, bool)> = vec![(&edge.to, true)];
+            reached.extend(edge.evidence.iter().map(|coordinate| (coordinate, false)));
+            for (coordinate, is_record) in reached {
+                let key = resource_key(coordinate);
+                let Some((membership, generation)) =
+                    admitted.iter().find(|(membership, generation)| {
+                        membership.id == coordinate.membership
+                            && generation.id == coordinate.generation
+                    })
+                else {
+                    if unresolvable.insert(key.clone()) {
+                        omitted.push(wirk_core::Omission::Unavailable {
+                            coordinate: format!("relationship/{}", edge.id.0),
+                            reason: wirk_core::UnavailableReason::GoverningRecordUnresolvable,
+                        });
+                    }
+                    continue;
+                };
+                let reason = if is_record {
+                    format!(
+                        "`{governed}` in source `{governed_alias}` is governed by this record, \
+                         which is in source `{}`, through the GovernedBy edge {} admitted by \
+                         `{}`, at the captured generation",
+                        membership.alias, edge.id.0, edge.producer
+                    )
+                } else {
+                    format!(
+                        "this is evidence the GovernedBy edge {} governing `{governed}` in \
+                         source `{governed_alias}` was admitted on, and it is in source `{}` at \
+                         the captured generation",
+                        edge.id.0, membership.alias
+                    )
+                };
+                // Delivered before — as an authored literal, as a
+                // ranked-in governing record, or through another edge.
+                // The resource is not rendered a second time and its
+                // bytes are **not read a second time**; what is added is
+                // the one thing the old visited set threw away, which is
+                // why this edge was followed at all.
+                if let Some(index) = delivered_at.get(&key).copied() {
+                    let item = &mut bound[index];
+                    item.reason = format!("{}; and {reason}", item.reason);
+                    if is_record {
+                        // What a governing record says stays true past
+                        // this stage, however this assembly first
+                        // happened to reach its bytes. Still not a read
+                        // grant (BUILD.md §4.1).
+                        item.lifetime = wirk_core::Lifetime::Standing;
+                    }
+                    if is_record && expanded.insert(key.clone()) {
+                        next.push(key);
+                    }
+                    continue;
+                }
+                let Ok(wirk_atlas::ResolveOutcome::Resolved(resolved)) =
+                    atlas.resolve_exact(membership, coordinate)
+                else {
+                    if unresolvable.insert(key.clone()) {
+                        omitted.push(wirk_core::Omission::Unavailable {
+                            coordinate: format!("relationship/{}", edge.id.0),
+                            reason: wirk_core::UnavailableReason::GoverningRecordUnresolvable,
+                        });
+                    }
+                    continue;
+                };
+                delivered_at.insert(key.clone(), bound.len());
+                bound.push(wirk_core::EvidenceItem {
+                    coordinate: encode_coordinate(coordinate),
+                    summary: bounded_summary(&resolved.bytes),
+                    // The `to` end of a `GovernedBy` edge is a governing
+                    // record: what it says stays true past this stage.
+                    // The evidence keeps its own content family's answer.
+                    // Neither is a read grant (BUILD.md §4.1).
+                    lifetime: if is_record {
+                        wirk_core::Lifetime::Standing
+                    } else {
+                        lifetime_of(generation, &coordinate.path)
+                    },
+                    reason,
+                    identity: wirk_core::ItemIdentity::Generation {
+                        generation: coordinate.generation.0.clone(),
+                        object_id: coordinate.object_id.clone(),
+                    },
+                });
+                governance.delivered += 1;
+                if is_record && expanded.insert(key.clone()) {
+                    next.push(key);
+                }
+            }
+        }
+        frontier = next;
+    }
+    governance
+}
+
+fn resource_key(coordinate: &wirk_atlas::ExactCoordinate) -> wirk_atlas::ResourceKey {
+    wirk_atlas::ResourceKey {
+        membership: coordinate.membership.clone(),
+        generation: coordinate.generation.clone(),
+        path: coordinate.path.clone(),
+    }
+}
+
+fn display_path(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+/// Step 5 (BUILD.md §4.3, BUILD-AMENDMENTS.md, ruling 0124): this Work's
+/// own already-claimed stages, bound by exact recorded digest.
+///
+/// For every leaf of this Work's Route other than the one being reserved,
+/// the **current** Run — the last one opened for that Waypoint — and that
+/// Run's own Validated `Done` `ClaimRecorded`. A superseded attempt's
+/// receipt is never borrowed because it happens to sit earlier in the
+/// event list, and a retry that re-opened a Waypoint moves what is bound
+/// to the new Run's own Claim.
+///
+/// The read is the whole property. The bytes are read **once**; the
+/// digest is taken over *those* bytes; the summary is derived from the
+/// same bytes. There is no `digest_of(path)` followed by a second
+/// `read(path)`, which is the window the amendment names and which would
+/// let a rewrite between the two be delivered as verified.
+///
+/// What that establishes, exactly (ruling 0124): these captured bytes
+/// hashed to the digest the Claim recorded. It is not a claim about the
+/// path's state at any later instant, and this assembler does not pretend
+/// a rewrite after its only read must have been detected — it retains the
+/// bytes it verified rather than reading a second time to check.
+/// Everything else is an explicit unavailability: rewritten bytes are
+/// `ArtifactBytesChanged` and are not bound, an unreadable file is
+/// `ArtifactUnreadable`, and a pre-correction name-only receipt is
+/// `ArtifactUnrecorded` — a path beside a `ClaimId` is not on its own
+/// historical evidence identity. Nothing here writes anything, so a Read
+/// binding gains no mutation authority through a declared artifact.
+fn bind_prior_stage_artifacts(
+    events: &[Event],
+    def: &WaypointDefinition,
+    bound: &mut Vec<wirk_core::EvidenceItem>,
+    omitted: &mut Vec<wirk_core::Omission>,
+) -> usize {
+    let defs = waypoint_defs_for(events);
+    let mut delivered = 0usize;
+    for leaf in wirk_core::flatten_leaves(&defs) {
+        if leaf == def.id {
+            continue;
+        }
+        let Some((run_id, _, world_hash)) = latest_run_for_waypoint(events, &leaf) else {
+            continue;
+        };
+        let Some((claim, receipts)) = validated_done_claim(events, &run_id) else {
+            continue;
+        };
+        let Some(worktree) = worktree_of_reserved_world(events, &leaf, &world_hash) else {
+            for receipt in &receipts {
+                omitted.push(wirk_core::Omission::Unavailable {
+                    coordinate: artifact_coordinate(&claim, &receipt.name),
+                    reason: wirk_core::UnavailableReason::ArtifactUnreadable,
+                });
+            }
+            continue;
+        };
+        for receipt in receipts {
+            let coordinate = artifact_coordinate(&claim, &receipt.name);
+            if receipt.digest.is_empty() {
+                omitted.push(wirk_core::Omission::Unavailable {
+                    coordinate,
+                    reason: wirk_core::UnavailableReason::ArtifactUnrecorded,
+                });
+                continue;
+            }
+            // The only read. Everything below is derived from `bytes`.
+            let Ok(bytes) = std::fs::read(worktree.join(&receipt.path)) else {
+                omitted.push(wirk_core::Omission::Unavailable {
+                    coordinate,
+                    reason: wirk_core::UnavailableReason::ArtifactUnreadable,
+                });
+                continue;
+            };
+            if sha256_hex(&bytes) != receipt.digest {
+                omitted.push(wirk_core::Omission::Unavailable {
+                    coordinate,
+                    reason: wirk_core::UnavailableReason::ArtifactBytesChanged,
+                });
+                continue;
+            }
+            let mut cap = (ASSEMBLY_LOOKUP_BYTES as usize).min(bytes.len());
+            while cap > 0 && std::str::from_utf8(&bytes[..cap]).is_err() {
+                cap -= 1;
+            }
+            bound.push(wirk_core::EvidenceItem {
+                coordinate,
+                summary: bounded_summary(&bytes[..cap]),
+                lifetime: wirk_core::Lifetime::Working,
+                reason: format!(
+                    "the prior stage `{}` of this Work claimed the artifact `{}`, and the bytes \
+                     read here hash to the digest that Claim validated",
+                    leaf.0, receipt.name
+                ),
+                identity: wirk_core::ItemIdentity::ArtifactDigest {
+                    claim: claim.0.clone(),
+                    digest: receipt.digest.clone(),
+                },
+            });
+            delivered += 1;
+        }
+    }
+    delivered
+}
+
+/// The opaque coordinate a prior-stage artifact is addressed by
+/// (BUILD.md §2). It names this Work's own Claim and the declared output
+/// name — never a host path.
+fn artifact_coordinate(claim: &ClaimId, name: &str) -> String {
+    format!("claim/{}/artifact/{name}", claim.0)
+}
+
+/// The Validated `Done` `ClaimRecorded` of exactly this Run, with the
+/// artifact receipts it was validated against. A refused Claim, a
+/// Question and a neighbouring Run's success are all not this.
+fn validated_done_claim(
+    events: &[Event],
+    run_id: &RunId,
+) -> Option<(ClaimId, Vec<wirk_core::ArtifactReceipt>)> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::ClaimRecorded {
+            claim,
+            claim_kind: ClaimKind::Done,
+            verdict: ClaimVerdict::Validated,
+            artifacts,
+        } if event.run.as_ref() == Some(run_id) => Some((claim.clone(), artifacts.clone())),
+        _ => None,
+    })
+}
+
+/// The checkout the reserved World for this Waypoint names — the same
+/// root `handle_claim` resolved the artifact against when it recorded the
+/// digest. Matched on the Run's own `world_hash`, so a Waypoint reserved
+/// again since is not read through the wrong reservation.
+fn worktree_of_reserved_world(
+    events: &[Event],
+    waypoint: &WaypointId,
+    world_hash: &WorldHash,
+) -> Option<PathBuf> {
+    events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::WaypointReserved {
+            waypoint: reserved,
+            world_hash: hash,
+            world,
+        } if reserved == waypoint && hash == world_hash => Some(match world {
+            World::Actor(actor) => actor.worktree_path.clone(),
+            World::Deterministic(deterministic) => deterministic.cwd.clone(),
+        }),
+        _ => None,
+    })
+}
+
+/// Step 7a: one scoped, pinned, ranked query for the authored question.
+///
+/// The same `wirk_atlas::search` the public `wirk atlas search` runs,
+/// under this Work's own scope and pinned to the vector this assembly
+/// captured — so a `referenced` hit resolves at the generation the
+/// projection names it at, exactly as a `bound` one does. Semantic
+/// ranking is *requested* rather than disabled: with no configured
+/// backend the answer reports `unavailable` with the reason the query
+/// itself produces, which is a truthful note, where `disabled` would say
+/// the caller asked for lexical.
+///
+/// `configured` is the Route's own `orient.semantic`, translated into
+/// exactly the `wirk_atlas::SemanticQueryConfig` the public
+/// `--semantic-backend`/`--semantic-model` flags build (ruling 0109,
+/// ruling 0128 F3). Nothing here supplies a default, reads an
+/// environment variable or names an installed executable: a Route that
+/// configures no backend gets `None`, and the answer's own reason then
+/// says the *request* named none — which is the true statement, where
+/// the previous one described a product that ships no backend and was
+/// false about both the product and any estate holding editions.
+///
+/// Every check that makes a semantic answer trustworthy — the absolute
+/// path rule, the digest of the executable actually opened, the query
+/// producer identity and basis, edition selection and currency — lives
+/// in `wirk_atlas` and is reached by handing it this config. That is the
+/// reuse: this function adds no policy of its own.
+fn ranked_answer(
+    atlas: &wirk_atlas::AtlasStore,
+    scope: &wirk_atlas::QueryScope,
+    pinned: &BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId>,
+    question: &str,
+    limit: usize,
+    configured: Option<&wirk_core::SemanticQueryRequest>,
+) -> Option<wirk_atlas::SearchAnswer> {
+    wirk_atlas::search(
+        atlas,
+        &wirk_atlas::SearchRequest {
+            scope: scope.clone(),
+            requested_source: None,
+            query: question.to_string(),
+            families: Vec::new(),
+            semantic: wirk_atlas::SemanticRequest::Requested,
+            limit,
+            pinned: Some(pinned.clone()),
+            offset: 0,
+            semantic_query: configured.map(|configured| wirk_atlas::SemanticQueryConfig {
+                backend: PathBuf::from(&configured.backend),
+                backend_args: configured.backend_args.clone(),
+                model: PathBuf::from(&configured.model),
+            }),
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+        },
+    )
+    .ok()
+}
+
+/// The retrieval note, copied out of the answer and nowhere else. An
+/// answer that could not be produced at all says so, rather than
+/// presenting a lexical default that never ran.
+fn retrieval_note(answer: Option<&wirk_atlas::SearchAnswer>) -> wirk_core::RetrievalNote {
+    let Some(answer) = answer else {
+        return wirk_core::RetrievalNote {
+            mode: "none".to_string(),
+            semantic: "unavailable".to_string(),
+            semantic_reason: Some(
+                "the ranked query for this question could not be run against the captured \
+                 vector; no ranking happened and no absence is asserted"
+                    .to_string(),
+            ),
+            editions: Vec::new(),
+            degraded: vec!["query_unavailable".to_string()],
+            total_candidates: 0,
+            returned: 0,
+        };
+    };
+    let coverage = answer.coverage;
+    let mut degraded = Vec::new();
+    for (flag, label) in [
+        (coverage.no_match, "no_match"),
+        (coverage.partial, "partial"),
+        (coverage.source_unavailable, "source_unavailable"),
+        (coverage.generation_unavailable, "generation_unavailable"),
+        (coverage.unsupported_family, "unsupported_family"),
+        (coverage.denied, "denied"),
+        (coverage.no_sources, "no_sources"),
+        (coverage.spent, "spent"),
+        (
+            coverage.continuation_unrecoverable,
+            "continuation_unrecoverable",
+        ),
+    ] {
+        if flag {
+            degraded.push(label.to_string());
+        }
+    }
+    wirk_core::RetrievalNote {
+        mode: answer.mode.label().to_string(),
+        semantic: answer.semantic.label().to_string(),
+        semantic_reason: answer.semantic.reason().map(str::to_string),
+        editions: answer
+            .editions
+            .iter()
+            .map(|(membership, edition)| (membership.0.clone(), edition.0.clone()))
+            .collect(),
+        degraded,
+        total_candidates: answer.budget.total_candidates,
+        returned: answer.budget.returned,
+    }
+}
+
+/// One ranked hit as a delivered item. Dropped, rather than delivered
+/// with a coordinate that names a generation this projection is not
+/// pinned to, if its membership is somehow not in the captured vector.
+fn ranked_item(
+    admitted: &[(wirk_atlas::Membership, wirk_atlas::SourceGeneration)],
+    hit: &wirk_atlas::EvidenceHit,
+) -> Option<wirk_core::EvidenceItem> {
+    let (membership, generation) = admitted.iter().find(|(membership, generation)| {
+        membership.id == hit.coordinate.membership && generation.id == hit.coordinate.generation
+    })?;
+    Some(wirk_core::EvidenceItem {
+        coordinate: encode_coordinate(&hit.coordinate),
+        summary: bounded_summary(hit.snippet.as_bytes()),
+        lifetime: lifetime_of(generation, &hit.coordinate.path),
+        reason: format!(
+            "ranked for the authored question in source `{}` at the captured generation, \
+             position by score and not by judgement; being ranked here is not a statement that \
+             it answers the question",
+            membership.alias
+        ),
+        identity: wirk_core::ItemIdentity::Generation {
+            generation: hit.coordinate.generation.0.clone(),
+            object_id: hit.coordinate.object_id.clone(),
+        },
+    })
+}
+
+/// Step 7b: the admitted places this stage may go looking that nothing
+/// in the authored text named.
+///
+/// A handle is `<source alias>:<family>`, and `fetch` is the exact public
+/// command that turns it into evidence — `wirk atlas search`, whose
+/// `--estate`/`--work` fall back to the actor's own injected triple by
+/// the same rule `wirk atlas resolve` runs on, so the printed line runs
+/// verbatim inside a pane. `resources` is a real count out of the
+/// captured generation, so an entry says how much is there rather than
+/// implying anything about what it holds.
+///
+/// Only admitted sources appear, and only families the captured
+/// generation actually indexes: an entry can never name a source outside
+/// this Work's bindings. Returns the rendered list and the real total.
+fn reachable_entries(
+    admitted: &[(wirk_atlas::Membership, wirk_atlas::SourceGeneration)],
+    limit: usize,
+) -> (Vec<wirk_core::ReachableEntry>, usize) {
+    let mut entries: Vec<wirk_core::ReachableEntry> = Vec::new();
+    for (membership, generation) in admitted {
+        let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for record in &generation.resources {
+            if record.disposition != wirk_atlas::CoverageDisposition::Indexed {
+                continue;
+            }
+            let Some(unit) = record.units.first() else {
+                continue;
+            };
+            *counts.entry(family_label(unit.family)).or_default() += 1;
+        }
+        for (family, resources) in counts {
+            entries.push(wirk_core::ReachableEntry {
+                handle: format!("{}:{family}", membership.alias),
+                source: membership.alias.clone(),
+                family: family.to_string(),
+                resources,
+                fetch: format!(
+                    "wirk atlas search --source {} --family {family} --query <terms>",
+                    membership.alias
+                ),
+            });
+        }
+    }
+    // Delivery order that is not an invention: the handle, which is the
+    // alias and the family the entry is made of.
+    entries.sort_by(|a, b| a.handle.cmp(&b.handle));
+    let total = entries.len();
+    entries.truncate(limit);
+    (entries, total)
+}
+
+fn family_label(family: wirk_atlas::ContentFamily) -> &'static str {
+    match family {
+        wirk_atlas::ContentFamily::Code => "code",
+        wirk_atlas::ContentFamily::Knowledge => "knowledge",
+        wirk_atlas::ContentFamily::Config => "config",
+    }
+}
+
+/// Step 8: one sentence about the **state of the delivered evidence**.
+///
+/// Chosen only by `coverage` and whether anything went unresolved, so it
+/// is byte-identical under any budget — a cut list cannot reach it, which
+/// is the whole point (BUILD.md §4.7: a rendering budget must not become
+/// a completion oracle). It names no role, assigns no work, and says
+/// nothing about whether the stage is finished: it describes what the
+/// assembler delivered and what it could not, and stops there (ruling
+/// 0124: "No role taxonomy or mandatory orientation agent").
+fn next_action_for(coverage: wirk_core::EvidenceCoverage, no_unknowns: bool) -> String {
+    let state = match coverage {
+        wirk_core::EvidenceCoverage::Complete => {
+            "every reference the authored text named resolved in the admitted sources at the \
+             captured generations"
+        }
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::UnresolvedReferences,
+        } => "some references the authored text named did not resolve",
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::InadmissibleSources,
+        } => {
+            "something inside this request's reach was not disclosed to this Work, and is \
+             reported here only as a count"
+        }
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::EvidenceUnavailable,
+        } => {
+            "something the captured vector or this Work's own record names could not be read \
+             back at the identity it was recorded against"
+        }
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::GovernanceOutsideCapturedEditions,
+        } => {
+            "this estate has admitted a governing relationship about a resource delivered here, \
+             recorded at an edition this assembly did not capture; it is reported only as a \
+             count, and nothing here says whether it still holds"
+        }
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::ConcurrentPublication,
+        }
+        | wirk_core::EvidenceCoverage::Degraded { .. } => {
+            "no usable snapshot was taken: the estate's published sources moved under this \
+             assembly, so nothing here is a statement about what the estate holds"
+        }
+    };
+    let unresolved = if no_unknowns {
+        "The assembler recorded no unresolved reference."
+    } else {
+        "The unresolved references are listed as unknowns, attributed to the intent that named \
+         them; none of them is a finding about whether the thing exists."
+    };
+    format!(
+        "State of the delivered evidence: {state}. {unresolved} This describes what was \
+         assembled and nothing else — not whether it is sufficient, not what should be done \
+         next, and not whether this stage is finished."
+    )
+}
+
+/// Exact path resolution **against the already-captured generation**,
+/// across every admitted source. A path present in three admitted
+/// sources genuinely resolves three times; each is its own coordinate at
+/// its own generation.
+///
+/// It reads the captured `SourceGeneration` this assembly already holds
+/// rather than asking the store to resolve the path, and that is the
+/// whole of BUILD.md §4.2's "capture once, pin every later read" taken
+/// literally: `AtlasStore::resolve_path` would re-read and re-validate
+/// the generation manifest on every single call, which on a real estate
+/// is the dominant cost of a reservation (measured: 35s for three path
+/// references over a 19MB + 54MB pair of manifests) and is also a second
+/// look at a catalog that may have moved. Reading the captured value
+/// cannot see a moving catalog at all.
+///
+/// The coordinate is built to be resolvable: the line bounds come from
+/// `wirk_atlas::actual_line_bounds`, the same function
+/// `AtlasStore::resolve_exact` validates against, so every coordinate
+/// this projection delivers resolves through the public
+/// `wirk atlas resolve` the actor actually types.
+fn resolve_path_reference(
+    admitted: &[(wirk_atlas::Membership, wirk_atlas::SourceGeneration)],
+    path: &str,
+    omitted: &mut Vec<wirk_core::Omission>,
+) -> Vec<wirk_core::EvidenceItem> {
+    let mut hits = Vec::new();
+    for (membership, generation) in admitted {
+        if hits.len() >= ASSEMBLY_HITS_PER_REFERENCE {
+            break;
+        }
+        // Not this source's file, and not a fact worth stating: an
+        // authored path naming one source's file is absent from every
+        // other one by construction.
+        let Some(record) = generation
+            .resources
+            .iter()
+            .find(|record| record.path == path.as_bytes())
+        else {
+            continue;
+        };
+        let reason = match record.disposition {
+            wirk_atlas::CoverageDisposition::Indexed => {
+                match bind_resource(membership, generation, record, path) {
+                    Ok(item) => {
+                        hits.push(item);
+                        continue;
+                    }
+                    Err(reason) => reason,
+                }
+            }
+            wirk_atlas::CoverageDisposition::Excluded => {
+                wirk_core::UnavailableReason::ResourceExcluded
+            }
+            wirk_atlas::CoverageDisposition::Unsupported => {
+                wirk_core::UnavailableReason::ResourceUnsupported
+            }
+            wirk_atlas::CoverageDisposition::Unavailable
+            | wirk_atlas::CoverageDisposition::Error => {
+                wirk_core::UnavailableReason::ResourceUnavailable
+            }
+        };
+        // The recorded resource is there and its content is not
+        // deliverable at the generation it was recorded against. Said
+        // explicitly, with a closed reason and no raw error text — never
+        // as absence, and never re-resolved against a newer generation to
+        // fill the hole.
+        omitted.push(wirk_core::Omission::Unavailable {
+            coordinate: format!("{}:{path}", membership.alias),
+            reason,
+        });
+    }
+    hits
+}
+
+/// Builds one bound item from a recorded, indexed resource at the
+/// captured generation, reading the committed Git object once.
+fn bind_resource(
+    membership: &wirk_atlas::Membership,
+    generation: &wirk_atlas::SourceGeneration,
+    record: &wirk_atlas::ResourceRecord,
+    path: &str,
+) -> Result<wirk_core::EvidenceItem, wirk_core::UnavailableReason> {
+    let Some(object_id) = record.object_id.clone() else {
+        return Err(wirk_core::UnavailableReason::ResourceUnavailable);
+    };
+    let Ok(bytes) = read_blob(&membership.locator, &object_id) else {
+        return Err(wirk_core::UnavailableReason::ResourceUnavailable);
+    };
+    let mut cap = (ASSEMBLY_LOOKUP_BYTES as usize).min(bytes.len());
+    while cap > 0 && std::str::from_utf8(&bytes[..cap]).is_err() {
+        cap -= 1;
+    }
+    let Some((line_start, line_end)) = wirk_atlas::actual_line_bounds(&bytes, 0, cap as u64) else {
+        return Err(wirk_core::UnavailableReason::ResourceUnavailable);
+    };
+    let coordinate = wirk_atlas::ExactCoordinate {
+        estate: membership.estate.clone(),
+        membership: membership.id.clone(),
+        source: membership.source.clone(),
+        generation: generation.id.clone(),
+        path: record.path.clone(),
+        object_id,
+        byte_start: 0,
+        byte_end: cap as u64,
+        line_start,
+        line_end,
+    };
+    Ok(wirk_core::EvidenceItem {
+        coordinate: encode_coordinate(&coordinate),
+        summary: bounded_summary(&bytes[..cap]),
+        lifetime: lifetime_of(generation, &record.path),
+        reason: format!(
+            "the authored text names the path `{path}`, resolved exactly in source `{}` at the \
+             captured generation",
+            membership.alias
+        ),
+        identity: wirk_core::ItemIdentity::Generation {
+            generation: coordinate.generation.0.clone(),
+            object_id: coordinate.object_id.clone(),
+        },
+    })
+}
+
+/// A resource's own content family decides how long what it says stays
+/// true: Knowledge is `Standing`, Code and Config are `Working`. This is
+/// a lifetime, never an authority — nothing may be read because it is
+/// `Standing` (BUILD.md §4.1).
+fn lifetime_of(generation: &wirk_atlas::SourceGeneration, path: &[u8]) -> wirk_core::Lifetime {
+    let family = generation
+        .resources
+        .iter()
+        .find(|record| record.path == path)
+        .and_then(|record| record.units.first())
+        .map(|unit| unit.family);
+    match family {
+        Some(wirk_atlas::ContentFamily::Knowledge) => wirk_core::Lifetime::Standing,
+        _ => wirk_core::Lifetime::Working,
+    }
+}
+
+/// Identifier resolution: pinned exact search for the tokens, then a
+/// literal check against the committed bytes at the coordinate each hit
+/// names.
+///
+/// The ranking chooses candidates; it never decides the answer. A hit
+/// whose recorded bytes do not literally contain the authored token is
+/// dropped, so what lands in `bound` is "this exact name occurs here at
+/// this exact generation" — a fact, verified against the committed
+/// object, not a similarity score.
+///
+/// One search covers every identifier the authored text named, because a
+/// search is a whole-corpus pass and one per token is one corpus pass per
+/// token. A token that the shared pass attributes nothing to gets its own
+/// targeted search afterwards, so batching never turns a resolvable
+/// identifier into a false `unknown` — it only saves the passes that
+/// would have found the same rows.
+fn resolve_identifier_references(
+    atlas: &wirk_atlas::AtlasStore,
+    scope: &wirk_atlas::QueryScope,
+    admitted: &[(wirk_atlas::Membership, wirk_atlas::SourceGeneration)],
+    pinned: &BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId>,
+    names: &[&str],
+) -> BTreeMap<String, Vec<wirk_core::EvidenceItem>> {
+    let mut found: BTreeMap<String, Vec<wirk_core::EvidenceItem>> = BTreeMap::new();
+    if admitted.is_empty() || names.is_empty() {
+        return found;
+    }
+    let shared = identifier_candidates(
+        atlas,
+        scope,
+        pinned,
+        &names.join(" "),
+        ASSEMBLY_CANDIDATES_PER_REFERENCE * names.len(),
+    );
+    attribute_candidates(admitted, names, &shared, &mut found);
+    let missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| !found.contains_key(*name))
+        .collect();
+    for name in missing {
+        let targeted = identifier_candidates(
+            atlas,
+            scope,
+            pinned,
+            name,
+            ASSEMBLY_CANDIDATES_PER_REFERENCE,
+        );
+        attribute_candidates(admitted, &[name], &targeted, &mut found);
+    }
+    found
+}
+
+fn identifier_candidates(
+    atlas: &wirk_atlas::AtlasStore,
+    scope: &wirk_atlas::QueryScope,
+    pinned: &BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId>,
+    query: &str,
+    limit: usize,
+) -> Vec<wirk_atlas::EvidenceHit> {
+    wirk_atlas::search(
+        atlas,
+        &wirk_atlas::SearchRequest {
+            scope: scope.clone(),
+            requested_source: None,
+            query: query.to_string(),
+            families: Vec::new(),
+            semantic: wirk_atlas::SemanticRequest::Disabled,
+            limit,
+            // The captured vector, pinned: a page of this search reads
+            // the generations this projection names and no others.
+            pinned: Some(pinned.clone()),
+            offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+        },
+    )
+    .map(|answer| answer.hits)
+    .unwrap_or_default()
+}
+
+/// Attributes ranked candidates to the authored tokens they literally
+/// contain, reading each candidate's committed bytes at most once.
+fn attribute_candidates(
+    admitted: &[(wirk_atlas::Membership, wirk_atlas::SourceGeneration)],
+    names: &[&str],
+    candidates: &[wirk_atlas::EvidenceHit],
+    found: &mut BTreeMap<String, Vec<wirk_core::EvidenceItem>>,
+) {
+    for hit in candidates {
+        let Some((membership, generation)) = admitted
+            .iter()
+            .find(|(membership, _)| membership.id == hit.coordinate.membership)
+        else {
+            continue;
+        };
+        let wanted: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| {
+                found
+                    .get(*name)
+                    .is_none_or(|hits| hits.len() < ASSEMBLY_HITS_PER_REFERENCE)
+            })
+            .collect();
+        if wanted.is_empty() {
+            continue;
+        }
+        let Ok(bytes) = read_blob(&membership.locator, &hit.coordinate.object_id) else {
+            continue;
+        };
+        let (start, end) = (
+            hit.coordinate.byte_start as usize,
+            hit.coordinate.byte_end as usize,
+        );
+        if end > bytes.len() || start > end {
+            continue;
+        }
+        let unit = &bytes[start..end];
+        let Ok(text) = std::str::from_utf8(unit) else {
+            continue;
+        };
+        for name in wanted {
+            if !text.contains(name) {
+                continue;
+            }
+            found
+                .entry(name.to_string())
+                .or_default()
+                .push(wirk_core::EvidenceItem {
+                    coordinate: encode_coordinate(&hit.coordinate),
+                    summary: bounded_summary(unit),
+                    lifetime: lifetime_of(generation, &hit.coordinate.path),
+                    reason: format!(
+                        "the authored text names the identifier `{name}`, which occurs literally \
+                         in source `{}` at the captured generation",
+                        membership.alias
+                    ),
+                    identity: wirk_core::ItemIdentity::Generation {
+                        generation: hit.coordinate.generation.0.clone(),
+                        object_id: hit.coordinate.object_id.clone(),
+                    },
+                });
+        }
+    }
+}
+
+/// Assemble with no guard of any kind held, then re-check the Atlas
+/// publication revision before the caller commits. Used at `submit`,
+/// where no journal exists yet, so the journal half of the re-check is
+/// vacuous and the Atlas half still applies (BUILD.md §4.6).
+fn prepared_without_journal(
+    state: &Arc<WirkdState>,
+    bindings: &[RepositoryBinding],
+    def: &WaypointDefinition,
+    route_edition: &str,
+) -> Option<PreparedProjection> {
+    let orient = def.orient.as_ref()?;
+    // One window for the whole assembly, laps included: the receipt
+    // reports what the reservation actually spent, not what the last
+    // successful lap spent.
+    let started = std::time::Instant::now();
+    for attempt in 1..=JOURNAL_OBSERVATION_ATTEMPTS {
+        // No journal exists yet at `submit`, so there is no prior stage
+        // of this Work to bind: an empty event slice is the literal
+        // truth here, not a shortcut.
+        let prepared = prepare_projection(
+            state,
+            &[],
+            bindings,
+            def,
+            route_edition,
+            attempt as u32,
+            started,
+        )?;
+        let current = state
+            .atlas
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .publication_revision();
+        if current == prepared.publication_revision {
+            return Some(prepared);
+        }
+    }
+    Some(degraded_projection(
+        def,
+        orient,
+        route_edition,
+        ObservationSpan::measured(JOURNAL_OBSERVATION_ATTEMPTS as u32, started),
+        DegradedCause::PublicationChurn,
+    ))
+}
+
+/// The observe / assemble / re-check loop for the three reservation
+/// sites that reserve against an existing journal.
+///
+/// 1. lock this Work's journal, replay, **drop the guard**;
+/// 2. decide, from that observation, which Waypoint the caller will
+///    reserve; if it declares no `orient`, there is nothing to do and
+///    the caller's existing path runs unchanged;
+/// 3. assemble on that dropped-guard observation;
+/// 4. re-lock, and use the result only if the journal has not moved and
+///    the Atlas publication revision has not moved.
+///
+/// The caller then takes the guard itself and reserves. The prepared
+/// projection carries the Waypoint it was assembled for, and the
+/// reserving code uses it only if that is still the Waypoint it decides
+/// on under the guard — so a lost race degrades the *evidence* and never
+/// the *authority* (ruling 0124).
+fn prepared_for_waypoint(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    decide: impl Fn(&[Event]) -> Option<WaypointId>,
+) -> Option<PreparedProjection> {
+    no_journal_guard_held("stage projection observation");
+    let journal_handle = journal_for(state, work_id).ok().flatten()?;
+    let started = std::time::Instant::now();
+    let mut last: Option<(WaypointDefinition, String)> = None;
+    for attempt in 1..=JOURNAL_OBSERVATION_ATTEMPTS {
+        let events = {
+            let journal = lock_journal(&journal_handle);
+            journal.replay().ok()?
+        };
+        let defs = waypoint_defs_for(&events);
+        let waypoint = decide(&events)?;
+        let def = find_definition(&defs, &waypoint)?.clone();
+        def.orient.as_ref()?;
+        let route_edition = route_edition_of(&defs);
+        let prepared = prepare_projection(
+            state,
+            &events,
+            &fold(&events).repositories,
+            &def,
+            &route_edition,
+            attempt as u32,
+            started,
+        )?;
+        let settled = {
+            let journal = lock_journal(&journal_handle);
+            journal
+                .replay()
+                .ok()
+                .is_some_and(|after| same_observation(&events, &after))
+        };
+        let published = state
+            .atlas
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .publication_revision();
+        if settled && published == prepared.publication_revision {
+            return Some(prepared);
+        }
+        last = Some((def, route_edition));
+    }
+    // Exhausted, and the reservation still proceeds: the stage runs, and
+    // the projection says the assembler kept losing to a moving estate.
+    let (def, route_edition) = last?;
+    let orient = def.orient.clone()?;
+    Some(degraded_projection(
+        &def,
+        &orient,
+        &route_edition,
+        ObservationSpan::measured(JOURNAL_OBSERVATION_ATTEMPTS as u32, started),
+        DegradedCause::PublicationChurn,
+    ))
+}
+
+/// Removes the `.tmp-` files a crash between a projection's temp write
+/// and its rename can leave. See the call site's own note for why
+/// nothing else in `projections/` is ever removed.
+fn sweep_projection_temporaries(state: &Arc<WirkdState>) {
+    let Ok(works) = std::fs::read_dir(state.estate_root.join("works")) else {
+        return;
+    };
+    for work in works.flatten() {
+        let Ok(entries) = std::fs::read_dir(work.path().join("projections")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// `wirk world show` (W-C1, BUILD.md §5.3): the delivered stage
+/// projection for the Run the caller's own injected triple names.
+///
+/// Three honest answers, and no fourth:
+///
+/// * the Waypoint declared no orientation request — said explicitly,
+///   never as an empty object a reader would have to interpret;
+/// * the reserved World names a projection and it is delivered, with its
+///   observation receipt beside it;
+/// * the reserved World names a projection and the file it names is
+///   missing, unreadable, or does not re-hash to the id the journal
+///   recorded — an explicit unavailability with a closed reason. It is
+///   never regenerated against today's estate: what was delivered is a
+///   historical fact, and re-assembling it now would answer a different
+///   question with the first question's identity.
+///
+/// **An id is not a capability.** The Work and the Run come from the
+/// triple; the file is read under `works/<work_id>/`; the reference
+/// comes from that Work's own journal. There is no argument on this
+/// surface that names a Work, a Run or a projection, so a coordinate or
+/// an id copied out of one projection opens nothing. `currentness` is
+/// reported, not enforced: a Run superseded by a retry may still be
+/// executing, and the context *it* was delivered is its own historical
+/// fact — the caller learns it is no longer the current Run rather than
+/// being refused a read of its own World.
+fn handle_world_show(state: &Arc<WirkdState>, payload: super::WorldShowPayload) -> Reply {
+    let work_id = payload.triple.work_id.clone();
+    let run_id = payload.triple.run_id.clone();
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the triple's estate root does not identify this daemon's estate",
+        );
+    }
+    let journal = match journal_for(state, &work_id) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let events = {
+        let journal = lock_journal(&journal);
+        match journal.replay() {
+            Ok(events) => events,
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        }
+    };
+    if events.is_empty() {
+        return err_reply("NotFound", "no such work");
+    }
+    let Some(run) = find_run(&events, &run_id) else {
+        return err_reply(
+            "TripleMismatch",
+            "the run id does not match any Run opened for this Work",
+        );
+    };
+    // The whole of the binding check: `resolve_run_binding` refuses a
+    // World whose own triple does not name this estate, this Work and
+    // this Run, so a caller cannot read a World by asserting a triple
+    // the journal does not carry.
+    let binding = match resolve_run_binding(&events, &state.estate_root, &work_id, &run_id) {
+        Ok(binding) => binding,
+        Err(reason) => return err_reply("ValidationUnavailable", &reason),
+    };
+    let current = latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
+        == Some(run_id.clone());
+    let declared_orientation = find_definition(&waypoint_defs_for(&events), &run.waypoint)
+        .is_some_and(|def| def.orient.is_some());
+
+    let mut result = json!({
+        "work": work_id.0,
+        "run": run_id.0,
+        "waypoint": run.waypoint.0,
+        "current": current,
+    });
+
+    // The whole chain this Run was delivered, oldest first: the reserved
+    // World's initial projection, then each revision its own actor
+    // expanded. Listed on every reply, so a fresh actor with no
+    // transcript learns that its context has a history — and how long it
+    // is — from the one command it already runs.
+    let chain = projection_chain(&binding, &run);
+    if chain.is_empty() {
+        result["orientation"] = json!(if declared_orientation {
+            "unavailable"
+        } else {
+            "none"
+        });
+        result["detail"] = json!(if declared_orientation {
+            "this Waypoint declares an orientation request, but the World reserved for this Run \
+             carries no projection"
+        } else {
+            "this Waypoint declared no orientation request"
+        });
+        return ok_reply(result);
+    }
+    result["revisions"] = Value::Array(
+        chain
+            .iter()
+            .map(|entry| {
+                json!({
+                    "revision": entry.revision,
+                    "observation": entry.observation.0,
+                    "projection": entry.projection.0,
+                    "format": entry.format,
+                    "initial": entry.revision == 0,
+                })
+            })
+            .collect(),
+    );
+    result["latest_revision"] = json!(chain.last().map(|entry| entry.revision).unwrap_or(0));
+    // Default: the latest revision, which is what "my context" means to
+    // an actor that has expanded it. `--revision N` reads exactly N, and
+    // a revision this Run was never delivered is refused by name rather
+    // than silently falling back to one it was — a fallback would hand a
+    // caller a different document under the number it asked for.
+    let reference = match payload.revision {
+        None => chain.last().expect("chain is non-empty"),
+        Some(wanted) => {
+            let Some(found) = chain.iter().find(|entry| entry.revision == wanted) else {
+                result["orientation"] = json!("unavailable");
+                result["reason"] = json!("no-such-revision");
+                result["detail"] = json!(format!(
+                    "this Run's delivered context has {} revision(s), 0 through {}; revision \
+                     {wanted} is not one of them",
+                    chain.len(),
+                    chain.last().map(|entry| entry.revision).unwrap_or(0),
+                ));
+                return ok_reply(result);
+            };
+            found
+        }
+    };
+
+    result["orientation"] = json!("delivered");
+    result["reference"] = json!({
+        "observation": reference.observation.0,
+        "projection": reference.projection.0,
+        "revision": reference.revision,
+        "format": reference.format,
+    });
+    match wirk_core::ProjectionFile::read_referenced(&state.estate_root, &work_id, reference) {
+        Ok(file) => {
+            result["projection"] =
+                serde_json::to_value(&file.content).expect("ProjectionContent always serializes");
+            result["receipt"] =
+                serde_json::to_value(&file.receipt).expect("ObservationReceipt always serializes");
+        }
+        Err(unavailable) => {
+            result["orientation"] = json!("unavailable");
+            result["reason"] = json!(unavailable.reason());
+            // Only revision 0 is the reserved World's. A later revision
+            // is one this Run asked for and this chain recorded, so name
+            // that revision rather than blaming the reservation for a
+            // file it does not name. The refusal and its `reason` are
+            // unchanged either way.
+            result["detail"] = json!(if reference.revision == 0 {
+                "the reserved World names a projection this estate cannot deliver; it is not \
+                 re-assembled, because what was delivered then is not what would be assembled now"
+                    .to_string()
+            } else {
+                format!(
+                    "revision {} of this Run's delivered context names a projection this estate \
+                     cannot deliver; it is not re-assembled, because what was delivered then is \
+                     not what would be assembled now",
+                    reference.revision,
+                )
+            });
+        }
+    }
+    ok_reply(result)
+}
+
+// ---- W-C3: expansion of a delivered stage context -------------------------
+//
+// One verb (`world expand`), one assembler (`prepare_expansion`), one
+// event (`ProjectionExpanded`). Four rules carry it, each of them a
+// ruling rather than a preference:
+//
+// * **Nothing already delivered is edited.** The reserved World, its
+//   `WorldHash`, and every projection file already written stay exactly
+//   as they are. An expansion writes a *new* file at `revision + 1` and
+//   the journal carries a *new* reference. `world show --revision 0`
+//   after any number of expansions reads the same bytes it read before
+//   the first one.
+// * **Authority is re-derived, never carried.** The triple is the only
+//   door; the Run must be the current Run of its own Waypoint and still
+//   Open; the binding must name this estate, this Work and this Run; and
+//   all of it is re-checked under the guard the append happens under.
+//   Laps buy a coherent parent, never a stale one (ruling 0124).
+// * **The captured vector is preserved.** Every read pins to the parent
+//   revision's own generations, re-admitted under this Work's bindings as
+//   they stand now. An expansion never reads today's bytes under a
+//   generation the stage was pinned to, and never observes a new vector
+//   under an old World's identity.
+// * **A handle is not a capability.** `--reference` must name a
+//   `reachable` entry this Run's own chain actually delivered, and the
+//   source it names must still be admitted. A handle copied from another
+//   Work's projection, or invented, resolves to nothing.
+
+/// The chain of projection revisions delivered to one Run, oldest first:
+/// the reserved World's own reference at revision 0, then each
+/// `ProjectionExpanded` this Run folded.
+///
+/// There is no other way to reach a revision. A `ProjectionId` is not an
+/// address (`ProjectionFile::read_referenced` takes a reference out of
+/// this Work's own journal and reads under `works/<work_id>/`), so a
+/// chain is exactly what this Run was given and nothing else.
+fn projection_chain(binding: &RunBinding, run: &Run) -> Vec<wirk_core::EvidenceProjectionRef> {
+    let mut chain = Vec::new();
+    if let Some(initial) = binding.world.evidence() {
+        chain.push(initial.clone());
+    }
+    if chain.is_empty() {
+        // No initial revision means no chain at all: an expansion cannot
+        // have happened without one, and folding a tail onto nothing
+        // would present a revision as if it were an initial delivery.
+        return chain;
+    }
+    chain.extend(run.expansions.iter().cloned());
+    chain
+}
+
+/// What one expansion asked for, after shape checking and before
+/// anything is observed.
+struct ExpansionAsk {
+    question: Option<String>,
+    reference: Option<String>,
+    reason: Option<String>,
+}
+
+/// A `reachable` handle, revalidated against the chain that delivered it.
+struct AdmittedHandle {
+    handle: String,
+    source: String,
+    family: wirk_atlas::ContentFamily,
+}
+
+/// `wirk world expand` (W-C3): the current Run's actor adds a revision to
+/// the context it was delivered.
+///
+/// The whole authority argument is here rather than spread across
+/// helpers, because every line of it is the difference between "this Run
+/// asked for more of its own context" and "something widened a stage's
+/// reach". In order: the triple names this daemon's estate; the Run
+/// exists in this Work's journal; the World reserved for it really is
+/// bound to this estate/Work/Run (`resolve_run_binding`); the Work is
+/// not terminal; the Run is still Open; the Run is the *current* Run of
+/// its Waypoint; and the Waypoint declares an orientation request whose
+/// initial projection is readable and re-hashes. Then, and only then,
+/// the parent revision is read, the expansion is assembled with no guard
+/// held, and the journal is re-checked under the commit guard before the
+/// event is appended.
+fn handle_world_expand(state: &Arc<WirkdState>, payload: super::WorldExpandPayload) -> Reply {
+    let work_id = payload.triple.work_id.clone();
+    let run_id = payload.triple.run_id.clone();
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the triple's estate root does not identify this daemon's estate",
+        );
+    }
+    // Shape, before anything is observed: it depends on the request and
+    // nothing else, so it never needs re-deciding when the loop re-reads.
+    let ask = {
+        let question = payload
+            .question
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let reference = payload
+            .reference
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let reason = payload
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        if question.is_none() && reference.is_none() {
+            return err_reply(
+                "BadRequest",
+                "an expansion asks for something: give --question, --reference, or both",
+            );
+        }
+        if question.as_ref().is_some_and(|text| text.len() > 4096)
+            || reason.as_ref().is_some_and(|text| text.len() > 4096)
+        {
+            return err_reply("BadRequest", "the authored text is too long to record");
+        }
+        ExpansionAsk {
+            question,
+            reference,
+            reason,
+        }
+    };
+    let journal_handle = match journal_for(state, &work_id) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+
+    // Observe with no guard held, assemble, then re-lock and re-check —
+    // the same discipline `handle_finding_raise` runs on (ruling 0119),
+    // for the same reason: assembly reads the Atlas and the filesystem,
+    // and a decision must not rest on authority that has since moved. A
+    // journal that did not move is a chain whose tail is still the
+    // parent this expansion was built on, which is what makes a
+    // concurrent expansion a loser that re-reads rather than a lost
+    // update.
+    let mut attempt = 0usize;
+    let started = std::time::Instant::now();
+    let (mut journal, prepared, parent_ref, mut chain) = loop {
+        attempt += 1;
+        let events = {
+            let journal = lock_journal(&journal_handle);
+            match journal.replay() {
+                Ok(events) => events,
+                Err(err) => return err_reply("JournalError", &err.to_string()),
+            }
+        };
+        if events.is_empty() {
+            return err_reply("NotFound", "no such work");
+        }
+        let Some(run) = find_run(&events, &run_id) else {
+            return err_reply(
+                "TripleMismatch",
+                "the run id does not match any Run opened for this Work",
+            );
+        };
+        let work = fold(&events);
+        if work.id != work_id {
+            return err_reply("TripleMismatch", "triple does not match this work");
+        }
+        if work.state.is_terminal() {
+            return err_reply(
+                "WorkTerminal",
+                "the Work is already terminal: its delivered context is history, not a context \
+                 to add to",
+            );
+        }
+        // The stale-expansion guard, asked **before** the Run's own
+        // state: a superseded Run is refused for being superseded, which
+        // is the authority fact, rather than for whatever a retry
+        // happened to leave its state as. An exhausted observation
+        // budget can never reach past this — it is asked again under the
+        // commit guard below, against the same events the append happens
+        // on.
+        if latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
+            != Some(run_id.clone())
+        {
+            return err_reply(
+                "TripleMismatch",
+                "the run is not current for its waypoint: a superseded Run's delivered context \
+                 is a historical fact and is never added to",
+            );
+        }
+        if !matches!(run.state, RunState::Open) {
+            return err_reply(
+                "RunClosed",
+                "this Run is no longer open: the context it was delivered stays exactly as it \
+                 was delivered",
+            );
+        }
+        let binding = match resolve_run_binding(&events, &state.estate_root, &work_id, &run_id) {
+            Ok(binding) => binding,
+            Err(reason) => return err_reply("ValidationUnavailable", &reason),
+        };
+        let chain = projection_chain(&binding, &run);
+        let Some(parent_ref) = chain.last().cloned() else {
+            return err_reply(
+                "NoOrientation",
+                "the World reserved for this Run carries no projection: there is nothing to \
+                 expand",
+            );
+        };
+        // The parent, read and re-hashed exactly as `world show` reads
+        // it. An unreadable or substituted parent is an explicit
+        // refusal, never an expansion built on bytes this journal does
+        // not vouch for.
+        let parent_file = match wirk_core::ProjectionFile::read_referenced(
+            &state.estate_root,
+            &work_id,
+            &parent_ref,
+        ) {
+            Ok(file) => file,
+            Err(unavailable) => {
+                return err_reply(
+                    "ProjectionUnavailable",
+                    &format!(
+                        "the revision this expansion would extend cannot be delivered \
+                         ({}); it is not re-assembled against today's estate",
+                        unavailable.reason()
+                    ),
+                );
+            }
+        };
+        let Some(parent) = parent_file.content.v2() else {
+            return err_reply(
+                "ProjectionUnavailable",
+                "the revision this expansion would extend was written in a format that carries \
+                 no expansion chain",
+            );
+        };
+        // The handle, revalidated against this Run's own chain. Every
+        // revision in the chain is read — a handle delivered by revision
+        // 0 stays usable after revision 3 — and a handle no revision
+        // delivered addresses nothing, whatever it spells.
+        let handle = match ask.reference.as_deref() {
+            None => None,
+            Some(wanted) => match admitted_handle(state, &work_id, &chain, wanted) {
+                Ok(handle) => Some(handle),
+                Err(message) => return err_reply("UnknownHandle", &message),
+            },
+        };
+        let defs = waypoint_defs_for(&events);
+        let Some(def) = find_definition(&defs, &run.waypoint).cloned() else {
+            return err_reply(
+                "NoOrientation",
+                "this Run's Waypoint is not in the Route this Work was submitted with",
+            );
+        };
+        let Some(orient) = def.orient.clone() else {
+            return err_reply(
+                "NoOrientation",
+                "this Run's Waypoint declares no orientation request",
+            );
+        };
+        // No guard is held here, by construction, and that is the whole
+        // reason this loop exists.
+        let prepared = prepare_expansion(
+            state,
+            &orient,
+            parent,
+            &parent_ref,
+            &run_id,
+            &fold(&events).repositories,
+            &ask,
+            handle.as_ref(),
+            attempt as u32,
+            started,
+        );
+
+        // Re-acquire and re-check. An unmoved journal means the chain's
+        // tail is still `parent_ref`, the Run is still current and still
+        // Open, and the binding is unchanged — all of them are folded
+        // from these same events.
+        let journal = lock_journal(&journal_handle);
+        let events_now = match journal.replay() {
+            Ok(events_now) => events_now,
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        };
+        if same_observation(&events, &events_now) {
+            break (journal, prepared, parent_ref, chain);
+        }
+        drop(journal);
+        if attempt >= JOURNAL_OBSERVATION_ATTEMPTS {
+            return err_reply(
+                "Conflict",
+                "this Work's journal moved under every attempt to extend this context: re-read \
+                 `wirk world show` and expand again from the revision that is now current",
+            );
+        }
+    };
+
+    // Durable before referenced: the file is written, fsynced and
+    // renamed under `works/<work>/projections/` before the event that
+    // names it exists, exactly as the initial reservation's is.
+    let reference = match prepared.commit(state, &work_id) {
+        Ok(reference) => reference,
+        Err((code, message)) => return err_reply(code, &message),
+    };
+    let event = new_event(
+        &work_id,
+        Some(run_id.clone()),
+        EventKind::ProjectionExpanded {
+            waypoint: prepared.waypoint.clone(),
+            parent: parent_ref.observation.clone(),
+            reference: Box::new(reference.clone()),
+        },
+    );
+    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    drop(journal);
+
+    let file = prepared.file;
+    chain.push(reference.clone());
+    let mut result = json!({
+        "work": work_id.0,
+        "run": run_id.0,
+        "waypoint": prepared.waypoint.0,
+        // Reaching this line means the Run was current under the same
+        // guard the append happened on. Said explicitly, because this
+        // reply is rendered by the same code `world show`'s is and an
+        // absent field would render as "not current" — which would be
+        // false about the one Run that just proved it was.
+        "current": true,
+        "orientation": "delivered",
+        "revision": reference.revision,
+        "parent": parent_ref.observation.0,
+        "latest_revision": reference.revision,
+        "revisions": Value::Array(
+            chain
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "revision": entry.revision,
+                        "observation": entry.observation.0,
+                        "projection": entry.projection.0,
+                        "format": entry.format,
+                        "initial": entry.revision == 0,
+                    })
+                })
+                .collect(),
+        ),
+        "reference": {
+            "observation": reference.observation.0,
+            "projection": reference.projection.0,
+            "revision": reference.revision,
+            "format": reference.format,
+        },
+    });
+    result["projection"] =
+        serde_json::to_value(&file.content).expect("ProjectionContent always serializes");
+    result["receipt"] =
+        serde_json::to_value(&file.receipt).expect("ObservationReceipt always serializes");
+    ok_reply(result)
+}
+
+/// Revalidates a `--reference` handle against the chain that delivered
+/// it, and against the family vocabulary the projection itself writes.
+///
+/// Two independent checks, and both are needed. The chain check is what
+/// makes a handle non-transferable: a handle is reachable **because some
+/// revision of this Run's own context delivered it**, so one lifted out
+/// of another Work's projection, or invented, is refused here before any
+/// source is named. The parse is what turns it into a query narrowing;
+/// it is deliberately the inverse of `reachable_entries`' own
+/// `<alias>:<family>` construction rather than a second grammar.
+///
+/// Admission is *not* checked here: it is re-derived in the assembler
+/// against this Work's bindings as they stand now, so a source unbound
+/// since delivery contributes an inadmissible count and no lookup, the
+/// same way an unbound `orient.sources` alias does.
+fn admitted_handle(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    chain: &[wirk_core::EvidenceProjectionRef],
+    wanted: &str,
+) -> Result<AdmittedHandle, String> {
+    let mut delivered: Option<wirk_core::ReachableEntry> = None;
+    for reference in chain {
+        let Ok(file) =
+            wirk_core::ProjectionFile::read_referenced(&state.estate_root, work_id, reference)
+        else {
+            // A revision that cannot be delivered cannot vouch for a
+            // handle. Skipped rather than fatal: an earlier revision may
+            // still carry it, and the parent's own readability was
+            // already checked by the caller.
+            continue;
+        };
+        let Some(content) = file.content.v2() else {
+            continue;
+        };
+        if let Some(entry) = content
+            .reachable
+            .iter()
+            .find(|entry| entry.handle == wanted)
+        {
+            delivered = Some(entry.clone());
+            break;
+        }
+    }
+    let Some(entry) = delivered else {
+        return Err(format!(
+            "no revision of this Run's own delivered context offers the handle `{wanted}`; a \
+             handle is usable because this context delivered it, never because it is spelled \
+             correctly"
+        ));
+    };
+    let family = match entry.family.as_str() {
+        "code" => wirk_atlas::ContentFamily::Code,
+        "knowledge" => wirk_atlas::ContentFamily::Knowledge,
+        "config" => wirk_atlas::ContentFamily::Config,
+        other => {
+            return Err(format!(
+                "the delivered handle `{wanted}` names a content family this binary does not \
+                 query (`{other}`)"
+            ));
+        }
+    };
+    Ok(AdmittedHandle {
+        handle: entry.handle.clone(),
+        source: entry.source.clone(),
+        family,
+    })
+}
+
+/// Assembles one expansion revision on top of `parent`.
+///
+/// **The captured vector is preserved, and that is the whole basis.**
+/// `parent.generations` is re-admitted — each membership must still be
+/// bound by this Work and still be readable at *the generation the
+/// parent named* — and every read pins to it. Nothing here consults the
+/// currently published generation of anything: a stage that was pinned
+/// to a snapshot stays pinned to it, so a coordinate delivered at
+/// revision 3 means exactly what the same coordinate meant at revision 0
+/// and no revision ever attributes today's bytes to a historical
+/// identity (ruling 0126, ruling 0128 F1). A generation that can no
+/// longer be read back is an explicit `Omission::Unavailable`; a source
+/// this Work no longer binds is an inadmissible count and no lookup.
+///
+/// Everything the parent delivered is carried forward in delivery order
+/// and the new material is appended after it, because a revision is the
+/// context the actor now has, whole — an actor reads one document, not a
+/// diff it has to reassemble. What the new material *is*: the ranked
+/// answer for the authored terms, plus the literal path and identifier
+/// references those terms name, both resolved exactly the way step 3 and
+/// step 7 of the initial assembly resolve them, and narrowed to one
+/// source and family when a handle was given.
+///
+/// `retrieval` describes the query *this revision* ran, not the parent's:
+/// each revision's note is about the query that produced its newest
+/// material, and the parent revision remains readable with its own note.
+#[allow(clippy::too_many_arguments)]
+fn prepare_expansion(
+    state: &Arc<WirkdState>,
+    orient: &wirk_core::OrientationRequest,
+    parent: &wirk_core::ProjectionContent,
+    parent_ref: &wirk_core::EvidenceProjectionRef,
+    run_id: &RunId,
+    bindings: &[RepositoryBinding],
+    ask: &ExpansionAsk,
+    handle: Option<&AdmittedHandle>,
+    laps: u32,
+    started: std::time::Instant,
+) -> PreparedProjection {
+    no_journal_guard_held("stage projection expansion");
+
+    // The terms. An actor that authored none is expanding a handle, and
+    // the stage's own question stands in — said as a fact on the record
+    // rather than presented as something the actor wrote.
+    let authored_question = ask.question.is_some();
+    let question = ask
+        .question
+        .clone()
+        .unwrap_or_else(|| parent.question.clone());
+
+    let mut bound = parent.bound.clone();
+    // The *initial* assembly's ranked list, carried forward unchanged:
+    // this revision's ranked material is `bound`, because this Run's own
+    // actor asked for it by name rather than the assembler offering it.
+    let referenced = parent.referenced.clone();
+    let mut assumptions = parent.assumptions.clone();
+    let mut unknowns = parent.unknowns.clone();
+    let mut omitted = parent.omitted.clone();
+    let mut added: Vec<wirk_core::EvidenceItem> = Vec::new();
+    let mut inadmissible = 0usize;
+
+    // What this context has already **bound**, so an expansion adds
+    // rather than repeats. Keyed by the coordinate, which is the exact
+    // (membership, generation, path, object, span) identity — not by
+    // summary text, which two resources can share.
+    //
+    // Deliberately not seeded with `referenced`. The initial assembly
+    // does not deduplicate the two lists against each other either, and
+    // for the same reason: `referenced` is what the assembler *offered*
+    // for the Route's question, and binding it is what this Run's own
+    // actor asked for by name. Suppressing it here was the first
+    // candidate's behavior and it made expanding a handle deliver
+    // nothing at all whenever the ranked answer was the one the initial
+    // assembly had already offered — the exact "decorative listing"
+    // outcome the verb exists to avoid. Each item carries its own reason
+    // in each list, so an honest reader can see it appear in both.
+    let already: HashSet<String> = parent
+        .bound
+        .iter()
+        .map(|item| item.coordinate.clone())
+        .collect();
+
+    let scope = wirk_atlas::QueryScope::Work(bindings.to_vec());
+    let bound_aliases: HashSet<&str> = bindings
+        .iter()
+        .map(|binding| binding.name.as_str())
+        .collect();
+
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    // Re-admit the parent's own captured vector. Note the order: the
+    // *parent's* list decides which generations, this Work's *current*
+    // bindings decide which are still admitted. A membership the Work no
+    // longer binds is counted and never read; a generation that no
+    // longer resolves is reported and never substituted.
+    let mut admitted: Vec<(wirk_atlas::Membership, wirk_atlas::SourceGeneration)> = Vec::new();
+    // Two counts, and they are not the same fact.
+    //
+    // `still_bound` is about the captured vector: does this Work still
+    // bind the membership the vector names. That is settled from
+    // bindings this loop already holds, for every captured member, at no
+    // cost.
+    //
+    // `selected` is this expansion's own query scope: of those, the ones
+    // a `--reference` handle names, or all of them when no handle
+    // narrows the request. Only a selected membership has its pinned
+    // generation looked up, which is what makes narrowing cheaper than
+    // not narrowing — and it is also why a narrowed expansion cannot
+    // report anything at all about a source it did not select, neither
+    // as readable nor as unavailable.
+    let mut still_bound = 0usize;
+    let mut selected = 0usize;
+    for (membership_id, generation_id) in &parent.generations {
+        let membership = atlas
+            .memberships()
+            .find(|member| member.id.0 == *membership_id)
+            .cloned();
+        let Some(membership) = membership else {
+            inadmissible += 1;
+            continue;
+        };
+        if !bound_aliases.contains(membership.alias.as_str())
+            || !(orient.sources.is_empty() || orient.sources.contains(&membership.alias))
+        {
+            inadmissible += 1;
+            continue;
+        }
+        still_bound += 1;
+        if let Some(handle) = handle
+            && handle.source != membership.alias
+        {
+            // Outside this expansion's query scope. Nothing further is
+            // read about it here: no generation lookup, no `Unavailable`
+            // omission, no effect on this revision's coverage. Narrowing
+            // is a choice about what to read, and a choice not to read a
+            // source is not a finding about it.
+            continue;
+        }
+        selected += 1;
+        match atlas.generation(&wirk_atlas::GenerationId(generation_id.clone())) {
+            Ok(generation) if generation.id.0 == *generation_id => {
+                admitted.push((membership, generation))
+            }
+            _ => omitted.push(wirk_core::Omission::Unavailable {
+                coordinate: membership.alias.clone(),
+                reason: wirk_core::UnavailableReason::GenerationUnavailable,
+            }),
+        }
+    }
+    let pinned: BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId> = admitted
+        .iter()
+        .map(|(membership, generation)| (membership.id.clone(), generation.id.clone()))
+        .collect();
+
+    // The authored references in the expansion's own text, resolved
+    // exactly as the initial assembly resolves the Route's — an actor
+    // that names a path gets that path, at the captured generation.
+    // Only the actor's own words: the Waypoint's intent was already
+    // resolved into the parent and re-resolving it would deliver the
+    // same items twice under a new reason.
+    let mut unresolved: Vec<Reference> = Vec::new();
+    if authored_question {
+        let references = authored_references(&[question.as_str()]);
+        let identifiers: Vec<&str> = references
+            .iter()
+            .filter_map(|reference| match reference {
+                Reference::Identifier(name) => Some(name.as_str()),
+                Reference::Path(_) => None,
+            })
+            .collect();
+        let mut resolved_identifiers =
+            resolve_identifier_references(&atlas, &scope, &admitted, &pinned, &identifiers);
+        for reference in &references {
+            let hits = match reference {
+                Reference::Path(path) => resolve_path_reference(&admitted, path, &mut omitted),
+                Reference::Identifier(name) => resolved_identifiers
+                    .remove(name.as_str())
+                    .unwrap_or_default(),
+            };
+            if hits.is_empty() {
+                unresolved.push(reference.clone());
+                continue;
+            }
+            for hit in hits {
+                added.push(wirk_core::EvidenceItem {
+                    reason: format!(
+                        "named literally by this Run's own expansion request, resolved at the \
+                         captured generation this stage was pinned to (revision {})",
+                        parent.revision + 1
+                    ),
+                    ..hit
+                });
+            }
+        }
+    }
+
+    // The ranked answer for the terms, narrowed to the handle's source
+    // and family when there is one. Same `wirk_atlas::search` the public
+    // `wirk atlas search` runs, same configured backend the Route
+    // recorded (ruling 0128 F3) — an expansion does not get to choose a
+    // different ranker than the stage was configured with, and it
+    // certainly does not pick a host one.
+    let answer = wirk_atlas::search(
+        &atlas,
+        &wirk_atlas::SearchRequest {
+            scope: scope.clone(),
+            requested_source: handle.map(|handle| handle.source.clone()),
+            query: question.clone(),
+            families: handle.map(|handle| vec![handle.family]).unwrap_or_default(),
+            semantic: wirk_atlas::SemanticRequest::Requested,
+            limit: orient.budget.referenced(),
+            pinned: Some(pinned.clone()),
+            offset: 0,
+            semantic_query: orient.semantic.as_ref().map(|configured| {
+                wirk_atlas::SemanticQueryConfig {
+                    backend: PathBuf::from(&configured.backend),
+                    backend_args: configured.backend_args.clone(),
+                    model: PathBuf::from(&configured.model),
+                }
+            }),
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+        },
+    )
+    .ok();
+    let retrieval = retrieval_note(answer.as_ref());
+    let ranked: Vec<wirk_core::EvidenceItem> = answer
+        .as_ref()
+        .map(|answer| {
+            answer
+                .hits
+                .iter()
+                .filter_map(|hit| ranked_item(&admitted, hit))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ranked_returned = ranked.len();
+    for item in ranked {
+        added.push(wirk_core::EvidenceItem {
+            reason: match handle {
+                Some(handle) => format!(
+                    "ranked for this Run's own expansion request inside the delivered handle \
+                     `{}`, at the captured generation this stage was pinned to; being ranked \
+                     here is not a statement that it answers the request",
+                    handle.handle
+                ),
+                None => "ranked for this Run's own expansion request across every admitted \
+                         source, at the captured generation this stage was pinned to; being \
+                         ranked here is not a statement that it answers the request"
+                    .to_string(),
+            },
+            ..item
+        });
+    }
+    drop(atlas);
+
+    // What is genuinely new. A resource the chain already delivered is
+    // not delivered again — its coordinate resolves to the same bytes it
+    // always did — and the count says so rather than the list quietly
+    // being shorter than the query's own total.
+    let offered = added.len();
+    let mut seen: HashSet<String> = already;
+    let mut fresh: Vec<wirk_core::EvidenceItem> = Vec::new();
+    for item in added {
+        if seen.insert(item.coordinate.clone()) {
+            fresh.push(item);
+        }
+    }
+    let repeated = offered - fresh.len();
+    let delivered = fresh.len();
+    bound.extend(fresh);
+
+    let shown_unknowns = unresolved.len().min(ASSEMBLY_UNKNOWN_MAX);
+    for reference in &unresolved[..shown_unknowns] {
+        unknowns.push(wirk_core::Statement {
+            text: unresolved_statement(reference),
+            attributed_to: wirk_core::StatementOrigin::Intent,
+        });
+    }
+    if unresolved.len() > shown_unknowns {
+        omitted.push(wirk_core::Omission::OverBudget {
+            of: "unknowns".to_string(),
+            shown: shown_unknowns,
+            total: unresolved.len(),
+        });
+    }
+    if inadmissible > 0 {
+        omitted.push(wirk_core::Omission::Inadmissible {
+            count: inadmissible,
+        });
+    }
+
+    assumptions.push(wirk_core::Statement {
+        text: format!(
+            "revision {revision} expands revision {parent_revision} of this same Run's delivered \
+             context. Every earlier revision is unchanged and still readable at the bytes it was \
+             delivered with; the World reserved for this Run, and its hash, are untouched — an \
+             expansion adds a revision, it never edits one.",
+            revision = parent.revision + 1,
+            parent_revision = parent.revision,
+        ),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    // What this sentence may claim is exactly what this expansion
+    // actually looked at. Unnarrowed, that is the whole captured vector
+    // and the original sentence is true of it. Narrowed, readability was
+    // only ever established for the selected memberships, so the
+    // sentence separates the three facts it really has — how many the
+    // vector names, how many this Work still binds, and how many of the
+    // ones this request selected were still readable — and says plainly
+    // that the unselected rest were not examined here. It must never
+    // present a scope choice as a source having gone away.
+    assumptions.push(wirk_core::Statement {
+        text: match handle {
+            None => format!(
+                "this expansion preserved the captured generation vector of the revision it \
+                 expands and observed no new one: {admitted} of the {captured} membership(s) \
+                 that vector names were still bound by this Work and still readable at the \
+                 exact generation the vector named, and every read here pinned to those. \
+                 Nothing was read at any source's currently published generation, so a \
+                 coordinate delivered here means what it meant when this stage was reserved, at \
+                 Atlas publication revision {publication}.",
+                admitted = admitted.len(),
+                captured = parent.generations.len(),
+                publication = parent.publication_revision,
+            ),
+            Some(handle) => format!(
+                "this expansion preserved the captured generation vector of the revision it \
+                 expands and observed no new one: of the {captured} membership(s) that vector \
+                 names, {still_bound} are still bound by this Work, and this expansion read \
+                 only the {selected} of those that the delivered handle `{name}` names — \
+                 {admitted} of them were still readable at the exact generation the vector \
+                 named, and every read here pinned to those. The rest were left unread here: \
+                 that is this expansion's own query scope, not a finding about whether they are \
+                 readable. Nothing was read at any source's currently published generation, so \
+                 a coordinate delivered here means what it meant when this stage was reserved, \
+                 at Atlas publication revision {publication}.",
+                captured = parent.generations.len(),
+                still_bound = still_bound,
+                selected = selected,
+                name = handle.handle,
+                admitted = admitted.len(),
+                publication = parent.publication_revision,
+            ),
+        },
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    assumptions.push(wirk_core::Statement {
+        text: format!(
+            "the request produced {offered} candidate item(s); {delivered} were added and \
+             {repeated} were already bound in this context at the same coordinate and were not \
+             delivered a second time. {ranked_returned} came from ranked retrieval{narrowed}, \
+             the rest from resolving the request's own literal path and identifier references. \
+             Being here is not a statement that any of it answers the request.",
+            narrowed = match handle {
+                Some(handle) => format!(
+                    " narrowed to the delivered handle `{}`, which this Run's own context \
+                     offered",
+                    handle.handle
+                ),
+                None => " across every source this projection is admitted to".to_string(),
+            },
+        ),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    });
+    if !authored_question {
+        assumptions.push(wirk_core::Statement {
+            text: "this expansion authored no question of its own: the terms it ranked with are \
+                   this stage's own orientation question, carried over verbatim. Nothing here is \
+                   attributed to the actor as words it wrote."
+                .to_string(),
+            attributed_to: wirk_core::StatementOrigin::Assembly,
+        });
+    }
+    if let Some(reason) = retrieval.semantic_reason.as_deref() {
+        assumptions.push(wirk_core::Statement {
+            text: format!(
+                "this revision's ranked retrieval ran in `{}` mode and its semantic status is \
+                 `{}`: {reason}. Each revision's retrieval note describes the query that \
+                 produced *its* newest material; the note the revision it expands was delivered \
+                 with is unchanged and still readable there.",
+                retrieval.mode, retrieval.semantic
+            ),
+            attributed_to: wirk_core::StatementOrigin::Assembly,
+        });
+    }
+
+    // Coverage never improves by expanding. A parent that was `Partial`
+    // because a reference did not resolve is still a context in which
+    // that reference did not resolve, whatever this revision found; and
+    // this revision's own denials and unavailabilities move it further
+    // if they are worse. Presentation cannot reach it: `truncated` and
+    // the `OverBudget` omissions are a separate field and a separate
+    // sentence (BUILD.md §4.7).
+    let local = if omitted.len() > parent.omitted.len()
+        && omitted[parent.omitted.len()..]
+            .iter()
+            .any(|item| matches!(item, wirk_core::Omission::Unavailable { .. }))
+    {
+        Some(wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::EvidenceUnavailable,
+        })
+    } else if inadmissible > 0 {
+        Some(wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::InadmissibleSources,
+        })
+    } else if !unresolved.is_empty() {
+        Some(wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::UnresolvedReferences,
+        })
+    } else {
+        None
+    };
+    let coverage = match (parent.coverage, local) {
+        (wirk_core::EvidenceCoverage::Complete, Some(local)) => local,
+        (parent_coverage, _) => parent_coverage,
+    };
+    let truncated = omitted
+        .iter()
+        .any(|item| matches!(item, wirk_core::Omission::OverBudget { .. }));
+
+    // Each expansion appends its own copy of the fixed Assembly-attributed
+    // sentences ("authored no question of its own", the retrieval-mode
+    // note, ...), and a long chain accumulates exact repeats of them while
+    // `bound` itself stops growing. Collapsing an *exact* byte-identical
+    // text under the same attribution to one copy loses nothing: order,
+    // attribution and every non-duplicate statement — including a
+    // revision's own Intent-origin unknowns, and any Assembly sentence
+    // whose wording actually differs — are unchanged. Every already-written
+    // revision file is a separate, immutable document; this only shapes
+    // the one being assembled now.
+    let mut seen_assembly_text: HashSet<String> = HashSet::new();
+    assumptions.retain(|statement| {
+        if statement.attributed_to != wirk_core::StatementOrigin::Assembly {
+            return true;
+        }
+        seen_assembly_text.insert(statement.text.clone())
+    });
+
+    let content = wirk_core::ProjectionContent {
+        format: wirk_core::PROJECTION_FORMAT.to_string(),
+        compilation_policy: wirk_core::ASSEMBLY_POLICY.to_string(),
+        route_edition: parent.route_edition.clone(),
+        waypoint: parent.waypoint.clone(),
+        revision: parent.revision + 1,
+        // The stage's own orientation question, unchanged. What this
+        // expansion asked is on the expansion record, where a reader can
+        // tell the two apart.
+        question: parent.question.clone(),
+        generations: parent.generations.clone(),
+        publication_revision: parent.publication_revision,
+        retrieval,
+        bound,
+        referenced,
+        reachable: parent.reachable.clone(),
+        assumptions,
+        unknowns: unknowns.clone(),
+        omitted,
+        next_action: next_action_for(coverage, unknowns.is_empty()),
+        coverage,
+        truncated,
+        expansion: Some(wirk_core::ExpansionRecord {
+            parent_projection: parent_ref.projection.clone(),
+            parent_observation: parent_ref.observation.clone(),
+            expanded_by: run_id.0.clone(),
+            request: wirk_core::ExpansionRequest {
+                question,
+                authored_question,
+                reference: handle.map(|handle| handle.handle.clone()),
+                reason: ask.reason.clone(),
+            },
+            basis: wirk_core::ExpansionBasis::PreservedCapturedVector,
+            delivered,
+            already_bound: repeated,
+        }),
+    };
+    finish_projection(content, ObservationSpan::measured(laps, started))
 }
