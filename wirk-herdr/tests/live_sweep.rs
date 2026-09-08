@@ -30,12 +30,47 @@
 //! and the conformance test in `tests/schema.rs` cannot, since it
 //! never touches a real server).
 //!
-//! Fix 3 adds one step to that: with `pane_b` writing continuously,
+//! Fix 3 adds one step to that: with a real writer running on `pane_b`,
 //! three `events.subscribe` calls in sequence — the third after a
 //! `pane.split` — each acked and each delivering an event. That is the
 //! combination tried step 3 crashed on and no earlier test could reach
 //! (one subscribe, idle pane); `pane_c`, split between the second and
 //! third, is closed with the others at teardown.
+//!
+//! **What actually pushes `PaneUpdated`, and why this step used to
+//! hang.** It sent `yes wirk-live-sweep-output | head -c 200000` to
+//! `pane_b` and then subscribed, on the assumption that a pane
+//! *producing output* pushes `PaneUpdated`. It blocked forever at
+//! `first.next()`, deterministically, 3 of 3
+//! (`index-retirement-order-verify/raw/21`–`raw/25`), and the burst
+//! having already finished was only the visible half of it.
+//!
+//! Read at the server instead of assumed (`refs/herdr` `0f8ad12`,
+//! herdr 0.9.0): **pane output emits no event at all.** Every
+//! `emit_pane_updated` call site is a state change of the pane's
+//! *record*, not of its screen — a metadata token expiring
+//! (`app/runtime.rs:66`), an agent name or managed-agent reconciliation
+//! (`app/agents.rs:60,136`), a terminal **title** whose stripped form
+//! changed (`app/terminal_titles.rs:73`), an agent-status update
+//! (`app/api.rs:632`), and `pane.report_metadata` when the tokens it
+//! carries actually change (`app/api/panes.rs:1756`, `token_changed`).
+//! A flood of characters through a pty is none of those. So no burst,
+//! however long, was ever going to satisfy that `next()`, and "make the
+//! output last longer" would have been a fix to the wrong thing.
+//!
+//! What causes each tested event now is the last of those: one real
+//! `pane.report_metadata` call per subscription, carrying a token value
+//! this test changes each round, made **after** `subscribe` has
+//! returned — which it does only after the server's own
+//! `subscription_started` ack (`socket.rs::subscribe_impl`). So the
+//! cause is a real schema method on the real socket, the emission is
+//! the server's own, and every tested event happens strictly after the
+//! subscription that must observe it, by construction rather than by
+//! timing. No sleep decides anything, no flood runs forever, no live
+//! path is skipped, and the product gains no timeout of any kind.
+//! `pane_b` is still put to work writing real output first, so these
+//! subscriptions still run against the pane fix 3 names — that part of
+//! the scenario was never the part that was wrong.
 
 #[path = "support/live_herdr.rs"]
 mod live_herdr;
@@ -46,23 +81,18 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
 
+use std::sync::mpsc;
+
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use wirk_herdr::{
     AgentStatus, Bearing, CloseWorkspace, CreateWorkspace, EventSubscription, FocusPane,
-    HerdrClient, HerdrError, Notify, OpenWorktree, PaneInfo, PromptAgent, ReleaseAgent,
+    HerdrClient, HerdrError, HerdrEvent, Notify, OpenWorktree, PaneInfo, PromptAgent, ReleaseAgent,
     RemoveWorktree, ReportAgent, ReportAgentSession, ReportMetadata, SendKeys, SplitDirection,
     SplitPane, StartAgent,
 };
 
-/// The read timeout applied to every request connection this test's
-/// client dials, and (via the reader thread `subscribe` starts) the
-/// bound on how long the `events.subscribe` step waits for a pushed
-/// event before giving up — generous for a live session, short enough
-/// that a genuinely wedged server fails this test instead of hanging
-/// the run (issue 359: bounded, not a sleep). Re-exported from the
-/// fixture so this file's own `raw_call` keeps using the same bound.
 use std::time::Duration;
 
 /// This test file's own termination bound for its one raw, hand-framed
@@ -71,7 +101,36 @@ use std::time::Duration;
 /// reported as "never observed" (the owner's ruling of 2026-09-02 §3;
 /// ruling 0044's own exception), never a verdict about the product,
 /// which itself sets no read timeout anywhere any more (fix 2).
+///
+/// **It applies to this one connection and nothing else.** This
+/// constant's doc used to claim it was "the read timeout applied to
+/// every request connection this test's client dials" and, "via the
+/// reader thread `subscribe` starts", the bound on how long the
+/// `events.subscribe` step waits for a pushed event. Both halves are
+/// false and were read off nothing: `SocketClient`'s own `dial` sets no
+/// read timeout on any connection it opens (`socket.rs::dial`, ruling
+/// 0044), and `subscribe_impl` says so in as many words before it hands
+/// the connection to its reader thread. The only `set_read_timeout` in
+/// all of `wirk-herdr` is `raw_call`'s, six lines below. What bounds a
+/// subscription wait in this file is `next_event_within`, and it is the
+/// test's own, on the test's own thread.
 const RAW_CALL_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// This test's own bound on waiting for one pushed event, and its own
+/// release of the subscription that was waiting.
+///
+/// **Test-only, and nothing like a poll or a product timeout.** The
+/// product sets no read timeout on a subscription connection and must
+/// not (ruling 0044, fix 2): a closed stream *is* the observation, and
+/// inventing an elapsed time is what that ruling forbids. But a test
+/// that blocks forever when its expected event never arrives is not a
+/// test — it is an unattended `cargo test --workspace` that never
+/// finishes, which is what this file did. So the bound lives here, on
+/// the test's side of the iterator, and its exhaustion is reported as
+/// "no event was ever observed" — a failure of this run, never a
+/// verdict about the product (ruling 0044 D134: "a bound on a wait is
+/// allowed and named as a bound").
+const EVENT_WAIT_BOUND: Duration = Duration::from_secs(60);
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -147,13 +206,65 @@ fn assert_raw_ok_or_business_error(method: &str, reply: &Value) {
     );
 }
 
+/// Takes one event off a live subscription within this test's own bound,
+/// and releases the subscription either way (`EVENT_WAIT_BOUND`).
+///
+/// The iterator is *moved in*, so returning from this function is the
+/// `drop` the caller used to write by hand: the receiving half of the
+/// client's channel goes away, the client's reader thread's next `send`
+/// fails, and it breaks out of its loop and closes the connection.
+///
+/// **When the bound is exhausted, the real resources still go.** The
+/// waiting thread is blocked inside the product's `read_line` with no
+/// timeout — correctly, that is the product's contract — so nothing
+/// here can interrupt it. The panic below unwinds the test thread into
+/// `LiveHerdrSession::drop`, which closes every workspace and then stops
+/// and deletes the throwaway session; the server exits, the kernel
+/// closes the subscription connection, `read_line` returns `Ok(0)`, and
+/// the waiting thread ends and drops the iterator with it. No workspace,
+/// pane, session or connection is left behind, and no bound of any kind
+/// is added to the product.
+fn next_event_within(
+    label: &str,
+    events: Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>,
+) -> HerdrEvent {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut events = events;
+        let first = events.next();
+        let _ = tx.send(first);
+    });
+    match rx.recv_timeout(EVENT_WAIT_BOUND) {
+        Ok(Some(Ok(event))) => event,
+        Ok(Some(Err(error))) => {
+            panic!("{label}: pushed line was not a well-formed HerdrEvent: {error:?}")
+        }
+        Ok(None) => panic!("{label}: the subscription ended before any event arrived"),
+        Err(_) => panic!(
+            "{label}: no event was ever observed on this subscription within \
+             {EVENT_WAIT_BOUND:?} — the bound is this test's own and its exhaustion is \
+             \"never observed\", not a verdict about the server"
+        ),
+    }
+}
+
 #[test]
 fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
     let Some(session) = live_herdr::LiveHerdrSession::start(
         "live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest",
     ) else {
+        // Said explicitly, so a run that took the `herdr not on PATH`
+        // early return can never be read as a live sweep that passed:
+        // that branch reports `ok` to `cargo test` like any other, and
+        // a bare `ok` on its own says nothing about which path ran.
+        eprintln!("live_sweep: SKIPPED — herdr is not on PATH; the live path was NOT entered");
         return;
     };
+    eprintln!(
+        "live_sweep: ENTERED the live path against throwaway session {} at {}",
+        session.name(),
+        session.socket_path().display()
+    );
     let socket_path = session.socket_path().to_path_buf();
     let client = session.client();
 
@@ -223,31 +334,31 @@ fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
     // harmless echo via pane.send_text), then read at least one event
     // before dropping the subscription — a genuine blocking read, no
     // timeout anywhere in the product (fix 2, ruling 0044).
-    let mut events = client
+    let events = client
         .subscribe(vec![EventSubscription::PaneUpdated {
             pane_id: pane_a.pane_id.clone(),
         }])
         .expect("events.subscribe");
+    // The cause comes *after* the ack, which is the only ordering that
+    // makes the event this step waits for the subscription's to see.
     client
         .send_input(&pane_a.pane_id, "echo wirk-live-sweep\n")
         .expect("pane.send_text (the harmless echo)");
-    // Blocks with no timeout (fix 2, ruling 0044: the product itself
-    // sets none on a subscription connection any more) until Herdr
-    // pushes the event the `send_input` above should trigger.
-    let first_event = events
-        .next()
-        .expect("events.subscribe: the subscription ended before any event arrived");
-    first_event.expect("events.subscribe: pushed line was not a well-formed HerdrEvent");
-    drop(events);
+    // The read itself blocks with no timeout in the product (fix 2,
+    // ruling 0044); the bound is the test's own and lives on the test's
+    // side of the iterator (`next_event_within`).
+    next_event_within("events.subscribe", events);
+    eprintln!("live_sweep: events.subscribe on pane_a delivered a pushed event");
 
     // ---- sequential subscriptions on a pane with output flowing ------
     //
     // Fix 3's own scenario (0028 tried step 3): the crash there needed
     // a *second* subscribe against a pane that was producing output,
-    // which the one-subscribe step above cannot reach. `pane_b` is put
-    // to work writing continuously, then three subscriptions are opened
-    // in sequence — the third after a `pane.split` changes the session
-    // — and each must ack and deliver.
+    // which the one-subscribe step above cannot reach. A real writer
+    // runs on `pane_b`, then three subscriptions are opened in sequence
+    // — the third after a `pane.split` changes the session — and each
+    // must ack and then deliver an event the test causes *after* the
+    // ack, never one it hopes is still in flight from before it.
     //
     // What the server's source says about a second subscription on a
     // busy pane (`refs/herdr` `0f8ad12`): nothing closes or renames it.
@@ -262,12 +373,17 @@ fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
     // `Ok(_)` from `subscribe` already means the ack id matched the
     // request id exactly (`socket.rs::subscribe_impl`), and an error
     // would name the failing subscription instead.
+    // `pane_b` really is put to work: a finite burst of real output
+    // through a real pty, so these three subscriptions run against the
+    // pane fix 3 names rather than an idle one. It is not what causes
+    // the events below, and it never was — the module doc has the
+    // server's own reason.
     client
         .send_input(
             &pane_b.pane_id,
-            "yes wirk-live-sweep-output | head -c 200000\n",
+            "seq 1 20000 | sed 's/^/wirk-live-sweep-output /'\n",
         )
-        .expect("pane.send_text (continuous output on pane_b)");
+        .expect("pane.send_text (real output on pane_b)");
 
     let busy_subscriptions = || {
         vec![
@@ -280,23 +396,38 @@ fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
         ]
     };
 
-    let mut first = client
+    // One real `pane.report_metadata` per round, each carrying a token
+    // value that differs from the last, which is the condition the
+    // server emits `PaneUpdated` on (`app/api/panes.rs:1756`:
+    // `token_changed`). Called only after the subscription it is meant
+    // for has been acked.
+    let cause_pane_updated = |round: u64| {
+        client
+            .report_metadata(ReportMetadata {
+                pane_id: Some(pane_b.pane_id.clone()),
+                workspace_id: None,
+                source: "wirk-live-sweep".to_string(),
+                tokens: Some(json!({"wirk-live-sweep-round": round.to_string()})),
+                title: None,
+            })
+            .unwrap_or_else(|e| {
+                panic!("pane.report_metadata (round {round}, the event's cause): {e:?}")
+            });
+    };
+
+    let first = client
         .subscribe(busy_subscriptions())
         .expect("events.subscribe #1 on a pane with output flowing: ack must match");
-    first
-        .next()
-        .expect("events.subscribe #1: no event arrived within the read timeout")
-        .expect("events.subscribe #1: pushed line was not a well-formed HerdrEvent");
-    drop(first);
+    cause_pane_updated(1);
+    next_event_within("events.subscribe #1", first);
+    eprintln!("live_sweep: events.subscribe #1 on pane_b delivered a pushed event");
 
-    let mut second = client
+    let second = client
         .subscribe(busy_subscriptions())
         .expect("events.subscribe #2 on the same busy pane: ack must match");
-    second
-        .next()
-        .expect("events.subscribe #2: no event arrived within the read timeout")
-        .expect("events.subscribe #2: pushed line was not a well-formed HerdrEvent");
-    drop(second);
+    cause_pane_updated(2);
+    next_event_within("events.subscribe #2", second);
+    eprintln!("live_sweep: events.subscribe #2 on pane_b delivered a pushed event");
 
     // A third, after the session changes under it (`pane.split`).
     let pane_c: PaneInfo = client
@@ -308,14 +439,12 @@ fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
             env: BTreeMap::new(),
         })
         .expect("pane.split (a third pane, between subscriptions)");
-    let mut third = client
+    let third = client
         .subscribe(busy_subscriptions())
         .expect("events.subscribe #3, after a pane.split: ack must match");
-    third
-        .next()
-        .expect("events.subscribe #3: no event arrived within the read timeout")
-        .expect("events.subscribe #3: pushed line was not a well-formed HerdrEvent");
-    drop(third);
+    cause_pane_updated(3);
+    next_event_within("events.subscribe #3", third);
+    eprintln!("live_sweep: events.subscribe #3 on pane_b delivered a pushed event");
 
     // agent.start: the genuine launch-order call, on pane_a. Expected
     // to succeed (a real Claude agent starts) — asserted loosely
@@ -471,4 +600,5 @@ fn live_sweep_walks_every_socketclient_method_in_launch_order_then_the_rest() {
             workspace_id: ws.workspace_id,
         })
         .expect("workspace.close");
+    eprintln!("live_sweep: COMPLETED the live path — every method above ran against a real Herdr");
 }

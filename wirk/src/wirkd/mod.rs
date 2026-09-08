@@ -983,6 +983,14 @@ pub struct FindingListPayload {
 pub struct AtlasFindingsPayload {
     #[serde(default)]
     pub rebuild: bool,
+    /// Renames every preserved copy of an index whose lines did not all
+    /// parse, which is the one thing that clears the unknown such a copy
+    /// stands for. Administrative, and never combinable with `rebuild`:
+    /// a rebuild is what creates a preserved copy, so clearing in the
+    /// same call would be the automatic laundering ruling 0130 refused.
+    /// Never deletes anything.
+    #[serde(default)]
+    pub retire_preserved: bool,
     #[serde(default)]
     pub requester: Option<WorkId>,
     #[serde(default)]

@@ -16,7 +16,12 @@ mod store;
 pub use admission::{AdmissionSummary, AdmittedSource, QueryScope};
 pub use domain::*;
 pub use extract::ExtractorPolicy;
-pub use findings::{FindingRow, FindingRowId, FindingRowKind, Origin as FindingOrigin};
+pub use findings::{
+    FINDINGS_INDEX_FILE, FindingIndexUnwritten, FindingRow, FindingRowId, FindingRowKind,
+    MalformedFindingLine, Origin as FindingOrigin, PRESERVED_INDEX_PREFIX,
+    PreservedIndexRetirementFailed, RETIRED_INDEX_PREFIX, SalvagedFindingIndex,
+    UnaccountedFindingRow, preserved_unreadable_indexes, unaccounted_finding_rows,
+};
 pub use query::{
     AnswerBudget, AnswerCoverage, EvidenceHit, HitGenerationIdentity, PathLookupOutcome,
     PathLookupRequest, PinnedProducer, SearchAnswer, SearchRequest, SemanticRequest,
@@ -40,4 +45,4 @@ pub use semantic::{
     SemanticEdition, SemanticVerification, TEXT_IDENTITY, TEXT_NORMALIZED, UnavailableEntry,
     VECTOR_FORMAT, VECTORS_FILE, VectorManifest,
 };
-pub use store::{AcquireOutcome, AtlasStore};
+pub use store::{AcquireOutcome, AtlasStore, BARRIER_RELEASE_SOCKET, checkpoint};

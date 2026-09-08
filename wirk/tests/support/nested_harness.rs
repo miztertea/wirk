@@ -26,17 +26,60 @@ pub fn wirk_bin() -> &'static str {
 }
 
 pub fn wait_for_pointer(estate: &Path) -> WirkdPointer {
+    wait_for_pointer_matching(estate, None)
+}
+
+/// Readiness for **the daemon this start spawned**, and not for any
+/// pointer file that happens to be lying in the estate.
+///
+/// A daemon that dies without a clean stop leaves its pointer file and
+/// its socket file behind — `wirkd stop` is the only thing that removes
+/// them (`server.rs`'s own doc: "wirkd removes the pointer and socket
+/// file and exits after the reply is flushed"), and a crash at a
+/// failpoint is precisely not that. So on the *second* start against
+/// such an estate the file the old wait keyed on is already there and
+/// already readable, and the wait returned on the corpse's pointer: it
+/// named a dead pid at a socket path nothing was listening on, and the
+/// very next request was refused by the kernel with `ECONNREFUSED`. That
+/// is the whole of the recurring
+/// `a_crash_between_the_journal_and_the_index_is_repaired_at_the_next_start`
+/// failure — `wirkd client I/O error: Connection refused (os error 111)`
+/// on the admin read immediately after `start_wirkd`.
+///
+/// **The product's own order is what makes the pid a real readiness
+/// state, and it is correct as it stands.** `run` binds the listener and
+/// only then writes the pointer with `std::process::id()`; `wirkd start`
+/// is the blocking server loop in that same process, not a fork. So a
+/// pointer carrying *this child's* pid cannot exist before that child's
+/// `UnixListener::bind` has returned, and once it has, a connect is
+/// queued by the kernel whether or not `accept` has been reached. The
+/// wait is therefore synchronized on the daemon's own state transition,
+/// not on an interval: the `sleep` here paces re-reading a file that is
+/// not there yet, and no assertion is retried until it passes. (Pid
+/// reuse would need the kernel to hand this exact number back inside one
+/// test's lifetime, and the pointer it wrote to be a different daemon's;
+/// nothing here is defended against that.)
+pub fn wait_for_pointer_of(estate: &Path, pid: u32) -> WirkdPointer {
+    wait_for_pointer_matching(estate, Some(pid))
+}
+
+fn wait_for_pointer_matching(estate: &Path, pid: Option<u32>) -> WirkdPointer {
     let path = estate.join(".wirk").join("wirkd.json");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(bytes) = fs::read(&path)
             && let Ok(pointer) = serde_json::from_slice::<WirkdPointer>(&bytes)
+            && pid.is_none_or(|pid| pointer.pid == pid)
         {
             return pointer;
         }
         assert!(
             Instant::now() < deadline,
-            "wirkd pointer file never appeared (readable) at {}",
+            "wirkd pointer file never appeared (readable{}) at {}",
+            match pid {
+                Some(pid) => format!(", naming pid {pid}"),
+                None => String::new(),
+            },
             path.display()
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -44,6 +87,15 @@ pub fn wait_for_pointer(estate: &Path) -> WirkdPointer {
 }
 
 pub struct KillOnDrop(std::process::Child);
+
+impl KillOnDrop {
+    /// The daemon's own pid — the same number `wirkd` writes into its
+    /// pointer file, because `wirk wirkd start` *is* the server loop and
+    /// does not fork.
+    pub fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
@@ -64,17 +116,33 @@ pub fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
 /// instrumentation. `None` is the ambient environment, byte for byte
 /// what every other caller already gets.
 pub fn start_wirkd_with_path(estate: &Path, path: Option<&str>) -> (KillOnDrop, WirkdPointer) {
+    match path {
+        Some(path) => start_wirkd_with_env(estate, &[("PATH", path)]),
+        None => start_wirkd_with_env(estate, &[]),
+    }
+}
+
+/// The same real daemon, with `env` added to its environment.
+///
+/// `findings_index_health.rs` uses it to put `WIRK_ATLAS_FAILPOINT` in
+/// front of the daemon's own Atlas writes, so a crash between a durable
+/// journal event and its index row is a **real** process death at a real
+/// write boundary (`AtlasStore::checkpoint`'s own doc: "deliberately
+/// process-level so a verifier can exercise real crash windows from a
+/// child process, rather than substituting a fake store failure").
+pub fn start_wirkd_with_env(estate: &Path, env: &[(&str, &str)]) -> (KillOnDrop, WirkdPointer) {
     let mut command = Command::new(wirk_bin());
     command
         .args(["wirkd", "start", "--estate"])
         .arg(estate)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    if let Some(path) = path {
-        command.env("PATH", path);
+    for (key, value) in env {
+        command.env(key, value);
     }
     let child = KillOnDrop(command.spawn().expect("spawn wirkd"));
-    let pointer = wait_for_pointer(estate);
+    // This start's own daemon, never a dead one's leftovers.
+    let pointer = wait_for_pointer_of(estate, child.0.id());
     (child, pointer)
 }
 

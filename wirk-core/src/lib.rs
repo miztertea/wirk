@@ -3641,15 +3641,72 @@ impl Journal {
     /// read cursor, per `O_APPEND` semantics) — one on-disk file, one
     /// write path, read from wherever this call needs.
     fn envelopes(&self) -> Result<EnvelopeIter, JournalError> {
-        let mut reader = self.file.try_clone()?;
-        reader.seek(SeekFrom::Start(0))?;
-        Ok(EnvelopeIter {
-            lines: BufReader::new(reader).lines(),
-            next_seq: 1,
-            line_no: 0,
-            done: false,
+        envelopes(&self.file)
+    }
+}
+
+/// The read-only half of the same journal, for a caller that only ever
+/// reads one: it opens `dir/journal.ndjson` for reading and **nothing
+/// else** — no `create_dir_all`, no `create(true)`, no append mode.
+///
+/// `Journal::open` is the estate's one *write* path and creates whatever
+/// is missing on the way in, which is right for the path that is about
+/// to append and wrong for a pure scan. A scanner routed through it had
+/// two executed consequences (`index-health-reverify/VERDICT.md`,
+/// "`Journal::open` on the read path"): a `works/` entry with no journal
+/// got a **zero-byte `journal.ndjson` invented by the scan itself**, and
+/// a journal that was perfectly readable but not writable (`0444`: a
+/// restored backup, an archived tree, a `chmod -R a-w` snapshot) failed
+/// the scan with `Permission denied`, so such an estate could never
+/// report a healthy derived index and could never be rebuilt.
+///
+/// This is the same on-disk format and the same replay, not a second
+/// one: `replay`/`iter` share `EnvelopeIter` with `Journal` verbatim and
+/// fail closed on the identical malformed-line/seq-gap rule (§5), so a
+/// torn tail is still an error here and never a short, silent row set.
+/// It cannot append, which is the point — the write path stays exactly
+/// one.
+pub struct JournalReader {
+    file: File,
+}
+
+impl JournalReader {
+    /// Opens `dir/journal.ndjson` read-only. A missing directory or a
+    /// missing journal is `io::ErrorKind::NotFound` for the caller to
+    /// interpret against the estate's own layout; nothing is created
+    /// either way.
+    pub fn open(dir: impl AsRef<Path>) -> Result<JournalReader, JournalError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .open(dir.as_ref().join("journal.ndjson"))?;
+        Ok(JournalReader { file })
+    }
+
+    /// `Journal::replay`, from a handle that cannot write.
+    pub fn replay(&self) -> Result<Vec<Event>, JournalError> {
+        self.iter()?.collect()
+    }
+
+    /// `Journal::iter`, from a handle that cannot write.
+    pub fn iter(&self) -> Result<JournalIter, JournalError> {
+        Ok(JournalIter {
+            inner: envelopes(&self.file)?,
         })
     }
+}
+
+/// One reader over one journal file, from its start, on a cloned handle.
+/// Shared by `Journal` and `JournalReader` so there is exactly one
+/// parser for the format however the file was opened.
+fn envelopes(file: &File) -> Result<EnvelopeIter, JournalError> {
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(EnvelopeIter {
+        lines: BufReader::new(reader).lines(),
+        next_seq: 1,
+        line_no: 0,
+        done: false,
+    })
 }
 
 /// `Iterator<Item = Result<Event, JournalError>>` over a buffered reader

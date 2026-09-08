@@ -785,12 +785,91 @@ fn valid_path(path: &[u8]) -> bool {
 
 /// Deliberately process-level so a verifier can exercise real crash windows
 /// from a child process, rather than substituting a fake store failure.
-/// `pub(crate)` (W-B `findings.rs`, W4-A `semantic.rs`): the identical
-/// failpoint mechanism, reused rather than a second one invented for a
-/// second append-only log or for the semantic edition writer
-/// (`WIRK_ATLAS_FAILPOINT`'s own env var, one gate for the whole crate).
-pub(crate) fn checkpoint(name: &str) {
+/// One gate for the whole product (W-B `findings.rs`, W4-A
+/// `semantic.rs`, and `wirkd::server`'s own index windows): the identical
+/// mechanism reused rather than a second one invented per append-only
+/// log. `pub` rather than `pub(crate)` only because `server.rs` names
+/// three windows of its own on this same gate; nothing else changed.
+///
+/// Two things a verifier can ask for at a named window, and **only**
+/// these two — this gate never fabricates a reply, a row, an outcome or
+/// an error, and it is inert unless its own environment variable names
+/// this exact window:
+///
+/// - `WIRK_ATLAS_FAILPOINT=<name>` dies here, the crash-window half that
+///   already existed;
+/// - `WIRK_ATLAS_BARRIER=<name>=<directory>` **parks** here, the
+///   scheduling half. A concurrency defect at a real window between two
+///   real operations cannot be pinned by a sleep: the test has to hold
+///   one real thread at the real instant and drive the other past it.
+///   Exactly one caller parks — the arm file is claimed by an atomic
+///   `rename`, so a second thread reaching the same window runs straight
+///   through — and it resumes when, and only when, the controller that
+///   armed the window says so.
+///
+/// **Nothing here is decided or paced by time** (ruling 0044 D134,
+/// final). The park is a blocking read on a real socket the controller
+/// owns: no interval, no poll, no deadline, and no path on which a
+/// parked operation resumes by itself while its caller is told it
+/// observed a schedule it never observed. A verifier that never releases
+/// the window holds its own parked operation for as long as it lives,
+/// which is the point — the termination bound belongs to the test
+/// controller, which reports its exhaustion as "the window was never
+/// reached" or "the operation was never observed to finish", never as a
+/// verdict.
+pub fn checkpoint(name: &str) {
     if std::env::var("WIRK_ATLAS_FAILPOINT").ok().as_deref() == Some(name) {
         std::process::exit(86);
     }
+    barrier(name);
+}
+
+/// The release socket a verifier binds inside the barrier directory
+/// before it arms the window.
+pub const BARRIER_RELEASE_SOCKET: &str = "release.sock";
+
+fn barrier(name: &str) {
+    let Ok(setting) = std::env::var("WIRK_ATLAS_BARRIER") else {
+        return;
+    };
+    let Some((window, dir)) = setting.split_once('=') else {
+        return;
+    };
+    if window != name {
+        return;
+    }
+    let dir = Path::new(dir);
+    // One arm, one parked thread: `rename` is atomic, so of every caller
+    // that reaches this window while the barrier is armed exactly one
+    // takes the arm file and parks and every other returns immediately.
+    if fs::rename(dir.join("arm"), dir.join("arrived")).is_err() {
+        return;
+    }
+    // Park by connecting to the controller's listening socket and
+    // blocking on a read only its end can end. `accept` returning on the
+    // controller's side *is* this thread's arrival, and the read returns
+    // when the controller drops its end of the connection, or dies and
+    // the kernel closes it — a state change of the peer, observed,
+    // exactly as `wirkd`'s own client reads treat a closed stream. No
+    // read timeout is ever set on this stream, so no elapsed time exists
+    // anywhere on this path.
+    //
+    // If the socket cannot be reached the arm was already claimed and
+    // this thread is committed: continuing would silently release a real
+    // operation and let it report a schedule it was never held for, so
+    // it fails loudly instead. Reachable only under this environment
+    // variable, and only for the one window it names.
+    let socket = dir.join(BARRIER_RELEASE_SOCKET);
+    let mut release = std::os::unix::net::UnixStream::connect(&socket).unwrap_or_else(|error| {
+        panic!(
+            "WIRK_ATLAS_BARRIER armed window {name} at {} has no reachable release socket {}: \
+             {error}",
+            dir.display(),
+            socket.display()
+        )
+    });
+    // Every outcome of this read is the controller's end going away,
+    // which is the release; the bytes themselves carry nothing.
+    let mut ignored = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut release, &mut ignored);
 }

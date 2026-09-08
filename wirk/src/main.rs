@@ -978,6 +978,37 @@ fn list_work_ids(estate: &Path) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
+/// Says, on stderr, that a reply's rows are a subset of what the
+/// estate's journals hold.
+///
+/// stderr on purpose, so it is seen in `--json` mode too — a script
+/// reading stdout gets the machine-readable `index` block, a human
+/// watching the terminal gets the sentence, and neither has to know
+/// about the other. The exit code is deliberately unchanged: the
+/// journal is the record, the mutation that produced this reply really
+/// did happen, and a derived projection that is behind is a degraded
+/// answer rather than a failed call. What is not acceptable — and what
+/// this closes — is the answer looking identical either way.
+pub(crate) fn warn_if_index_incomplete(what: &str, result: &serde_json::Value) {
+    let index = &result["index"];
+    if index["complete"] != serde_json::Value::Bool(false) {
+        return;
+    }
+    let projection = index["projection"].as_str().unwrap_or("incomplete");
+    eprintln!(
+        "wirk {what}: the estate findings index is {projection} — this answer is a subset of what the estate's journals hold, not a complete one"
+    );
+    if let Some(pending) = index["pending_rows"].as_u64() {
+        eprintln!("  {pending} journaled row(s) are not in the index");
+    }
+    if let Some(detail) = index["detail"].as_str() {
+        eprintln!("  {detail}");
+    }
+    if let Some(recovery) = index["recovery"].as_str() {
+        eprintln!("  {recovery}");
+    }
+}
+
 /// Locates wirkd at `estate`, sends `request`, and on an `ok` reply
 /// hands its `result` to `on_ok` for the subcommand's own printing.
 /// Locate/transport failure is exit 2; a `{"ok":false,...}` reply (only

@@ -15,7 +15,7 @@ use crate::wirkd::{
     AtlasRelatePayload, AtlasResolvePayload, AtlasSearchPayload, AtlasSemanticBuildPayload,
     AtlasSemanticSelectPayload, AtlasStatusPayload, Reply, Request,
 };
-use crate::{flag_value, wirkd_client_call};
+use crate::{flag_value, warn_if_index_incomplete, wirkd_client_call};
 use wirk_core::WorkId;
 
 pub fn atlas_command(rest: &[String]) -> ExitCode {
@@ -47,7 +47,7 @@ fn atlas_usage() -> ExitCode {
          | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--chunker units|native] [--json] \
          | wirk atlas semantic select --estate <root> --source <name> --edition <id> [--json] \
          | wirk atlas relate --estate <root> --work <id> --kind governed_by --from <coordinate> --to <coordinate> --evidence <coordinate> [--evidence <coordinate>...] [--run <id>] [--world <hash>] [--json] \
-         | wirk atlas findings --estate <root> (--requesting-work <id> | --admin [--rebuild]) [--json]"
+         | wirk atlas findings --estate <root> (--requesting-work <id> | --admin [--rebuild | --retire-preserved-index]) [--json]"
     );
     ExitCode::from(1)
 }
@@ -880,6 +880,7 @@ fn findings_command(rest: &[String]) -> ExitCode {
             ESTATE,
             JSON,
             ("--rebuild", false),
+            ("--retire-preserved-index", false),
             ("--admin", false),
             ("--requesting-work", true),
         ],
@@ -891,6 +892,7 @@ fn findings_command(rest: &[String]) -> ExitCode {
     };
     let json = is_json(rest);
     let rebuild = rest.iter().any(|arg| arg == "--rebuild");
+    let retire_preserved = rest.iter().any(|arg| arg == "--retire-preserved-index");
     let admin = rest.iter().any(|arg| arg == "--admin");
     let requester = flag_value(rest, "--requesting-work").map(wirk_core::WorkId);
     if admin == requester.is_some() {
@@ -903,11 +905,24 @@ fn findings_command(rest: &[String]) -> ExitCode {
         &estate,
         &Request::atlas_findings(AtlasFindingsPayload {
             rebuild,
+            retire_preserved,
             requester,
             admin,
         }),
         |result| {
+            warn_if_index_incomplete("atlas findings", result);
             print_result(json, result, |result| {
+                for pair in result["retired_index_copies"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                {
+                    println!(
+                        "retired {} as {} (its bytes are kept, not removed)",
+                        pair["preserved"].as_str().unwrap_or("?"),
+                        pair["retired"].as_str().unwrap_or("?")
+                    );
+                }
                 let count = result["rows"]
                     .as_array()
                     .map(|rows| rows.len())

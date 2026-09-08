@@ -65,13 +65,13 @@ use wirk_core::{
     ClaimKind, ClaimRefusal, ClaimVerdict, ConfirmedBy, Decision, DeterministicWorld,
     DischargedRole, Event, EventId, EventKind, EvidenceOutcome, EvidenceRef, ExecutionTriple,
     FailureCause, Finding, FindingId, FindingKind, FindingRecord, FindingScope, FindingState,
-    GenerationPoint, Journal, JournalError, LaunchAttempt, ObligationRef, OutcomeReceipt,
-    OutputContract, ParentBinding, PeerIdentity, ReadySettlement, RelationRoute, RelationStanding,
-    RepositoryBinding, ReviewTarget, Route, RouteId, Run, RunId, RunState, Settlement,
-    SettlementAuthority, SettlementCheck, SettlementClass, SourceBasis, Timestamp, UnreadFields,
-    WaypointDefinition, WaypointId, WaypointKind, Work, WorkId, WorkState, World, WorldHash,
-    ancestor_chain, find_definition, finding_kind_name, first_dfs_leaf, flatten_leaves, fold,
-    load_route, obligation_basis, validate_claim,
+    GenerationPoint, Journal, JournalError, JournalReader, LaunchAttempt, ObligationRef,
+    OutcomeReceipt, OutputContract, ParentBinding, PeerIdentity, ReadySettlement, RelationRoute,
+    RelationStanding, RepositoryBinding, ReviewTarget, Route, RouteId, Run, RunId, RunState,
+    Settlement, SettlementAuthority, SettlementCheck, SettlementClass, SourceBasis, Timestamp,
+    UnreadFields, WaypointDefinition, WaypointId, WaypointKind, Work, WorkId, WorkState, World,
+    WorldHash, ancestor_chain, find_definition, finding_kind_name, first_dfs_leaf, flatten_leaves,
+    fold, load_route, obligation_basis, validate_claim,
 };
 
 use super::boundary;
@@ -218,6 +218,243 @@ struct WirkdState {
     /// generation vector I captured for you" checkable. Persisted, not
     /// in-memory, because a continuation must survive `wirkd` restart.
     continuation_key: [u8; 32],
+    /// How the derived Findings index stood at this daemon's **own last
+    /// reconciliation attempt** (ruling 0116's first carried limit).
+    ///
+    /// In-memory on purpose, and correct across restart without being
+    /// persisted: the only writer of `atlas/findings.ndjson` is this
+    /// daemon, `run` reconciles from every journal in the estate before
+    /// the listener accepts a single connection, and every mutating verb
+    /// reconciles again after its own append. So a crash between a
+    /// journaled event and its index row is re-detected — and repaired,
+    /// or reported as unrepaired — by the next start, and no client ever
+    /// reads a value this process did not itself measure. Persisting it
+    /// would be worse than useless: the one failure this exists to
+    /// report is an unwritable `atlas/` directory, which is exactly
+    /// where a persisted health file could not be written either.
+    ///
+    /// It is deliberately **not** a fresh estate scan on read. Queries
+    /// stay pure (W3-CORRECTION.md item 3, "a query must never create
+    /// Atlas state"); they report the health this daemon last observed,
+    /// and say so.
+    index_health: Mutex<IndexHealth>,
+    /// The order every index observation is ranked by, and nothing else:
+    /// a monotonic per-daemon ticket taken where a reconciliation's
+    /// **walk** begins, so that "older" and "newer" mean *when this
+    /// attempt read the estate* rather than when its record happened to
+    /// arrive.
+    ///
+    /// Ruling 0125 closed "an older outcome cannot overwrite a newer
+    /// publication" at the publication boundary, by making `{append,
+    /// record}` one critical section. The same class survived one step
+    /// earlier, at the scan boundary, because an older walk needs no
+    /// publication at all to record: once somebody else has indexed
+    /// every row it was carrying, its `append_finding_rows` returns
+    /// `Ok(0)` **without writing a byte**, and it then recorded
+    /// `Synchronized` over a newer, known, unrepaired failure
+    /// (`index-health-reverify/VERDICT.md`, reproduced four times on a
+    /// real daemon under a real kernel `EACCES`).
+    ///
+    /// It is a counter on this daemon's own state, never a process
+    /// global: one estate's ordering is not another's, and the tests
+    /// that pin this run several daemons at once. It is an order, not a
+    /// duration, a deadline or a budget — nothing here is paced or
+    /// decided by time (ruling 0044 D134).
+    index_observations: AtomicU64,
+}
+
+/// What the last reconciliation attempt found, in the terms a caller
+/// needs: whether the derived index currently projects every journaled
+/// row, and — when it does not — enough to act on without disclosing
+/// what the caller may not see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexProjection {
+    /// No reconciliation has run in this process yet. The honest state
+    /// before `run`'s startup sweep, and never reported as clean: an
+    /// index nobody has checked is not an index known to be complete.
+    Unreconciled,
+    /// Every row this estate's journals support is in the file.
+    Synchronized,
+    /// The rows are visible to a fresh reader — the atomic rename
+    /// succeeded — but the containing directory's `fsync` did not, so a
+    /// power loss could still lose the directory entry. `AtlasStore`'s
+    /// own `DurabilityUncertain` window, reported as itself rather than
+    /// flattened into "behind" (a different, false fact) or into
+    /// "synchronized" (the silence this closes).
+    DurabilityUnconfirmed { detail: String },
+    /// The index is missing rows the journals hold. `pending` is how
+    /// many, or `None` when the index could not be read at all and the
+    /// count is genuinely unknown.
+    Behind {
+        pending: Option<usize>,
+        detail: String,
+    },
+}
+
+/// What one attempt established about the estate's **atlas directory**
+/// being on disk — the other half of an index write, and the half a
+/// reader cannot check afterwards.
+///
+/// Every path that writes the index writes a temporary, `fsync`s it,
+/// renames it over the real name and then `fsync`s the containing
+/// directory (`AtlasStore::rewrite_rows`); the retirement renames
+/// preserved copies and `fsync`s the same directory
+/// (`retire_preserved_unreadable_indexes`). That last `fsync` is the
+/// only thing anywhere that turns "a fresh reader can see it" into "a
+/// machine that loses power still sees it", and it is the only thing
+/// that can retire an earlier one's failure: a directory `fsync` covers
+/// the entries pending in it, not just this call's.
+///
+/// So an attempt reports which of three things it did, and nothing
+/// infers it from the projection: the projection says what the *index*
+/// holds, and these three say what the *directory* is known to hold.
+#[derive(Debug, Clone)]
+enum DirectoryDurability {
+    /// This attempt `fsync`ed the atlas directory and it returned
+    /// success — so every rename and rewrite that was visible before it
+    /// is on disk, including one an earlier attempt could not confirm.
+    Confirmed,
+    /// This attempt's own directory `fsync` failed, after its rename had
+    /// already made the bytes visible to a fresh reader.
+    Uncertain(String),
+    /// This attempt did not write to the atlas directory at all, so it
+    /// established nothing either way — a sweep that found nothing to
+    /// append writes not one byte, and must not be read as confirming a
+    /// directory it never opened.
+    Unestablished,
+}
+
+#[derive(Debug, Clone)]
+struct IndexHealth {
+    projection: IndexProjection,
+    /// When this projection state was first entered (not the last time
+    /// it was re-observed) — so a caller can tell a window that just
+    /// opened from one that has been open all along.
+    since: Timestamp,
+    /// When a reconciliation was last attempted at all.
+    last_attempt: Option<Timestamp>,
+    /// Which observation this whole record came from — the ticket the
+    /// recording attempt took before its walk. Everything above belongs
+    /// to that one observation, including its timestamps: an attempt
+    /// whose record is discarded contributes nothing at all, rather than
+    /// leaving its clock behind on somebody else's outcome.
+    ///
+    /// `0` is "no observation has recorded here yet", which is exactly
+    /// `Unreconciled`, and is older than every real ticket.
+    observation: u64,
+    /// Copies of an earlier standing index that could not be parsed,
+    /// kept aside rather than replaced away (`preserve_unreadable_index`).
+    ///
+    /// Why this is on the *health* record and not only in a detail
+    /// string: what those bytes held is unknowable, so no walk of the
+    /// estate can establish that the index is whole again. A rebuild
+    /// that proceeded over unparsable lines therefore leaves a residual
+    /// uncertainty that the next ordinary reconciliation must **not**
+    /// clear — its basis is the shortened file that rebuild just wrote,
+    /// so it is comparing like with like and learns nothing (ruling
+    /// 0130). Recorded from the estate itself on every attempt, so it
+    /// survives a restart, and cleared only when an administrator says
+    /// they have reviewed the preserved bytes
+    /// (`--retire-preserved-index`).
+    preserved: PreservedIndexCopies,
+    /// A write or rename this daemon already reported as landed whose
+    /// containing directory's `fsync` did not succeed, as the failing
+    /// call described it.
+    ///
+    /// Why this is remembered rather than re-derived: unlike
+    /// `preserved`, no listing of the estate can answer it. The rename
+    /// *is* visible — that is what makes the window a durability
+    /// question and not a missing-row question — so every later read of
+    /// the estate sees a healthy directory and learns nothing about
+    /// whether its entry survives a power cut. The one thing that
+    /// answers it is a **later successful `fsync` of that same
+    /// directory**, which is exactly what `DirectoryDurability` reports
+    /// (ruling 0130's "no one-call warning that is automatically
+    /// laundered into complete": before this, the retirement's own
+    /// reconciliation cleared the window it had just opened, because a
+    /// sweep with nothing to append writes nothing and so certifies a
+    /// directory it never touched).
+    ///
+    /// Not a latch and not a clock: it is cleared by an ordinary
+    /// successful write of the index, an administrative `--rebuild`, a
+    /// retirement that renames a copy, or a restart — every one of them
+    /// an `fsync` of the atlas directory this product already makes.
+    unconfirmed_directory: Option<String>,
+}
+
+/// What one listing of the estate's atlas directory established about
+/// preserved copies of an unreadable index.
+///
+/// **Two different facts, deliberately not flattened into one list of
+/// strings.** Names that were listed, and — when the directory could not
+/// be listed at all — why not. Flattened, the listing's own error text
+/// went into `preserved_index_copies` as though it were a file name and
+/// was then *counted*: an administrator was told "1 preserved copy(ies)
+/// … are held" and given a name that was a sentence, and every scoped
+/// requester was told that bytes "are preserved in this estate" and that
+/// the wait was on someone retiring them — all of it manufactured out of
+/// a permission problem on a directory, with no such file anywhere and
+/// the retirement they were pointed at returning `EACCES`
+/// (`index-basis-recovery-verify/raw/46`).
+///
+/// Both facts stop this estate certifying its projection complete: an
+/// estate whose atlas directory cannot be listed has not been checked.
+/// Only one of them is a claim about bytes, and only that one may be
+/// said.
+#[derive(Debug, Clone, Default)]
+struct PreservedIndexCopies {
+    /// Copies actually listed. Only ever file names.
+    names: Vec<String>,
+    /// Why the question could not be answered, when it could not. The
+    /// underlying cause, for the administrator who can act on it.
+    unknown: Option<String>,
+}
+
+impl PreservedIndexCopies {
+    /// Whether this estate may not certify its projection complete.
+    /// Neither held copies nor an unanswerable question authorizes it.
+    fn qualifies(&self) -> bool {
+        !self.names.is_empty() || self.unknown.is_some()
+    }
+
+    /// The administrative note, which says only what was established.
+    fn note(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.names.is_empty() {
+            parts.push(format!(
+                "{} preserved copy(ies) of an index whose lines did not all parse are held in the estate's atlas directory ({}); what those lines held cannot be established by any walk of the estate, so this projection's completeness is unknown until an administrator reviews them and runs `wirk atlas findings --admin --retire-preserved-index`",
+                self.names.len(),
+                self.names.join("; ")
+            ));
+        }
+        if let Some(unknown) = &self.unknown {
+            parts.push(format!(
+                "the estate's atlas directory could not be listed, so whether it holds preserved copies of an index whose lines did not all parse is unknown and this projection's completeness cannot be established either way: {unknown}"
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+impl IndexHealth {
+    fn unreconciled() -> Self {
+        Self {
+            projection: IndexProjection::Unreconciled,
+            since: now_ts(),
+            last_attempt: None,
+            observation: 0,
+            preserved: PreservedIndexCopies::default(),
+            unconfirmed_directory: None,
+        }
+    }
+
+    /// True only for `Synchronized`. `Unreconciled` and
+    /// `DurabilityUnconfirmed` are both honestly short of it: the first
+    /// because nothing has checked, the second because the file's
+    /// directory entry is not confirmed on disk.
+    fn complete(&self) -> bool {
+        matches!(self.projection, IndexProjection::Synchronized)
+    }
 }
 
 /// Appends `event` to `journal`, then hands a clone to every live
@@ -290,6 +527,8 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
         watchers: Mutex::new(HashMap::new()),
         atlas: Mutex::new(atlas),
         continuation_key,
+        index_health: Mutex::new(IndexHealth::unreconciled()),
+        index_observations: AtomicU64::new(0),
     });
 
     // W5 (0035 D110): before this listener starts accepting
@@ -720,10 +959,11 @@ fn remove_owned_containers(estate_root: &Path) {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(journal) = Journal::open(&dir) else {
-            continue;
-        };
-        let Ok(events) = journal.replay() else {
+        // Pure discovery: read the journal that is there, create
+        // nothing, and read one an operator left read-only
+        // (`discovery_events`). The mutation this sweep decides on
+        // still goes through the one write path below.
+        let Some(events) = discovery_events(&dir) else {
             continue;
         };
         for event in &events {
@@ -804,10 +1044,11 @@ pub(crate) fn open_deterministic_runs(
         if !dir.is_dir() {
             continue;
         }
-        let Ok(journal) = Journal::open(&dir) else {
-            continue;
-        };
-        let Ok(events) = journal.replay() else {
+        // Pure discovery: read the journal that is there, create
+        // nothing, and read one an operator left read-only
+        // (`discovery_events`). The mutation this sweep decides on
+        // still goes through the one write path below.
+        let Some(events) = discovery_events(&dir) else {
             continue;
         };
         let Some(work_id) = events.first().map(|event| event.work.clone()) else {
@@ -4656,6 +4897,57 @@ fn create_journal_for(
     Ok(journal)
 }
 
+/// The estate's **pure discovery read** of one `works/` entry: replay
+/// the canonical journal that is there, and be no reason for one to
+/// appear that was not.
+///
+/// Six sweeps in this file walk `works/` only to *find out* which Works
+/// exist and what they hold, and each then hands the answer to a
+/// separate, already-authoritative operation — `remove_owned_containers`
+/// to `docker rm -f`, `open_deterministic_runs` to the recovery match,
+/// `reevaluate_waiting_works` to `reevaluate_parent`, `find_finding_
+/// owner` to the `finding assert`/`settle`/`applied` handlers,
+/// `settle_ready_findings` to `settle_ready`, and the admin estate-wide
+/// `finding list` to its own reply. Every one of those mutating paths
+/// still goes through `journal_for`/`create_journal_for` and appends
+/// through `Journal::append`; the write path is untouched and still
+/// exactly one.
+///
+/// Routed through `Journal::open` — the estate's one *write* path — the
+/// discovery half had the two executed consequences the findings walk
+/// was already cured of (`index-health-reverify/VERDICT.md`,
+/// "`Journal::open` on the read path"), and they are worse here because
+/// these run at startup, at shutdown and on ordinary mutating verbs:
+///
+/// 1. A `works/` entry with no journal got a **zero-byte
+///    `journal.ndjson` created by the sweep itself** — a read path
+///    inventing a canonical file, and the reason a restart turned an
+///    absent journal into an empty one.
+/// 2. A journal that is readable but not writable (`0444`: a restored
+///    backup, an archived tree, a `chmod -R a-w` snapshot) failed to
+///    open, so a real Work was **silently skipped** by container
+///    cleanup, by run recovery, by held-work re-evaluation, by
+///    settlement and by the admin listing — its findings simply were
+///    not there.
+///
+/// Same on-disk format, same `EnvelopeIter`, same fail-closed rule on a
+/// malformed line or a sequence gap (`store.md` §5): `JournalReader` is
+/// the read-only half of the same journal, not a second parser.
+///
+/// `None` is *nothing this sweep may act on*, exactly as before: a
+/// directory that is not a Work (no journal — the estate's own layout
+/// rule, the one `journal_for` already applies to every other read), a
+/// journal this sweep could not read, or a journal whose replay failed.
+/// Each caller already `continue`s on `None`, so an absent, denied or
+/// torn journal authorizes no mutation and is never folded as if it
+/// were a legitimately empty history. What a caller must never do is
+/// treat `None` as an attestation that the estate holds nothing — that
+/// is the completeness question, and it is answered where it is asked,
+/// by `CanonicalScan` against the rows the index already holds.
+fn discovery_events(dir: &Path) -> Option<Vec<Event>> {
+    JournalReader::open(dir).ok()?.replay().ok()
+}
+
 /// Reconstructs the `Run` named `run_id` by replaying `events` in order:
 /// seeds the initial state at its `RunOpened`, then folds every
 /// subsequent event through `Run::apply` (which already ignores events
@@ -5372,10 +5664,11 @@ fn reevaluate_waiting_works(state: &Arc<WirkdState>) {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(journal) = Journal::open(&dir) else {
-            continue;
-        };
-        let Ok(events) = journal.replay() else {
+        // Pure discovery: read the journal that is there, create
+        // nothing, and read one an operator left read-only
+        // (`discovery_events`). The mutation this sweep decides on
+        // still goes through the one write path below.
+        let Some(events) = discovery_events(&dir) else {
             continue;
         };
         if events.is_empty() {
@@ -9299,10 +9592,11 @@ fn find_finding_owner(
         if !dir.is_dir() {
             continue;
         }
-        let Ok(journal) = Journal::open(&dir) else {
-            continue;
-        };
-        let Ok(events) = journal.replay() else {
+        // Pure discovery: read the journal that is there, create
+        // nothing, and read one an operator left read-only
+        // (`discovery_events`). The mutation this sweep decides on
+        // still goes through the one write path below.
+        let Some(events) = discovery_events(&dir) else {
             continue;
         };
         if events.is_empty() {
@@ -9667,6 +9961,7 @@ fn handle_finding_assert(
     let Some(record) = fold(&events_now).findings.get(&finding_id).cloned() else {
         return err_reply("Internal", "finding vanished after assert");
     };
+    let admin = requester_view.is_none();
     let result = match requester_view {
         None => finding_json(&work_id, &finding_id, &record),
         Some((requester, requester_events, lineage)) => {
@@ -9674,7 +9969,12 @@ fn handle_finding_assert(
             finding_json_scoped(state, &mut view, &work_id, &finding_id, &record)
         }
     };
-    ok_reply(result)
+    // The assertion above is journaled and durable whatever the sweep
+    // did, so this reply is a success — but it says, in the same
+    // breath, whether the derived index actually took the row. This is
+    // the surface ruling 0116 recorded as silent: exit 0 and a complete
+    // reply while the index quietly fell behind.
+    ok_reply(with_index_health(state, admin, result))
 }
 
 /// §2.4, construction review's own corrected verb: never a client
@@ -9784,7 +10084,10 @@ fn handle_finding_settle(state: &Arc<WirkdState>, payload: super::FindingSettleP
         };
         map.insert("pending".to_string(), json!({"reason": reason}));
     }
-    ok_reply(result)
+    // `settle_ready` above reconciles the index whenever it minted a
+    // settlement; a settled reply that does not say whether the row
+    // reached the index is the same silence `assert` carried.
+    ok_reply(with_index_health(state, payload.admin, result))
 }
 
 /// Whether the Actor Waypoint declaring `named` in this Work reserved
@@ -10723,12 +11026,12 @@ fn handle_finding_applied(
         return err_reply("Internal", "finding vanished after applied");
     };
     let mut view = DisclosureView::new(&producer, &producer_events, &lineage);
-    ok_reply(finding_json_scoped(
+    // Same honesty as `assert`: the Application is journaled, and this
+    // says whether the index took its row.
+    ok_reply(with_index_health(
         state,
-        &mut view,
-        &work_id,
-        &finding_id,
-        &record,
+        false,
+        finding_json_scoped(state, &mut view, &work_id, &finding_id, &record),
     ))
 }
 
@@ -10928,10 +11231,11 @@ fn handle_finding_list(state: &Arc<WirkdState>, payload: super::FindingListPaylo
                         if !dir.is_dir() {
                             continue;
                         }
-                        let Ok(journal) = Journal::open(&dir) else {
-                            continue;
-                        };
-                        let Ok(events) = journal.replay() else {
+                        // Pure discovery: read the journal that is there, create
+                        // nothing, and read one an operator left read-only
+                        // (`discovery_events`). The mutation this sweep decides on
+                        // still goes through the one write path below.
+                        let Some(events) = discovery_events(&dir) else {
                             continue;
                         };
                         if events.is_empty() {
@@ -12005,10 +12309,11 @@ fn settle_ready_findings(state: &Arc<WirkdState>) {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(journal) = Journal::open(&dir) else {
-            continue;
-        };
-        let Ok(events) = journal.replay() else {
+        // Pure discovery: read the journal that is there, create
+        // nothing, and read one an operator left read-only
+        // (`discovery_events`). The mutation this sweep decides on
+        // still goes through the one write path below.
+        let Some(events) = discovery_events(&dir) else {
             continue;
         };
         if let Some(event) = events.first() {
@@ -12036,27 +12341,324 @@ fn find_raised_finding(events: &[Event], finding_id: &FindingId) -> Option<(Even
     })
 }
 
+/// What one walk of the estate's Work journals actually observed: the
+/// rows it could build, **and** whatever it could not read.
+///
+/// The second half is the whole point. The walk this replaced returned a
+/// bare `Vec` and dropped every `read_dir`, `Journal::open` and `replay`
+/// error on the floor, so a canonical journal that could not be read —
+/// a real `EACCES` on a wrongly-owned estate, or the torn final line a
+/// crash between `write_all` and `sync_all` leaves, which `Journal`
+/// fails closed on by design — produced a *short* row set that was
+/// indistinguishable from a genuinely complete one. Appending that set
+/// then reported `Synchronized`, and `--rebuild` replaced the whole
+/// index with it and reported `Synchronized` too: valid rows deleted,
+/// exit 0, empty stderr (`index-health-adversarial/REPORT.md` case 1,
+/// executed; ruling 0125).
+///
+/// A projection built from a partial walk is missing rows nobody
+/// counted. So this carries the fact forward and its holder is the one
+/// thing that decides whether an attempt may call itself synchronized.
+struct CanonicalScan {
+    rows: Vec<wirk_atlas::FindingRow>,
+    /// One entry per thing under `works/` this walk could not read,
+    /// named the way an operator repairing it needs and nobody else
+    /// ever sees it: `unreadable` reaches a caller only through
+    /// `IndexProjection::Behind`'s `detail`, which is `--admin` only.
+    unreadable: Vec<String>,
+    /// One entry per Work the **standing index** durably holds rows for
+    /// that this walk did not reproduce, filled in by `account` under
+    /// the same Atlas hold that publishes.
+    ///
+    /// Kept beside `unreadable` and not inside it because they are not
+    /// the same fact. `unreadable` is "this walk hit an error reading a
+    /// journal"; this is "this walk hit no error at all and still came
+    /// back short of evidence the estate already published", which is
+    /// what an absent journal, an absent Work directory, a journal some
+    /// other startup path re-created empty, and a canonical history
+    /// that is valid but shorter than it was all look like. None of
+    /// them raises an error anywhere, and every one of them is a walk
+    /// that did not observe the estate.
+    ///
+    /// Admin-only on exactly the same terms as `unreadable`.
+    unaccounted: Vec<String>,
+}
+
+impl CanonicalScan {
+    /// True when every journal the estate's layout says is canonical was
+    /// actually read. An estate with no `works/` directory at all is
+    /// complete and empty — a legal new estate is not a broken one.
+    fn complete(&self) -> bool {
+        self.unreadable.is_empty() && self.unaccounted.is_empty()
+    }
+
+    /// Compares this walk against what the index durably holds, under
+    /// the Atlas hold, and records every Work the index has rows for
+    /// that this walk produced nothing for.
+    ///
+    /// This is the only thing that can tell an absent Work from one that
+    /// never existed, and it does it without any new store, any new file
+    /// and any second read: the index is already read under this hold,
+    /// and it already names the origin Work of every row it holds
+    /// (`FindingOrigin::work`). A `works/` directory alone genuinely
+    /// cannot distinguish the two — this does not pretend otherwise, it
+    /// asks the durable projection instead.
+    ///
+    /// `unaccounted` must be computed against what the index held
+    /// **before** this walk began (`unaccounted_finding_rows`'s own
+    /// doc): an ordinary sweep walks outside the Atlas lock, so a
+    /// concurrent mutation legitimately publishes rows this walk is
+    /// older than, and those are a healthy estate.
+    ///
+    /// **Evidence, never authority.** What this establishes is that a
+    /// walk was incomplete. Nothing here invents a Work, reconstructs a
+    /// canonical event or writes a journal; the refusal it drives leaves
+    /// the estate exactly as it found it, and the record is still the
+    /// raising Work's journal. See `UnaccountedFindingRow` for why a
+    /// missing row is evidence at all: the Finding lifecycle has no
+    /// retraction and the journals are append-only, so a complete walk
+    /// of an intact estate reproduces every row it produced before.
+    fn account(&mut self, unaccounted: &[wirk_atlas::UnaccountedFindingRow]) {
+        // Grouped by Work, in the index's own order, because that is the
+        // unit an operator repairs: one restored journal explains every
+        // row that came out of it.
+        let mut by_work: Vec<(String, usize)> = Vec::new();
+        for row in unaccounted {
+            match by_work.iter_mut().find(|(work, _)| work == &row.work.0) {
+                Some((_, count)) => *count += 1,
+                None => by_work.push((row.work.0.clone(), 1)),
+            }
+        }
+        self.unaccounted = by_work
+            .into_iter()
+            .map(|(work, count)| {
+                format!(
+                    "{work}: {count} indexed row{} this walk did not reproduce",
+                    if count == 1 { "" } else { "s" }
+                )
+            })
+            .collect();
+    }
+
+    /// Admin-only: what could not be read, and how many. Never rendered
+    /// to a scoped requester, which learns the projection's state and
+    /// nothing about its contents (`index_health_json`'s own rule).
+    fn detail(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.unreadable.is_empty() {
+            parts.push(format!(
+                "the estate's canonical journals could not be read completely, so how many rows the index is missing is unknown: {} unreadable ({})",
+                self.unreadable.len(),
+                self.unreadable.join("; ")
+            ));
+        }
+        if !self.unaccounted.is_empty() {
+            parts.push(format!(
+                "the estate's canonical journals no longer account for rows this index already holds, so this walk did not observe the whole estate: {} unaccounted ({})",
+                self.unaccounted.len(),
+                self.unaccounted.join("; ")
+            ));
+        }
+        parts.join("; ")
+    }
+}
+
+/// What the standing index could be established to hold, before a
+/// destructive `--rebuild` replaces it.
+///
+/// The rebuild's preservation check (`CanonicalScan::account`) is only
+/// as good as its basis, and the basis used to be `AtlasStore::findings`
+/// alone — an all-or-nothing read that refuses the whole file when one
+/// line does not parse. That is the right rule for every ordinary read,
+/// and it was the wrong basis here: `--rebuild` exists precisely to
+/// repair a file with a malformed line, so the one case the check was
+/// most needed for was the one case it was skipped in, and a published
+/// Work's rows were deleted at exit 0 with `synchronized` on the reply
+/// (ruling 0130, executed as `index-combined-verify` H2).
+///
+/// One malformed line is not evidence that no valid row is in the file.
+/// `salvage_findings` parses the same file with the same parser, keeping
+/// the rows that are rows and counting the lines that are not, and those
+/// rows are known evidence the estate published — checkable, and checked.
+/// The malformed lines are the honest remainder: unknown content, so
+/// unknowable absence, so their bytes are preserved rather than replaced
+/// away and the projection says its completeness is unknown.
+///
+/// **Never a second authority.** No variant here is ever returned to a
+/// caller, written back into the index, or used to reconstruct a Work or
+/// a journal event. Rows are compared by id against a canonical walk and
+/// then dropped.
+enum IndexBasis {
+    /// The ordinary read succeeded — including on an absent or empty
+    /// index, which honestly holds no rows.
+    Read(Vec<wirk_atlas::FindingRow>),
+    /// The ordinary read refused because at least one line is not a row,
+    /// and a line-by-line salvage recovered the rest.
+    Salvaged {
+        salvaged: wirk_atlas::SalvagedFindingIndex,
+        read_error: wirk_atlas::AtlasError,
+    },
+    /// The file itself could not be read: a real denial, or a directory
+    /// where the file should be. Nothing about what the index holds can
+    /// be established, so nothing may replace it.
+    Unreadable {
+        read_error: wirk_atlas::AtlasError,
+        open_error: wirk_atlas::AtlasError,
+    },
+}
+
+impl IndexBasis {
+    /// The rows the index is **known** to hold, or `None` when that is
+    /// not established at all. An empty slice and `None` are deliberately
+    /// different answers: the first is "the index holds nothing", the
+    /// second is "nobody knows what the index holds".
+    fn known_rows(&self) -> Option<&[wirk_atlas::FindingRow]> {
+        match self {
+            IndexBasis::Read(rows) => Some(rows.as_slice()),
+            IndexBasis::Salvaged { salvaged, .. } => Some(salvaged.rows.as_slice()),
+            IndexBasis::Unreadable { .. } => None,
+        }
+    }
+
+    /// Admin-only: what the salvage had to do, and what it could not
+    /// establish. `None` when the ordinary read succeeded, which is the
+    /// path every healthy rebuild takes and where nothing about this is
+    /// said at all.
+    fn salvage_note(&self) -> Option<String> {
+        let IndexBasis::Salvaged {
+            salvaged,
+            read_error,
+        } = self
+        else {
+            return None;
+        };
+        Some(format!(
+            "the standing index could not be parsed whole ({read_error}), so this rebuild was checked against the {} row(s) of it that could still be read; {} line(s) could not be, and what they held cannot be established from anything in the estate",
+            salvaged.rows.len(),
+            salvaged.malformed.len()
+        ))
+    }
+}
+
+/// Reads the standing index as a basis a destructive replacement may be
+/// judged against, falling back to the recovery read only when the
+/// ordinary one refuses.
+fn index_basis(atlas: &wirk_atlas::AtlasStore) -> IndexBasis {
+    match atlas.findings() {
+        Ok(rows) => IndexBasis::Read(rows),
+        Err(read_error) => match atlas.salvage_findings() {
+            // A salvage that finds no malformed line at all cannot
+            // happen from a parse failure, but it can from a file that
+            // changed between the two reads — and then the ordinary
+            // read's refusal is the older fact, so this is treated as
+            // the salvage it is rather than as a clean read.
+            Ok(salvaged) => IndexBasis::Salvaged {
+                salvaged,
+                read_error,
+            },
+            Err(open_error) => IndexBasis::Unreadable {
+                read_error,
+                open_error,
+            },
+        },
+    }
+}
+
 /// Every settled/asserted/applied row this estate's journals currently
 /// support, EstateLocal only (`work_local_finding... never indexed`,
 /// §5.4/§9) — the daemon's own journal walk, shared by `--rebuild` and
-/// by startup reconciliation.
-fn all_finding_rows(state: &Arc<WirkdState>) -> Vec<wirk_atlas::FindingRow> {
+/// by startup reconciliation — **and** what it could not read
+/// (`CanonicalScan`).
+///
+/// What is skipped and what is an error is decided by the estate's own
+/// layout, never by "an error happened here". A `works/` that does not
+/// exist is an estate with no Work in it. A directory entry that is not
+/// a directory is not a Work. A Work whose journal is empty holds no
+/// Findings. Each of those is a complete observation of nothing. Every
+/// other failure — the directory listing denied, an entry whose type
+/// cannot be read, a journal that will not open or will not replay — is
+/// a journal this walk did not see, and is recorded as one.
+fn all_finding_rows(state: &Arc<WirkdState>) -> CanonicalScan {
     let mut rows = Vec::new();
+    let mut unreadable = Vec::new();
+    let unaccounted = Vec::new();
     let works_dir = state.estate_root.join("works");
-    let Ok(entries) = std::fs::read_dir(&works_dir) else {
-        return rows;
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
+    let entries = match std::fs::read_dir(&works_dir) {
+        Ok(entries) => entries,
+        // A new estate, or one that has never submitted: complete, and
+        // empty. The positive control the failure below must not swallow.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CanonicalScan {
+                rows,
+                unreadable,
+                unaccounted,
+            };
         }
-        let Ok(journal) = Journal::open(&dir) else {
-            continue;
+        // Anything else — denied, not a directory, an I/O error — means
+        // this walk saw none of the estate's journals and knows it.
+        Err(error) => {
+            unreadable.push(format!("works/: {error}"));
+            return CanonicalScan {
+                rows,
+                unreadable,
+                unaccounted,
+            };
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                unreadable.push(format!("works/ entry: {error}"));
+                continue;
+            }
         };
-        let Ok(events) = journal.replay() else {
-            continue;
+        let dir = entry.path();
+        // `file_type` on the entry, not `is_dir()` on the path: the
+        // latter answers `false` for a directory it could not `stat`,
+        // which is exactly the silent skip this walk is being cured of.
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                unreadable.push(format!("{}: {}", entry_name(&dir), with_causes(&error)));
+                continue;
+            }
+        }
+        // Read-only, and only readable: this walk is a pure scan, and
+        // `Journal::open` — the estate's one write path — would
+        // `create_dir_all`, create the file it did not find, and demand
+        // append permission on a journal any reader can read
+        // (`index-health-reverify/VERDICT.md`). Same format, same
+        // replay, same fail-closed rule on a torn tail; no creation and
+        // no write.
+        let journal = match JournalReader::open(&dir) {
+            Ok(journal) => journal,
+            // The estate's own layout rule, the one `journal_for`
+            // already applies to every other read: a directory under
+            // `works/` with no journal file is **not a Work**, and this
+            // walk is not the thing that decides otherwise by making
+            // one. A complete observation of nothing, exactly as a
+            // `works/` that does not exist is a complete observation of
+            // an empty estate. Any other failure is a journal this walk
+            // did not see, and is recorded as one.
+            Err(JournalError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => {
+                unreadable.push(format!("{}: {}", entry_name(&dir), with_causes(&error)));
+                continue;
+            }
         };
+        let events = match journal.replay() {
+            Ok(events) => events,
+            Err(error) => {
+                unreadable.push(format!("{}: {}", entry_name(&dir), with_causes(&error)));
+                continue;
+            }
+        };
+        // An empty journal is read in full and holds nothing. Not an
+        // error, and not a Work either until its first event names one.
         let Some(work_id) = events.first().map(|event| event.work.clone()) else {
             continue;
         };
@@ -12115,27 +12717,828 @@ fn all_finding_rows(state: &Arc<WirkdState>) -> Vec<wirk_atlas::FindingRow> {
             });
         }
     }
-    rows
+    CanonicalScan {
+        rows,
+        unreadable,
+        unaccounted,
+    }
+}
+
+/// The directory's own name, never the path it sits at: `detail` is
+/// administrative, but there is no reason for it to carry the estate's
+/// location around when the Work directory identifies the journal
+/// completely.
+/// An error with its whole source chain, which is what an operator
+/// repairing a denied journal needs: `JournalError`'s own `Display` for
+/// an I/O failure is the bare words "journal io error", and the errno
+/// that says *which* failure it was lives on the source beneath it.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    text
+}
+
+fn entry_name(dir: &std::path::Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
 }
 
 /// Startup pass (§5.4): journal first (already true by construction —
 /// this reads what `settle_ready_findings` just minted), index second.
-/// Additive only (`append_finding_row`, idempotent) — never the
+/// Additive only (`append_finding_rows`, idempotent) — never the
 /// destructive `--rebuild` overwrite.
+///
+/// Two repairs over the shape ruling 0116 accepted and recorded limits
+/// against, both of them here rather than split across surfaces:
+///
+/// 1. **One rewrite, not one per row.** This offers every journaled row
+///    on every call, and the old per-row loop re-read and atomically
+///    rewrote the whole index once per row — O(rows²) bytes and O(rows)
+///    `fsync` pairs for a single `assert`. `append_finding_rows` does
+///    the identical read/dedup/rewrite once for the whole sweep, and
+///    writes nothing at all when nothing is missing.
+/// 2. **The outcome is recorded, not only printed.** The old sweep's
+///    only report was `eprintln!` on the daemon's own stderr: the
+///    mutating caller still got a complete-looking reply, and a later
+///    `atlas findings` answered from a silently stale index. Every
+///    attempt now lands in `WirkdState::index_health`, which every
+///    mutating and every dependent query surface renders. The journal
+///    stays canonical and the mutation stays accepted — a derived
+///    projection falling behind is not a lost record — but nothing
+///    claims to be synchronized while it is not.
+///
+/// **What this sweep does not carry.** It reports what its own
+/// `append_finding_rows` established about the atlas directory and
+/// nothing else, recorded inside the critical section that established
+/// it. A directory fact made by an *earlier* critical section — a
+/// retirement's renames and their `fsync` — is recorded where it
+/// happened, by `record_directory_durability`, and is never handed to
+/// this sweep to publish on its behalf. `record_directory_durability`'s
+/// own doc has the reason: this sweep's ticket orders its *walk*, and a
+/// walk ticket cannot order an `fsync`.
 fn reconcile_findings_index(state: &Arc<WirkdState>) {
-    let rows = all_finding_rows(state);
+    // The ticket is taken **before** the walk, because the walk is what
+    // this attempt's outcome is an observation of. Everything after this
+    // line — the walk, the wait for the Atlas mutex, the append — only
+    // ever makes this attempt's picture of the estate older.
+    let observation = next_index_observation(state);
+    // What the index durably held *before* this walk begins, which is
+    // the only honest basis to judge the walk's completeness against.
+    // The index legitimately moves forward under a sweep — this walk
+    // runs outside the lock, so a concurrent mutation can journal and
+    // publish a row this walk is simply older than, and that is a
+    // healthy estate. Taken before the walk, released immediately, and
+    // never held across it.
+    let held_before_walk = {
+        let atlas = state
+            .atlas
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        atlas.findings()
+    };
+    // Outside the lock, unchanged and deliberately so: the walk reads
+    // journal files through its own handles and acquires no mutex at
+    // all, and what it produces is *offered* to an additive, idempotent
+    // append. A row that lands between this walk and the append below is
+    // added by the append's own re-read under the lock, never erased —
+    // which is precisely why the destructive `--rebuild` path, further
+    // down, must not do the same thing.
+    let mut scan = all_finding_rows(state);
+    // The window a verifier parks at to prove the ordering this sweep
+    // is subject to is decided by *when its walk ran*, not by when its
+    // record happens to arrive: after the walk, before the Atlas lock.
+    wirk_atlas::checkpoint("findings-index-scanned");
+    // {publish, record} is one critical section (ruling 0125, case 2C
+    // executed). Held apart, an older attempt that appended first and
+    // recorded last overwrote a newer attempt's genuine failure with its
+    // own stale success, and the daemon then told every later caller
+    // that a demonstrably incomplete index was complete. The Atlas mutex
+    // already serializes the publication; extending it over the health
+    // record makes the pair one ordered operation, and it is also what
+    // lets a reader take `rows` and the health that describes them
+    // together (`handle_atlas_findings`). Lock order is
+    // `atlas -> index_health` and nothing anywhere inverts it: the only
+    // three sites that touch `index_health` are `record_index_projection`,
+    // `record_directory_durability` and `index_health_snapshot`, and none
+    // of them takes another lock.
     let mut atlas = state
         .atlas
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    for row in rows {
-        if let Err(err) = atlas.append_finding_row(&row) {
-            eprintln!(
-                "wirkd: findings index reconciliation failed for {}: {err}",
-                row.id.0
-            );
+    let outcome = atlas.append_finding_rows(&scan.rows);
+    // A pre-walk read that itself failed is not evidence of anything —
+    // and the append below re-read the same file, so it reports the
+    // failure on its own account and this projection is `Behind` either
+    // way.
+    if let Ok(held) = &held_before_walk {
+        scan.account(&wirk_atlas::unaccounted_finding_rows(held, &scan.rows));
+    }
+    let durability = directory_durability_of(&outcome);
+    let projection = projection_of(&scan, outcome);
+    // The window a verifier parks at to prove the two are one operation:
+    // between the publication and the record, with the lock held.
+    wirk_atlas::checkpoint("findings-index-published");
+    record_index_projection(state, observation, projection, durability);
+    drop(atlas);
+}
+
+/// What an `append_finding_rows` outcome establishes about the atlas
+/// directory, read off the one thing that decides it: whether this call
+/// reached the directory `fsync` at the end of `rewrite_rows`, and what
+/// it returned.
+///
+/// `Ok(0)` is the common case after the first mutation and is
+/// deliberately **not** `Confirmed`: the method's own contract is that a
+/// sweep which finds nothing missing "writes nothing at all", so it
+/// never opened the directory. A failure before the rename is
+/// `Unestablished` for the same reason — it did not get that far.
+fn directory_durability_of(
+    outcome: &Result<usize, wirk_atlas::FindingIndexUnwritten>,
+) -> DirectoryDurability {
+    match outcome {
+        Ok(0) => DirectoryDurability::Unestablished,
+        Ok(_) => DirectoryDurability::Confirmed,
+        Err(unwritten) => match &unwritten.error {
+            wirk_atlas::AtlasError::DurabilityUncertain(detail) => {
+                DirectoryDurability::Uncertain(detail.clone())
+            }
+            _ => DirectoryDurability::Unestablished,
+        },
+    }
+}
+
+/// The next observation ticket for this daemon. Monotonic, per estate,
+/// and taken exactly once per reconciliation attempt.
+fn next_index_observation(state: &Arc<WirkdState>) -> u64 {
+    state.index_observations.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// What an attempt observed, from the two facts that decide it: whether
+/// the canonical walk was complete, and what the write did.
+///
+/// The rule the silence in ruling 0125 case 1 comes down to: **a
+/// successful append of a partial walk is not a synchronized index.**
+/// The append can only ever report on the rows it was handed; the walk
+/// is the only thing that knows whether those were all of them. When it
+/// was not, how far behind the index is, is genuinely unknown — the
+/// unreadable journals were never counted — so this reports the
+/// `Behind { pending: None }` shape the surface already uses for exactly
+/// that ("unknown, not zero"), and not a number nobody measured.
+fn projection_of(
+    scan: &CanonicalScan,
+    outcome: Result<usize, wirk_atlas::FindingIndexUnwritten>,
+) -> IndexProjection {
+    if !scan.complete() {
+        // Kept from the write path and extended to the read of the
+        // record: the operator-facing line on the daemon's own stderr,
+        // which is no longer the only report either way.
+        eprintln!(
+            "wirkd: findings index reconciliation read the estate's journals incompletely: {}",
+            scan.detail()
+        );
+    }
+    match outcome {
+        Ok(_) if scan.complete() => IndexProjection::Synchronized,
+        Ok(_) => IndexProjection::Behind {
+            pending: None,
+            detail: scan.detail(),
+        },
+        Err(unwritten) => {
+            eprintln!("wirkd: findings index reconciliation failed: {unwritten}");
+            match (unwritten.error, scan.complete()) {
+                (wirk_atlas::AtlasError::DurabilityUncertain(detail), true) => {
+                    IndexProjection::DurabilityUnconfirmed { detail }
+                }
+                // The rows that were offered are visible, but the ones
+                // the walk never read are not — an incomplete projection,
+                // not a durability window, and reported as the more
+                // serious of the two facts. Both are still said: the
+                // durability half is the health record's own directory
+                // fact now, and `qualified_by_unconfirmed_directory`
+                // appends it to this detail exactly once — here and on
+                // every later attempt, until a directory `fsync`
+                // succeeds.
+                (wirk_atlas::AtlasError::DurabilityUncertain(_), false) => {
+                    IndexProjection::Behind {
+                        pending: None,
+                        detail: scan.detail(),
+                    }
+                }
+                (error, true) => IndexProjection::Behind {
+                    pending: unwritten.pending,
+                    detail: error.to_string(),
+                },
+                // A count of what the write missed is not a count of
+                // what the index is missing when the walk was short.
+                (error, false) => IndexProjection::Behind {
+                    pending: None,
+                    detail: format!("{}; {error}", scan.detail()),
+                },
+            }
         }
     }
+}
+
+/// What a **failed** retirement established about the atlas directory,
+/// read off the two places `PreservedIndexRetirementFailed` records it.
+///
+/// The failure itself is a directory sync when the last rename had
+/// already landed (`operation: "confirm the rename(s) on disk"`), and
+/// `retired_unconfirmed` is the same window on the partial path, where
+/// the sync was attempted for the renames that had landed before a later
+/// one was refused. A partial failure whose sync *succeeded* leaves
+/// `retired_unconfirmed: None` with renames in `retired`, and that is a
+/// real confirmation: the directory was `fsync`ed and returned success.
+/// A failure with nothing renamed — the listing, or the very first
+/// claim — never opened the directory at all.
+fn retirement_durability(
+    failed: &wirk_atlas::PreservedIndexRetirementFailed,
+) -> DirectoryDurability {
+    if let wirk_atlas::AtlasError::DurabilityUncertain(detail) = &failed.error {
+        return DirectoryDurability::Uncertain(detail.clone());
+    }
+    match &failed.retired_unconfirmed {
+        Some(wirk_atlas::AtlasError::DurabilityUncertain(detail)) => {
+            DirectoryDurability::Uncertain(detail.clone())
+        }
+        Some(error) => DirectoryDurability::Uncertain(error.to_string()),
+        None if !failed.retired.is_empty() => DirectoryDurability::Confirmed,
+        None => DirectoryDurability::Unestablished,
+    }
+}
+
+/// Records a directory fact this caller's **own** Atlas critical section
+/// established, from inside that critical section. Called with the Atlas
+/// guard held; the lock order is the same `atlas -> index_health` every
+/// other site takes.
+///
+/// **Why a directory fact cannot travel to a later sweep, and why no
+/// ticket fixes it.** An observation ticket orders a *walk*: it is taken
+/// before the walk, and everything after it only makes that walk's
+/// picture of the estate older, which is exactly what
+/// `record_index_projection`'s staleness guard needs. An `fsync` is not
+/// a walk. Every `fsync` of the atlas directory this daemon makes —
+/// `append_finding_rows`, `retire_preserved_unreadable_indexes`,
+/// `rebuild_finding_rows` — is made under the Atlas mutex, so **the
+/// order of the critical sections is the order the syncs really
+/// happened in**, and that is the only order a durability fact can be
+/// judged by. A ticket is a different clock, and the two are not
+/// comparable in either direction:
+///
+/// * A concurrent sweep can take its ticket, walk, and *then* wait for
+///   the mutex. Its record is therefore newer than a retirement's while
+///   its ticket is older.
+/// * So the retirement's renames-and-`fsync` completed *before* that
+///   sweep's failing `fsync`, and published *after* it. Handed to a
+///   later sweep to publish, its `Confirmed` cleared a window a
+///   genuinely later failure had just opened, and the estate read
+///   `synchronized` / `complete: true` over a rename nothing had
+///   confirmed on disk — the D3 outcome, reached from the other side
+///   (`index-retirement-durability-verify/raw/44`, isolated by its
+///   no-preserved-copy control `raw/45`).
+/// * Taking the retirement's ticket *before* its Atlas guard does not
+///   close it. The concurrent sweep's ticket is older still — it was
+///   taken before the retirement's call arrived at all — so the stale
+///   record is the *failure*, and the guard drops it for exactly the
+///   right reason. Moving the ticket only moves which of two
+///   incomparable clocks is read.
+///
+/// Recorded here, the fact lands in the critical section that made it:
+/// a `fsync` that happened first is applied first, and a failure in a
+/// later critical section is applied over it. The `--rebuild` arm
+/// already works this way (its ticket and its record both live inside
+/// its hold), and so does the sweep (`{publish, record}` is one critical
+/// section, ruling 0125 case 2C); this is the same discipline applied to
+/// the one path that had left it.
+///
+/// No ticket is taken and `observation` is not moved. It does not need
+/// to be, and the reason is **not** the one this doc used to give.
+///
+/// It used to say that an older sweep landing afterwards carries
+/// `Unestablished`, "a sweep can only carry what its own append
+/// established". The second clause is true; the first does not follow
+/// from it and is false. `append_finding_rows` returns `Ok(0)` without
+/// opening a file only when the index already holds **every** offered
+/// row (`wirk-atlas/src/findings.rs:210-220`); any row it lacks sends
+/// the call into `rewrite_rows`, which renames and `fsync`s the atlas
+/// directory. A walk with an **older** ticket can hold a row a newer
+/// walk never read — because the newer walk was short — so its append
+/// really does write, and really does `fsync` that directory, in a
+/// critical section that runs strictly **after** the newer record. Its
+/// `Confirmed` or `Uncertain` is a genuinely later directory fact
+/// wearing an older walk's ticket, which is precisely the shape this
+/// function exists to keep out of the walk's clock
+/// (`index-retirement-order-verify/raw/61`, `raw/62`: executed against
+/// a real daemon and a real `EIO`, on this source and on its parent).
+///
+/// What actually makes a ticket unnecessary is the discipline this
+/// function names and `record_index_projection` now shares: the
+/// directory fact is applied **under the Atlas guard of the critical
+/// section that made it**, before and independently of any judgement
+/// about how fresh the walk was. So an older sweep that lands
+/// afterwards no longer needs to carry anything on this fact's behalf,
+/// and no longer silently drops one of its own.
+///
+/// **Asymmetric, deliberately.** `Uncertain` re-qualifies the standing
+/// projection here and now, through the same
+/// `qualified_by_unconfirmed_directory` every record uses, so the window
+/// is open the instant the failing `fsync` returns and does not wait on
+/// a sweep whose own record may be discarded as stale. `Confirmed`
+/// clears the field but leaves the projection to the sweep that follows:
+/// the qualification is one-way — `Behind`'s detail has the sentence
+/// concatenated into it — and re-deriving a projection is what a walk is
+/// for. Reading `durability_unconfirmed` for the moment between is the
+/// conservative direction, and the sweep this call always runs closes it.
+fn record_directory_durability(state: &Arc<WirkdState>, durability: DirectoryDurability) {
+    let mut health = state
+        .index_health
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    apply_directory_durability(&mut health, durability);
+}
+
+/// The directory fact itself, applied to a health record the caller
+/// already holds the lock on.
+///
+/// Split out of `record_directory_durability` so the sweep's own record
+/// can apply it too, under the Atlas guard its `fsync` was made under
+/// and **before** `record_index_projection`'s staleness guard has a say
+/// — the one path where an `fsync` that really happened was being judged
+/// by the freshness of the walk that happened to make it. One body, one
+/// set of rules, called from both: there is no second store, no second
+/// clock and no latch here, and the three outcomes mean exactly what
+/// `DirectoryDurability` says they mean.
+fn apply_directory_durability(health: &mut IndexHealth, durability: DirectoryDurability) {
+    match durability {
+        // This call did not write to the directory at all, so it has
+        // nothing to say about it and says nothing — the standing record
+        // stands.
+        DirectoryDurability::Unestablished => {}
+        DirectoryDurability::Confirmed => health.unconfirmed_directory = None,
+        DirectoryDurability::Uncertain(detail) => {
+            let projection =
+                qualified_by_unconfirmed_directory(health.projection.clone(), Some(&detail));
+            if health.projection != projection {
+                health.since = now_ts();
+                health.projection = projection;
+            }
+            health.unconfirmed_directory = Some(detail);
+        }
+    }
+}
+
+/// Records what a reconciliation attempt observed. `since` moves only
+/// when the state actually changes, so a window that has been open for
+/// twenty attempts still reports when it opened rather than when it was
+/// last re-confirmed.
+///
+/// `durability` is what the attempt established about the atlas
+/// directory itself, which the projection cannot carry on its own: a
+/// projection is recomputed from the estate every time, and an
+/// unconfirmed directory entry is invisible to every later read of it.
+///
+/// **Two facts on two clocks, and only one of them is the walk's.** The
+/// projection is what this attempt's *walk* saw, and a walk is ordered
+/// by the observation ticket taken before it — that is what the
+/// staleness guard below is for. The directory fact is what this
+/// attempt's *own* `fsync` of the atlas directory returned, and an
+/// `fsync` is ordered by the Atlas critical section it was made in.
+/// Every production caller of this function holds the Atlas guard
+/// across the call (the sweep, and all five arms of `--rebuild`), so by
+/// the time it is reached the directory fact is already the latest one
+/// there is, whatever the ticket says.
+///
+/// So the directory fact is applied **first and unconditionally**,
+/// through the same `apply_directory_durability` the retirement's own
+/// record uses, and only the projection is then subject to the guard.
+/// Before this, a stale walk's genuinely later failure was discarded
+/// with its projection and never reached `unconfirmed_directory` at
+/// all: the assignment sat below the `return`. A walk with an older
+/// ticket writes and `fsync`s exactly when it holds a row a newer,
+/// shorter walk never read, so this was reachable by ordinary
+/// mutations with no administrative call anywhere near it — executed
+/// against a real daemon and a real `EIO` at
+/// `index-retirement-order-verify/raw/61`, where the next no-op sweep
+/// then certified `synchronized` / `complete: true` over an entry whose
+/// `fsync` had returned `EIO`.
+///
+/// Both directions are kept, and they are the same two the retirement's
+/// record already keeps:
+///
+/// * A genuinely later **failure** opens the window immediately,
+///   re-qualifying the standing projection here and now, whether or not
+///   the walk that made it is stale.
+/// * A genuinely later **success** clears the window, leaving the
+///   projection to the walk that re-derives it — which is the ordinary
+///   sweep that follows, never this stale record.
+/// * A stale **projection** still cannot overwrite a newer one: the
+///   guard is untouched, and `weakens` still admits only the one
+///   direction it ever admitted.
+/// * An attempt that wrote nothing (`Unestablished`) still establishes
+///   nothing: it re-reads the standing field and carries it forward,
+///   exactly as before, so a no-op sweep cannot resolve a window it
+///   never touched (ruling 0130).
+fn record_index_projection(
+    state: &Arc<WirkdState>,
+    observation: u64,
+    projection: IndexProjection,
+    durability: DirectoryDurability,
+) {
+    let at = now_ts();
+    // Read from the estate on every attempt rather than remembered in
+    // this process, so it survives a restart and so an administrator who
+    // retires the preserved bytes is believed by the very next
+    // reconciliation without a second mechanism.
+    let preserved = preserved_unreadable_indexes(state);
+    let mut health = state
+        .index_health
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // The directory fact this attempt's own `fsync` established, applied
+    // in the critical section that made it and before anything is judged
+    // stale — the whole argument is on `record_index_projection`'s and
+    // `record_directory_durability`'s docs. `Unestablished` is a no-op,
+    // so an attempt that wrote nothing still reads the standing field
+    // below rather than replacing it.
+    apply_directory_durability(&mut health, durability);
+    // Carried under the same lock as the record it qualifies, and
+    // *before* the preserved qualification, so an unconfirmed directory
+    // that a preserved copy then folds into `behind` is said once rather
+    // than twice. Read back off the record rather than recomputed, so
+    // this is the fact as it now stands: this attempt's own, when it
+    // established one, and the standing one when it did not.
+    let unconfirmed_directory = health.unconfirmed_directory.clone();
+    let projection =
+        qualified_by_unconfirmed_directory(projection, unconfirmed_directory.as_deref());
+    let projection = qualified_by_preserved(projection, &preserved);
+    if observation < health.observation && !weakens(&projection, &health.projection) {
+        // An observation older than the standing one is discarded whole:
+        // its projection, its `since` and its `last_attempt` alike. It
+        // saw an older estate than the record already here, so it has
+        // nothing to add — and the one thing it must never do is what
+        // the reverify review executed, which is hand a caller
+        // `synchronized` over a failure a newer sweep already found,
+        // reported and did not repair.
+        //
+        // Its *directory* fact is not discarded with it and is already
+        // applied above: that fact is not something the walk saw, it is
+        // something this critical section did.
+        return;
+    }
+    if health.projection != projection {
+        health.since = at;
+        health.projection = projection;
+    }
+    health.preserved = preserved;
+    health.last_attempt = Some(at);
+    health.observation = std::cmp::max(health.observation, observation);
+}
+
+/// Why an index that holds every journaled row is still not a
+/// synchronized index when a directory entry behind it was never
+/// confirmed on disk.
+///
+/// The same shape as `qualified_by_preserved` and for the same reason:
+/// a fact the walk cannot see, applied to the walk's own finding rather
+/// than folded into it. `Synchronized` becomes the state the product
+/// already has for exactly this window — visible now, not confirmed on
+/// disk — and every other state already says something at least as
+/// serious, so only the detail is added.
+///
+/// It is deliberately **not** cleared by "the next reconciliation":
+/// a sweep that finds nothing missing writes nothing at all
+/// (`append_finding_rows` returns `Ok(0)` without a byte), so it opens
+/// no file, `fsync`s no directory, and has learned exactly nothing
+/// about the entry it would be certifying. What clears it is a real
+/// successful `fsync` of the atlas directory — see `DirectoryDurability`.
+fn qualified_by_unconfirmed_directory(
+    projection: IndexProjection,
+    unconfirmed: Option<&str>,
+) -> IndexProjection {
+    let Some(detail) = unconfirmed else {
+        return projection;
+    };
+    match projection {
+        // Nothing has checked the index at all; that is already not
+        // complete, and claiming an observation this process has not
+        // made is the one thing `Unreconciled` exists to avoid.
+        IndexProjection::Unreconciled => IndexProjection::Unreconciled,
+        IndexProjection::Synchronized => IndexProjection::DurabilityUnconfirmed {
+            detail: detail.to_string(),
+        },
+        // Already saying this, with this attempt's own words for it.
+        durability @ IndexProjection::DurabilityUnconfirmed { .. } => durability,
+        IndexProjection::Behind {
+            pending,
+            detail: behind,
+        } => IndexProjection::Behind {
+            pending,
+            detail: format!("{behind}; {detail}"),
+        },
+    }
+}
+
+/// The preserved copies this estate is currently holding, as the health
+/// record renders them.
+///
+/// One directory listing of `atlas/`, taken on the reconciliation path
+/// that is already writing that directory — no new store, no registry,
+/// no process-global state and nothing to keep in sync. A listing that
+/// **fails** is itself a reason not to certify the index: an estate
+/// whose atlas directory cannot be listed has not been checked, so the
+/// error is carried as the finding it is rather than flattened to "none
+/// preserved" — and carried *as an error*, in its own field, rather than
+/// as an invented file name in the list of names.
+fn preserved_unreadable_indexes(state: &Arc<WirkdState>) -> PreservedIndexCopies {
+    match wirk_atlas::preserved_unreadable_indexes(&state.estate_root) {
+        Ok(names) => PreservedIndexCopies {
+            names,
+            unknown: None,
+        },
+        Err(error) => PreservedIndexCopies {
+            names: Vec::new(),
+            unknown: Some(error.to_string()),
+        },
+    }
+}
+
+/// Why an index can be a complete projection of every journal the walk
+/// read and still not be a complete projection of the estate.
+///
+/// `--rebuild` is allowed to proceed over a standing index whose lines
+/// do not all parse — it is the documented repair for exactly that file
+/// — but the lines that did not parse could have held anything,
+/// including rows for a Work the walk no longer reaches. Their bytes are
+/// preserved instead of replaced away, and while they are held *nothing
+/// automatic* may report this projection complete: the rebuild's own
+/// output is the basis every later sweep compares against, so a later
+/// sweep is comparing the shortened file with itself and learns nothing
+/// about what was lost (ruling 0130 — "subsequent mutation with a
+/// shortened now-readable basis must not wash away known loss
+/// automatically").
+///
+/// So this is deliberately *sticky*, and deliberately not a latch that
+/// only a clock or a redesign can open: it is a fact about a file in the
+/// estate, and it stops being true when an administrator reviews those
+/// bytes and retires them.
+fn qualified_by_preserved(
+    projection: IndexProjection,
+    preserved: &PreservedIndexCopies,
+) -> IndexProjection {
+    if !preserved.qualifies() {
+        return projection;
+    }
+    let note = preserved.note();
+    match projection {
+        // Nothing has checked *and* bytes are held: still unreconciled,
+        // which is already not complete, and saying `behind` would claim
+        // an observation this process has not made.
+        IndexProjection::Unreconciled => IndexProjection::Unreconciled,
+        IndexProjection::Synchronized => IndexProjection::Behind {
+            pending: None,
+            detail: note,
+        },
+        // Both facts, and the more serious one decides the state. The
+        // count goes to unknown: a durability window is `0` pending
+        // because every offered row is visible, and that says nothing
+        // about rows nobody could parse.
+        IndexProjection::DurabilityUnconfirmed { detail } => IndexProjection::Behind {
+            pending: None,
+            detail: format!("{note}; {detail}"),
+        },
+        IndexProjection::Behind { detail, .. } => IndexProjection::Behind {
+            pending: None,
+            detail: format!("{note}; {detail}"),
+        },
+    }
+}
+
+/// Whether an older observation is allowed to land anyway, and it is
+/// allowed exactly one direction: **an older walk may make the standing
+/// projection less complete, never more.**
+///
+/// The rule this enforces is a safety rule, not a recency rule. What
+/// must never reach a caller is `complete: true` over an index that is
+/// demonstrably missing a durably journaled row, so an older attempt
+/// claiming completeness is dropped. The mirror is not symmetrical: an
+/// older attempt's *failure* is still a fact about a write this daemon
+/// really just tried and a read it really just made, so it is allowed to
+/// replace a newer success, and the estate errs toward "incomplete,
+/// unknown" — the same direction ruling 0125 chose for a partial scan.
+///
+/// A conservative `Behind` recorded that way is cleared by exactly what
+/// the surface's own `recovery` sentence already names: the **next**
+/// observation, whose ticket is newer than everything parked behind it —
+/// the next successful settle/assert/apply sweep, a daemon restart, or
+/// an administrative `--rebuild`. It is never latched and never waits on
+/// a clock.
+fn weakens(older: &IndexProjection, standing: &IndexProjection) -> bool {
+    matches!(standing, IndexProjection::Synchronized)
+        && !matches!(older, IndexProjection::Synchronized)
+}
+
+/// The projection-health block every mutating verb and every dependent
+/// query surface carries.
+///
+/// `complete` is the field a caller must read: `false` means this
+/// estate's journals hold Finding records the derived index does not,
+/// so a `rows` list beside it is a **subset**, not an answer. The
+/// journal remains the record either way, which is why the mutation that
+/// produced this reply still succeeded.
+///
+/// **Scoping.** A scoped requester is told the projection's *state* and
+/// nothing about its contents: no count, no row or finding id, no error
+/// text, no path. The rows it cannot see are estate-local Findings of
+/// other Works, and how many of them are missing is as much theirs as
+/// their claims are — an incompleteness signal is health metadata, and
+/// health metadata is not a side channel onto the estate. `--admin`
+/// already reads every row in the file, so it also gets the count, the
+/// underlying error and the timings it needs to repair the thing.
+fn index_health_json(health: &IndexHealth, admin: bool, paired_with_rows: bool) -> Value {
+    let projection = match &health.projection {
+        IndexProjection::Unreconciled => "unreconciled",
+        IndexProjection::Synchronized => "synchronized",
+        IndexProjection::DurabilityUnconfirmed { .. } => "durability_unconfirmed",
+        IndexProjection::Behind { .. } => "behind",
+    };
+    let mut block = json!({
+        "projection": projection,
+        "complete": health.complete(),
+        // Said on every reply, complete or not, because the thing a
+        // reader most needs to know about this index is that it is never
+        // the record.
+        "canonical": "the raising Work's journal is the record; this index is a derived projection of it",
+        // What this block describes, exactly. The first form is the one
+        // ruling 0125 case 2A required: when a reply carries `rows`,
+        // this health and those rows are one snapshot taken together
+        // under the index's own lock, so `complete` is a statement about
+        // *these* rows and not about some later moment. The second is
+        // for a reply that carries no rows at all — a mutating verb's.
+        // It says which *record* it renders and not which attempt
+        // produced it: this call's sweep is always offered to the
+        // record, but `weakens` deliberately lets an older attempt's
+        // failure stand over a newer success, so the projection a
+        // caller reads here is not always its own sweep's. The ticket
+        // proves the offer, never the provenance of what is rendered
+        // (`index-health-order-verify/VERDICT.md`), and claiming
+        // otherwise was an overstatement on the one surface where the
+        // asymmetry is visible. The direction is the safe one and the
+        // next complete reconciliation clears it.
+        "observed": if paired_with_rows {
+            "this projection and the rows beside it were read together as one snapshot, so `complete` describes this list; reading the index does not re-scan the estate"
+        } else {
+            "this daemon's own most recently recorded reconciliation outcome, which this call's own sweep was offered to; an older attempt's failure is deliberately allowed to stand over a newer success, so `behind` here may have been observed before this call and is cleared by the next complete reconciliation; reading the index does not re-scan the estate"
+        },
+    });
+    let map = block
+        .as_object_mut()
+        .expect("the literal above is an object");
+    if !health.complete() {
+        map.insert(
+            "recovery".to_string(),
+            Value::String(
+                // The preserved case first, because the sentence below
+                // it would be a lie there: a later reconciliation does
+                // **not** re-project what nobody could parse, and
+                // telling an operator to wait for one is telling them
+                // to wait for something that will never arrive. No
+                // name, no count and no path here — this string is read
+                // by a scoped requester too, and what it must convey is
+                // that the wait is on a person, not on a sweep.
+                if !health.preserved.names.is_empty() {
+                    "bytes of an earlier index that could not be parsed are preserved in this estate rather than dropped; no reconciliation, restart or rebuild can establish what they held, so this projection stays incomplete until an administrator reviews the preserved copy and retires it"
+                } else if health.preserved.unknown.is_some() {
+                    // Not the sentence above: no copy is known to be
+                    // held, and telling a caller that bytes are
+                    // preserved — or telling them to go and retire
+                    // something — would be inventing both the file and
+                    // the instruction. What is true is that the
+                    // question could not be answered, which no sweep
+                    // can change on its own. No path, no count and no
+                    // name here either: a scoped requester reads this
+                    // string too.
+                    "whether bytes of an earlier index that could not be parsed are preserved in this estate could not be established, so no reconciliation, restart or rebuild can decide this projection's completeness until an administrator determines it"
+                } else {
+                    match health.projection {
+                        IndexProjection::DurabilityUnconfirmed { .. } => "the rows are visible to a reader now; a machine that loses power before the next successful write may need `wirk atlas findings --admin --rebuild`",
+                        _ => "the next successful settle/assert/apply reconciliation, a daemon restart, or `wirk atlas findings --admin --rebuild` re-projects every journaled row; no record is lost meanwhile",
+                    }
+                }
+                .to_string(),
+            ),
+        );
+    }
+    if admin {
+        map.insert("since".to_string(), Value::from(health.since.0));
+        map.insert(
+            "last_reconciled".to_string(),
+            match health.last_attempt {
+                Some(at) => Value::from(at.0),
+                None => Value::Null,
+            },
+        );
+        let (pending, detail) = match &health.projection {
+            IndexProjection::Behind { pending, detail } => (
+                match pending {
+                    Some(pending) => Value::from(*pending),
+                    // Unknown, not zero: the index could not be read.
+                    None => Value::Null,
+                },
+                Some(detail.clone()),
+            ),
+            IndexProjection::DurabilityUnconfirmed { detail } => {
+                (Value::from(0_u64), Some(detail.clone()))
+            }
+            IndexProjection::Synchronized => (Value::from(0_u64), None),
+            IndexProjection::Unreconciled => (Value::Null, None),
+        };
+        map.insert("pending_rows".to_string(), pending);
+        map.insert(
+            "detail".to_string(),
+            detail.map(Value::String).unwrap_or(Value::Null),
+        );
+        // Admin-only on exactly the terms `detail` is: these are file
+        // names in the estate's own atlas directory, and a scoped
+        // requester learns the projection's state and nothing about the
+        // estate's contents.
+        map.insert(
+            "preserved_index_copies".to_string(),
+            Value::Array(
+                health
+                    .preserved
+                    .names
+                    .iter()
+                    .map(|name| Value::String(name.clone()))
+                    .collect(),
+            ),
+        );
+        // Beside the list, never inside it. A listing that failed named
+        // no file, so `preserved_index_copies` stays empty and this
+        // carries the cause the administrator can act on — the one
+        // thing they need and the one thing a scoped requester still
+        // does not get.
+        map.insert(
+            "preserved_index_copies_unknown".to_string(),
+            match &health.preserved.unknown {
+                Some(unknown) => Value::String(unknown.clone()),
+                None => Value::Null,
+            },
+        );
+    }
+    block
+}
+
+/// The health this daemon has currently recorded, as one value.
+///
+/// A *snapshot*, not a live read, because a caller that carries index
+/// rows has to render the health that describes those rows and not
+/// whatever the number happened to be by the time the reply was built.
+/// The disclosure work between the two in `handle_atlas_findings` is
+/// long — a full journal replay, a lineage walk and a per-row scoping
+/// pass — and a repair landing inside it produced a reply whose rows
+/// were a strict subset while its own `complete` said `true` (ruling
+/// 0125, case 2A executed).
+fn index_health_snapshot(state: &Arc<WirkdState>) -> IndexHealth {
+    state
+        .index_health
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+/// Attaches `index_health_json` to a reply object under `index`.
+/// A reply that is not an object is returned untouched rather than
+/// wrapped — no verb this is called from produces one, and silently
+/// changing a reply's shape to carry health would be a worse bug than
+/// the one this closes.
+///
+/// For a reply that carries no index rows: it reads the health now,
+/// which for a mutating verb is at or after its own sweep. A reply that
+/// *does* carry rows must use `with_paired_index_health` instead.
+fn with_index_health(state: &Arc<WirkdState>, admin: bool, mut result: Value) -> Value {
+    if let Value::Object(map) = &mut result {
+        let health = index_health_snapshot(state);
+        map.insert(
+            "index".to_string(),
+            index_health_json(&health, admin, false),
+        );
+    }
+    result
+}
+
+/// The same, for a reply whose `rows` were captured together with
+/// `health` under one hold of the Atlas mutex: it renders the captured
+/// value rather than re-reading a later one.
+fn with_paired_index_health(health: &IndexHealth, admin: bool, mut result: Value) -> Value {
+    if let Value::Object(map) = &mut result {
+        map.insert("index".to_string(), index_health_json(health, admin, true));
+    }
+    result
 }
 
 fn finding_row_json(row: &wirk_atlas::FindingRow) -> Value {
@@ -12200,30 +13603,357 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
             "rebuilding the index from every journal in the estate is an administrative call",
         );
     }
+    if payload.retire_preserved && !payload.admin {
+        return err_reply(
+            "BadRequest",
+            "retiring preserved copies of an unreadable index is an administrative call",
+        );
+    }
+    if payload.retire_preserved && payload.rebuild {
+        // Separate acts, deliberately not combinable. A rebuild that
+        // proceeds over unparsable lines *creates* the preserved copy
+        // and the unknown it stands for; retiring in the same call would
+        // clear the signal in the call that raised it, which is the
+        // automatic laundering ruling 0130 refused.
+        return err_reply(
+            "BadRequest",
+            "rebuilding the index and retiring preserved copies of an earlier one are separate administrative acts; a rebuild that preserves bytes is the reason to review them, not a review of them",
+        );
+    }
+    // Retirement is the one thing that clears the residual uncertainty a
+    // preserved copy stands for, and it is deliberately a person saying
+    // so. It **renames**; no byte of a preserved copy is removed here or
+    // anywhere else in this product.
+    let mut retired = Vec::new();
+    if payload.retire_preserved {
+        let outcome = {
+            let atlas = state
+                .atlas
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let outcome = atlas.retire_preserved_unreadable_indexes();
+            // What this retirement established about the atlas
+            // directory, recorded **here**, under the guard its renames
+            // and their `fsync` were made under. A retirement that
+            // renamed at least one copy and returned `Ok` `fsync`ed that
+            // directory successfully, which confirms every entry pending
+            // in it — including one an earlier call could not confirm.
+            // One that renamed nothing touched nothing.
+            //
+            // It used to be handed to the sweep below to publish, which
+            // put a fact made in *this* critical section under a ticket
+            // taken after the guard was dropped — so a concurrent
+            // mutation whose own `fsync` failed in between was overwritten
+            // by this one's older success. The sync order is the order of
+            // these critical sections and of nothing else, which is why
+            // this record belongs inside this one:
+            // `record_directory_durability` has the whole argument.
+            record_directory_durability(
+                state,
+                match &outcome {
+                    Ok(pairs) if !pairs.is_empty() => DirectoryDurability::Confirmed,
+                    Ok(_) => DirectoryDurability::Unestablished,
+                    Err(failed) => retirement_durability(failed),
+                },
+            );
+            outcome
+        };
+        match outcome {
+            Ok(pairs) => {
+                retired = pairs
+                    .into_iter()
+                    .map(|(from, to)| json!({ "preserved": from, "retired": to }))
+                    .collect();
+            }
+            Err(failed) => {
+                // A retirement that stopped part-way still changed the
+                // estate, and the record every later caller reads must
+                // describe the estate as it now is rather than as it
+                // was before this call — the failing path returning
+                // without re-observing is what left the health naming a
+                // file that had already been renamed away
+                // (`index-basis-recovery-verify/raw/48`). Same sweep,
+                // same measurement, same lock order as the success path
+                // below: the Atlas guard is dropped with the block
+                // above.
+                //
+                // **And the durability of what it did rename is
+                // already recorded**, above, in the critical section
+                // that renamed. This is the defect the bounded
+                // verification executed
+                // (`index-recovery-report-verify/raw/45`): the renames
+                // landed, the atlas directory's `fsync` returned `EIO`,
+                // the caller was told so — and this very sweep then
+                // recorded `Synchronized`, because with the last
+                // preserved name now retired there was nothing left for
+                // it to qualify and an append with nothing to append
+                // writes nothing. The one caller who ran the verb held
+                // the only copy of the fact. The sweep here re-observes
+                // the estate this call changed and carries the standing
+                // window forward; it does not publish this call's
+                // directory fact for it.
+                reconcile_findings_index(state);
+                return err_reply("AtlasError", &failed.to_string());
+            }
+        }
+        // Re-observe through the estate's own sweep rather than editing
+        // the health record from here: the projection this call changed
+        // is the projection a reconciliation measures, and there is only
+        // one thing in this daemon that measures it. The directory fact
+        // is not its to carry — that was recorded above, where it
+        // happened.
+        reconcile_findings_index(state);
+    }
     if payload.rebuild {
-        let rows = all_finding_rows(state);
+        // The walk moves **inside** the critical section on this path
+        // and only on this path (ruling 0125, case 2B executed).
+        // `rebuild_finding_rows` is an unconditional whole-file
+        // replacement, so a row that lands between the walk and the
+        // replacement is not merely missed — it is deleted, after being
+        // durably journaled *and* successfully indexed, and the reply
+        // that deleted it said `synchronized`. Holding the mutex across
+        // the walk is what a whole-file replacement warrants and it
+        // introduces no new wait: the walk opens journal files through
+        // its own handles and takes no lock of any kind, so it cannot
+        // wait on anything a lock holder holds. The ordinary sweep keeps
+        // its walk outside the lock, where the same window is benign
+        // because the append re-reads under the lock and only adds.
         let mut atlas = state
             .atlas
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Err(err) = atlas.rebuild_finding_rows(rows) {
-            return err_reply("AtlasError", &err.to_string());
+        // This path's walk lives **inside** the hold, so its ticket is
+        // taken here rather than before the lock: a rebuild observes the
+        // estate at this instant, and is newer than every sweep already
+        // parked between its own walk and this mutex.
+        let observation = next_index_observation(state);
+        // The same pre-walk basis the sweep uses, read here under the
+        // hold this replacement already takes — which is also why no
+        // row can land between this read and the walk below.
+        //
+        // An index that cannot be *read* is not evidence of anything,
+        // and rebuilding from journals is that file's own documented
+        // repair (`findings.rs`: a malformed row blocks reads until
+        // `rebuild_finding_rows` recreates it). So that case is said out
+        // loud on the operator's stderr and the rebuild proceeds, rather
+        // than the one repair path refusing to repair.
+        let held_before_walk = index_basis(&atlas);
+        let mut scan = all_finding_rows(state);
+        // Rows the index durably held that this walk did not reproduce
+        // make it a partial observation, whatever the filesystem said
+        // while it was walking. Without this, a Work whose journal is
+        // absent — moved aside, its directory gone, or re-created empty
+        // by some other startup path — raises no error anywhere, and the
+        // replacement deletes its published rows at exit 0.
+        // `None` — nothing at all could be established about the
+        // standing index — accounts nothing, and the refusal below is
+        // then unconditional. Deliberately not treated as an empty
+        // basis: an index that could not be opened is not an index known
+        // to hold no rows, and treating it as one is how a replacement
+        // deletes evidence it never read.
+        if let Some(held) = held_before_walk.known_rows() {
+            scan.account(&wirk_atlas::unaccounted_finding_rows(held, &scan.rows));
+        }
+        // The window a verifier parks at to prove the walk and the
+        // replacement are one operation.
+        wirk_atlas::checkpoint("findings-index-walked");
+        // An index nobody could read at all is not a basis, and this
+        // path is destructive. Refuse, leaving the file exactly as it
+        // is — the same treatment a partial walk already gets, for the
+        // same reason.
+        if let IndexBasis::Unreadable {
+            read_error,
+            open_error,
+        } = &held_before_walk
+        {
+            let detail = format!(
+                "the standing index could not be read at all, so this rebuild's walk could not be checked against what the index already holds and the index was left as it is: {read_error}; {open_error}"
+            );
+            eprintln!("wirkd: findings index rebuild refused: {detail}");
+            // Refused before a byte was written: this rebuild opened
+            // no file and `fsync`ed no directory, so it establishes
+            // nothing about one an earlier call left unconfirmed.
+            record_index_projection(
+                state,
+                observation,
+                IndexProjection::Behind {
+                    pending: None,
+                    detail: detail.clone(),
+                },
+                DirectoryDurability::Unestablished,
+            );
+            drop(atlas);
+            return err_reply("IndexBasisUnreadable", &detail);
+        }
+        // A partial walk is a refusal, never an overwrite (ruling 0125,
+        // case 1). The rows this walk could not read are still in the
+        // index from a healthier sweep; replacing the file with a walk
+        // that is known to be short deletes them and calls it a rebuild.
+        // The existing index is left exactly as it is, the health says
+        // the projection is behind by an unknown amount, and the
+        // administrator gets a non-zero exit and a reason to act on —
+        // which is the same treatment a failed *write* already gets.
+        if !scan.complete() {
+            let mut detail = scan.detail();
+            if let Some(note) = held_before_walk.salvage_note() {
+                detail = format!("{detail}; {note}");
+            }
+            // The way out, said in the refusal itself, because a repair
+            // that can only ever refuse is not a repair. Restoring the
+            // canonical journals named above is the real fix. When that
+            // history is genuinely gone, the standing index's rows are
+            // the last remaining trace of it, so the escape is to
+            // **keep** them under a name this estate recognises — never
+            // to delete the file, which is the one instruction that
+            // would destroy the only evidence left.
+            detail = format!(
+                "{detail}; restore the canonical journal(s) named above and run this again — or, if that history is genuinely unrecoverable, keep the standing index's evidence by moving `atlas/{}` to `atlas/{}<a name of your choosing>` and run this again, after which this estate reports its projection incomplete until `wirk atlas findings --admin --retire-preserved-index`",
+                wirk_atlas::FINDINGS_INDEX_FILE,
+                wirk_atlas::PRESERVED_INDEX_PREFIX,
+            );
+            eprintln!("wirkd: findings index rebuild refused: {detail}");
+            record_index_projection(
+                state,
+                observation,
+                IndexProjection::Behind {
+                    pending: None,
+                    detail: detail.clone(),
+                },
+                DirectoryDurability::Unestablished,
+            );
+            drop(atlas);
+            return err_reply(
+                "IndexScanIncomplete",
+                &format!(
+                    "the index was left as it is rather than replaced from a partial walk of the estate: {detail}"
+                ),
+            );
+        }
+        // The walk accounts for every row that could be established —
+        // but not for the lines that could not be parsed, whose content
+        // is unknowable and may have named a Work this walk no longer
+        // reaches. Their bytes are the only remaining trace of them, so
+        // they are copied aside *before* the replacement, and a
+        // preservation that fails stops the replacement rather than
+        // being logged past: destroying the last copy of unreadable
+        // evidence is the failure this whole path exists to prevent.
+        if held_before_walk.salvage_note().is_some() {
+            match atlas.preserve_unreadable_index() {
+                Ok(_) => {}
+                Err(error) => {
+                    let detail = format!(
+                        "the standing index's unparsable bytes could not be preserved, so it was left as it is rather than replaced: {error}"
+                    );
+                    eprintln!("wirkd: findings index rebuild refused: {detail}");
+                    record_index_projection(
+                        state,
+                        observation,
+                        IndexProjection::Behind {
+                            pending: None,
+                            detail: detail.clone(),
+                        },
+                        DirectoryDurability::Unestablished,
+                    );
+                    drop(atlas);
+                    return err_reply("AtlasError", &detail);
+                }
+            }
+        }
+        let outcome = atlas.rebuild_finding_rows(scan.rows);
+        // `--rebuild` writes exactly the full journal walk, so its
+        // outcome *is* a reconciliation outcome and is recorded as one:
+        // a rebuild that succeeds clears a `behind` window that the
+        // operator ran it to clear, and one that fails leaves the health
+        // saying so rather than silently reverting to the previous
+        // reading. Unlike the sweep this is a refusal, not a warning —
+        // an administrator who asked for a rebuild that did not happen
+        // is told by exit code, not only by a field. Recorded under the
+        // same hold as the replacement, for the same reason the sweep
+        // records under its own.
+        match outcome {
+            Ok(()) => {
+                // A whole-file replacement that returned `Ok` ran
+                // `rewrite_rows` to its end, and its last act is a
+                // successful `fsync` of the atlas directory — which is
+                // why `--rebuild` is what the durability window's own
+                // recovery sentence tells an operator to run.
+                record_index_projection(
+                    state,
+                    observation,
+                    IndexProjection::Synchronized,
+                    DirectoryDurability::Confirmed,
+                );
+                drop(atlas);
+            }
+            Err(wirk_atlas::AtlasError::DurabilityUncertain(detail)) => {
+                record_index_projection(
+                    state,
+                    observation,
+                    IndexProjection::DurabilityUnconfirmed {
+                        detail: detail.clone(),
+                    },
+                    DirectoryDurability::Uncertain(detail.clone()),
+                );
+                drop(atlas);
+                return err_reply(
+                    "AtlasError",
+                    &format!(
+                        "catalog is visible but its directory entry durability is uncertain: {detail}"
+                    ),
+                );
+            }
+            Err(err) => {
+                record_index_projection(
+                    state,
+                    observation,
+                    IndexProjection::Behind {
+                        // A failed whole-file replacement left the file
+                        // as it was; how far behind that is, is what the
+                        // previous sweep already knew, and this one did
+                        // not measure. Reported as unknown rather than
+                        // invented.
+                        pending: None,
+                        detail: err.to_string(),
+                    },
+                    // The replacement failed before its rename, so the
+                    // directory was never synced by this call.
+                    DirectoryDurability::Unestablished,
+                );
+                drop(atlas);
+                return err_reply("AtlasError", &err.to_string());
+            }
         }
     }
-    let rows = {
+    // One snapshot: the rows and the health that describes them, taken
+    // together under the mutex that orders every publication and its own
+    // health record. Everything below — the replay, the lineage walk,
+    // the per-row scoping — happens outside the lock and against the
+    // captured pair, so a repair that lands while this reply is being
+    // rendered changes neither half of it (ruling 0125, case 2A).
+    let (rows, health) = {
         let atlas = state
             .atlas
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        match atlas.findings() {
+        let rows = match atlas.findings() {
             Ok(rows) => rows,
             Err(err) => return err_reply("AtlasError", &err.to_string()),
-        }
+        };
+        (rows, index_health_snapshot(state))
     };
+    // The window a verifier parks at to prove the snapshot is one: after
+    // the pair is captured and the lock released, before a single row is
+    // rendered.
+    wirk_atlas::checkpoint("findings-index-read");
     if payload.admin {
-        return ok_reply(json!({
-            "rows": rows.iter().map(finding_row_json).collect::<Vec<_>>(),
-        }));
+        return ok_reply(with_paired_index_health(
+            &health,
+            true,
+            json!({
+                "rows": rows.iter().map(finding_row_json).collect::<Vec<_>>(),
+                "retired_index_copies": retired,
+            }),
+        ));
     }
     let requester_id = payload
         .requester
@@ -12263,16 +13993,27 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
             None => off_lineage += 1,
         }
     }
-    ok_reply(json!({
-        "rows": scoped,
-        // Counts, never identities — `wirk_atlas::AdmissionSummary`'s
-        // own established shape: how many rows lay off this requester's
-        // lineage and how many parts of the rows it did receive were
-        // withheld, and nothing about either. Every counted row is still
-        // off this requester's lineage; what the count no longer implies
-        // is that lineage alone decided it.
-        "disclosure": {"off_lineage": off_lineage, "withheld": view.withheld},
-    }))
+    // The `index` block below is the one thing this reply says about
+    // rows the requester is not shown: whether the file it was rendered
+    // from is a complete projection of the estate's journals. It carries
+    // no count and no identity for a scoped requester, so it widens
+    // nothing — and without it a stale index answers a scoped query
+    // exactly as a complete one does, which is the silence ruling 0116
+    // recorded.
+    ok_reply(with_paired_index_health(
+        &health,
+        false,
+        json!({
+            "rows": scoped,
+            // Counts, never identities — `wirk_atlas::AdmissionSummary`'s
+            // own established shape: how many rows lay off this requester's
+            // lineage and how many parts of the rows it did receive were
+            // withheld, and nothing about either. Every counted row is still
+            // off this requester's lineage; what the count no longer implies
+            // is that lineage alone decided it.
+            "disclosure": {"off_lineage": off_lineage, "withheld": view.withheld},
+        }),
+    ))
 }
 
 /// One estate publication, rendered for a requester that is **not** on
@@ -12445,6 +14186,353 @@ mod tests {
             let _held = lock_journal(&journal);
         }
         no_journal_guard_held("this test");
+    }
+
+    /// A real `WirkdState` over a real, empty estate: a real
+    /// `AtlasStore` on a real directory, so `record_index_projection`'s
+    /// own listing of `atlas/` is a real listing and nothing here is a
+    /// stand-in for the thing under test.
+    fn state_over(estate_root: &Path) -> Arc<WirkdState> {
+        std::fs::create_dir_all(estate_root).unwrap();
+        let atlas =
+            wirk_atlas::AtlasStore::open(estate_root, estate_root.display().to_string()).unwrap();
+        Arc::new(WirkdState {
+            estate_root: estate_root.to_path_buf(),
+            journals: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
+            atlas: Mutex::new(atlas),
+            continuation_key: [0u8; 32],
+            index_health: Mutex::new(IndexHealth::unreconciled()),
+            index_observations: AtomicU64::new(0),
+        })
+    }
+
+    fn projection(state: &Arc<WirkdState>) -> IndexProjection {
+        state
+            .index_health
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .projection
+            .clone()
+    }
+
+    /// The defect the bounded verification executed as D3, at the record
+    /// it happens in: a retirement whose atlas-directory `fsync` failed
+    /// reports the window to its one caller, and the reconciliation the
+    /// same handler then runs finds nothing to append — so it writes
+    /// nothing, `fsync`s nothing, and used to certify the estate
+    /// `Synchronized` over the entry it had just been told it could not
+    /// confirm.
+    ///
+    /// A sweep that wrote nothing establishes nothing about the
+    /// directory. The window stands.
+    #[test]
+    fn a_sweep_that_wrote_nothing_does_not_confirm_a_directory_sync_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_over(&dir.path().join("estate"));
+
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+        );
+        assert!(
+            matches!(
+                projection(&state),
+                IndexProjection::DurabilityUnconfirmed { .. }
+            ),
+            "the failing call's own record says the window is open"
+        );
+
+        // Every later ordinary observation: the index holds every row,
+        // the append had nothing to add, and not one byte was written.
+        for _ in 0..3 {
+            record_index_projection(
+                &state,
+                next_index_observation(&state),
+                IndexProjection::Synchronized,
+                DirectoryDurability::Unestablished,
+            );
+            assert!(
+                matches!(
+                    projection(&state),
+                    IndexProjection::DurabilityUnconfirmed { .. }
+                ),
+                "a no-op reconciliation must not certify a directory it never opened"
+            );
+        }
+        assert!(
+            !state.index_health.lock().unwrap().complete(),
+            "and the estate does not read as complete while it stands"
+        );
+    }
+
+    /// And it is not a latch: the one thing that answers the question is
+    /// an `fsync` of that directory that returns success — an ordinary
+    /// index write, an administrative `--rebuild`, or a retirement that
+    /// renames a copy. Every one of them arrives here as `Confirmed`.
+    #[test]
+    fn a_successful_directory_sync_resolves_the_window_and_nothing_else_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_over(&dir.path().join("estate"));
+
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+        );
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Confirmed,
+        );
+        assert_eq!(projection(&state), IndexProjection::Synchronized);
+        assert!(state.index_health.lock().unwrap().complete());
+    }
+
+    /// The partial branch, where the fact was masked rather than
+    /// dropped: a retirement that renamed one copy, could not confirm
+    /// it, and was refused on the next one. The preserved copy that is
+    /// still there makes the projection `behind` on its own account —
+    /// and the durability window is *also* said, in the administrator's
+    /// detail, rather than lost behind the copy that happens to remain.
+    /// When that last copy is retired the window must still be there
+    /// unless something really synced.
+    #[test]
+    fn a_preserved_copy_masks_neither_the_durability_window_nor_its_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let estate_root = dir.path().join("estate");
+        let state = state_over(&estate_root);
+        let preserved = estate_root
+            .join("atlas")
+            .join(format!("{}01ABC", wirk_atlas::PRESERVED_INDEX_PREFIX));
+        std::fs::write(&preserved, b"not json\n").unwrap();
+
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+        );
+        let IndexProjection::Behind { detail, .. } = projection(&state) else {
+            panic!("a held preserved copy is `behind` whatever else is true");
+        };
+        assert!(
+            detail.contains("preserved copy(ies)"),
+            "the copy that is held is said: {detail}"
+        );
+        assert!(
+            detail.contains("directory sync failed"),
+            "and so is the window the retirement could not confirm: {detail}"
+        );
+
+        // The administrator retires the last copy, and this time nothing
+        // synced the directory (the rename is gone from the estate, but
+        // the earlier entry is still unconfirmed).
+        std::fs::remove_file(&preserved).unwrap();
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Unestablished,
+        );
+        assert!(
+            matches!(
+                projection(&state),
+                IndexProjection::DurabilityUnconfirmed { .. }
+            ),
+            "with the copy gone, what is left is the window — not a clean estate"
+        );
+    }
+
+    /// The ordering defect the independent verification executed with
+    /// the product's own barrier and a real `EIO` from a real `fsync`
+    /// (`index-retirement-durability-verify/raw/44`), at the record it
+    /// happens in.
+    ///
+    /// The two calls are the two in that log. **B** is an ordinary
+    /// mutation: it takes its ticket first, walks, then waits for the
+    /// Atlas mutex. **A** is the retirement: it renames and `fsync`s the
+    /// atlas directory successfully, drops its guard, and only then
+    /// sweeps — so A's sweep ticket is *newer* than B's, while A's
+    /// `fsync` is *older* than B's. B then wins the mutex, appends, and
+    /// its own directory `fsync` fails.
+    ///
+    /// The tickets therefore run one way and the syncs the other, which
+    /// is why no ticket the retirement could take fixes this: taken
+    /// before its Atlas guard it is still newer than B's, because B's
+    /// was taken before the retirement's call arrived. What orders two
+    /// `fsync`s is the Atlas critical sections they were made in, and A
+    /// records in its own. B's failure is the last word.
+    #[test]
+    fn an_older_successful_sync_does_not_erase_a_failure_that_happened_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_over(&dir.path().join("estate"));
+
+        // B takes its ticket and walks, outside the Atlas mutex.
+        let b = next_index_observation(&state);
+        // A's retirement: under its own Atlas guard, the renames land and
+        // the directory `fsync` returns success.
+        record_directory_durability(&state, DirectoryDurability::Confirmed);
+        // A drops that guard and sweeps, taking a later ticket.
+        let a = next_index_observation(&state);
+        assert!(b < a, "the retirement's sweep ticket is the newer one");
+
+        // B wins the mutex, appends its row, and its directory `fsync`
+        // fails — after A's succeeded.
+        record_index_projection(
+            &state,
+            b,
+            IndexProjection::Synchronized,
+            DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+        );
+        // A's sweep finds nothing to append, so it writes nothing and
+        // establishes nothing.
+        record_index_projection(
+            &state,
+            a,
+            IndexProjection::Synchronized,
+            DirectoryDurability::Unestablished,
+        );
+
+        assert!(
+            matches!(
+                projection(&state),
+                IndexProjection::DurabilityUnconfirmed { .. }
+            ),
+            "the window the later failing sync opened must still stand"
+        );
+        assert!(
+            !state.index_health.lock().unwrap().complete(),
+            "and the estate must not read complete over a rename nothing confirmed"
+        );
+    }
+
+    /// The same two callers, the same ticket order, the opposite **sync**
+    /// order — and the opposite outcome, so the rule above is the
+    /// critical sections' order and not a rule against retirements.
+    ///
+    /// B's `fsync` fails first; A's retirement then really does `fsync`
+    /// that directory and it really does return success, which confirms
+    /// every entry pending in it, B's included. The window is resolved,
+    /// exactly as a later successful sync always resolves it.
+    #[test]
+    fn a_sync_that_really_is_later_still_resolves_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_over(&dir.path().join("estate"));
+
+        let b = next_index_observation(&state);
+        record_index_projection(
+            &state,
+            b,
+            IndexProjection::Synchronized,
+            DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+        );
+        assert!(
+            matches!(
+                projection(&state),
+                IndexProjection::DurabilityUnconfirmed { .. }
+            ),
+            "B's failure opens the window"
+        );
+
+        // A's retirement, in its own critical section, after B's.
+        record_directory_durability(&state, DirectoryDurability::Confirmed);
+        let a = next_index_observation(&state);
+        assert!(b < a);
+        record_index_projection(
+            &state,
+            a,
+            IndexProjection::Synchronized,
+            DirectoryDurability::Unestablished,
+        );
+
+        assert_eq!(projection(&state), IndexProjection::Synchronized);
+        assert!(state.index_health.lock().unwrap().complete());
+    }
+
+    /// A failing retirement does not wait for its sweep to say so. The
+    /// record is made in the critical section that made the `fsync`, so
+    /// the window is open the instant the syscall returns — and it is
+    /// still open after the sweep that follows, which appended nothing.
+    #[test]
+    fn a_failed_retirement_sync_opens_the_window_in_its_own_critical_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_over(&dir.path().join("estate"));
+
+        // A healthy estate, observed.
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Confirmed,
+        );
+        assert_eq!(projection(&state), IndexProjection::Synchronized);
+
+        record_directory_durability(
+            &state,
+            DirectoryDurability::Uncertain("directory sync failed: EIO".to_string()),
+        );
+        assert!(
+            matches!(
+                projection(&state),
+                IndexProjection::DurabilityUnconfirmed { .. }
+            ),
+            "no sweep has run yet, and the estate already says so"
+        );
+
+        record_index_projection(
+            &state,
+            next_index_observation(&state),
+            IndexProjection::Synchronized,
+            DirectoryDurability::Unestablished,
+        );
+        assert!(
+            matches!(
+                projection(&state),
+                IndexProjection::DurabilityUnconfirmed { .. }
+            ),
+            "and the sweep that appended nothing carries it, rather than clearing it"
+        );
+    }
+
+    /// The detail is said once, not once per attempt: an incomplete walk
+    /// whose write also could not be confirmed reports both facts, and
+    /// re-reports exactly the same sentence on the next attempt rather
+    /// than growing one.
+    #[test]
+    fn the_durability_detail_does_not_accumulate_across_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_over(&dir.path().join("estate"));
+        let uncertain = || DirectoryDurability::Uncertain("directory sync failed: EIO".to_string());
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            record_index_projection(
+                &state,
+                next_index_observation(&state),
+                IndexProjection::Behind {
+                    pending: None,
+                    detail: "one journal could not be read".to_string(),
+                },
+                uncertain(),
+            );
+            let IndexProjection::Behind { detail, .. } = projection(&state) else {
+                panic!("an unreadable journal is `behind`");
+            };
+            seen.push(detail);
+        }
+        assert_eq!(seen[0], seen[1]);
+        assert_eq!(seen[1], seen[2]);
+        assert_eq!(
+            seen[0].matches("directory sync failed").count(),
+            1,
+            "said once: {}",
+            seen[0]
+        );
     }
 
     fn work_submitted_event(waypoints: Vec<&str>) -> Event {

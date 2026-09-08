@@ -22,7 +22,7 @@ use crate::wirkd::{
     FindingAppliedPayload, FindingAssertPayload, FindingListPayload, FindingRaisePayload,
     FindingSettlePayload, Reply, Request,
 };
-use crate::{TRIPLE_VARS, flag_value, wirkd_client_call};
+use crate::{TRIPLE_VARS, flag_value, warn_if_index_incomplete, wirkd_client_call};
 use wirk_core::{ExecutionTriple, RunId, WorkId};
 
 pub fn finding_command(rest: &[String]) -> ExitCode {
@@ -195,6 +195,9 @@ fn assert_command(rest: &[String]) -> ExitCode {
             admin,
         }),
         |result| {
+            // The assertion is journaled and durable; this says whether
+            // the estate index took its row, in the same breath.
+            warn_if_index_incomplete("finding assert", result);
             print_result(json, result, |result| {
                 println!(
                     "finding {} settled {}",
@@ -241,6 +244,7 @@ fn settle_command(rest: &[String]) -> ExitCode {
             admin,
         }),
         |result| {
+            warn_if_index_incomplete("finding settle", result);
             print_result(json, result, |result| {
                 if result["settled"].is_null() {
                     println!(
@@ -346,6 +350,7 @@ fn applied_command(rest: &[String]) -> ExitCode {
         }),
     ) {
         Ok(Reply::Ok { result, .. }) => {
+            warn_if_index_incomplete("finding applied", &result);
             print_result(json, &result, |result| {
                 let Some(applied) = result["applied"].as_array().and_then(|list| list.last())
                 else {
