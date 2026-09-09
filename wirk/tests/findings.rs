@@ -2731,6 +2731,22 @@ fn an_unresolved_review_selector_says_so_without_disclosing_the_selector() {
         !reason.contains("nowhere") && !reason.contains("socket.rs"),
         "the reason names the cause and discloses nothing about the selector: {reason}"
     );
+    // The seventh rung of the readiness ladder, in the one shape that
+    // reaches it — and `work obligations` names it identically. The
+    // other six are walked by
+    // `the_readiness_reason_ladder_is_walked_end_to_end_and_both_verbs_agree`,
+    // which cannot reach this one: it needs an Actor obligation with a
+    // `review` contract (F4).
+    assert_eq!(
+        obligations_reason(
+            &estate,
+            &work.work_id,
+            "review",
+            raised["id"].as_str().unwrap()
+        ),
+        "review-targets-unresolved",
+        "both verbs must name the identical reason at this rung too"
+    );
 
     stop_wirkd(&estate, wirkd_child);
 }
@@ -6679,6 +6695,116 @@ fn work_obligations_discloses_the_reserved_basis_an_operator_admits_by_hand() {
     stop_wirkd(&estate, wirkd_child);
 }
 
+/// `work obligations`'s `findings[].ready.reason` for a `not-ready`
+/// Finding, and `finding settle`'s own `pending.reason` for the same
+/// Finding, must name the identical cause — this is what
+/// `diagnose/investigate`'s finding-18d39153def38ae4-6 established was
+/// missing (`handle_work_obligations` sent a bare `{"state":
+/// "not-ready"}` with no reason at all) and what `not_ready_reason`
+/// (`server.rs`) now computes once for both verbs.
+#[test]
+fn work_obligations_not_ready_reason_matches_finding_settle_pending_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    write_two_leaf_route(&estate);
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+
+    let repo = dir.path().join("repo");
+    init_repo(&repo);
+    let work = submit(&estate, "two_leaf", &repo, &["demo:write"], None).unwrap();
+    write_file(&repo, "out1.md", "one\n");
+    claim_ok(&estate, &work.work_id, &work.run_id, "out1.md=out1.md");
+
+    // Evidence naming the `WorkSubmitted` event, not the `ClaimRecorded`
+    // one wp-1's own Claim produced: `deterministic_verified_readiness`
+    // (`wirk-core/src/lib.rs`) requires the cited event to be that
+    // Waypoint's own Validated `Done` Claim, so citing a different event
+    // kind leaves the check genuinely unheld — a true `not-ready`, never
+    // a `ready`-but-unadmitted case that would land in the other arm.
+    let submitted_id = submitted_event_id(&estate, &work.work_id);
+    let evidence = format!("work/{}/event/{submitted_id}", work.work_id);
+    let wp2_run = status(&pointer.socket, &work.work_id)["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No `policy/settlement.json` exists at all, so `finding settle`
+    // would report `no-policy-file` — the plainest of the pending
+    // reasons and enough to pin that `work obligations` now carries the
+    // same value rather than a bare `not-ready` with nothing beside it.
+    let (code, raised, stderr) = raise_cli(
+        &estate,
+        &work.work_id,
+        &wp2_run,
+        &[
+            "--kind",
+            "verified_outcome",
+            "--scope",
+            "estate_local",
+            "--evidence",
+            &evidence,
+            "--claim",
+            "out1.md was produced as wp-1 declared",
+            "--obligation",
+            "out1-produced@1",
+        ],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        raised["settled"].is_null(),
+        "no policy admits anything yet: {raised}"
+    );
+    let finding_id = raised["id"].as_str().unwrap().to_string();
+
+    let (_, settle_pending, _) =
+        finding_cli(&estate, &["settle", "--finding", &finding_id, "--admin"]);
+    let settle_reason = settle_pending["pending"]["reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(settle_reason, "no-policy-file", "{settle_pending}");
+
+    let (code, reply, stderr) = obligations_cli(&estate, &["--work", &work.work_id, "--admin"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let entry = obligation_entry(&reply, "wp-1");
+    let finding = entry["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["finding"].as_str() == Some(finding_id.as_str()))
+        .unwrap_or_else(|| panic!("no finding entry for {finding_id}: {entry}"));
+    assert_eq!(finding["ready"]["state"].as_str().unwrap(), "not-ready");
+    assert_eq!(
+        finding["ready"]["reason"].as_str().unwrap(),
+        settle_reason,
+        "`work obligations` must name the identical reason `finding settle` computes for the same finding: {finding}"
+    );
+
+    // The human renderer prints the reason beside the `not-ready` state,
+    // the same pattern the adjacent `basis unavailable` line already
+    // uses for `entry["basis"]["reason"]`.
+    let output = Command::new(wirk_bin())
+        .args([
+            "work",
+            "obligations",
+            "--estate",
+            estate.to_str().unwrap(),
+            "--work",
+            &work.work_id,
+            "--admin",
+        ])
+        .output()
+        .expect("wirk work obligations runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("not-ready") && stdout.contains("reason: no-policy-file"),
+        "human output should print the not-ready reason: {stdout}"
+    );
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
 /// Inspection is inspection. Nothing this verb does appends an event,
 /// writes the derived findings index, or edits the settlement policy —
 /// asserted over every byte of the estate, before and after, in the
@@ -9286,5 +9412,540 @@ fn verify_a_relation_token_in_applies_to_discharges_no_review_target() {
     assert_eq!(code2, Some(0), "{stderr2}");
     assert!(out2["settled"].is_object(), "positive control: {out2}");
     let _ = socket;
+    stop_wirkd(&estate, wirkd_child);
+}
+
+// ---- F5: the finding-coordinate namespace, reached at the gate -------
+
+/// A managed output's recorded path is `claims/<claim>/<name>`. Nothing
+/// stops a *repository* from containing a file at that literal path, so
+/// the two namespaces can collide by string equality alone — and
+/// `resolve_claim_attribution`'s answer, "only a `Worktree` receipt
+/// names a source coordinate", is the only thing between that collision
+/// and a Work being credited with mutating a source it never touched
+/// (ruling 0145; F5 of the independent native-foundation review, which
+/// recorded the control as present, correct and **untested**).
+///
+/// **This reaches the gate, it does not stop short of it.** The
+/// independent review's own reason for not reproducing this live was
+/// that everything before the store filter — a current Run, a Validated
+/// Done Claim, a `Write` binding on the named source, a matching
+/// execution identity — has to hold first, and that
+/// `ReadOnlyMutationCredit` refusing earlier proves nothing about the
+/// filter. So every one of those gates is satisfied here, twice, by one
+/// Work with a real `Write` binding on a real published Atlas source:
+///
+/// * `wp-1` files a real Claim of a **managed** output, minting claim
+///   `C1` and a receipt `store=work_outputs path=claims/C1/REPORT.md`;
+/// * the repository is then given a real file at that same literal path,
+///   `claims/C1/REPORT.md`, committed and published;
+/// * `wp-2` files a real Claim of **that repository file**, minting a
+///   receipt `store=worktree path=claims/C1/REPORT.md`.
+///
+/// The two receipts carry the **same path string and the same digest**
+/// — the staged bytes and the committed bytes are byte-identical on
+/// purpose — and differ in exactly one field, `store`. So the positive
+/// control (cite `wp-2`) and the denied control (cite `wp-1`) differ in
+/// nothing the earlier gates can see, and the only check that can
+/// separate them is the store discriminator. A synthetic pair of
+/// constructed receipts could not make that argument.
+#[test]
+fn a_managed_receipt_never_attests_a_source_coordinate_that_collides_with_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    route_fixture::write_route(
+        &estate,
+        "collide_three",
+        r#"{"id":"collide-three","waypoints":[
+            {"id":"wp-1","kind":"Deterministic","command":["true"],"declared_outputs":[{"name":"REPORT.md","required":true}]},
+            {"id":"wp-2","kind":"Deterministic","command":["true"],"declared_outputs":[{"name":"REPORT.md","required":true}]},
+            {"id":"wp-3","kind":"Deterministic","command":["true"],"declared_outputs":[{"name":"done.md","required":true}]}
+        ]}"#,
+    );
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+    let repo = publish_source(dir.path(), &estate, "demo", "repo");
+    let work = submit(&estate, "collide_three", &repo, &["demo:write"], None).unwrap();
+    let wp1_run = work.run_id.clone();
+
+    // The bytes both receipts will attest. Distinctive so the Work's own
+    // admitted Atlas search resolves this file and no other.
+    const REPORT: &str = "namespacecollisionprobe: the reviewed report\n";
+
+    // ---- wp-1: a real managed-output Claim -------------------------
+    let staging = {
+        let out = Command::new(wirk_bin())
+            .args(["output", "dir"])
+            .env("WIRK_ESTATE_ROOT", &estate)
+            .env("WIRK_WORK_ID", &work.work_id)
+            .env("WIRK_RUN_ID", &wp1_run)
+            .output()
+            .expect("wirk output dir runs");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "wirk output dir: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    fs::write(staging.join("REPORT.md"), REPORT).expect("stage the managed output");
+    let (code, stdout) = claim(&estate, &work.work_id, &wp1_run, &["--output", "REPORT.md"]);
+    assert_eq!(code, Some(0), "the managed Claim must validate: {stdout}");
+
+    // The receipt wirkd actually recorded, read back from the daemon —
+    // its `claims/<claim>/<name>` path is the collision this test then
+    // builds in the repository.
+    let managed = receipt_with_store(&pointer.socket, &work.work_id, "work_outputs")
+        .expect("wp-1's managed receipt is recorded");
+    let managed_path = managed["path"].as_str().expect("managed path").to_string();
+    let managed_digest = managed["digest"]
+        .as_str()
+        .expect("managed digest")
+        .to_string();
+    assert!(
+        managed_path.starts_with("claims/") && managed_path.ends_with("/REPORT.md"),
+        "the managed namespace is claims/<claim>/<name>: {managed_path}"
+    );
+
+    // ---- the repository really does hold a file at that path --------
+    fs::create_dir_all(repo.join(&managed_path).parent().unwrap())
+        .expect("the repository's own claims/<claim>/ directory");
+    // Published first at *other* bytes, so the Finding's own
+    // `applies_to` is a real before-state at a real generation.
+    fs::write(
+        repo.join(&managed_path),
+        "namespacecollisionprobe: before\n",
+    )
+    .unwrap();
+    let _rev_before = republish(&estate, &repo, "demo", "collide-before");
+
+    let coordinate = {
+        let (ok, search, err) = atlas(
+            &estate,
+            &[
+                "search",
+                "--work",
+                &work.work_id,
+                "--query",
+                "namespacecollisionprobe",
+            ],
+        );
+        assert!(ok, "{err}");
+        search["hits"][0]["coordinate"]
+            .as_str()
+            .expect("the Work's own admitted search resolves the colliding path")
+            .to_string()
+    };
+    let (code, raised, stderr) = raise_cli(
+        &estate,
+        &work.work_id,
+        &wp1_run,
+        &[
+            "--kind",
+            "contradicted_assumption",
+            "--scope",
+            "estate_local",
+            "--claim",
+            "the report at the colliding path is stale",
+            "--evidence",
+            &coordinate,
+            "--applies-to",
+            &coordinate,
+        ],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let finding = raised["id"].as_str().unwrap().to_string();
+
+    // ---- wp-2: a real worktree Claim at the identical path ----------
+    let wp2_run = status(&pointer.socket, &work.work_id)["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(wp2_run, wp1_run);
+    fs::write(repo.join(&managed_path), REPORT).unwrap();
+    let (code, stdout) = claim(
+        &estate,
+        &work.work_id,
+        &wp2_run,
+        &["--artifact", &format!("REPORT.md={managed_path}")],
+    );
+    assert_eq!(code, Some(0), "the worktree Claim must validate: {stdout}");
+    let rev_after = republish(&estate, &repo, "demo", "collide-after");
+
+    let worktree = receipt_with_store(&pointer.socket, &work.work_id, "worktree")
+        .expect("wp-2's worktree receipt is recorded");
+    // The premise of the whole test, asserted rather than assumed: the
+    // two receipts are indistinguishable except by `store`.
+    assert_eq!(worktree["path"].as_str().unwrap(), managed_path);
+    assert_eq!(worktree["digest"].as_str().unwrap(), managed_digest);
+
+    let wp3_run = status(&pointer.socket, &work.work_id)["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(wp3_run, wp2_run);
+
+    // ---- denied control: the managed receipt alone ------------------
+    // Every earlier gate holds for this Run — it is current for `wp-1`,
+    // it carries a Validated Done Claim, its Work holds `Write` on
+    // `demo`, and its execution identity is this very repository — so
+    // the refusal below is the store discriminator firing and nothing
+    // else.
+    let refusal = applied_refusal(
+        &estate,
+        &work.work_id,
+        &wp3_run,
+        &[
+            "--finding",
+            &finding,
+            "--source",
+            "demo",
+            "--revision",
+            &rev_after,
+            "--by",
+            "root",
+            "--claim-run",
+            &wp1_run,
+        ],
+    );
+    assert!(
+        refusal.contains("ChangedClaimedArtifact"),
+        "a managed receipt whose path collides with a repository path must not attest it: {refusal}"
+    );
+
+    // ---- positive control: the worktree receipt ---------------------
+    let (code, applied, stderr) = applied_cli(
+        &estate,
+        &work.work_id,
+        &wp3_run,
+        &[
+            "--finding",
+            &finding,
+            "--source",
+            "demo",
+            "--revision",
+            &rev_after,
+            "--by",
+            "root",
+            "--claim-run",
+            &wp2_run,
+            "--json",
+        ],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let record = applied["applied"].as_array().unwrap().last().unwrap();
+    assert_eq!(record["attribution"]["attribution"], "claim");
+    assert_eq!(
+        record["attribution"]["run"], wp2_run,
+        "the Worktree receipt at the same path is what attests: {record}"
+    );
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+/// The first artifact receipt this Work recorded in the named store, as
+/// `wirk work status --admin` reports it.
+fn receipt_with_store(socket: &Path, work_id: &str, store: &str) -> Option<serde_json::Value> {
+    let status = status(socket, work_id);
+    for entry in status["evidence"].as_array().cloned().unwrap_or_default() {
+        for artifact in entry["artifacts"].as_array().cloned().unwrap_or_default() {
+            if artifact["store"].as_str() == Some(store) {
+                return Some(artifact);
+            }
+        }
+    }
+    None
+}
+
+// ---- F4: the readiness ladder, every reachable rung, both verbs ------
+
+/// The `ready.reason` for one Finding, as `work obligations` reports it.
+fn obligations_reason(estate: &Path, work_id: &str, waypoint: &str, finding: &str) -> String {
+    let (code, reply, stderr) = obligations_cli(estate, &["--work", work_id, "--admin"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let entry = obligation_entry(&reply, waypoint);
+    let row = entry["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["finding"].as_str() == Some(finding))
+        .unwrap_or_else(|| panic!("no finding row for {finding}: {entry}"));
+    assert_eq!(row["ready"]["state"].as_str(), Some("not-ready"), "{row}");
+    row["ready"]["reason"].as_str().unwrap().to_string()
+}
+
+/// The `pending.reason` for one Finding, as `finding settle` reports it.
+fn settle_reason(estate: &Path, finding: &str) -> String {
+    let (code, pending, stderr) = finding_cli(estate, &["settle", "--finding", finding, "--admin"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    pending["pending"]["reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no pending reason: {pending}"))
+        .to_string()
+}
+
+/// Every readiness reason the ladder can reach, walked as a real
+/// operator walks it — by editing this estate's own
+/// `policy/settlement.json` between calls and asking both verbs the same
+/// question about the same Finding each time.
+///
+/// **What this replaces.** The change shipped one test, for
+/// `no-policy-file`, which is also the one branch the manual CLI probe
+/// ruling 0146 recorded had already covered. Six values were untested
+/// (F4 of the independent native-foundation review).
+///
+/// **The defect the untested branches hid.** `obligation-basis-not-admitted`
+/// derived its basis *only* from `settlement_candidates`, and a Finding
+/// has a settlement candidate only when its check already holds. So in
+/// the very situation the value names — the estate admitted the
+/// obligation at some basis, but not the one this Waypoint derives, which
+/// is *why* no check holds — the arm could not fire, and the operator was
+/// handed the vaguer `no-admitted-check-holds-yet` while
+/// `admission.state` in the same reply already said `basis-not-admitted`.
+/// Row 5 below is that case; it asserts the two halves of one reply agree,
+/// and it is watched red against the pre-correction candidate, which
+/// answers `no-admitted-check-holds-yet` there.
+///
+/// **The seventh value.** `no-obligation-named` is reachable through
+/// `finding settle` and *structurally unreachable* through `work
+/// obligations`, because that verb lists a Finding only under the
+/// obligation the Finding itself names — a Finding naming none is in no
+/// obligation's list. That is asserted below as the truthful behaviour it
+/// is, rather than manufactured into a row.
+#[test]
+fn the_readiness_reason_ladder_is_walked_end_to_end_and_both_verbs_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    write_two_leaf_route(&estate);
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+
+    let repo = dir.path().join("repo");
+    init_repo(&repo);
+    let work = submit(&estate, "two_leaf", &repo, &["demo:write"], None).unwrap();
+    write_file(&repo, "out1.md", "one\n");
+    claim_ok(&estate, &work.work_id, &work.run_id, "out1.md=out1.md");
+    let wp2_run = status(&pointer.socket, &work.work_id)["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Evidence naming `WorkSubmitted`, not wp-1's own `ClaimRecorded`:
+    // `deterministic_verified_readiness` requires the cited event to be
+    // that Waypoint's own Validated Done Claim, so the check is
+    // genuinely unheld and every rung below is a real not-ready.
+    let evidence = format!(
+        "work/{}/event/{}",
+        work.work_id,
+        submitted_event_id(&estate, &work.work_id)
+    );
+    let raise_obliged = |claim: &str| -> String {
+        let (code, raised, stderr) = raise_cli(
+            &estate,
+            &work.work_id,
+            &wp2_run,
+            &[
+                "--kind",
+                "verified_outcome",
+                "--scope",
+                "estate_local",
+                "--evidence",
+                &evidence,
+                "--claim",
+                claim,
+                "--obligation",
+                "out1-produced@1",
+            ],
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(raised["settled"].is_null(), "{raised}");
+        raised["id"].as_str().unwrap().to_string()
+    };
+    let finding = raise_obliged("out1.md was produced as wp-1 declared");
+    let real_basis = obligation_basis_for(&estate, &work.work_id, "wp-1");
+
+    // ---- 1. no policy file at all ----------------------------------
+    let mut walked: Vec<&str> = Vec::new();
+    let both = |expected: &str, walked: &mut Vec<&'static str>, tag: &'static str| {
+        let settle = settle_reason(&estate, &finding);
+        let obligations = obligations_reason(&estate, &work.work_id, "wp-1", &finding);
+        assert_eq!(settle, expected, "finding settle at rung {tag}");
+        assert_eq!(
+            obligations, expected,
+            "work obligations must name the identical reason at rung {tag}"
+        );
+        walked.push(tag);
+    };
+    assert!(!estate.join("policy").join("settlement.json").exists());
+    both("no-policy-file", &mut walked, "no-policy-file");
+
+    // ---- 2. a policy file that cannot be read ----------------------
+    write_policy(&estate, "{not json at all");
+    both("policy-unreadable", &mut walked, "policy-unreadable");
+
+    // ---- 3. a policy admitting some *other* obligation -------------
+    write_policy_admitting(
+        &estate,
+        "deterministic_verified",
+        "verified_outcome",
+        &[("some-other-obligation", "1", &real_basis)],
+    );
+    both(
+        "obligation-not-admitted",
+        &mut walked,
+        "obligation-not-admitted",
+    );
+
+    // ---- 4. the name admitted, at a basis this estate never derives -
+    // The rung the correction makes reachable.
+    write_policy_admitting(
+        &estate,
+        "deterministic_verified",
+        "verified_outcome",
+        &[(
+            "out1-produced",
+            "1",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )],
+    );
+    both(
+        "obligation-basis-not-admitted",
+        &mut walked,
+        "obligation-basis-not-admitted",
+    );
+    // …and the *same reply* agrees with itself: the admission object
+    // eight lines above the finding row says the same thing, which is
+    // exactly what the vaguer answer used to contradict.
+    let (_, reply, _) = obligations_cli(&estate, &["--work", &work.work_id, "--admin"]);
+    let entry = obligation_entry(&reply, "wp-1");
+    assert_eq!(
+        entry["admission"]["state"].as_str(),
+        Some("basis-not-admitted"),
+        "the reply's own admission state: {entry}"
+    );
+
+    // ---- 5. the real derived basis admitted, the check still unheld -
+    write_policy_admitting(
+        &estate,
+        "deterministic_verified",
+        "verified_outcome",
+        &[("out1-produced", "1", &real_basis)],
+    );
+    both(
+        "no-admitted-check-holds-yet",
+        &mut walked,
+        "no-admitted-check-holds-yet",
+    );
+    let (_, reply, _) = obligations_cli(&estate, &["--work", &work.work_id, "--admin"]);
+    assert_eq!(
+        obligation_entry(&reply, "wp-1")["admission"]["state"].as_str(),
+        Some("admitted"),
+        "the basis really is admitted now, so the reason is about the check"
+    );
+
+    // ---- 6. a Finding naming no obligation at all ------------------
+    // Reachable through `finding settle`; structurally absent from
+    // `work obligations`, which lists a Finding only under the
+    // obligation that Finding names.
+    let (code, unobliged, stderr) = raise_cli(
+        &estate,
+        &work.work_id,
+        &wp2_run,
+        &[
+            "--kind",
+            "verified_outcome",
+            "--scope",
+            "estate_local",
+            "--evidence",
+            &evidence,
+            "--claim",
+            "an outcome this Work claims without naming an obligation",
+        ],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let unobliged = unobliged["id"].as_str().unwrap().to_string();
+    assert_eq!(settle_reason(&estate, &unobliged), "no-obligation-named");
+    let (_, reply, _) = obligations_cli(&estate, &["--work", &work.work_id, "--admin"]);
+    assert!(
+        !obligation_entry(&reply, "wp-1")["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["finding"].as_str() == Some(unobliged.as_str())),
+        "a Finding naming no obligation is under no obligation's list, so this \
+         value is honestly unreachable here rather than reported as something else"
+    );
+    walked.push("no-obligation-named");
+
+    // Six of the seven, plus `review-targets-unresolved`, which needs an
+    // Actor obligation with a `review` contract and is walked by
+    // `an_actor_review_whose_selector_never_resolved_says_so`.
+    assert_eq!(walked.len(), 6, "walked: {walked:?}");
+
+    // ---- F3: one coherent request, many findings -------------------
+    // The reason is a property of the Finding and the policy, never of
+    // how many Findings share the reply. Sixty more on the same
+    // obligation must not change any answer — the shared snapshot the
+    // correction reuses is the same snapshot the single-Finding reply
+    // was computed from.
+    for i in 0..60 {
+        raise_obliged(&format!("bulk probe {i}"));
+    }
+    let (code, reply, stderr) = obligations_cli(&estate, &["--work", &work.work_id, "--admin"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let rows = obligation_entry(&reply, "wp-1")["findings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(rows.len(), 61, "every obliged finding is listed");
+    for row in &rows {
+        assert_eq!(
+            row["ready"]["reason"].as_str(),
+            Some("no-admitted-check-holds-yet"),
+            "the reason must not depend on how many findings share the reply: {row}"
+        );
+    }
+    assert_eq!(
+        settle_reason(&estate, &finding),
+        "no-admitted-check-holds-yet",
+        "and `finding settle` still agrees after the bulk"
+    );
+
+    // ---- read stays read -------------------------------------------
+    // Neither verb settled anything and neither appended: the correction
+    // moves *where* the inputs are read, never whether reading mutates.
+    let before = estate_fingerprint(&estate);
+    let _ = obligations_cli(&estate, &["--work", &work.work_id, "--admin"]);
+    let _ = settle_reason(&estate, &finding);
+    assert_eq!(
+        before,
+        estate_fingerprint(&estate),
+        "reading why a Finding is not ready must move no byte of the estate"
+    );
+
+    // ---- a same-lineage requester with narrower bindings ------------
+    // The scoped view withholds the authored half and keeps readiness:
+    // the reason is a closed vocabulary with no alias, path, digest or
+    // sentence in it.
+    let (code, scoped, stderr) = obligations_cli(
+        &estate,
+        &["--work", &work.work_id, "--requesting-work", &work.work_id],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(scoped["scope"].as_str(), Some("requester"));
+    let scoped_entry = obligation_entry(&scoped, "wp-1");
+    let scoped_row = scoped_entry["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["finding"].as_str() == Some(finding.as_str()))
+        .unwrap();
+    assert_eq!(
+        scoped_row["ready"]["reason"].as_str(),
+        Some("no-admitted-check-holds-yet"),
+        "readiness is Kept in the scoped view: {scoped_row}"
+    );
+
     stop_wirkd(&estate, wirkd_child);
 }

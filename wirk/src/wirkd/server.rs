@@ -47,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -1304,6 +1304,10 @@ fn reattach_docker_run(
                 triple,
                 kind: ClaimKind::Done,
                 artifacts,
+                // A Deterministic executor writes into its own `cwd`,
+                // which is a real checkout it holds Write on: it has no
+                // reason to reach for the managed area (ruling 0145).
+                outputs: Default::default(),
             },
         );
         return;
@@ -1487,6 +1491,12 @@ fn dispatch(
         Verb::WorldShow => {
             match serde_json::from_value::<super::WorldShowPayload>(request.payload.clone()) {
                 Ok(payload) => Outcome::Reply(handle_world_show(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::RunOutputs => {
+            match serde_json::from_value::<super::RunOutputsPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_run_outputs(state, payload)),
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
@@ -2880,6 +2890,17 @@ fn handle_record(
     ok_reply(json!({}))
 }
 
+/// Whether this claimed artifact is addressed in the Run's own checkout
+/// (ruling 0145). Every worktree escape, existence, containment and
+/// boundary-diff check below applies to these and only these: a managed
+/// output is not in any repository, so there is nothing for those checks
+/// to inspect and — critically — nothing for a `Read` binding's "refuses
+/// any change at all" rule to see. That rule is not relaxed anywhere;
+/// the managed route simply never puts a byte inside the checkout.
+fn is_worktree_artifact(artifact: &ArtifactRef) -> bool {
+    matches!(artifact.store, wirk_core::ArtifactStore::Worktree)
+}
+
 /// Whether `worktree_path.join(artifact_path)` (`server.rs`'s own join,
 /// used both by the artifact-exists check below and by the boundary
 /// diff's own membership test) would land outside `worktree_path` —
@@ -3013,13 +3034,26 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     };
 
     let claim_id = ClaimId(mint_id("claim"));
+    // Ruling 0145: two kinds of claimed artifact, kept apart from the
+    // first line of this handler and never merged again. A `Worktree`
+    // ref carries the actor's own path and goes through every existing
+    // escape/existence/containment/diff check unchanged; a `WorkOutputs`
+    // ref carries no path at all and is addressed by name against this
+    // Work's own managed area. `validate_claim`'s required-output check
+    // reads `name` alone, so both satisfy an output contract the same
+    // way — which is the whole point — while nothing about the Read
+    // binding's "refuses any change at all" rule sees a managed output,
+    // because a managed output is not in any repository to change.
     let artifacts: Vec<ArtifactRef> = payload
         .artifacts
         .iter()
-        .map(|(name, path)| ArtifactRef {
-            name: name.clone(),
-            path: path.clone(),
-        })
+        .map(|(name, path)| ArtifactRef::worktree(name.clone(), path.clone()))
+        .chain(
+            payload
+                .outputs
+                .iter()
+                .map(|name| ArtifactRef::managed(name.clone())),
+        )
         .collect();
     let claim = Claim {
         id: claim_id.clone(),
@@ -3112,6 +3146,44 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             },
         );
     };
+    // Ruling 0145, before anything else looks at this Claim: a managed
+    // output whose *address* is unusable is refused with the rule it
+    // broke, by name. Ahead of `validate_claim` deliberately — a
+    // misspelled or malformed `--output` would otherwise surface as the
+    // required output it failed to satisfy ("MissingArtifact
+    // report.md"), which names the wrong file and tells the actor
+    // nothing about what it actually got wrong.
+    let managed_address_refusal = claim
+        .artifacts
+        .iter()
+        .filter(|a| !is_worktree_artifact(a))
+        .find_map(|artifact| {
+            if let Err(err) = wirk_core::outputs::check_output_name(&artifact.name) {
+                return Some(ClaimRefusal::OutOfBoundary(format!(
+                    "declared output `{}` cannot address a managed output: {}",
+                    artifact.name,
+                    err.detail()
+                )));
+            }
+            // The Route's own output contract bounds the namespace: a
+            // managed output exists because a Waypoint declared it, so a
+            // name this Waypoint never declared has no derived address
+            // and is refused rather than invented. This is also what
+            // keeps the area from becoming a general filesystem.
+            if !waypoint
+                .declared_outputs
+                .iter()
+                .any(|spec| spec.name == artifact.name)
+            {
+                return Some(ClaimRefusal::OutOfBoundary(format!(
+                    "`{}` is not a declared output of this Waypoint, so this Work owns no \
+                     managed output by that name",
+                    artifact.name
+                )));
+            }
+            None
+        });
+
     let binding = resolve_run_binding(&events, &state.estate_root, &work_id, &run_id);
     let mut verdict = match (&payload.kind, &binding) {
         (_, Err(reason)) => {
@@ -3126,6 +3198,9 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         }
         _ => validate_claim(&waypoint, &run, &claim),
     };
+    if let Some(refusal) = managed_address_refusal {
+        verdict = ClaimVerdict::Refused(refusal);
+    }
 
     if matches!(verdict, ClaimVerdict::Validated)
         && let Ok(binding) = &binding
@@ -3150,7 +3225,11 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         // reaches this arm unmaterialized (the earlier verdict match
         // already refuses it first); an artifact-free Question has
         // nothing here to inspect and is unaffected.
-        if !binding.materialized && !claim.artifacts.is_empty() {
+        // Ruling 0145: only a *checkout* artifact needs a worktree to
+        // inspect. A managed output lives under `works/<work>/outputs/`
+        // and is unaffected by materialization, so an unmaterialized
+        // Run's Question naming one is not sent down this refusal.
+        if !binding.materialized && claim.artifacts.iter().any(is_worktree_artifact) {
             verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(
                 "Actor checkout has not been materialized for this Run; no worktree is available to inspect the claimed artifacts".to_string(),
             ));
@@ -3180,13 +3259,14 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             if let Some(escaping) = claim
                 .artifacts
                 .iter()
+                .filter(|a| is_worktree_artifact(a))
                 .find(|a| artifact_join_escapes(&worktree_path, &a.path))
             {
                 verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(escaping.path.clone()));
             }
 
             if matches!(verdict, ClaimVerdict::Validated) {
-                for artifact in &claim.artifacts {
+                for artifact in claim.artifacts.iter().filter(|a| is_worktree_artifact(a)) {
                     if !worktree_path.join(&artifact.path).exists() {
                         verdict = ClaimVerdict::Refused(ClaimRefusal::MissingArtifact(
                             artifact.name.clone(),
@@ -3197,7 +3277,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             }
 
             if matches!(verdict, ClaimVerdict::Validated) {
-                for artifact in &claim.artifacts {
+                for artifact in claim.artifacts.iter().filter(|a| is_worktree_artifact(a)) {
                     match artifact_canonical_containment(&worktree_path, &artifact.path) {
                         Ok(true) => {
                             verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(
@@ -3262,9 +3342,15 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                     // here already passed the escape guard above (verdict
                     // is still `Validated`), so `strip_prefix` never fails;
                     // `unwrap_or_default` only guards a defensive fallback.
+                    // Only a checkout artifact can be a changed path in
+                    // the worktree diff at all (ruling 0145), so only one
+                    // can be excluded from `offending`. A managed output
+                    // is not in this repository and never appears in
+                    // `changed`.
                     let mut declared: std::collections::BTreeSet<String> = claim
                         .artifacts
                         .iter()
+                        .filter(|a| is_worktree_artifact(a))
                         .map(|a| {
                             artifact_relative_to_worktree(&worktree_path, &a.path)
                                 .unwrap_or_default()
@@ -3389,6 +3475,92 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         }
     }
 
+    // ---- Ruling 0145: the managed declared outputs of this Claim ----
+    //
+    // Validated here, *snapshotted below* once every other check has
+    // passed, so a refused Claim writes nothing into the Work's durable
+    // area. Each name is read exactly once and digested from the bytes
+    // that read returned, which is what binds the receipt to the content
+    // that was actually inspected rather than to whatever the mutable
+    // staged path holds a moment later.
+    //
+    // Nothing here takes a caller path. The address is derived from the
+    // triple's Work and Run — both already checked against this estate
+    // and this journal above — plus the declared name, so "another
+    // Work's staging area" and "an arbitrary path outside the checkout"
+    // are not refusals this code has to make: they are shapes it cannot
+    // express. What it does still have to refuse, and does, is a name
+    // that cannot be one filename component, a name the Route never
+    // declared, and an entry in the staging area that is not a plain
+    // regular file contained in it (a symlink out is the case that
+    // matters).
+    let mut managed_bytes: Vec<(String, Vec<u8>, String)> = Vec::new();
+    if matches!(verdict, ClaimVerdict::Validated) {
+        // Addressability and declaration were settled above, before
+        // `validate_claim`; what is left is the state of the actual
+        // staged file.
+        for artifact in claim.artifacts.iter().filter(|a| !is_worktree_artifact(a)) {
+            // Addressability first, so "this Work and Run cannot address a
+            // managed output by that name" stays its own verdict rather
+            // than arriving as an unreadable area.
+            if wirk_core::outputs::staged_path(
+                &state.estate_root,
+                &work_id,
+                &run_id,
+                &artifact.name,
+            )
+            .is_none()
+            {
+                verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
+                    "no managed output address can be derived for `{}` from this Work and Run",
+                    artifact.name
+                )));
+                break;
+            }
+            // Absent is `MissingArtifact` — the same answer a missing
+            // checkout artifact gets, and the honest one: the actor did
+            // not produce it. Present but not a regular file reached
+            // inside the area (a symlink at the name, a symlink where an
+            // ancestor directory should be, a directory) is
+            // `OutOfBoundary`. Both verdicts, and the bytes, come from
+            // one no-follow walk ending in one open file object — never
+            // from a check followed by a second lookup (F6).
+            let bytes = match read_staged_output(
+                &state.estate_root,
+                &work_id,
+                &run_id,
+                &artifact.name,
+            ) {
+                StagedRead::Bytes(bytes) => bytes,
+                StagedRead::Absent => {
+                    verdict =
+                        ClaimVerdict::Refused(ClaimRefusal::MissingArtifact(artifact.name.clone()));
+                    break;
+                }
+                StagedRead::OutOfBoundary => {
+                    verdict = ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(format!(
+                        "the staged output `{}` is not a regular file contained in this Run's \
+                         own output area",
+                        artifact.name
+                    )));
+                    break;
+                }
+                StagedRead::Unreadable => {
+                    verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
+                        "the staged output {} could not be read to record its content identity",
+                        artifact.name
+                    )));
+                    break;
+                }
+            };
+            let digest = sha256_hex(&bytes);
+            managed_bytes.push((artifact.name.clone(), bytes, digest));
+        }
+        if !matches!(verdict, ClaimVerdict::Validated) {
+            managed_bytes.clear();
+        }
+    }
+
     // W-A correction (F3): capture the content identity of the exact
     // artifacts that validated, bound to this Claim/Run and to the
     // canonical path inside the Run's own checkout. Recorded on
@@ -3406,7 +3578,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             World::Actor(actor) => actor.worktree_path.clone(),
             World::Deterministic(deterministic) => deterministic.cwd.clone(),
         };
-        for artifact in &claim.artifacts {
+        for artifact in claim.artifacts.iter().filter(|a| is_worktree_artifact(a)) {
             let resolved = worktree_path.join(&artifact.path);
             let Some(digest) = ArtifactReceipt::digest_of(&resolved) else {
                 verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
@@ -3416,12 +3588,68 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 artifact_receipts.clear();
                 break;
             };
-            artifact_receipts.push(ArtifactReceipt {
-                name: artifact.name.clone(),
-                path: artifact_relative_to_worktree(&worktree_path, &artifact.path)
+            artifact_receipts.push(ArtifactReceipt::worktree(
+                artifact.name.clone(),
+                artifact_relative_to_worktree(&worktree_path, &artifact.path)
                     .map(|relative| relative.to_string_lossy().into_owned())
                     .unwrap_or_else(|| artifact.path.clone()),
                 digest,
+            ));
+        }
+    }
+
+    // Ruling 0145, durable before referenced: the bytes validated just
+    // above are written, fsynced and renamed under
+    // `works/<work>/outputs/claims/<claim>/` **before** the
+    // `ClaimRecorded` that names them exists — the same order, and the
+    // same reason, as `works/<work>/projections/` (R2). A crash between
+    // the two leaves a snapshot no event references, which nothing reads
+    // and nothing deletes; the reverse order would journal a receipt for
+    // a file that never existed.
+    //
+    // Last, after every refusal check including the worktree receipts'
+    // own: a Claim that is going to be refused writes nothing here.
+    if matches!(verdict, ClaimVerdict::Validated) && !managed_bytes.is_empty() {
+        for (name, bytes, digest) in &managed_bytes {
+            match wirk_core::outputs::store_claimed_bytes(
+                &state.estate_root,
+                &work_id,
+                &claim_id,
+                name,
+                bytes,
+            ) {
+                Ok(_) => {}
+                // The rename made it visible; only the directory fsync
+                // failed. The bytes are there and re-hash to `digest`,
+                // so reporting this as "never wrote" would be false —
+                // `PreparedProjection::commit`'s own judgement, reused.
+                Err(wirk_core::outputs::OutputWriteError::DurabilityUncertain(detail)) => {
+                    eprintln!("wirkd: {detail}");
+                }
+                Err(err) => {
+                    verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
+                        "the managed output {name} could not be stored durably: {err}"
+                    )));
+                    artifact_receipts.clear();
+                    break;
+                }
+            }
+            // `stored_relative` re-checks the same two rules
+            // `store_claimed_bytes` just enforced, so it cannot be
+            // `None` here; a defensive `None` is an explicit
+            // unavailability rather than a receipt naming nothing.
+            let Some(path) = wirk_core::outputs::stored_relative(&claim_id, name) else {
+                verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
+                    "no managed output address could be recorded for {name}"
+                )));
+                artifact_receipts.clear();
+                break;
+            };
+            artifact_receipts.push(ArtifactReceipt {
+                name: name.clone(),
+                path,
+                digest: digest.clone(),
+                store: wirk_core::ArtifactStore::WorkOutputs,
             });
         }
     }
@@ -4115,7 +4343,7 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
     // identity recorded at validation — `available: false` with an
     // explicit reason when the bytes changed or the file is gone,
     // rather than a path that silently reads as whatever is there now.
-    result["evidence"] = Value::Array(claim_evidence(&events));
+    result["evidence"] = Value::Array(claim_evidence(&state.estate_root, &work.id, &events));
     if let Some(cause) = &work.needs_input {
         result["needs_input"] = json!({
             "run": cause.run.0,
@@ -4316,7 +4544,7 @@ fn withhold_status_content(result: &mut Value) -> usize {
 /// what actually validated. Historical entries stay inspectable
 /// (BUILD-AMENDMENTS.md: "Snapshot needed bytes or resolve against the
 /// recorded digest and return explicit unavailable after change").
-fn claim_evidence(events: &[Event]) -> Vec<Value> {
+fn claim_evidence(estate_root: &Path, work_id: &WorkId, events: &[Event]) -> Vec<Value> {
     events
         .iter()
         .filter_map(|event| {
@@ -4343,24 +4571,40 @@ fn claim_evidence(events: &[Event]) -> Vec<Value> {
             let entries: Vec<Value> = artifacts
                 .iter()
                 .map(|artifact| {
-                    let (available, reason) = match &worktree {
+                    // Ruling 0145: the receipt names the root its path
+                    // is relative to, so this resolves against that root
+                    // and never guesses from the string. A managed
+                    // output resolves from the estate and this Work's id
+                    // — which are always available — so it is never
+                    // `unresolved` for want of a worktree; but it *is*
+                    // `unresolved` when the canonical containment check
+                    // fails, which is the honest answer when the stored
+                    // bytes can no longer be reached inside the area
+                    // that owns them.
+                    let resolved: Option<PathBuf> = match artifact.store {
+                        wirk_core::ArtifactStore::Worktree => worktree
+                            .as_ref()
+                            .map(|worktree| worktree.join(&artifact.path)),
+                        wirk_core::ArtifactStore::WorkOutputs => {
+                            wirk_core::outputs::resolve_stored(estate_root, work_id, &artifact.path)
+                        }
+                    };
+                    let (available, reason) = match &resolved {
                         // A pre-correction receipt recorded a name and
                         // nothing else: inspectable, but never
                         // reportable as evidence that still holds.
                         _ if artifact.digest.is_empty() => (false, Some("unrecorded")),
                         None => (false, Some("unresolved")),
-                        Some(worktree) => {
-                            let path = worktree.join(&artifact.path);
-                            match ArtifactReceipt::digest_of(&path) {
-                                None => (false, Some("absent")),
-                                Some(now) if now == artifact.digest => (true, None),
-                                Some(_) => (false, Some("changed")),
-                            }
-                        }
+                        Some(path) => match ArtifactReceipt::digest_of(path) {
+                            None => (false, Some("absent")),
+                            Some(now) if now == artifact.digest => (true, None),
+                            Some(_) => (false, Some("changed")),
+                        },
                     };
                     json!({
                         "name": artifact.name,
                         "path": artifact.path,
+                        "store": artifact.store.label(),
                         "digest": artifact.digest,
                         "available": available,
                         "reason": reason,
@@ -7149,8 +7393,17 @@ struct EvidenceWindow {
 }
 
 /// The start of the line `offset` is on.
+///
+/// A byte inside a character is on that character's own line, so the
+/// offset falls back to a character boundary before the line is looked
+/// for: `evidence_window` computes its lead by arithmetic, and that
+/// arithmetic lands mid-character over multi-byte prose.
 fn line_begin(text: &str, offset: usize) -> usize {
-    text[..offset].rfind('\n').map_or(0, |index| index + 1)
+    let mut at = offset;
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    text[..at].rfind('\n').map_or(0, |index| index + 1)
 }
 
 /// Choose the displayed window for a lexical hit.
@@ -7236,16 +7489,15 @@ fn evidence_window(
 
     let ceiling = (start + budget).min(text.len());
     let mut end = ceiling;
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
     if end < text.len() {
         // Prefer a whole number of committed lines.
         if let Some(index) = text[start..end].rfind('\n')
             && start + index + 1 >= anchor_at + anchor_len
         {
             end = start + index + 1;
-        } else {
-            while end > start && !text.is_char_boundary(end) {
-                end -= 1;
-            }
         }
     }
     let mut matched_terms: Vec<String> = matches
@@ -8460,6 +8712,10 @@ fn artifact_receipt_json(receipt: &ArtifactReceipt) -> Value {
     json!({
         "name": receipt.name,
         "path": receipt.path,
+        // Ruling 0145: a rendered receipt says which root its path is
+        // relative to. Without it a reader would have to guess, and
+        // `claims/<claim>/<name>` reads like a repository path.
+        "store": receipt.store.label(),
         "digest": if receipt.digest.is_empty() { Value::Null } else { Value::String(receipt.digest.clone()) },
     })
 }
@@ -10674,72 +10930,155 @@ fn handle_finding_settle(state: &Arc<WirkdState>, payload: super::FindingSettleP
         let mut view = DisclosureView::new(&requester, &requester_events, &lineage);
         finding_json_scoped(state, &mut view, &work_id, &finding_id, record)
     };
-    if !matches!(record.state, FindingState::Settled(_))
-        && let Value::Object(map) = &mut result
-    {
-        let reason = match read_settlement_policy(state) {
-            PolicyState::Absent => "no-policy-file",
-            PolicyState::Unreadable => "policy-unreadable",
-            // W-B obligation proof: distinguish "this estate has not
-            // admitted the obligation you named" from "the check has not
-            // held yet", so an operator reading a pending reply is told
-            // which of the two it is rather than guessing.
-            PolicyState::Loaded(policy) => {
-                // The obligation this finding's own *ready* check would
-                // discharge, if any check holds at all — so a basis the
-                // estate never admitted is reported as exactly that
-                // rather than as "the check has not held yet", which is a
-                // different fact entirely.
-                let candidate_basis = fold_work(state, &work_id)
-                    .and_then(|work| {
-                        let events = replay_events(state, &work_id)?;
-                        settlement_candidates(state, &events, &work)
-                            .into_iter()
-                            .find(|ready| ready.finding == finding_id)
-                    })
-                    .and_then(|ready| match obligation_admission(&ready.check) {
-                        Some(Admission::Required(obligation, basis, _)) => {
-                            Some((obligation.clone(), basis.to_string()))
-                        }
-                        _ => None,
-                    });
-                match (&record.finding.obligation, candidate_basis) {
-                    (None, _) if record.finding.kind == FindingKind::VerifiedOutcome => {
-                        "no-obligation-named"
-                    }
-                    (Some(named), _)
-                        if !policy.classes.iter().any(|entry| {
-                            entry.obligations.iter().any(|admitted| {
-                                admitted.id == named.id && admitted.edition == named.edition
-                            })
-                        }) =>
-                    {
-                        "obligation-not-admitted"
-                    }
-                    (Some(_), Some((obligation, basis)))
-                        if !policy.classes.iter().any(|entry| {
-                            entry.obligations.iter().any(|admitted| {
-                                admitted.id == obligation.id
-                                    && admitted.edition == obligation.edition
-                                    && admitted.basis == basis
-                            })
-                        }) =>
-                    {
-                        "obligation-basis-not-admitted"
-                    }
-                    (Some(named), _) if review_selectors_unresolved(state, &work_id, named) => {
-                        "review-targets-unresolved"
-                    }
-                    _ => "no-admitted-check-holds-yet",
-                }
-            }
+    if !matches!(record.state, FindingState::Settled(_)) {
+        // One coherent read of this request's world, exactly as `work
+        // obligations` does: the journal is replayed once, the policy is
+        // read once, and the readiness candidates are derived once, then
+        // lent to the reason ladder (F3).
+        let Some(events) = replay_events(state, &work_id) else {
+            return err_reply("JournalError", "work journal vanished during settlement");
         };
-        map.insert("pending".to_string(), json!({"reason": reason}));
+        let policy = read_settlement_policy(state);
+        let candidates = settlement_candidates(state, &events, &work);
+        let reason = not_ready_reason(&policy, &events, &candidates, &finding_id, record);
+        if let Value::Object(map) = &mut result {
+            map.insert("pending".to_string(), json!({"reason": reason}));
+        }
     }
     // `settle_ready` above reconciles the index whenever it minted a
     // settlement; a settled reply that does not say whether the row
     // reached the index is the same silence `assert` carried.
     ok_reply(with_index_health(state, payload.admin, result))
+}
+
+/// The reason a Finding is not yet ready to settle — shared by `wirk
+/// finding settle`'s `pending.reason` and `wirk work obligations`'s
+/// `findings[].ready.reason` so the two verbs report a consistent
+/// reason for the same underlying condition rather than duplicating or
+/// drifting from it (W-B obligation proof).
+///
+/// **Every input is the caller's own already-read request state.** The
+/// policy, the replayed journal and the readiness candidates are read
+/// once per request by the caller and lent here; nothing on this ladder
+/// re-reads `policy/settlement.json`, re-replays the journal or
+/// re-derives the candidate list. `work obligations` calls this once per
+/// not-ready Finding, so a re-read here was a re-read per Finding —
+/// quadratic in the Findings of one obligation, since each replay also
+/// walks a journal every Finding lengthened (F3 of the independent
+/// native-foundation review).
+///
+/// Read-only in the strict sense: it appends nothing and settles
+/// nothing. Reading why a Finding is not ready never makes it ready.
+fn not_ready_reason(
+    policy: &PolicyState,
+    events: &[Event],
+    candidates: &[ReadySettlement],
+    finding_id: &FindingId,
+    record: &FindingRecord,
+) -> &'static str {
+    match policy {
+        PolicyState::Absent => "no-policy-file",
+        PolicyState::Unreadable => "policy-unreadable",
+        // W-B obligation proof: distinguish "this estate has not
+        // admitted the obligation you named" from "the check has not
+        // held yet", so an operator reading a pending reply is told
+        // which of the two it is rather than guessing.
+        PolicyState::Loaded(policy) => {
+            // The basis this Finding's obligation would have to be
+            // admitted at.
+            //
+            // Read from the *declaring Waypoint's own* derived basis,
+            // not only from a ready settlement candidate (F4). A ready
+            // candidate exists only for a Finding whose check already
+            // holds, so deriving the basis from the candidate alone made
+            // `obligation-basis-not-admitted` unreachable in exactly the
+            // case it names — an unadmitted basis is *why* no check
+            // holds — and handed the operator the vaguer
+            // `no-admitted-check-holds-yet` while the same reply's own
+            // `admission.state` already said `basis-not-admitted`. When
+            // a candidate does exist its check's basis is what would
+            // actually be minted against, so that value still wins.
+            let candidate_basis = candidates
+                .iter()
+                .find(|ready| &ready.finding == finding_id)
+                .and_then(|ready| match obligation_admission(&ready.check) {
+                    Some(Admission::Required(obligation, basis, _)) => Some((
+                        obligation.id.clone(),
+                        obligation.edition.clone(),
+                        basis.to_string(),
+                    )),
+                    _ => None,
+                });
+            let named_basis = record.finding.obligation.as_ref().and_then(|named| {
+                declared_obligation_basis(events, named)
+                    .map(|basis| (named.id.clone(), named.edition.clone(), basis))
+            });
+            let basis_to_admit = candidate_basis.or(named_basis);
+            match (&record.finding.obligation, basis_to_admit) {
+                (None, _) if record.finding.kind == FindingKind::VerifiedOutcome => {
+                    "no-obligation-named"
+                }
+                (Some(named), _)
+                    if !policy.classes.iter().any(|entry| {
+                        entry.obligations.iter().any(|admitted| {
+                            admitted.id == named.id && admitted.edition == named.edition
+                        })
+                    }) =>
+                {
+                    "obligation-not-admitted"
+                }
+                (Some(_), Some((id, edition, basis)))
+                    if !policy.classes.iter().any(|entry| {
+                        entry.obligations.iter().any(|admitted| {
+                            admitted.id == id
+                                && admitted.edition == edition
+                                && admitted.basis == basis
+                        })
+                    }) =>
+                {
+                    "obligation-basis-not-admitted"
+                }
+                (Some(named), _) if review_selectors_unresolved(events, named) => {
+                    "review-targets-unresolved"
+                }
+                _ => "no-admitted-check-holds-yet",
+            }
+        }
+    }
+}
+
+/// The obligation basis the Waypoint that *declares* `named` derives
+/// right now, from the journal the caller already replayed.
+///
+/// The same `obligation_basis(def, world_hash)` call `work obligations`
+/// renders as `basis.basis`, read for the Waypoint whose `verifies`
+/// names this obligation — so a reason string and the `admission` object
+/// beside it in the same reply are computed from one value, and cannot
+/// disagree about which basis the estate was asked to admit. `None`
+/// while the declaring Waypoint's World is unreserved: there is then no
+/// derived basis to admit, and the ladder says so by falling through
+/// rather than by inventing one.
+fn declared_obligation_basis(events: &[Event], named: &ObligationRef) -> Option<String> {
+    let defs = waypoint_defs_for(events);
+    // Containers included: a container obligation is declared on the
+    // container itself, which `flatten_leaves` deliberately omits, and
+    // `work obligations` walks the same whole tree.
+    let mut all: Vec<&WaypointDefinition> = Vec::new();
+    fn walk<'a>(nodes: &'a [WaypointDefinition], out: &mut Vec<&'a WaypointDefinition>) {
+        for node in nodes {
+            out.push(node);
+            walk(&node.leaves, out);
+        }
+    }
+    walk(&defs, &mut all);
+    all.into_iter().find_map(|def| {
+        let obligation = def.verifies.as_ref()?;
+        if obligation.id != named.id || obligation.edition != named.edition {
+            return None;
+        }
+        let world_hash = latest_reservation_for_waypoint(events, &def.id).map(|(hash, _)| hash);
+        obligation_basis(def, world_hash.as_ref())
+    })
 }
 
 /// Whether the Actor Waypoint declaring `named` in this Work reserved
@@ -10753,15 +11092,8 @@ fn handle_finding_settle(state: &Arc<WirkdState>, payload: super::FindingSettleP
 /// string. No source alias, path, membership or generation is disclosed,
 /// so this adds no disclosure surface — the wider consultation repair
 /// stays a separate stage.
-fn review_selectors_unresolved(
-    state: &Arc<WirkdState>,
-    work_id: &WorkId,
-    named: &ObligationRef,
-) -> bool {
-    let Some(events) = replay_events(state, work_id) else {
-        return false;
-    };
-    let defs = waypoint_defs_for(&events);
+fn review_selectors_unresolved(events: &[Event], named: &ObligationRef) -> bool {
+    let defs = waypoint_defs_for(events);
     flatten_leaves(&defs).iter().any(|waypoint| {
         let Some(def) = find_definition(&defs, waypoint) else {
             return false;
@@ -10778,7 +11110,7 @@ fn review_selectors_unresolved(
         let Some(review) = obligation.review.as_ref() else {
             return false;
         };
-        match latest_reservation_for_waypoint(&events, waypoint) {
+        match latest_reservation_for_waypoint(events, waypoint) {
             Some((_, World::Actor(actor))) => actor.review_targets.len() != review.targets.len(),
             _ => false,
         }
@@ -11056,7 +11388,10 @@ fn handle_work_obligations(
                                 _ => Value::Null,
                             },
                         }),
-                        None => json!({"state": "not-ready"}),
+                        None => json!({
+                            "state": "not-ready",
+                            "reason": not_ready_reason(&policy, &events, &candidates, id, record),
+                        }),
                     },
                     "settled": settled,
                 })
@@ -11792,8 +12127,17 @@ fn resolve_claim_attribution(
     }
     let receipts = claim_artifact_receipts(claim_events, &claim_id);
     let coordinate_path = String::from_utf8_lossy(&coordinate.path).into_owned();
+    // Ruling 0145, made explicit rather than left accidental: a finding
+    // coordinate is a path *in a source repository*, and only a
+    // `Worktree` receipt names one. A managed output lives under
+    // `works/<work>/outputs/` and is in no repository at all, so it can
+    // never attest a source coordinate — and must not be able to, since
+    // its recorded path (`claims/<claim>/<name>`) is a different
+    // namespace that could otherwise collide with a repository path by
+    // string equality alone.
     let Some(receipt) = receipts
         .iter()
+        .filter(|receipt| matches!(receipt.store, wirk_core::ArtifactStore::Worktree))
         .find(|receipt| receipt.path == coordinate_path)
     else {
         return Err((
@@ -16453,6 +16797,179 @@ mod tests {
             "materialization is not a launch outcome"
         );
     }
+
+    /// wirkd panicked (`end byte index ... is not a char boundary`) when
+    /// an orienting Route's projection ran `evidence_window` over prose
+    /// that put a multi-byte character exactly where the budget's raw
+    /// ceiling landed: `text[start..end]` was sliced with that raw
+    /// ceiling as `end` before any char-boundary correction, at
+    /// `wirk/src/wirkd/server.rs:7241` (as of the panic reported in the
+    /// field). The reproduction here uses a literal em dash — a 3-byte
+    /// UTF-8 character — so a naive byte-count budget lands mid-character
+    /// exactly the way the operator's knowledge corpus did.
+    #[test]
+    fn evidence_window_does_not_panic_when_the_budget_ceiling_lands_inside_a_multibyte_char() {
+        // 48 ASCII bytes, then a 3-byte em dash at [48..51), then more
+        // ASCII. A budget of 50 puts the raw ceiling at byte 50, which is
+        // the middle byte of the em dash — not a char boundary.
+        let text = format!("{}—{}", "a".repeat(48), "b".repeat(200));
+        assert!(
+            !text.is_char_boundary(50),
+            "fixture must land mid-character"
+        );
+        let matches = vec![wirk_atlas::TermMatch {
+            offset: 0,
+            len: 1,
+            term: "a".to_string(),
+        }];
+
+        let window = evidence_window(&text, &matches, 50)
+            .expect("text longer than the budget with a match must produce a window");
+
+        assert!(
+            text.is_char_boundary(window.start) && text.is_char_boundary(window.end),
+            "window [{}, {}) must land on char boundaries",
+            window.start,
+            window.end
+        );
+        assert!(
+            window.end - window.start <= 50,
+            "window must not exceed the budget: got {} bytes",
+            window.end - window.start
+        );
+        assert!(
+            window.start == 0 && window.end >= 1,
+            "window must not cut the anchor away"
+        );
+    }
+
+    #[test]
+    fn evidence_window_does_not_panic_when_the_lead_lands_inside_a_multibyte_char() {
+        // The real assembly budget. A single one-byte match makes the
+        // lead `(320 - 1) / 2 == 159`, so `line_begin` is asked for the
+        // line containing byte `anchor - 159`. Put the anchor at 318 and
+        // a 3-byte em dash at [158..161) and that byte is the middle of
+        // the dash — not a char boundary.
+        let text = format!(
+            "{}—{}q{}",
+            "a".repeat(158),
+            "c".repeat(157),
+            "b".repeat(200)
+        );
+        assert_eq!(text.find('q'), Some(318), "fixture must anchor at 318");
+        assert!(
+            !text.is_char_boundary(318 - 159),
+            "fixture must put the lead mid-character"
+        );
+        let matches = vec![wirk_atlas::TermMatch {
+            offset: 318,
+            len: 1,
+            term: "q".to_string(),
+        }];
+
+        let window = evidence_window(&text, &matches, ASSEMBLY_SUMMARY_BYTES)
+            .expect("text longer than the budget with a match must produce a window");
+
+        assert!(
+            text.is_char_boundary(window.start) && text.is_char_boundary(window.end),
+            "window [{}, {}) must land on char boundaries",
+            window.start,
+            window.end
+        );
+        assert!(
+            window.end - window.start <= ASSEMBLY_SUMMARY_BYTES,
+            "window must not exceed the budget: got {} bytes",
+            window.end - window.start
+        );
+        assert!(
+            window.start <= 318 && window.end >= 319,
+            "window [{}, {}) must not cut the anchor away",
+            window.start,
+            window.end
+        );
+    }
+
+    #[test]
+    fn evidence_window_honours_its_contract_over_multibyte_prose_at_every_budget() {
+        // One paragraph of real multi-byte prose, so em dashes, curly
+        // quotes and accents fall at many different byte offsets, and
+        // one committed line break so line snapping is exercised too.
+        let prose = "Le rapport — écrit à Genève — dit « la preuve n'est pas la promesse ».\n                     Une décision porte sa portée : elle expire par elle, jamais par décret.\n                     Ce qui est écrit — même à contrecœur — reste ce qui était connu alors.\n";
+        let text = prose.repeat(6);
+
+        // Every char boundary in the text is a candidate anchor, and the
+        // budgets sweep through the real one.
+        for anchor in (0..text.len()).filter(|at| text.is_char_boundary(*at)) {
+            let len = text[anchor..].chars().next().map_or(1, |c| c.len_utf8());
+            let matches = vec![wirk_atlas::TermMatch {
+                offset: anchor as u64,
+                len: len as u64,
+                term: text[anchor..anchor + len].to_string(),
+            }];
+            for budget in [
+                1usize,
+                2,
+                3,
+                7,
+                64,
+                159,
+                160,
+                161,
+                ASSEMBLY_SUMMARY_BYTES,
+                321,
+            ] {
+                let Some(window) = evidence_window(&text, &matches, budget) else {
+                    continue;
+                };
+                assert!(
+                    text.is_char_boundary(window.start),
+                    "start {} is not a char boundary (anchor {anchor}, budget {budget})",
+                    window.start
+                );
+                assert!(
+                    text.is_char_boundary(window.end),
+                    "end {} is not a char boundary (anchor {anchor}, budget {budget})",
+                    window.end
+                );
+                assert!(
+                    window.start <= window.end,
+                    "window [{}, {}) is inverted (anchor {anchor}, budget {budget})",
+                    window.start,
+                    window.end
+                );
+                assert!(
+                    window.end - window.start <= budget,
+                    "window [{}, {}) exceeds budget {budget} (anchor {anchor})",
+                    window.start,
+                    window.end
+                );
+                if budget >= len {
+                    assert!(
+                        window.start <= anchor && window.end > anchor,
+                        "window [{}, {}) cuts the anchor {anchor} away (budget {budget})",
+                        window.start,
+                        window.end
+                    );
+                } else {
+                    // No bounded window can carry even the anchor's first
+                    // character; the window still begins at the anchor.
+                    assert_eq!(
+                        (window.start, window.end),
+                        (anchor, anchor),
+                        "a budget under the anchor's own character must not wander (budget {budget})"
+                    );
+                }
+                if window.whole_match_shown {
+                    assert!(
+                        window.end >= anchor + len,
+                        "window [{}, {}) claims the whole match but cuts it (anchor {anchor}, budget {budget})",
+                        window.start,
+                        window.end
+                    );
+                }
+            }
+        }
+    }
 }
 
 // ---- W-C1: stage projection assembly --------------------------------------
@@ -17733,7 +18250,8 @@ fn prepare_projection(
 
     // Step 5: this Work's own already-claimed stages, by exact recorded
     // digest.
-    let artifacts = bind_prior_stage_artifacts(events, def, &mut bound, &mut omitted);
+    let artifacts =
+        bind_prior_stage_artifacts(&state.estate_root, events, def, &mut bound, &mut omitted);
 
     // Step 6 (§4.3, §6): consulted recorded learning, and the actual
     // scoped health of the index it was read from — deliberately here,
@@ -18287,12 +18805,19 @@ fn display_path(path: &[u8]) -> String {
 /// historical evidence identity. Nothing here writes anything, so a Read
 /// binding gains no mutation authority through a declared artifact.
 fn bind_prior_stage_artifacts(
+    estate_root: &Path,
     events: &[Event],
     def: &WaypointDefinition,
     bound: &mut Vec<wirk_core::EvidenceItem>,
     omitted: &mut Vec<wirk_core::Omission>,
 ) -> usize {
     let defs = waypoint_defs_for(events);
+    // `events` is one Work's own journal, so every event in it names
+    // that Work — the id a managed receipt resolves against (ruling
+    // 0145). Taken from the slice rather than threaded through
+    // `prepare_projection`'s signature, which has no Work id because
+    // until now nothing in the assembly needed one.
+    let work_id = events.first().map(|event| event.work.clone());
     let mut delivered = 0usize;
     for leaf in wirk_core::flatten_leaves(&defs) {
         if leaf == def.id {
@@ -18304,15 +18829,11 @@ fn bind_prior_stage_artifacts(
         let Some((claim, receipts)) = validated_done_claim(events, &run_id) else {
             continue;
         };
-        let Some(worktree) = worktree_of_reserved_world(events, &leaf, &world_hash) else {
-            for receipt in &receipts {
-                omitted.push(wirk_core::Omission::Unavailable {
-                    coordinate: artifact_coordinate(&claim, &receipt.name),
-                    reason: wirk_core::UnavailableReason::ArtifactUnreadable,
-                });
-            }
-            continue;
-        };
+        // A prior stage that produced only managed outputs needs no
+        // worktree at all (ruling 0145), so an absent one is no longer
+        // a whole-stage unavailability — it is resolved per receipt,
+        // against the root that receipt names.
+        let worktree = worktree_of_reserved_world(events, &leaf, &world_hash);
         for receipt in receipts {
             let coordinate = artifact_coordinate(&claim, &receipt.name);
             if receipt.digest.is_empty() {
@@ -18322,8 +18843,23 @@ fn bind_prior_stage_artifacts(
                 });
                 continue;
             }
+            let resolved: Option<PathBuf> = match receipt.store {
+                wirk_core::ArtifactStore::Worktree => worktree
+                    .as_ref()
+                    .map(|worktree| worktree.join(&receipt.path)),
+                wirk_core::ArtifactStore::WorkOutputs => work_id.as_ref().and_then(|work| {
+                    wirk_core::outputs::resolve_stored(estate_root, work, &receipt.path)
+                }),
+            };
+            let Some(resolved) = resolved else {
+                omitted.push(wirk_core::Omission::Unavailable {
+                    coordinate,
+                    reason: wirk_core::UnavailableReason::ArtifactUnreadable,
+                });
+                continue;
+            };
             // The only read. Everything below is derived from `bytes`.
-            let Ok(bytes) = std::fs::read(worktree.join(&receipt.path)) else {
+            let Ok(bytes) = std::fs::read(resolved) else {
                 omitted.push(wirk_core::Omission::Unavailable {
                     coordinate,
                     reason: wirk_core::UnavailableReason::ArtifactUnreadable,
@@ -19275,6 +19811,165 @@ fn prepared_for_waypoint(
     ))
 }
 
+// ---- the staged read is one open file object (F6) --------------------
+
+/// What reading a staged managed output found.
+///
+/// The three answers the Claim path already distinguishes, established
+/// by the syscalls that open the file rather than re-derived from a
+/// second path lookup afterwards.
+enum StagedRead {
+    /// A regular file inside this Run's own staging directory, reached
+    /// without following a symlink at any component — and these are the
+    /// bytes of *that* file object.
+    Bytes(Vec<u8>),
+    /// No entry by that name. The actor did not produce it.
+    Absent,
+    /// The entry, or a component on the way to it, is not what the area
+    /// requires: a symlink at the name, a symlink where an ancestor
+    /// directory should be, or a non-directory in the middle.
+    OutOfBoundary,
+    /// The area could not be inspected at all.
+    Unreadable,
+}
+
+/// Open `component` inside the directory `parent` already holds open,
+/// following no symlink.
+///
+/// `openat` with `O_NOFOLLOW`, `libc` used the way `ChildExecutor`'s
+/// `prctl` already uses it (R5, the installed dependency's own
+/// mechanism, not a `nix`/`cap-std` adoption and not a filesystem
+/// capability layer). `component` is resolved *relative to a descriptor
+/// this process is already holding*, so the lookup has exactly one
+/// component and no ancestor for anything to swap underneath it.
+fn open_no_follow(
+    parent: BorrowedFd<'_>,
+    component: &str,
+    directory: bool,
+) -> std::io::Result<OwnedFd> {
+    let Ok(name) = std::ffi::CString::new(component) else {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    };
+    let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    // SAFETY: `name` is NUL-terminated and outlives the call, `parent`
+    // is a live borrowed descriptor, and the result is either -1 or a
+    // fresh descriptor owned by this process alone.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor just returned by `openat` and
+    // is not owned anywhere else.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// How a failed component open answers, by the kernel's own reason.
+fn staged_open_failure(err: &std::io::Error) -> StagedRead {
+    match err.raw_os_error() {
+        Some(libc::ENOENT) => StagedRead::Absent,
+        // `ELOOP` is `O_NOFOLLOW` refusing a symlink at this component;
+        // `ENOTDIR` is a non-directory where the walk needed one. Both
+        // are the area's boundary, not an inspection failure.
+        Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::ENAMETOOLONG) => {
+            StagedRead::OutOfBoundary
+        }
+        _ => StagedRead::Unreadable,
+    }
+}
+
+/// The bytes of the managed output `name` staged by this Run, read
+/// through **one** open file object.
+///
+/// **Why not check the path and then read it.** The previous shape
+/// `lstat`ed and `canonicalize`d the staged path and then called
+/// `std::fs::read` on the result — a second, fresh path lookup that
+/// *does* follow symlinks. The actor owns its staging directory, so
+/// between the two the entry could be replaced and the bytes recorded
+/// need never have been the bytes validated (F6 of the independent
+/// native-foundation review; ruling 0147 declines to call the path
+/// race fixed). `O_NOFOLLOW` on the final component alone would not
+/// close it either: an ancestor of a multi-component path is resolved
+/// by the same lookup and is not covered by that flag.
+///
+/// **What closes it.** The estate root is opened once, and every
+/// component below it — `works`, the Work id, `outputs`, `staging`, the
+/// Run id, and finally the declared name — is opened with `openat` and
+/// `O_NOFOLLOW` *relative to the descriptor the previous step returned*.
+/// Each lookup is therefore a single component inside an already-pinned
+/// directory: there is no ancestor left in any lookup for a rename to
+/// retarget, and a symlink at any component is refused rather than
+/// followed. Every one of those components is either a literal or an id
+/// `well_formed_id` admits, and the name is one `check_output_name`
+/// admits, so none of them can contain a separator, a `..` or a NUL.
+///
+/// The descriptor that survives the walk is then `fstat`ed for a regular
+/// file and read to end. Check and read are the same file object, so the
+/// digest recorded downstream is the digest of exactly the bytes that
+/// validated — which is what makes the durable snapshot taken before the
+/// Claim a snapshot *of the validated bytes* and not of whatever the
+/// path resolved to a moment later.
+fn read_staged_output(
+    estate_root: &Path,
+    work_id: &WorkId,
+    run_id: &RunId,
+    name: &str,
+) -> StagedRead {
+    if wirk_core::outputs::check_output_name(name).is_err() {
+        return StagedRead::OutOfBoundary;
+    }
+    // The addressability rules stay where they are authored: if the
+    // module cannot derive this Run's staging address, there is nothing
+    // to walk to.
+    if wirk_core::outputs::staged_path(estate_root, work_id, run_id, name).is_none() {
+        return StagedRead::Unreadable;
+    }
+    // The estate root is the daemon's own, established at startup and
+    // not inside any actor's area; it is the anchor the no-follow walk
+    // starts from, not a step of it.
+    let Ok(root) = std::fs::canonicalize(estate_root) else {
+        return StagedRead::Unreadable;
+    };
+    let Ok(root_dir) = std::fs::File::open(&root) else {
+        return StagedRead::Unreadable;
+    };
+    let mut dir: OwnedFd = root_dir.into();
+    for component in [
+        "works",
+        work_id.0.as_str(),
+        "outputs",
+        "staging",
+        run_id.0.as_str(),
+    ] {
+        match open_no_follow(dir.as_fd(), component, true) {
+            Ok(next) => dir = next,
+            Err(err) => return staged_open_failure(&err),
+        }
+    }
+    let opened = match open_no_follow(dir.as_fd(), name, false) {
+        Ok(fd) => fd,
+        Err(err) => return staged_open_failure(&err),
+    };
+    let mut file = std::fs::File::from(opened);
+    // `fstat` on the descriptor just opened, never a path: a directory
+    // opens read-only without `O_DIRECTORY`, and this is what refuses
+    // it. There is no window between this and the read below, because
+    // both address the same open file.
+    let Ok(meta) = file.metadata() else {
+        return StagedRead::Unreadable;
+    };
+    if !meta.file_type().is_file() {
+        return StagedRead::OutOfBoundary;
+    }
+    let mut bytes = Vec::new();
+    match io::Read::read_to_end(&mut file, &mut bytes) {
+        Ok(_) => StagedRead::Bytes(bytes),
+        Err(_) => StagedRead::Unreadable,
+    }
+}
+
 /// Removes the `.tmp-` files a crash between a projection's temp write
 /// and its rename can leave. See the call site's own note for why
 /// nothing else in `projections/` is ever removed.
@@ -19292,6 +19987,114 @@ fn sweep_projection_temporaries(state: &Arc<WirkdState>) {
             }
         }
     }
+}
+
+/// `wirk output` (ruling 0145): where this Run's actor writes its
+/// declared outputs, and which of them are staged right now.
+///
+/// **The daemon derives the storage.** The only inputs are the injected
+/// triple's ids, each already checked against this estate and this
+/// Work's own journal before a path is built: the caller supplies no
+/// path, and there is no field on this verb through which it could. A
+/// declared name that cannot be one filename component is reported here,
+/// by name, with the rule it broke — the same diagnostic a Claim naming
+/// it would refuse with, delivered before the actor spends a model on
+/// producing it.
+///
+/// Read-only and side-effect-light: it creates this Run's staging
+/// directory (so the path it prints is one the actor can write into
+/// immediately) and appends nothing to any journal.
+///
+/// Deliberately no `--work`/`--run`: `WorldShow`'s own reasoning, which
+/// is that authority is the journal line and never an id.
+fn handle_run_outputs(state: &Arc<WirkdState>, payload: super::RunOutputsPayload) -> Reply {
+    let work_id = payload.triple.work_id.clone();
+    let run_id = payload.triple.run_id.clone();
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the triple's estate root does not identify this daemon's estate",
+        );
+    }
+    let journal = match journal_for(state, &work_id) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let events = {
+        let journal = lock_journal(&journal);
+        match journal.replay() {
+            Ok(events) => events,
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        }
+    };
+    if events.is_empty() {
+        return err_reply("NotFound", "no such work");
+    }
+    let Some(run) = find_run(&events, &run_id) else {
+        return err_reply(
+            "TripleMismatch",
+            "the run id does not match any Run opened for this Work",
+        );
+    };
+    let defs = waypoint_defs_for(&events);
+    let Some(def) = find_definition(&defs, &run.waypoint) else {
+        return err_reply(
+            "TripleMismatch",
+            "this Run's Waypoint has no journaled definition",
+        );
+    };
+    let staging =
+        match wirk_core::outputs::ensure_staging_dir(&state.estate_root, &work_id, &run_id) {
+            Ok(dir) => dir,
+            Err(err) => {
+                return err_reply(
+                    "OutputsUnavailable",
+                    &format!("this Run's managed output area could not be prepared: {err}"),
+                );
+            }
+        };
+    let current = latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
+        == Some(run_id.clone());
+    let outputs: Vec<Value> = def
+        .declared_outputs
+        .iter()
+        .map(
+            |spec| match wirk_core::outputs::check_output_name(&spec.name) {
+                Ok(()) => {
+                    let path = staging.join(&spec.name);
+                    // `staged` is the plain question "is there a regular
+                    // file there now" — a symlink or a directory answers
+                    // `false` here and refuses at Claim, rather than reading
+                    // as ready and refusing later.
+                    let staged = std::fs::symlink_metadata(&path)
+                        .map(|meta| meta.file_type().is_file())
+                        .unwrap_or(false);
+                    json!({
+                        "name": spec.name,
+                        "required": spec.required,
+                        "addressable": true,
+                        "path": path.display().to_string(),
+                        "staged": staged,
+                    })
+                }
+                Err(err) => json!({
+                    "name": spec.name,
+                    "required": spec.required,
+                    "addressable": false,
+                    "detail": err.detail(),
+                }),
+            },
+        )
+        .collect();
+    ok_reply(json!({
+        "work": work_id.0,
+        "run": run_id.0,
+        "waypoint": run.waypoint.0,
+        "current": current,
+        "staging": staging.display().to_string(),
+        "outputs": outputs,
+    }))
 }
 
 /// `wirk world show` (W-C1, BUILD.md §5.3): the delivered stage

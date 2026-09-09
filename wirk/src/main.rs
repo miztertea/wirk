@@ -37,7 +37,7 @@
 //! so a verifier can `SIGKILL` the process mid-sequence with an exact,
 //! reproducible line count.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -102,9 +102,10 @@ fn main() -> ExitCode {
         Some("atlas") => atlas::atlas_command(&args[2..]),
         Some("finding") => finding::finding_command(&args[2..]),
         Some("world") => world_command(&args[2..]),
+        Some("output") => output_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json]"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json]"
             );
             ExitCode::FAILURE
         }
@@ -123,6 +124,7 @@ fn main() -> ExitCode {
 /// is exit 2, the error printed to stderr.
 fn claim(args: &[String]) -> ExitCode {
     let mut artifacts: BTreeMap<String, String> = BTreeMap::new();
+    let mut outputs: BTreeSet<String> = BTreeSet::new();
     let mut question: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -137,6 +139,25 @@ fn claim(args: &[String]) -> ExitCode {
                 };
                 artifacts.insert(name.to_string(), path.to_string());
             }
+            // Ruling 0145: a declared output this Work owns, claimed by
+            // *name* — deliberately no `=PATH` half, because there is no
+            // path for the actor to supply. wirkd derives the address
+            // from the bound Work, the bound Run and this name; `wirk
+            // output` prints where to write it.
+            "--output" => {
+                i += 1;
+                let Some(name) = args.get(i) else {
+                    return claim_usage();
+                };
+                if name.contains('=') {
+                    eprintln!(
+                        "wirk claim: --output takes a declared output NAME, not NAME=PATH: a \
+                         managed output's location is derived by wirkd, not supplied"
+                    );
+                    return ExitCode::from(1);
+                }
+                outputs.insert(name.clone());
+            }
             "--question" => {
                 i += 1;
                 let Some(text) = args.get(i) else {
@@ -147,6 +168,18 @@ fn claim(args: &[String]) -> ExitCode {
             _ => return claim_usage(),
         }
         i += 1;
+    }
+
+    // One name cannot be both a checkout artifact and a managed output:
+    // they are different files in different places, and silently
+    // preferring one would make the receipt disagree with what the actor
+    // meant. Refused as usage, before wirkd is contacted.
+    if let Some(both) = outputs.iter().find(|name| artifacts.contains_key(*name)) {
+        eprintln!(
+            "wirk claim: `{both}` is named by both --artifact and --output; a declared output is \
+             claimed from one place or the other, never both"
+        );
+        return ExitCode::from(1);
     }
 
     let mut missing = Vec::new();
@@ -185,7 +218,14 @@ fn claim(args: &[String]) -> ExitCode {
     // relative path; wirkd's own validator still refuses whatever is
     // actually missing. An explicit `--artifact` flag keeps its
     // meaning exactly — this only fires when the caller supplied none.
-    if artifacts.is_empty() && question.is_none() {
+    //
+    // Unchanged by ruling 0145, deliberately: an explicit `--output`
+    // flag means the caller named its outputs by hand, so this fallback
+    // does not fire, and it still resolves a bare `wirk claim` to
+    // *checkout* artifacts exactly as it always has. A Read-bound Run
+    // asks for the managed route by name; nothing about the historical
+    // default changes underneath a Work that never heard of it.
+    if artifacts.is_empty() && outputs.is_empty() && question.is_none() {
         match fetch_output_contract_names(&pointer.socket, &work_id) {
             Ok(names) => {
                 for name in names {
@@ -211,6 +251,7 @@ fn claim(args: &[String]) -> ExitCode {
         },
         kind,
         artifacts,
+        outputs,
     };
 
     match wirkd::client::call(&pointer.socket, &Request::claim(payload)) {
@@ -265,6 +306,127 @@ fn fetch_output_contract_names(socket: &Path, work_id: &WorkId) -> Result<Vec<St
         World::Deterministic(det) => det.expected_artifacts,
     };
     Ok(contract.0.into_iter().map(|spec| spec.name).collect())
+}
+
+// ---- wirk output (ruling 0145) --------------------------------------
+
+/// `wirk output [list] [--json]` / `wirk output dir`: where this Run's
+/// actor writes the outputs its Waypoint declares, and which of them are
+/// staged.
+///
+/// The same triple-only door `wirk world show` uses, for the same reason
+/// (0001 D3, D5): an actor asks about the Run *it* is executing, and
+/// there is no `--work`, no `--run` and no path argument here — the
+/// location is derived by wirkd from ids it already holds, so there is
+/// nothing for a caller to point somewhere else.
+///
+/// `dir` prints the staging directory alone, for `$(wirk output dir)` in
+/// a shell. `list` (the default) prints one line per declared output.
+/// A declared name that cannot address a managed output is printed as
+/// `unaddressable` with the rule it breaks, so the actor learns that
+/// before producing the file rather than at its Claim.
+fn output_command(rest: &[String]) -> ExitCode {
+    let (mode, flags) = match rest.first().map(String::as_str) {
+        Some("dir") => ("dir", &rest[1..]),
+        Some("list") => ("list", &rest[1..]),
+        Some(flag) if flag.starts_with("--") => ("list", rest),
+        None => ("list", rest),
+        _ => return output_usage(),
+    };
+    let mut json_out = false;
+    for flag in flags {
+        match flag.as_str() {
+            "--json" => json_out = true,
+            _ => return output_usage(),
+        }
+    }
+    if mode == "dir" && json_out {
+        return output_usage();
+    }
+
+    let triple = match world_triple() {
+        Ok(triple) => triple,
+        Err(missing) => {
+            for name in &missing {
+                eprintln!("wirk output: missing {name}");
+            }
+            return ExitCode::from(1);
+        }
+    };
+    let estate_root = triple["WIRK_ESTATE_ROOT"].clone();
+    let pointer = match wirkd::client::locate(Path::new(&estate_root)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk output: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let payload = wirkd::RunOutputsPayload {
+        triple: ExecutionTriple {
+            estate_root,
+            work_id: WorkId(triple["WIRK_WORK_ID"].clone()),
+            run_id: RunId(triple["WIRK_RUN_ID"].clone()),
+        },
+    };
+    let result = match wirkd::client::call(&pointer.socket, &Request::run_outputs(payload)) {
+        Ok(Reply::Ok { result, .. }) => result,
+        Ok(Reply::Err { error, .. }) => {
+            eprintln!("wirk output: {} {}", error.code, error.message);
+            return ExitCode::from(3);
+        }
+        Err(err) => {
+            eprintln!("wirk output: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    if mode == "dir" {
+        println!("{}", result["staging"].as_str().unwrap_or(""));
+        return ExitCode::SUCCESS;
+    }
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!("staging {}", result["staging"].as_str().unwrap_or("?"));
+    let empty = Vec::new();
+    let outputs = result["outputs"].as_array().unwrap_or(&empty);
+    if outputs.is_empty() {
+        println!("  (this Waypoint declares no outputs)");
+    }
+    for output in outputs {
+        let name = output["name"].as_str().unwrap_or("?");
+        let required = if output["required"].as_bool().unwrap_or(false) {
+            "required"
+        } else {
+            "optional"
+        };
+        if output["addressable"].as_bool().unwrap_or(false) {
+            println!(
+                "  {name} {required} {} {}",
+                if output["staged"].as_bool().unwrap_or(false) {
+                    "staged"
+                } else {
+                    "not-staged"
+                },
+                output["path"].as_str().unwrap_or("?"),
+            );
+        } else {
+            println!(
+                "  {name} {required} unaddressable: {}",
+                output["detail"].as_str().unwrap_or("?"),
+            );
+        }
+    }
+    println!("claim with: wirk claim --output NAME");
+    ExitCode::SUCCESS
+}
+
+fn output_usage() -> ExitCode {
+    eprintln!("usage: wirk output [list [--json] | dir]");
+    ExitCode::from(1)
 }
 
 // ---- wirk world (P3 W-C1) ------------------------------------------
@@ -878,7 +1040,12 @@ fn world_usage() -> ExitCode {
 }
 
 fn claim_usage() -> ExitCode {
-    eprintln!("usage: wirk claim [--artifact NAME=PATH]... [--question TEXT]");
+    eprintln!(
+        "usage: wirk claim [--artifact NAME=PATH]... [--output NAME]... [--question TEXT]\n  \
+         --artifact  a file in this Run's own checkout, at the path you name\n  \
+         --output    a declared output this Work owns, by name; run `wirk output` for where to \
+         write it"
+    );
     ExitCode::from(1)
 }
 
@@ -1611,10 +1778,14 @@ fn wirkd_status_command(
                                 artifact["reason"].as_str().unwrap_or("unknown")
                             )
                         };
+                        // Ruling 0145: which store the bytes were read
+                        // back from is part of the evidence line, not an
+                        // inference from the path.
                         println!(
-                            "  evidence {} {} sha256:{} {} claim {} run {}",
+                            "  evidence {} {} [{}] sha256:{} {} claim {} run {}",
                             entry["waypoint"].as_str().unwrap_or("?"),
                             artifact["name"].as_str().unwrap_or("?"),
+                            artifact["store"].as_str().unwrap_or("worktree"),
                             artifact["digest"].as_str().unwrap_or("?"),
                             availability,
                             entry["claim"].as_str().unwrap_or("?"),
@@ -2264,6 +2435,9 @@ fn work_obligations_command(rest: &[String]) -> ExitCode {
                         finding["ready"]["state"].as_str().unwrap_or("?"),
                         finding["settled"]["state"].as_str().unwrap_or("?"),
                     );
+                    if let Some(reason) = finding["ready"]["reason"].as_str() {
+                        println!("      reason: {reason}");
+                    }
                 }
             }
             if result["scope"].as_str() == Some("requester") {

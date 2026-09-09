@@ -364,6 +364,7 @@ fn payload_shape_compiles(work_id: &str, run_id: &str, estate: &str) -> ClaimPay
         },
         kind: ClaimKind::Done,
         artifacts: Default::default(),
+        outputs: Default::default(),
     }
 }
 

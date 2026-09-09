@@ -1,0 +1,20 @@
+{
+  "id": "outputs-two-stage",
+  "waypoints": [
+    {
+      "id": "outputs-two-stage/survey",
+      "kind": "Actor",
+      "intent": "survey the source and return survey.md",
+      "declared_outputs": [{"name": "survey.md", "required": true}],
+      "boundary": []
+    },
+    {
+      "id": "outputs-two-stage/change",
+      "kind": "Actor",
+      "intent": "read the survey and change src/lib.rs",
+      "declared_outputs": [{"name": "change.md", "required": true}],
+      "boundary": ["src/**", "change.md"],
+      "orient": {"question": "What did the survey conclude about src/lib.rs?", "sources": ["demo"]}
+    }
+  ]
+}

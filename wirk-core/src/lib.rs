@@ -27,6 +27,16 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// P3, ruling 0145: Work-owned declared outputs — the durable, daemon-
+/// derived area a Run's actor writes a declared output into when that
+/// output cannot live in the Run's own checkout (a `Read` execution
+/// binding). Its own module for the same reason `projection` is one: a
+/// self-contained storage contract (name rules, derived addresses,
+/// containment, write-once snapshot) rather than another face of
+/// `Work`/`Run`/`Event`.
+pub mod outputs;
+pub use outputs::ArtifactStore;
+
 /// P3 W-C1: the stage projection — the delivered, immutable, inspectable
 /// context an orienting Waypoint received. Its own module because it is
 /// a self-contained content contract (types, canonical bytes, identity,
@@ -1917,7 +1927,39 @@ pub struct Claim {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRef {
     pub name: String,
+    /// The path the actor named, for a `Worktree` artifact. Empty for a
+    /// `WorkOutputs` one, which carries no caller path at all: the
+    /// daemon derives its address from the bound Work, the bound Run and
+    /// this `name` (ruling 0145, `outputs::staged_path`).
     pub path: String,
+    /// Which of the two places this Claim says the artifact is
+    /// (ruling 0145). `#[serde(default)]`: every pre-0145 Claim named a
+    /// checkout artifact and said nothing, and reads back as exactly
+    /// that.
+    #[serde(default)]
+    pub store: ArtifactStore,
+}
+
+impl ArtifactRef {
+    /// The historical shape: a caller-supplied path in the Run's own
+    /// checkout.
+    pub fn worktree(name: String, path: String) -> Self {
+        ArtifactRef {
+            name,
+            path,
+            store: ArtifactStore::Worktree,
+        }
+    }
+
+    /// A declared output in this Work's managed output area, addressed
+    /// by name alone.
+    pub fn managed(name: String) -> Self {
+        ArtifactRef {
+            name,
+            path: String::new(),
+            store: ArtifactStore::WorkOutputs,
+        }
+    }
 }
 
 /// W-A correction (F3): one artifact as it actually validated —
@@ -1932,10 +1974,21 @@ pub struct ArtifactRef {
 pub struct ArtifactReceipt {
     pub name: String,
     /// Worktree-relative where the join resolved inside the Run's
-    /// checkout, otherwise the claimed path verbatim.
+    /// checkout, otherwise the claimed path verbatim — for a `Worktree`
+    /// receipt. For a `WorkOutputs` one (ruling 0145) it is
+    /// `claims/<claim>/<name>` relative to `works/<work>/outputs/`,
+    /// which is the daemon's own derived address and never a caller
+    /// string.
     pub path: String,
     /// Lowercase hex sha256 of the file's bytes at validation.
     pub digest: String,
+    /// Which root `path` is relative to (ruling 0145). Explicit, because
+    /// a permissive `String` does not make a consumer support a second
+    /// namespace: every consumer that resolves a receipt reads this to
+    /// decide which root to join against, and one that does not
+    /// understand the answer refuses rather than resolving against the
+    /// wrong one.
+    pub store: ArtifactStore,
 }
 
 /// A pre-correction record carried the artifact *name* alone
@@ -1960,21 +2013,50 @@ impl<'de> Deserialize<'de> for ArtifactReceipt {
                 name: String,
                 path: String,
                 digest: String,
+                /// Ruling 0145. Absent on every pre-0145 record, which
+                /// had exactly one root and named none — so the default
+                /// is `Worktree` and a historical journal resolves at
+                /// the same path, with the same digest and the same
+                /// availability as before this field existed.
+                #[serde(default)]
+                store: ArtifactStore,
             },
             NameOnly(String),
         }
         Ok(match Wire::deserialize(deserializer)? {
-            Wire::Recorded { name, path, digest } => ArtifactReceipt { name, path, digest },
+            Wire::Recorded {
+                name,
+                path,
+                digest,
+                store,
+            } => ArtifactReceipt {
+                name,
+                path,
+                digest,
+                store,
+            },
             Wire::NameOnly(name) => ArtifactReceipt {
                 name,
                 path: String::new(),
                 digest: String::new(),
+                store: ArtifactStore::Worktree,
             },
         })
     }
 }
 
 impl ArtifactReceipt {
+    /// The historical shape: an artifact validated in the Run's own
+    /// checkout. Every call site that predates ruling 0145 means this.
+    pub fn worktree(name: String, path: String, digest: String) -> Self {
+        ArtifactReceipt {
+            name,
+            path,
+            digest,
+            store: ArtifactStore::Worktree,
+        }
+    }
+
     /// The sha256 of `path`'s bytes, or `None` when the file cannot be
     /// read at all (removed, replaced by a directory, unreadable) —
     /// which is the "explicit unavailable" answer, never a silent pass.

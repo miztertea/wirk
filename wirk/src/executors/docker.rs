@@ -233,6 +233,10 @@ impl DockerExecutor {
             triple,
             kind: ClaimKind::Done,
             artifacts: artifacts.into_iter().map(|a| (a.name, a.path)).collect(),
+            // A Deterministic executor's declared outputs are files it
+            // wrote in its own `cwd`, a checkout it holds Write on. It
+            // never reaches for the managed output area (ruling 0145).
+            outputs: Default::default(),
         };
         match client::call(&pointer.socket, &Request::claim(payload)) {
             Ok(Reply::Ok { .. }) => Ok(()),
@@ -413,9 +417,11 @@ impl DockerExecutor {
                 .expected_artifacts
                 .0
                 .iter()
-                .map(|spec| ArtifactRef {
-                    name: spec.name.clone(),
-                    path: state.cwd.join(&spec.name).display().to_string(),
+                .map(|spec| {
+                    ArtifactRef::worktree(
+                        spec.name.clone(),
+                        state.cwd.join(&spec.name).display().to_string(),
+                    )
                 })
                 .collect();
             let triple = ExecutionTriple {

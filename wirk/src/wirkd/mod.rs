@@ -43,7 +43,7 @@
 // cascades to `client`/`server` as this module's own descendants).
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,13 @@ pub enum Verb {
     /// there is deliberately no surface on which one Work asks for
     /// another's delivered context.
     WorldShow,
+    /// `wirk output` (ruling 0145): where this Run's actor writes its
+    /// declared outputs, and which of them are staged right now. Same
+    /// triple-only door as `WorldShow`: read-only, mints nothing,
+    /// appends nothing, and names no Work or Run, so it can only ever
+    /// answer for the caller's own bound Run. The daemon derives the
+    /// storage; the caller never supplies a path.
+    RunOutputs,
     /// `wirk world expand` (W-C3): the actor of the current Run adds a
     /// revision to the context it was delivered. Same triple-only door
     /// as `WorldShow` — nothing on this surface names a Work, a Run or a
@@ -411,6 +418,15 @@ impl Request {
         }
     }
 
+    /// `wirk output`'s request (ruling 0145): the injected triple, and
+    /// nothing else.
+    pub fn run_outputs(payload: RunOutputsPayload) -> Self {
+        Request {
+            verb: Verb::RunOutputs,
+            payload: serde_json::to_value(payload).expect("RunOutputsPayload always serializes"),
+        }
+    }
+
     pub fn work_obligations(payload: WorkObligationsPayload) -> Self {
         Request {
             verb: Verb::WorkObligations,
@@ -494,6 +510,16 @@ pub struct ClaimPayload {
     pub triple: ExecutionTriple,
     pub kind: ClaimKind,
     pub artifacts: BTreeMap<String, String>,
+    /// Ruling 0145: declared outputs claimed from this Work's own
+    /// managed output area, **by name only**. Deliberately a separate
+    /// field rather than a reserved spelling inside `artifacts`: a
+    /// managed output carries no caller path at all — wirkd derives its
+    /// address from the bound Work, the bound Run and this name — so
+    /// there is no path for a caller to supply, and no string for a
+    /// consumer to have to interpret. `#[serde(default)]`: a pre-0145
+    /// client sends none and means none.
+    #[serde(default)]
+    pub outputs: BTreeSet<String>,
 }
 
 /// `status`'s payload (transport.md §2): the `Work` to report on.
@@ -1091,6 +1117,16 @@ pub struct WorldShowPayload {
     /// always asked: "what is my context now".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+}
+
+/// `wirk output`'s payload (ruling 0145): the injected execution triple
+/// and nothing else, for exactly `WorldShowPayload`'s reason — the Work
+/// and the Run are resolved from the triple the daemon itself injected,
+/// so there is no surface on which one Work asks where another's outputs
+/// live.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunOutputsPayload {
+    pub triple: wirk_core::ExecutionTriple,
 }
 
 /// `world expand`'s request (W-C3): the injected triple, plus what the

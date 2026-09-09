@@ -455,10 +455,10 @@ fn done_claim_with_required_artifact_present_is_validated() {
         id: ClaimId("claim-1".to_string()),
         run: RunId("run-1".to_string()),
         triple: triple("run-1"),
-        artifacts: vec![wirk_core::ArtifactRef {
-            name: "report.md".to_string(),
-            path: "report.md".to_string(),
-        }],
+        artifacts: vec![wirk_core::ArtifactRef::worktree(
+            "report.md".to_string(),
+            "report.md".to_string(),
+        )],
         kind: ClaimKind::Done,
     };
     let verdict = wirk_core::validate_claim(&waypoint, &run, &claim);

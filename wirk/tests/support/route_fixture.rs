@@ -43,6 +43,14 @@ fn fixture_text(name: &str) -> &'static str {
         }
         "wa_grandchild" => include_str!("../fixtures/routes/wa_grandchild.json"),
         "wa_simple_leaf" => include_str!("../fixtures/routes/wa_simple_leaf.json"),
+        // Ruling 0145: the read-only reviewer that must return a
+        // declared report, and the container that requires it as a
+        // child role — the shape the observed blocker was found in.
+        "outputs_read_reviewer" => include_str!("../fixtures/routes/outputs_read_reviewer.json"),
+        "outputs_container_reviewer_role" => {
+            include_str!("../fixtures/routes/outputs_container_reviewer_role.json")
+        }
+        "outputs_two_stage" => include_str!("../fixtures/routes/outputs_two_stage.json"),
         "wa_reopen" => include_str!("../fixtures/routes/wa_reopen.json"),
         "wa_reopen_deep" => include_str!("../fixtures/routes/wa_reopen_deep.json"),
         "wa_reopen_roles" => include_str!("../fixtures/routes/wa_reopen_roles.json"),

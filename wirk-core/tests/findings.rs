@@ -49,11 +49,11 @@ fn obliged_leaf(id: &str) -> WaypointDefinition {
 /// The receipt an obliged leaf's own Claim carries: the obligated
 /// output, with a real recorded content identity.
 fn receipts() -> Vec<ArtifactReceipt> {
-    vec![ArtifactReceipt {
-        name: "out.md".to_string(),
-        path: "out.md".to_string(),
-        digest: "2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c5254348060".to_string(),
-    }]
+    vec![ArtifactReceipt::worktree(
+        "out.md".to_string(),
+        "out.md".to_string(),
+        "2c8b08da5ce60398e1f19af0e5dccc744df274b826abe585eaba68c5254348060".to_string(),
+    )]
 }
 
 /// The `basis` a settled check must carry for `obliged_leaf` opened
@@ -625,21 +625,21 @@ fn deterministic_verified_readiness_refuses_a_receipt_that_misses_the_obligated_
         "an empty receipt set never discharges a named obligated output"
     );
     assert!(
-        fold(&case(vec![ArtifactReceipt {
-            name: "elsewhere.md".to_string(),
-            path: "elsewhere.md".to_string(),
-            digest: "a".repeat(64),
-        }]))
+        fold(&case(vec![ArtifactReceipt::worktree(
+            "elsewhere.md".to_string(),
+            "elsewhere.md".to_string(),
+            "a".repeat(64),
+        )]))
         .settlement_ready
         .is_empty(),
         "a receipt for a different artifact never discharges this obligation"
     );
     assert!(
-        fold(&case(vec![ArtifactReceipt {
-            name: "out.md".to_string(),
-            path: String::new(),
-            digest: String::new(),
-        }]))
+        fold(&case(vec![ArtifactReceipt::worktree(
+            "out.md".to_string(),
+            String::new(),
+            String::new(),
+        )]))
         .settlement_ready
         .is_empty(),
         "a receipt with no recorded content identity is not an evidence basis"

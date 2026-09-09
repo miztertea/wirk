@@ -573,6 +573,7 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
                 },
                 kind: ClaimKind::Done,
                 artifacts: BTreeMap::from([("report.md".to_string(), "report.md".to_string())]),
+                outputs: Default::default(),
             }),
         )
         .expect("claim call reaches wirkd");

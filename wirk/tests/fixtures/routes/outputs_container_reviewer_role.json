@@ -1,0 +1,19 @@
+{
+  "id": "outputs-container-reviewer-role",
+  "waypoints": [
+    {
+      "id": "outer",
+      "kind": "Container",
+      "declared_outputs": [{"name": "a.md", "required": true}],
+      "required_child_outcomes": [{"role": "reviewer", "required": true}],
+      "leaves": [
+        {
+          "id": "outer/leaf-a",
+          "kind": "Deterministic",
+          "command": ["sh", "-c", "echo a > a.md"],
+          "declared_outputs": [{"name": "a.md", "required": true}]
+        }
+      ]
+    }
+  ]
+}

@@ -490,21 +490,21 @@ fn container_closes_with_leaf_receipts_and_advances_to_next_waypoint() {
                     waypoint: WaypointId("outer/leaf-a".to_string()),
                     run: RunId("r1".to_string()),
                     claim: ClaimId("claim-1".to_string()),
-                    artifacts: vec![ArtifactReceipt {
-                        name: "a.md".to_string(),
-                        path: "a.md".to_string(),
-                        digest: "sha-of-a.md".to_string(),
-                    }],
+                    artifacts: vec![ArtifactReceipt::worktree(
+                        "a.md".to_string(),
+                        "a.md".to_string(),
+                        "sha-of-a.md".to_string(),
+                    )],
                 },
                 OutcomeReceipt::Leaf {
                     waypoint: WaypointId("outer/leaf-b".to_string()),
                     run: RunId("r2".to_string()),
                     claim: ClaimId("claim-1".to_string()),
-                    artifacts: vec![ArtifactReceipt {
-                        name: "b.md".to_string(),
-                        path: "b.md".to_string(),
-                        digest: "sha-of-b.md".to_string(),
-                    }],
+                    artifacts: vec![ArtifactReceipt::worktree(
+                        "b.md".to_string(),
+                        "b.md".to_string(),
+                        "sha-of-b.md".to_string(),
+                    )],
                 },
             ],
         },
@@ -567,11 +567,11 @@ fn grandchild_container_closure_completes_the_work() {
                     waypoint: WaypointId("outer/inner/leaf".to_string()),
                     run: RunId("r2".to_string()),
                     claim: ClaimId("claim-1".to_string()),
-                    artifacts: vec![ArtifactReceipt {
-                        name: "b.md".to_string(),
-                        path: "b.md".to_string(),
-                        digest: "sha-of-b.md".to_string(),
-                    }],
+                    artifacts: vec![ArtifactReceipt::worktree(
+                        "b.md".to_string(),
+                        "b.md".to_string(),
+                        "sha-of-b.md".to_string(),
+                    )],
                 }],
             },
         ),
@@ -588,11 +588,11 @@ fn grandchild_container_closure_completes_the_work() {
                         waypoint: WaypointId("outer/lead".to_string()),
                         run: RunId("r1".to_string()),
                         claim: ClaimId("claim-1".to_string()),
-                        artifacts: vec![ArtifactReceipt {
-                            name: "a.md".to_string(),
-                            path: "a.md".to_string(),
-                            digest: "sha-of-a.md".to_string(),
-                        }],
+                        artifacts: vec![ArtifactReceipt::worktree(
+                            "a.md".to_string(),
+                            "a.md".to_string(),
+                            "sha-of-a.md".to_string(),
+                        )],
                     },
                     OutcomeReceipt::Container {
                         waypoint: WaypointId("outer/inner".to_string()),
@@ -600,11 +600,11 @@ fn grandchild_container_closure_completes_the_work() {
                             waypoint: WaypointId("outer/inner/leaf".to_string()),
                             run: RunId("r2".to_string()),
                             claim: ClaimId("claim-1".to_string()),
-                            artifacts: vec![ArtifactReceipt {
-                                name: "b.md".to_string(),
-                                path: "b.md".to_string(),
-                                digest: "sha-of-b.md".to_string(),
-                            }],
+                            artifacts: vec![ArtifactReceipt::worktree(
+                                "b.md".to_string(),
+                                "b.md".to_string(),
+                                "sha-of-b.md".to_string(),
+                            )],
                         }],
                     },
                 ],
@@ -716,4 +716,50 @@ fn a_pre_correction_journal_line_still_deserializes_and_folds() {
         panic!("expected StageHeld, got {:?}", held.kind);
     };
     assert_eq!(*attempt, 1);
+}
+
+/// Ruling 0145 (historical compatibility): a `ClaimRecorded` written
+/// before the managed-output store existed carries `{name, path,
+/// digest}` and no `store` at all. It must read back as exactly the
+/// receipt it always was — a `Worktree` one, at the same path, with the
+/// same digest — so every consumer resolves it against the same root as
+/// before and no historical record silently changes meaning. The
+/// name-only shape from the pre-correction era is unaffected too.
+#[test]
+fn a_receipt_written_before_the_managed_store_reads_as_a_worktree_receipt() {
+    let recorded: Event = serde_json::from_str(
+        r#"{"id":"e1","work":"w1","run":"r1","at":1,"kind":{"kind":"ClaimRecorded",
+            "claim":"c1","claim_kind":"Done","verdict":"Validated",
+            "artifacts":[{"name":"report.md","path":"docs/report.md","digest":"ab12"},
+                         "legacy-name-only.md"]}}"#,
+    )
+    .expect("a pre-0145 ClaimRecorded still deserializes");
+    let EventKind::ClaimRecorded { artifacts, .. } = &recorded.kind else {
+        panic!("expected ClaimRecorded, got {:?}", recorded.kind);
+    };
+    assert_eq!(artifacts[0].name, "report.md");
+    assert_eq!(artifacts[0].path, "docs/report.md");
+    assert_eq!(artifacts[0].digest, "ab12");
+    assert_eq!(
+        artifacts[0].store,
+        wirk_core::ArtifactStore::Worktree,
+        "a record that names no store is the one store that existed when it was written"
+    );
+    assert_eq!(artifacts[1].name, "legacy-name-only.md");
+    assert_eq!(artifacts[1].store, wirk_core::ArtifactStore::Worktree);
+    assert_eq!(artifacts[1].digest, "");
+
+    // And the new shape round-trips through the same wire.
+    let managed: Event = serde_json::from_str(
+        r#"{"id":"e2","work":"w1","run":"r1","at":2,"kind":{"kind":"ClaimRecorded",
+            "claim":"c2","claim_kind":"Done","verdict":"Validated",
+            "artifacts":[{"name":"report.md","path":"claims/c2/report.md",
+                          "digest":"cd34","store":"work_outputs"}]}}"#,
+    )
+    .expect("a managed ClaimRecorded deserializes");
+    let EventKind::ClaimRecorded { artifacts, .. } = &managed.kind else {
+        panic!("expected ClaimRecorded");
+    };
+    assert_eq!(artifacts[0].store, wirk_core::ArtifactStore::WorkOutputs);
+    assert_eq!(artifacts[0].path, "claims/c2/report.md");
 }
