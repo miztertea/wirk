@@ -164,15 +164,23 @@ fn content(bound: Vec<EvidenceItem>) -> ProjectionContent {
         coverage: EvidenceCoverage::Complete,
         truncated: false,
         expansion: None,
+        consulted: Vec::new(),
+        findings_index: wirk_core::FindingsIndexNote {
+            state: wirk_core::FindingsIndexState::Synchronized,
+            complete: true,
+        },
     }
 }
 
-/// The v2 content inside a file under test, mutably: every projection
-/// this build writes is v2, and a test that edits one is editing that.
+/// The current content inside a file under test, mutably: every
+/// projection this build writes is v3, and a test that edits one is
+/// editing that.
 fn v2_mut(file: &mut ProjectionFile) -> &mut ProjectionContent {
     match &mut file.content {
-        wirk_core::DeliveredContent::V2(content) => content,
-        wirk_core::DeliveredContent::V1(_) => panic!("this build writes v2 content"),
+        wirk_core::DeliveredContent::V3(content) => content,
+        wirk_core::DeliveredContent::V2(_) | wirk_core::DeliveredContent::V1(_) => {
+            panic!("this build writes v3 content")
+        }
     }
 }
 
@@ -199,7 +207,7 @@ fn receipt_of(observation: &str, observed_at: u64) -> ObservationReceipt {
 
 fn file(content: ProjectionContent, observation: &str, observed_at: u64) -> ProjectionFile {
     ProjectionFile {
-        content: wirk_core::DeliveredContent::V2(Box::new(content)),
+        content: wirk_core::DeliveredContent::V3(Box::new(content)),
         receipt: receipt_of(observation, observed_at),
     }
 }
@@ -687,7 +695,10 @@ const V1_DOCUMENT: &str = r#"{"content":{"format":"wirk.projection/v1","compilat
 fn a_v1_projection_still_reads_as_v1_after_the_format_advanced() {
     let parsed: ProjectionFile = serde_json::from_str(V1_DOCUMENT).expect("the v1 document parses");
     let wirk_core::DeliveredContent::V1(v1) = &parsed.content else {
-        panic!("a v1 document must not decode as v2: {:?}", parsed.content);
+        panic!(
+            "a v1 document must not decode as a later shape: {:?}",
+            parsed.content
+        );
     };
     assert_eq!(parsed.content.format(), wirk_core::PROJECTION_FORMAT_V1);
     assert_eq!(v1.compilation_policy, wirk_core::ASSEMBLY_POLICY_V1);
@@ -760,8 +771,129 @@ fn a_v1_projection_still_reads_as_v1_after_the_format_advanced() {
         coverage: v1.coverage,
         truncated: false,
         expansion: None,
+        consulted: Vec::new(),
+        findings_index: wirk_core::FindingsIndexNote::unobserved(),
     };
     assert_ne!(as_v2.projection_id(), v1.projection_id());
+}
+
+/// The **actual historical** v2 document: one real native C3 Run's own
+/// delivered projection, harvested verbatim out of the estate that Run
+/// wrote it into (`.wirk/native-c3-use`, ruling 0135's trial), together
+/// with the exact `ProjectionId` and receipt digest that Run's journal
+/// recorded for it.
+///
+/// A hand-written lookalike would prove nothing here: what has to hold is
+/// that a document a *shipped binary* wrote still decodes under the
+/// shape that wrote it and still re-hashes to the id a real journal is
+/// carrying today. This is why `ProjectionContentV2` is frozen — if
+/// `consulted` or `findings_index` were added to it instead, every one of
+/// these files would re-hash to something its own journal has never
+/// recorded, and every native Run of the C3 trial would read
+/// `content-mismatch`.
+const V2_DOCUMENT: &str = include_str!("fixtures/native-c3-projection-v2.json");
+
+/// The reference `work-18d3618230ce24ef-0`'s journal carries for it, as
+/// literals — read out of that journal, not recomputed here.
+const V2_OBSERVATION: &str = "obs-18d361a1bd2a4fb9-2";
+const V2_ID: &str = "283bef8256916c6cdeccea04bd4e0c53a3acd8f0cd1d2ff1cedead4b4e25e857";
+const V2_RECEIPT: &str = "c95cf65b73e89e6e5e6c42b81908fa0406c629418c4c37684aafdbf09583ac55";
+
+#[test]
+fn a_native_c3_projection_still_reads_as_v2_after_the_format_advanced() {
+    let parsed: ProjectionFile = serde_json::from_str(V2_DOCUMENT).expect("the v2 document parses");
+    let wirk_core::DeliveredContent::V2(v2) = &parsed.content else {
+        panic!(
+            "a v2 document must not decode as a later shape: {:?}",
+            parsed.content
+        );
+    };
+    assert_eq!(parsed.content.format(), wirk_core::PROJECTION_FORMAT_V2);
+    assert_eq!(v2.compilation_policy, wirk_core::ASSEMBLY_POLICY_V2);
+    assert_ne!(
+        wirk_core::PROJECTION_FORMAT,
+        wirk_core::PROJECTION_FORMAT_V2,
+        "this test is vacuous unless the format actually advanced"
+    );
+
+    // The canonical bytes are the document's own bytes: nothing was
+    // added, dropped or reordered by decoding it.
+    assert_eq!(
+        String::from_utf8(serde_json::to_vec(&parsed).unwrap()).unwrap(),
+        V2_DOCUMENT,
+        "decoding a v2 file must not change its canonical bytes"
+    );
+    assert_eq!(v2.projection_id(), ProjectionId(V2_ID.to_string()));
+    assert_eq!(parsed.receipt.digest(), V2_RECEIPT);
+
+    // And it delivers, against the reference that Run's journal carries.
+    let dir = estate();
+    let reference = EvidenceProjectionRef {
+        observation: ObservationId(V2_OBSERVATION.to_string()),
+        projection: ProjectionId(V2_ID.to_string()),
+        revision: 0,
+        format: wirk_core::PROJECTION_FORMAT_V2.to_string(),
+        receipt: V2_RECEIPT.to_string(),
+    };
+    let path = wirk_core::projections_dir(dir.path(), &WorkId("work-1".to_string()));
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::write(path.join(format!("{V2_OBSERVATION}.json")), V2_DOCUMENT).unwrap();
+    let read =
+        ProjectionFile::read_referenced(dir.path(), &WorkId("work-1".to_string()), &reference)
+            .expect("a native C3 projection still delivers");
+    assert_eq!(read, parsed);
+
+    // The same delivered context in the *current* shape is a different
+    // id, under a different domain tag — which is the whole reason the
+    // two may not share one hasher or one struct.
+    let lifted = v2.lift();
+    assert_ne!(lifted.projection_id(), v2.projection_id());
+    // Lifting says what that revision actually observed, and does not
+    // invent a health state for a document that carries none.
+    assert!(lifted.consulted.is_empty());
+    assert_eq!(
+        lifted.findings_index,
+        wirk_core::FindingsIndexNote::unobserved()
+    );
+    // Everything else survives it, so an expansion of a pre-W-C4
+    // revision expands the context that revision really delivered.
+    assert_eq!(lifted.bound, v2.bound);
+    assert_eq!(lifted.referenced, v2.referenced);
+    assert_eq!(lifted.reachable, v2.reachable);
+    assert_eq!(lifted.generations, v2.generations);
+    assert_eq!(lifted.assumptions, v2.assumptions);
+}
+
+/// W-C4's own compatibility half, the mirror of the W-C3 test below:
+/// adding two *required* fields moves the id of everything written from
+/// here on, which is exactly why the tag advanced — and it must not move
+/// the id of anything already delivered.
+#[test]
+fn the_two_consulted_fields_are_required_and_never_reach_an_older_document() {
+    let current = content(vec![item("coord-a")]);
+    let document = serde_json::to_string(&current).expect("serialize");
+    assert!(
+        document.contains("\"consulted\":") && document.contains("\"findings_index\":"),
+        "both fields are required and are on the wire of every document: {document}"
+    );
+
+    // A v3 document does not decode as v2, and a v2 document does not
+    // decode as v3: `deny_unknown_fields` on both sides, so the untagged
+    // order below cannot silently prefer one.
+    assert!(
+        serde_json::from_str::<wirk_core::ProjectionContentV2>(&document).is_err(),
+        "a v3 document carries fields the frozen v2 shape denies"
+    );
+    let historical: ProjectionFile =
+        serde_json::from_str(V2_DOCUMENT).expect("the v2 document parses");
+    let wirk_core::DeliveredContent::V2(v2) = &historical.content else {
+        panic!("the historical fixture is v2");
+    };
+    let v2_document = serde_json::to_string(&**v2).expect("serialize");
+    assert!(
+        serde_json::from_str::<ProjectionContent>(&v2_document).is_err(),
+        "a v2 document lacks fields the current shape requires"
+    );
 }
 
 /// W-C3, the compatibility property the whole design rests on: adding

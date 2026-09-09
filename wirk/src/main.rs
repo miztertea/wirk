@@ -716,6 +716,75 @@ fn print_world_show(result: &serde_json::Value) {
             );
         }
     }
+    // The recorded learning this stage was handed, and the state of the
+    // index the published half was read from — printed together and in
+    // that order, because "nothing was consulted" means one thing beside
+    // a synchronized index and a completely different one beside an
+    // unreadable index, and a reader must not have to hold the second
+    // fact in their head to interpret the first.
+    if let Some(note) = projection.get("findings_index") {
+        println!(
+            "findings index {} (complete {})",
+            string(note, "state"),
+            note.get("complete")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        );
+    }
+    if let Some(items) = projection.get("consulted").and_then(|v| v.as_array()) {
+        for item in items {
+            println!(
+                "consulted [{}] {} — {}",
+                string(item, "origin"),
+                string(item, "id"),
+                string(item, "claim")
+            );
+            println!(
+                "      status {} generations {} — {}",
+                item.get("status")
+                    .map(|status| string(status, "state"))
+                    .unwrap_or_default(),
+                string(item, "generation_relation"),
+                string(item, "reason")
+            );
+            // Every recorded evidence entry this stage was not given, as
+            // the two counts they are: one refused by this requester's
+            // own scope, one outside what this assembly captured. No
+            // alias, path, coordinate or generation travels in either.
+            let count = |key: &str| -> u64 {
+                item.get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            if count("evidence_withheld") > 0 || count("evidence_not_delivered") > 0 {
+                println!(
+                    "      {} recorded evidence entr(ies) withheld from this requester, {} not \
+                     delivered here",
+                    count("evidence_withheld"),
+                    count("evidence_not_delivered")
+                );
+            }
+            for evidence in item
+                .get("evidence")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                println!(
+                    "      resolve its evidence with: wirk atlas resolve --coordinate {}",
+                    string(evidence, "coordinate")
+                );
+            }
+            for contradiction in item
+                .get("contradictions")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                println!("      contradicts {}", string(contradiction, "text"));
+            }
+        }
+    }
     for (label, key) in [("assumption", "assumptions"), ("unknown", "unknowns")] {
         let Some(items) = projection.get(key).and_then(|v| v.as_array()) else {
             continue;

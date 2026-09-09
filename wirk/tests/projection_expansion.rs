@@ -1858,8 +1858,8 @@ fn a_repeated_earlier_scope_is_still_reported_as_this_requests_own_scope() {
 /// A statement carried forward into later revisions never tells one of
 /// them that it is revision 0.
 ///
-/// The initial assembly's closing assumption says what is *not* in the
-/// document and where more can be got, and every expansion clones the
+/// The initial assembly's closing assumption says what this document
+/// holds and where more can be got, and every expansion clones the
 /// parent's assumptions verbatim — that is the whole point of a chain,
 /// and it is why the sentence has to be true of every revision that will
 /// carry it, not only of the one that wrote it. It was not: it asserted
@@ -1870,10 +1870,16 @@ fn a_repeated_earlier_scope_is_still_reported_as_this_requests_own_scope() {
 ///
 /// Both revisions are checked, because either half alone is passable by
 /// the wrong fix: dropping the sentence from expansions would lose a
-/// true disclosure the actor needs, and rewriting it per revision would
-/// mean editing a statement the chain is supposed to carry unchanged.
-/// What is asserted is that one and the same sentence is present, and
-/// honest, in both.
+/// true disclosure the actor needs, and a per-revision rewrite that says
+/// a different thing about the *same* observation would mean two
+/// revisions of one chain disagreeing about what was consulted.
+///
+/// W-C4 changed what the sentence says and not this property. It now
+/// states what was consulted and what the findings index backing it
+/// actually was — a per-revision observation, so each revision authors
+/// its own — and where two consecutive revisions observed the same
+/// thing, the chain still carries exactly one copy of one sentence,
+/// which is what this asserts.
 #[test]
 fn a_carried_assumption_never_tells_a_later_revision_it_is_revision_zero() {
     let mut estate = Estate::new();
@@ -1883,7 +1889,7 @@ fn a_carried_assumption_never_tells_a_later_revision_it_is_revision_zero() {
         let mut found: Vec<String> = statements(projection, "assumptions")
             .into_iter()
             .map(|(text, _)| text)
-            .filter(|text| text.contains("consulted estate findings"))
+            .filter(|text| text.contains("were consulted"))
             .collect();
         assert_eq!(
             found.len(),
@@ -1919,10 +1925,14 @@ fn a_carried_assumption_never_tells_a_later_revision_it_is_revision_zero() {
         "revision 1 of this Run's chain must not be told it is revision 0: {at_one}"
     );
     assert!(
-        at_one.contains(
-            "consulted estate findings and the findings-index health note are not assembled here"
-        ) && at_one.contains("is not evidence that the estate holds none"),
+        at_one.contains("record(s) of this Work's own journal")
+            && at_one.contains("settled estate publication(s) were consulted")
+            && at_one.contains("nothing here asserts, endorses or invalidates any of it"),
         "the disclosure the sentence exists to make survives the correction: {at_one}"
+    );
+    assert!(
+        !at_one.contains("are not assembled here"),
+        "and it must not still claim the fields it now delivers are absent: {at_one}"
     );
 
     // Revision 0 is still readable, and still says the same true thing:

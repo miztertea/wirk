@@ -50,10 +50,20 @@
 //! Scope, honestly: W-C1 assembles `bound` from literal references
 //! resolved out of the authored question and intent; W-C2 adds
 //! governance edges, prior-stage artifacts, ranked `referenced`,
-//! `reachable` handles and the retrieval note; W-C3 adds expansion.
-//! Consulted findings and the index-health note have no producer here,
-//! so they have no field here either (ruling 0124: "no unreachable event
-//! kinds or empty future schema pretending implemented semantics").
+//! `reachable` handles and the retrieval note; W-C3 adds expansion;
+//! W-C4 adds `consulted` — this Work's own recorded findings and the
+//! estate's genuinely settled EstateLocal publications — and
+//! `findings_index`, the actual scoped health of the index those
+//! publications were read from, frozen into the same document.
+//!
+//! Both are *required* fields: unlike `expansion`, which is legitimately
+//! absent from a revision that expands nothing, every assembly from here
+//! on either consults or says why it could not, so there is no honest
+//! document in which they are missing. That is why the format tag
+//! advances (`PROJECTION_FORMAT`) and `ProjectionContentV2` below is
+//! frozen exactly as C3 wrote it (ruling 0124: "no unreachable event
+//! kinds or empty future schema pretending implemented semantics" — this
+//! schema is implemented, and nothing here is a slot for a later wave).
 
 use crate::WaypointId;
 use serde::{Deserialize, Serialize};
@@ -71,12 +81,21 @@ use thiserror::Error;
 ///
 /// W-C3 adds `expansion` and deliberately does **not** advance the tag,
 /// because it is an optional field that is *absent from the document*
-/// unless there is one: a revision-0 projection written by this binary
+/// unless there is one: a revision-0 projection written by that binary
 /// serializes to the same bytes a C2 binary wrote, and re-hashes to the
 /// `ProjectionId` its journal already recorded. The rule is the field's
 /// shape, not the wave number — an added field advances the tag exactly
 /// when it moves the bytes of a document that could already exist.
-pub const PROJECTION_FORMAT: &str = "wirk.projection/v2";
+///
+/// W-C4 adds `consulted` and `findings_index`, which are *required* on
+/// every document this binary writes, so it does advance the tag, by
+/// exactly the same rule.
+pub const PROJECTION_FORMAT: &str = "wirk.projection/v3";
+
+/// W-C2/C3's format, still read. `ProjectionContentV2` below is frozen
+/// for the same reason `ProjectionContentV1` is: its canonical bytes are
+/// the bytes whose sha256 a C2- or C3-era journal recorded.
+pub const PROJECTION_FORMAT_V2: &str = "wirk.projection/v2";
 
 /// W-C1's format, still read. `ProjectionContentV1` below is frozen: it
 /// is the exact field set C1 wrote, so a file written then still
@@ -90,7 +109,10 @@ pub const PROJECTION_FORMAT_V1: &str = "wirk.projection/v1";
 /// content so a delivered projection says which policy produced it,
 /// rather than leaving a reader to infer it from which fields are
 /// populated.
-pub const ASSEMBLY_POLICY: &str = "wirk.assembly/v2";
+pub const ASSEMBLY_POLICY: &str = "wirk.assembly/v3";
+
+/// W-C2/C3's selector set, still named by every projection they wrote.
+pub const ASSEMBLY_POLICY_V2: &str = "wirk.assembly/v2";
 
 /// W-C1's selector set, still named by every projection C1 wrote.
 pub const ASSEMBLY_POLICY_V1: &str = "wirk.assembly/v1";
@@ -347,6 +369,12 @@ pub enum UnavailableReason {
     /// its endpoints or evidence coordinates no longer resolves at the
     /// generation the edge was admitted against.
     GoverningRecordUnresolvable,
+    /// The estate's findings index could not be read at all at this
+    /// assembly, so the consulted set is whatever this Work's own journal
+    /// holds and nothing else. Named as the one coordinate an actor can
+    /// act on — never a filesystem path, and never the error's own text,
+    /// which carries a path no scope admitted (BUILD.md §9).
+    FindingsIndexUnreadable,
 }
 
 /// What was left out, and why. Never a coordinate the requester's scope
@@ -414,6 +442,22 @@ pub enum CoverageReason {
     /// does. It is not a judgement about whether the relationship holds
     /// (ruling 0128 F1).
     GovernanceOutsideCapturedEditions,
+    /// The findings index this assembly's consulted set was read from is
+    /// not a projection this estate can attest is complete: it has never
+    /// been reconciled in this daemon, its rows' directory entry is not
+    /// confirmed on disk, it is missing rows the journals hold, or it
+    /// could not be read at all. A parsable index is not proof of
+    /// synchronization (ruling 0124), and a missing one is not an empty
+    /// estate (ruling 0137) — so the projection says its consulted set
+    /// may be short, rather than presenting it as everything the estate
+    /// holds.
+    IndexCannotAttestCompleteness,
+    /// The findings index could not be read at all at this assembly, so
+    /// the consulted set is whatever this Work's own journal holds and
+    /// nothing else. A closed reason: the read error's own text carries
+    /// a filesystem path no scope admitted and never travels (BUILD.md
+    /// §9).
+    FindingsIndexUnreadable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,6 +602,203 @@ pub struct ExpansionRecord {
     pub already_bound: usize,
 }
 
+/// Where one consulted record came from, and it is the whole set of
+/// routes: this Work's own journal, or a genuinely settled EstateLocal
+/// publication reached through the estate publication route. There is no
+/// third variant and no cross-estate one — estate isolation is total and
+/// `Shared` is not a variant at any layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsultedOrigin {
+    OwnWork,
+    EstatePublication,
+}
+
+/// The named record's own settlement standing, as the route that
+/// delivered it reported it. A *receipt fact*, deliberately separate
+/// from the generation relation below and from whether the record's own
+/// evidence still resolves: three different facts, and collapsing any
+/// two of them is how a projection starts deciding what P3 refuses to
+/// decide (ruling 0135).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ConsultedStatus {
+    /// Raised and not settled. The honest state of most of what a Work
+    /// records about itself, and never a defect.
+    Provisional,
+    /// Settled, by the named compiled settlement class.
+    Settled { class: String },
+    /// A later record in the same origin supersedes it. It is still
+    /// delivered: a superseded record is history, not an error.
+    Superseded { by: String },
+}
+
+/// How the generations this record was raised against compare with the
+/// vector this assembly captured. **It states a generation relation and
+/// never a truth value** (BUILD.md §6): a changed generation does not
+/// mean the claim became false, and an unchanged one is not a proof that
+/// it was ever true. P3 records the pair and refuses to collapse it;
+/// deciding is P4 invalidation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationRelation {
+    /// Every generation this record names is one the captured vector
+    /// still names for the same membership.
+    RecordedStillPublished,
+    /// At least one membership this record names is published here at a
+    /// different generation than the one it was recorded against.
+    RecordedSuperseded,
+    /// The record names no generation this assembly captured a
+    /// membership for — including the ordinary case of a record whose
+    /// evidence is journal-side and names no source at all.
+    Unknown,
+}
+
+/// One recorded evidence coordinate of a consulted finding, delivered as
+/// **identity only**: the opaque coordinate an actor can resolve for
+/// themselves, and the exact generation and object it was recorded
+/// against. No bytes are read here and no summary is derived — consulting
+/// a record is not a read-through onto its evidence (BUILD.md §4.1).
+///
+/// An entry reaches this list only if the *current* requester's own
+/// disclosure view admits it and this assembly's own admission step
+/// captured its membership at exactly this generation. Raise-time
+/// admission is frozen provenance and is explicitly not transferable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsultedEvidence {
+    pub coordinate: String,
+    pub generation: String,
+    pub object_id: String,
+}
+
+/// A typed disagreement a consulted record recorded against something
+/// **this projection actually delivered**.
+///
+/// No prose is read, matched or compared: the only thing that makes this
+/// a contradiction is that the record's own `contradicts` list names a
+/// coordinate that is in this projection's `bound` list. It is attributed
+/// to the finding by being carried on it, and it endorses nothing: the
+/// record is not made true by disagreeing, and the bound item is not made
+/// false by being disagreed with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Contradiction {
+    /// The delivered coordinate the record names.
+    pub coordinate: String,
+    pub text: String,
+}
+
+/// One record this stage was handed, from one of the two routes in
+/// `ConsultedOrigin`.
+///
+/// `claim` is the *captioned* sentence the daemon already renders
+/// everywhere else — `recorded claim: <text>, unverified` — and
+/// `claim_verified` is the `false` beside it. The projection carries what
+/// was recorded and never asserts it (BUILD.md §6, acceptance 17).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsultedFinding {
+    pub id: String,
+    pub origin: ConsultedOrigin,
+    /// The Work whose journal holds the record. For an own record this
+    /// Work; for a publication, the producing Work — which the
+    /// publication route has already admitted to this requester whole,
+    /// or the row would not be here at all.
+    pub work: String,
+    pub kind: String,
+    pub claim: String,
+    /// Always `false`. Carried rather than omitted, because a reader
+    /// that has to *infer* that a recorded sentence is unverified is a
+    /// reader that will eventually forget to.
+    pub claim_verified: bool,
+    pub status: ConsultedStatus,
+    /// `(membership id, generation id)` for every source generation this
+    /// record was recorded against, in recorded order.
+    pub recorded_generations: Vec<(String, String)>,
+    /// The generation this assembly captured for each of those same
+    /// memberships. Present so the pair is inspectable rather than
+    /// summarized away by the relation below.
+    pub current_generations: Vec<(String, String)>,
+    pub generation_relation: GenerationRelation,
+    pub evidence: Vec<ConsultedEvidence>,
+    /// Recorded entries the *current* requester's disclosure view
+    /// refuses. A count, and only a count: no id, alias, path,
+    /// generation or coordinate travels in it.
+    pub evidence_withheld: usize,
+    /// Recorded entries this assembly does not deliver as a coordinate —
+    /// a journal or relation reference, an entry recorded unavailable at
+    /// raise time, or one recorded against a membership or generation
+    /// this assembly did not capture. Also a count, for the same reason.
+    pub evidence_not_delivered: usize,
+    pub contradictions: Vec<Contradiction>,
+    pub reason: String,
+}
+
+/// What the estate's findings index was, at this assembly, in the terms
+/// a scoped reader is entitled to.
+///
+/// A 1:1 map of the projection state the daemon's own `IndexHealth`
+/// records and its scoped `atlas findings` surface already renders, plus
+/// the two states that surface cannot have: `Unobserved`, for an
+/// assembly that never got as far as looking, and `Unreadable`, for a
+/// read that failed. **No administrative count, detail or path** —
+/// scoped readers get the projection's state and nothing about the
+/// estate's contents (ruling 0135: "do not expose admin data"; ruling
+/// 0124: "scoped projections must not gain administrative pending row
+/// counts").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingsIndexState {
+    /// This assembly did not observe the index at all — the degraded
+    /// shape, where the estate moved under the assembler on every lap
+    /// and nothing was read. Never "there is nothing there".
+    Unobserved,
+    /// No reconciliation has run in this daemon yet. An index nobody has
+    /// checked is not an index known to be complete.
+    Unreconciled,
+    /// Every row this estate's journals support is in the file.
+    Synchronized,
+    /// The rows are visible to a fresh reader and their directory entry
+    /// is not confirmed on disk.
+    DurabilityUnconfirmed,
+    /// The index is missing rows the journals hold, or its completeness
+    /// cannot be established — including the file that a health record
+    /// was formed over having since gone away (ruling 0137).
+    Behind,
+    /// The index could not be read at all at this assembly.
+    Unreadable,
+}
+
+/// The index note, frozen into this document at assembly and never
+/// retro-corrected: a later query does not change what a delivered
+/// projection said, and an expansion re-observes and records its own note
+/// in its own revision, so a health change is visible as a difference
+/// between two frozen records rather than a silent edit (BUILD.md §9).
+///
+/// Its observation instant is `ObservationReceipt.observed_at` — the one
+/// frozen window this document already carries. There is deliberately no
+/// second timestamp here (ruling 0120).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FindingsIndexNote {
+    pub state: FindingsIndexState,
+    /// Whether the consulted set below may be read as a complete
+    /// projection of the estate's journals. True for `Synchronized` and
+    /// for nothing else — the same single field, with the same meaning,
+    /// that `wirk atlas findings` puts in front of a scoped reader.
+    pub complete: bool,
+}
+
+impl FindingsIndexNote {
+    pub fn unobserved() -> Self {
+        Self {
+            state: FindingsIndexState::Unobserved,
+            complete: false,
+        }
+    }
+}
+
 /// W-C1's delivered context, frozen.
 ///
 /// Not a compatibility shim to be tidied away later: it is the literal
@@ -598,8 +839,13 @@ impl ProjectionContentV1 {
     }
 }
 
-/// The delivered context. This — and only this — is what `ProjectionId`
-/// covers.
+/// W-C2/C3's delivered context, frozen.
+///
+/// Not a compatibility shim: it is the literal definition of what a
+/// `wirk.projection/v2` file means, and its canonical bytes are the
+/// bytes whose sha256 a C2- or C3-era journal recorded. A v3 field goes
+/// in `ProjectionContent` below and nowhere else, for exactly the reason
+/// `ProjectionContentV1` says.
 ///
 /// W-C2 adds the rest of the selector set to it: governance and
 /// prior-stage items inside `bound`, the ranked `referenced` list, the
@@ -609,6 +855,120 @@ impl ProjectionContentV1 {
 /// so the format tag advances to `wirk.projection/v2` and
 /// `ProjectionContentV1` keeps decoding what came before, rather than
 /// this struct quietly re-hashing older files under a newer shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionContentV2 {
+    pub format: String,
+    pub compilation_policy: String,
+    /// sha256 over the journaled `waypoint_defs` this Work reserves
+    /// against, so a projection says which Route edition produced it.
+    pub route_edition: String,
+    pub waypoint: WaypointId,
+    /// 0 for an initial assembly. Expansion (a new revision on the same
+    /// Run) is W-C3; nothing in this wave produces a non-zero value, and
+    /// the field exists because the World hash covers it and a later
+    /// revision must not collide with revision 0.
+    pub revision: u64,
+    pub question: String,
+    /// The captured admitted generation vector, in delivery order:
+    /// `(membership id, generation id)`. Every coordinate in `bound`
+    /// resolves at exactly one of these.
+    pub generations: Vec<(String, String)>,
+    pub publication_revision: u64,
+    pub retrieval: RetrievalNote,
+    pub bound: Vec<EvidenceItem>,
+    /// Ranked hits for the authored question that no authored reference
+    /// named. Presentation-budgeted; every cut is disclosed with the real
+    /// total.
+    pub referenced: Vec<EvidenceItem>,
+    pub reachable: Vec<ReachableEntry>,
+    pub assumptions: Vec<Statement>,
+    pub unknowns: Vec<Statement>,
+    pub omitted: Vec<Omission>,
+    /// A sentence about the **state of the delivered evidence** —
+    /// chosen only by `coverage` and whether `unknowns` is empty, so it
+    /// is byte-identical under any budget. It never names a role, never
+    /// says the stage is finished, and never says the stage is not
+    /// (ruling 0124: "No role taxonomy"; BUILD.md §4.7: a rendering
+    /// budget must not become a completion oracle).
+    pub next_action: String,
+    pub coverage: EvidenceCoverage,
+    /// Some presentation list was cut. Always accompanied by an
+    /// `Omission::OverBudget` carrying the real total, and never a
+    /// coverage fact.
+    pub truncated: bool,
+    /// W-C3: what this revision expands, and why. `None` — and, on the
+    /// wire, *absent* — for every initial assembly.
+    ///
+    /// Additive-and-skipped rather than a new format tag, the same shape
+    /// `ActorWorld::evidence` and `OrientationRequest::semantic` already
+    /// take (R2): a revision-0 projection serializes to byte-identical
+    /// canonical bytes with this field present in the struct and absent
+    /// from the document, so every `ProjectionId` a journal has already
+    /// recorded still re-hashes. A tag advance would have moved all of
+    /// them, which is the one thing an immutable delivered context may
+    /// not do — so the tag stays `wirk.projection/v2` and the *document*
+    /// carries the field only when there is one to carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<ExpansionRecord>,
+}
+
+impl ProjectionContentV2 {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("ProjectionContentV2 always serializes")
+    }
+
+    pub fn projection_id(&self) -> ProjectionId {
+        let mut hasher = Sha256::new();
+        hasher.update(b"wirk.projection/v2\0");
+        hasher.update(self.canonical_bytes());
+        ProjectionId(crate::hex_lower(&hasher.finalize()))
+    }
+
+    /// The same delivered context in the current shape, for the one
+    /// caller that needs it: `world expand` reads its parent revision
+    /// through this so a chain begun before W-C4 stays expandable. The
+    /// two fields it cannot have are exactly what this revision never
+    /// observed, said as that — the expansion re-observes both for
+    /// itself and overwrites them on the revision it writes.
+    pub fn lift(&self) -> ProjectionContent {
+        ProjectionContent {
+            format: self.format.clone(),
+            compilation_policy: self.compilation_policy.clone(),
+            route_edition: self.route_edition.clone(),
+            waypoint: self.waypoint.clone(),
+            revision: self.revision,
+            question: self.question.clone(),
+            generations: self.generations.clone(),
+            publication_revision: self.publication_revision,
+            retrieval: self.retrieval.clone(),
+            bound: self.bound.clone(),
+            referenced: self.referenced.clone(),
+            reachable: self.reachable.clone(),
+            assumptions: self.assumptions.clone(),
+            unknowns: self.unknowns.clone(),
+            omitted: self.omitted.clone(),
+            next_action: self.next_action.clone(),
+            coverage: self.coverage,
+            truncated: self.truncated,
+            expansion: self.expansion.clone(),
+            consulted: Vec::new(),
+            findings_index: FindingsIndexNote::unobserved(),
+        }
+    }
+}
+
+/// The delivered context. This — and only this — is what `ProjectionId`
+/// covers.
+///
+/// W-C4 adds `consulted` and `findings_index` to it: what recorded
+/// learning this stage was handed, and what the index those publications
+/// were read from actually was at that instant. Both are required on
+/// every document written from here on, which changes the canonical
+/// bytes of all of them — so the format tag advances to
+/// `wirk.projection/v3` and `ProjectionContentV2`/`ProjectionContentV1`
+/// keep decoding what came before, rather than this struct quietly
+/// re-hashing older files under a newer shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectionContent {
@@ -665,6 +1025,19 @@ pub struct ProjectionContent {
     /// carries the field only when there is one to carry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expansion: Option<ExpansionRecord>,
+    /// W-C4: the recorded learning this stage was handed — this Work's
+    /// own findings and the estate's settled EstateLocal publications
+    /// this requester independently admits, in that order, each with the
+    /// route that delivered it.
+    ///
+    /// Required, and empty is a real answer: an empty list beside a
+    /// `findings_index` that says `Synchronized` means this estate holds
+    /// nothing for this requester, and beside anything else it means the
+    /// index could not attest that. The two are read together, which is
+    /// why they are one document and one frozen observation.
+    pub consulted: Vec<ConsultedFinding>,
+    /// W-C4: what the findings index was when the list above was read.
+    pub findings_index: FindingsIndexNote,
 }
 
 /// What a projection file was found to contain, at the format it
@@ -675,17 +1048,21 @@ pub struct ProjectionContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DeliveredContent {
-    /// Tried first: a v2 file has fields `ProjectionContentV1` denies,
-    /// and a v1 file lacks fields `ProjectionContent` requires, so the
-    /// two shapes are mutually exclusive and the order only decides
-    /// which error a malformed file reports.
-    V2(Box<ProjectionContent>),
+    /// Tried in order, and the shapes are mutually exclusive rather than
+    /// merely ordered: every one of them is `deny_unknown_fields`, so a
+    /// v3 document carries two fields `ProjectionContentV2` refuses and a
+    /// v2 document lacks two `ProjectionContent` requires — and the same
+    /// argument one version down. The order only decides which error a
+    /// malformed file reports.
+    V3(Box<ProjectionContent>),
+    V2(Box<ProjectionContentV2>),
     V1(Box<ProjectionContentV1>),
 }
 
 impl DeliveredContent {
     pub fn format(&self) -> &str {
         match self {
+            Self::V3(content) => content.format.as_str(),
             Self::V2(content) => content.format.as_str(),
             Self::V1(content) => content.format.as_str(),
         }
@@ -693,6 +1070,7 @@ impl DeliveredContent {
 
     pub fn revision(&self) -> u64 {
         match self {
+            Self::V3(content) => content.revision,
             Self::V2(content) => content.revision,
             Self::V1(content) => content.revision,
         }
@@ -700,6 +1078,7 @@ impl DeliveredContent {
 
     pub fn waypoint(&self) -> &WaypointId {
         match self {
+            Self::V3(content) => &content.waypoint,
             Self::V2(content) => &content.waypoint,
             Self::V1(content) => &content.waypoint,
         }
@@ -707,6 +1086,7 @@ impl DeliveredContent {
 
     pub fn projection_id(&self) -> ProjectionId {
         match self {
+            Self::V3(content) => content.projection_id(),
             Self::V2(content) => content.projection_id(),
             Self::V1(content) => content.projection_id(),
         }
@@ -718,15 +1098,42 @@ impl DeliveredContent {
     /// through under whichever shape happened to parse.
     pub fn declared_format(&self) -> &'static str {
         match self {
-            Self::V2(_) => PROJECTION_FORMAT,
+            Self::V3(_) => PROJECTION_FORMAT,
+            Self::V2(_) => PROJECTION_FORMAT_V2,
             Self::V1(_) => PROJECTION_FORMAT_V1,
         }
     }
 
-    pub fn v2(&self) -> Option<&ProjectionContent> {
+    /// The content in this binary's current shape, if this document is
+    /// one it wrote.
+    pub fn current(&self) -> Option<&ProjectionContent> {
         match self {
-            Self::V2(content) => Some(content),
+            Self::V3(content) => Some(content),
+            Self::V2(_) | Self::V1(_) => None,
+        }
+    }
+
+    /// The content in the current shape, **lifting** an older document
+    /// that carries an expansion chain rather than refusing it: a Run
+    /// whose revision 0 was written before W-C4 stays expandable, and
+    /// the revision the expansion writes re-observes for itself. A v1
+    /// document has no chain at all and is `None`, exactly as before.
+    pub fn expandable(&self) -> Option<ProjectionContent> {
+        match self {
+            Self::V3(content) => Some((**content).clone()),
+            Self::V2(content) => Some(content.lift()),
             Self::V1(_) => None,
+        }
+    }
+
+    /// The discovery handles this revision delivered, whichever format
+    /// it was written in — a handle offered by a pre-W-C4 revision of a
+    /// chain is still one this Run's own context delivered.
+    pub fn reachable(&self) -> &[ReachableEntry] {
+        match self {
+            Self::V3(content) => &content.reachable,
+            Self::V2(content) => &content.reachable,
+            Self::V1(_) => &[],
         }
     }
 }
@@ -784,7 +1191,7 @@ impl ProjectionContent {
 
     pub fn projection_id(&self) -> ProjectionId {
         let mut hasher = Sha256::new();
-        hasher.update(b"wirk.projection/v2\0");
+        hasher.update(b"wirk.projection/v3\0");
         hasher.update(self.canonical_bytes());
         ProjectionId(crate::hex_lower(&hasher.finalize()))
     }

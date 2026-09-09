@@ -33,13 +33,16 @@ use thiserror::Error;
 /// write-once file) rather than another face of `Work`/`Run`/`Event`.
 mod projection;
 pub use projection::{
-    ASSEMBLY_POLICY, ASSEMBLY_POLICY_V1, CoverageReason, DeliveredContent, EvidenceCoverage,
-    EvidenceItem, EvidenceProjectionRef, ExpansionBasis, ExpansionRecord, ExpansionRequest,
-    ItemIdentity, Lifetime, ObservationId, ObservationReceipt, Omission, OrientationRequest,
-    PROJECTION_FORMAT, PROJECTION_FORMAT_V1, PresentationBudget, ProjectionContent,
-    ProjectionContentV1, ProjectionFile, ProjectionId, ProjectionUnavailable, ProjectionWriteError,
-    REACHABLE_DEFAULT, REFERENCED_DEFAULT, ReachableEntry, RetrievalNote, SemanticQueryRequest,
-    Statement, StatementOrigin, UnavailableReason, projection_path, projections_dir,
+    ASSEMBLY_POLICY, ASSEMBLY_POLICY_V1, ASSEMBLY_POLICY_V2, ConsultedEvidence, ConsultedFinding,
+    ConsultedOrigin, ConsultedStatus, Contradiction, CoverageReason, DeliveredContent,
+    EvidenceCoverage, EvidenceItem, EvidenceProjectionRef, ExpansionBasis, ExpansionRecord,
+    ExpansionRequest, FindingsIndexNote, FindingsIndexState, GenerationRelation, ItemIdentity,
+    Lifetime, ObservationId, ObservationReceipt, Omission, OrientationRequest, PROJECTION_FORMAT,
+    PROJECTION_FORMAT_V1, PROJECTION_FORMAT_V2, PresentationBudget, ProjectionContent,
+    ProjectionContentV1, ProjectionContentV2, ProjectionFile, ProjectionId, ProjectionUnavailable,
+    ProjectionWriteError, REACHABLE_DEFAULT, REFERENCED_DEFAULT, ReachableEntry, RetrievalNote,
+    SemanticQueryRequest, Statement, StatementOrigin, UnavailableReason, projection_path,
+    projections_dir,
 };
 
 // ---- Identity ----------------------------------------------------------

@@ -14221,6 +14221,35 @@ fn with_paired_index_health(health: &IndexHealth, admin: bool, mut result: Value
     result
 }
 
+/// The index's rows and the health that describes **those rows**, read
+/// as one snapshot under the mutex that orders every publication and its
+/// own health record (ruling 0125 case 2A, ruling 0137's paired
+/// qualification).
+///
+/// Extracted rather than duplicated: `handle_atlas_findings` and the
+/// stage assembler must not be able to disagree about what one
+/// requester's index read was, and a second copy of this policy is
+/// exactly how they would. The Atlas guard is taken here and dropped
+/// here — every caller does its disclosure work outside it, and nothing
+/// called from inside takes the Atlas lock again.
+fn read_findings_with_health(
+    state: &Arc<WirkdState>,
+) -> Result<(Vec<wirk_atlas::FindingRow>, IndexHealth), wirk_atlas::AtlasError> {
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let read = atlas.read_findings()?;
+    // The health this read renders is qualified by the backing state
+    // this very read observed, inside the same hold of the mutex that
+    // took the rows (ruling 0137). Nothing recorded is changed:
+    // `index_health` still holds this daemon's own last reconciliation
+    // outcome, and what is qualified is the copy that is about to be
+    // paired with these rows and called complete.
+    let health = qualified_by_absent_index(index_health_snapshot(state), read.backing);
+    Ok((read.rows, health))
+}
+
 fn finding_row_json(row: &wirk_atlas::FindingRow) -> Value {
     json!({
         "id": row.id.0,
@@ -14634,23 +14663,9 @@ fn handle_atlas_findings(state: &Arc<WirkdState>, payload: super::AtlasFindingsP
     // the per-row scoping — happens outside the lock and against the
     // captured pair, so a repair that lands while this reply is being
     // rendered changes neither half of it (ruling 0125, case 2A).
-    let (rows, health) = {
-        let atlas = state
-            .atlas
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let read = match atlas.read_findings() {
-            Ok(read) => read,
-            Err(err) => return err_reply("AtlasError", &err.to_string()),
-        };
-        // The health this reply renders is qualified by the backing
-        // state this very read observed, inside the same hold of the
-        // mutex that took the rows (ruling 0137). Nothing recorded is
-        // changed: `index_health` still holds this daemon's own last
-        // reconciliation outcome, and what is qualified is the copy that
-        // is about to be paired with these rows and called complete.
-        let health = qualified_by_absent_index(index_health_snapshot(state), read.backing);
-        (read.rows, health)
+    let (rows, health) = match read_findings_with_health(state) {
+        Ok(pair) => pair,
+        Err(err) => return err_reply("AtlasError", &err.to_string()),
     };
     // The window a verifier parks at to prove the snapshot is one: after
     // the pair is captured and the lock released, before a single row is
@@ -14913,8 +14928,8 @@ mod projection_tests {
         let content = prepared
             .file
             .content
-            .v2()
-            .expect("this wave writes v2 content");
+            .current()
+            .expect("this wave writes v3 content");
         assert!(matches!(
             content.coverage,
             wirk_core::EvidenceCoverage::Degraded {
@@ -14994,7 +15009,10 @@ mod projection_tests {
             "the journaled projection names the Waypoint actually being reserved"
         );
         assert!(matches!(
-            file.content.v2().expect("v2 content").coverage,
+            file.content
+                .current()
+                .expect("this build writes v3 content")
+                .coverage,
             wirk_core::EvidenceCoverage::Degraded { .. }
         ));
         // And a Waypoint that declares no orientation gets nothing at
@@ -15073,15 +15091,18 @@ mod projection_tests {
         );
         assert!(
             file.content
-                .v2()
-                .expect("v2 content")
+                .current()
+                .expect("this build writes v3 content")
                 .assumptions
                 .iter()
                 .any(|statement| statement
                     .text
                     .contains("is not the one any prepared assembly was made for")),
             "the degraded projection must name the race it actually lost: {:?}",
-            file.content.v2().expect("v2 content").assumptions
+            file.content
+                .current()
+                .expect("this build writes v3 content")
+                .assumptions
         );
     }
 
@@ -16295,6 +16316,530 @@ fn route_edition_of(defs: &[WaypointDefinition]) -> String {
         .collect()
 }
 
+// ---- W-C4: consulted recorded learning, and the index it was read from ----
+//
+// BUILD.md §4.3 step 6 and §6, bounded by rulings 0124, 0135 and 0137.
+//
+// Two routes to a record and no others:
+//
+// 1. **this Work's own journal**, folded from the events this assembly
+//    already observed — every finding this Work has raised, across every
+//    Run, stage and retry of it, because a Work's own record does not
+//    expire when a Run does (ruling 0135: "same-Work journaled findings
+//    persist across retries"). A new Run's *projection chain* restarts at
+//    revision 0; its journal does not restart at all.
+//
+// 2. **genuinely settled EstateLocal publications**, through
+//    `published_row_scoped` — the same four conditions the estate index's
+//    own publication route applies, whole-row-or-nothing, reused rather
+//    than re-derived.
+//
+// Route 2 is applied to **every** foreign row, explicitly including rows
+// on this requester's own lineage. `handle_atlas_findings` renders a
+// lineage row through `finding_row_json_scoped`, which admits asserted
+// and applied rows too; a stage projection must not consult those,
+// because a reference is not a promotion and an assertion is a recorded
+// judgement, not a settlement (`W-B-LATER-WORK-ADJUDICATION`). So the
+// selector here is publication and only publication, and a lineage row
+// that has not settled is counted like any other inadmissible row.
+//
+// Everything in here runs with **no journal guard and no Atlas guard
+// held**: `published_row_scoped` reaches `review_targets_admitted` and
+// `admit_evidence`, both of which take the Atlas mutex, which is not
+// reentrant (BUILD.md §4.2).
+
+/// The requester a `submit`-time assembly scopes by: the bindings, and
+/// deliberately nothing else.
+///
+/// Not a fold of an empty slice — `fold` panics there, correctly, because
+/// there is no oracle for a Work that has not been submitted. This is not
+/// an oracle either: every other field is the empty value it will in fact
+/// hold a moment later, and the only field anything reads is
+/// `repositories`.
+fn pre_journal_requester(bindings: &[RepositoryBinding]) -> Work {
+    Work {
+        id: WorkId(String::new()),
+        intent: String::new(),
+        route: RouteId(String::new()),
+        repositories: bindings.to_vec(),
+        state: WorkState::Pending,
+        current_waypoint: None,
+        last_activity: Timestamp(0),
+        needs_input: None,
+        parent: None,
+        held: None,
+        activations: Vec::new(),
+        execution_repo: None,
+        execution_identity: None,
+        findings: BTreeMap::new(),
+        settlement_ready: Vec::new(),
+    }
+}
+
+/// What one consultation step produced.
+struct ConsultedSet {
+    findings: Vec<wirk_core::ConsultedFinding>,
+    note: wirk_core::FindingsIndexNote,
+    /// Rows this requester may not be shown at all. A count, exactly as
+    /// the index surface's own `off_lineage` is.
+    inadmissible: usize,
+    /// The index could not be read at all, so the consulted set is this
+    /// Work's own journal and nothing else.
+    unreadable: bool,
+}
+
+/// The scoped note for one observed `IndexHealth` — a 1:1 map of the
+/// projection state the daemon recorded, with no administrative count,
+/// detail or path (ruling 0135 R11, ruling 0124).
+fn findings_index_note(health: &IndexHealth) -> wirk_core::FindingsIndexNote {
+    wirk_core::FindingsIndexNote {
+        state: match health.projection {
+            IndexProjection::Unreconciled => wirk_core::FindingsIndexState::Unreconciled,
+            IndexProjection::Synchronized => wirk_core::FindingsIndexState::Synchronized,
+            IndexProjection::DurabilityUnconfirmed { .. } => {
+                wirk_core::FindingsIndexState::DurabilityUnconfirmed
+            }
+            IndexProjection::Behind { .. } => wirk_core::FindingsIndexState::Behind,
+        },
+        // The same single field, with the same meaning, that the scoped
+        // `atlas findings` reply puts in front of a reader: true for
+        // `Synchronized` and nothing else. A preserved unreadable copy
+        // already forces the recorded projection off `Synchronized`
+        // (`qualified_by_preserved`), and a backing file that has gone
+        // away already forces it off here (`qualified_by_absent_index`,
+        // inside `read_findings_with_health`) — so this reads the
+        // qualified record rather than re-deciding the policy.
+        complete: health.complete(),
+    }
+}
+
+/// The `(membership, generation)` pairs one frozen evidence entry names,
+/// and the coordinate it names them at.
+///
+/// Only a `Source` reference admitted at raise time has any: a `Journal`
+/// or `Finding` reference names a journal record, not source bytes, and
+/// an entry recorded `Unavailable` names an outcome, not an identity.
+/// Neither is padded with a zero value to make this function total.
+fn recorded_source_identity(
+    item: &AdmittedEvidence,
+) -> Option<(wirk_atlas::ExactCoordinate, String, String)> {
+    let EvidenceRef::Source(encoded) = &item.reference else {
+        return None;
+    };
+    let EvidenceOutcome::Admitted {
+        generation,
+        object_id,
+    } = &item.outcome
+    else {
+        return None;
+    };
+    let coordinate = decode_coordinate(encoded).ok()?;
+    Some((coordinate, generation.clone(), object_id.clone()))
+}
+
+/// Everything one consulted record says about generations, decided
+/// against the vector **this assembly captured** and nothing else.
+///
+/// Three separate facts, and this computes exactly one of them: the
+/// relation. The record's settlement standing is its own field, and
+/// whether its evidence still resolves is a third — collapsing any two
+/// is what ruling 0135 refuses.
+fn generation_relation(
+    recorded: &[(String, String)],
+    captured: &BTreeMap<String, String>,
+) -> wirk_core::GenerationRelation {
+    let mut seen_captured = false;
+    for (membership, generation) in recorded {
+        let Some(current) = captured.get(membership) else {
+            continue;
+        };
+        seen_captured = true;
+        if current != generation {
+            // One membership published here at another generation is
+            // enough to say the pair differs, and it says nothing at all
+            // about whether the change affects this claim.
+            return wirk_core::GenerationRelation::RecordedSuperseded;
+        }
+    }
+    if seen_captured {
+        wirk_core::GenerationRelation::RecordedStillPublished
+    } else {
+        // Including the ordinary case: a record whose evidence is
+        // journal-side and names no source generation at all. Unknown,
+        // never "still published".
+        wirk_core::GenerationRelation::Unknown
+    }
+}
+
+/// The typed disagreements one record contributes: a `contradicts` entry
+/// naming a coordinate **this projection actually delivered**, and
+/// nothing else.
+///
+/// Two gates, both required. The entry must pass the *current*
+/// requester's own disclosure view — raise-time admission is frozen
+/// provenance and is not transferable — and the coordinate must already
+/// be in `bound`, so naming it here discloses nothing this document did
+/// not already deliver. No prose is read, matched or compared, and
+/// neither side is endorsed or invalidated by the other.
+fn consulted_contradictions(
+    state: &Arc<WirkdState>,
+    view: &mut DisclosureView,
+    finding: &Finding,
+    bound_coordinates: &HashSet<&str>,
+) -> Vec<wirk_core::Contradiction> {
+    let mut out = Vec::new();
+    for item in &finding.contradicts {
+        let EvidenceRef::Source(encoded) = &item.reference else {
+            continue;
+        };
+        if !bound_coordinates.contains(encoded.as_str()) {
+            continue;
+        }
+        if !view.admits_evidence(state, item) {
+            continue;
+        }
+        out.push(wirk_core::Contradiction {
+            coordinate: encoded.clone(),
+            text: format!(
+                "a consulted record ({}) names this delivered coordinate in its own \
+                 `contradicts` list. That is the typed reference its author recorded and \
+                 nothing more: no prose was read or compared here, the record is not made true \
+                 by disagreeing, and the coordinate is not made false by being disagreed with.",
+                finding.id.0
+            ),
+        });
+    }
+    out
+}
+
+/// The evidence half of one consulted record: which recorded
+/// coordinates this document delivers as identity, and honest counts for
+/// the rest.
+///
+/// A coordinate is delivered only when **both** hold: the current
+/// requester's disclosure view admits the entry, and this assembly's own
+/// admission step captured that membership at exactly the generation the
+/// entry was recorded against. The second is what makes consulting a
+/// record not a read-through: a Work's own finding may name evidence in a
+/// source the *stage* was not oriented to, and the stage does not acquire
+/// it by having recorded it (BUILD.md §4.1). No bytes are read here at
+/// all — the coordinate is what an actor resolves for themselves.
+fn consulted_evidence(
+    state: &Arc<WirkdState>,
+    view: &mut DisclosureView,
+    entries: &[AdmittedEvidence],
+    captured: &BTreeMap<String, String>,
+) -> (Vec<wirk_core::ConsultedEvidence>, usize, usize) {
+    let mut delivered = Vec::new();
+    let mut withheld = 0usize;
+    let mut not_delivered = 0usize;
+    for item in entries {
+        if !view.admits_evidence(state, item) {
+            withheld += 1;
+            continue;
+        }
+        let Some((coordinate, generation, object_id)) = recorded_source_identity(item) else {
+            not_delivered += 1;
+            continue;
+        };
+        if captured.get(&coordinate.membership.0) != Some(&generation) {
+            not_delivered += 1;
+            continue;
+        }
+        let EvidenceRef::Source(encoded) = &item.reference else {
+            not_delivered += 1;
+            continue;
+        };
+        delivered.push(wirk_core::ConsultedEvidence {
+            coordinate: encoded.clone(),
+            generation,
+            object_id,
+        });
+    }
+    (delivered, withheld, not_delivered)
+}
+
+/// The `(membership, generation)` pairs a record was raised against, in
+/// recorded order, deduplicated — taken from the record's own frozen
+/// evidence outcomes, never re-resolved against today's estate.
+fn recorded_generations_of(finding: &Finding) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for item in &finding.evidence {
+        let Some((coordinate, generation, _)) = recorded_source_identity(item) else {
+            continue;
+        };
+        let pair = (coordinate.membership.0.clone(), generation);
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+/// Step 6 (BUILD.md §4.3, §6): this Work's own recorded findings and the
+/// estate's genuinely settled publications, plus the actual scoped health
+/// of the index the second half was read from — one observation, frozen
+/// together.
+///
+/// No guard of any kind is held on entry and none is taken across a
+/// helper that takes the Atlas mutex.
+fn consult_findings(
+    state: &Arc<WirkdState>,
+    events: &[Event],
+    bindings: &[RepositoryBinding],
+    generations: &[(String, String)],
+    bound: &[wirk_core::EvidenceItem],
+) -> ConsultedSet {
+    no_journal_guard_held("consulted findings assembly");
+
+    let captured: BTreeMap<String, String> = generations.iter().cloned().collect();
+    let bound_coordinates: HashSet<&str> =
+        bound.iter().map(|item| item.coordinate.as_str()).collect();
+
+    // The requester, from the events this assembly already observed.
+    //
+    // At `submit` there is no journal at all yet — the reservation is
+    // being prepared *before* the first event is appended — and `fold`
+    // is explicit that a Work exists only from its own `WorkSubmitted`
+    // onward. So the pre-journal requester is built from the one thing
+    // that does exist: the bindings the submit named, which are exactly
+    // what `resolve_query_scope` would derive from the `WorkSubmitted`
+    // about to be written. It has no id, so it is on nobody's lineage
+    // and matches no row's origin, and it carries no findings, so route
+    // 1 is legitimately empty — which is the literal truth for a Work
+    // that has not run a stage yet.
+    let mut requester = if events.is_empty() {
+        pre_journal_requester(bindings)
+    } else {
+        fold(events)
+    };
+    requester.repositories = bindings.to_vec();
+    let lineage = lineage_of(state, &requester, events);
+    let mut view = DisclosureView::new(&requester, events, &lineage);
+
+    let mut findings: Vec<wirk_core::ConsultedFinding> = Vec::new();
+
+    // Route 1: this Work's own journal, in FindingId order — `fold`
+    // keeps them in a `BTreeMap`, so delivery order is the record's own
+    // identity and not iteration luck.
+    for (id, record) in &requester.findings {
+        let finding = &record.finding;
+        let recorded_generations = recorded_generations_of(finding);
+        let current_generations: Vec<(String, String)> = recorded_generations
+            .iter()
+            .filter_map(|(membership, _)| {
+                captured
+                    .get(membership)
+                    .map(|current| (membership.clone(), current.clone()))
+            })
+            .collect();
+        let (evidence, evidence_withheld, evidence_not_delivered) =
+            consulted_evidence(state, &mut view, &finding.evidence, &captured);
+        let status = match &record.state {
+            FindingState::Proposed => wirk_core::ConsultedStatus::Provisional,
+            FindingState::Settled(settlement) => wirk_core::ConsultedStatus::Settled {
+                class: settlement_class_str(settlement.authority.class).to_string(),
+            },
+        };
+        // A later record of this same Work naming this one is a journal
+        // fact this Work owns on both ends, and it is said here rather
+        // than the older record silently disappearing: history is
+        // delivered, not erased (ruling 0135).
+        let superseded_by = requester
+            .findings
+            .values()
+            .find(|later| later.finding.supersedes.as_ref() == Some(id))
+            .map(|later| later.finding.id.0.clone());
+        let status = match superseded_by {
+            Some(by) => wirk_core::ConsultedStatus::Superseded { by },
+            None => status,
+        };
+        findings.push(wirk_core::ConsultedFinding {
+            id: id.0.clone(),
+            origin: wirk_core::ConsultedOrigin::OwnWork,
+            work: finding.work.0.clone(),
+            kind: finding_kind_str(finding.kind).to_string(),
+            claim: format!("recorded claim: {}, unverified", finding.claim),
+            claim_verified: false,
+            status,
+            generation_relation: generation_relation(&recorded_generations, &captured),
+            recorded_generations,
+            current_generations,
+            contradictions: consulted_contradictions(state, &mut view, finding, &bound_coordinates),
+            evidence,
+            evidence_withheld,
+            evidence_not_delivered,
+            reason: format!(
+                "this Work's own record, raised by its Run {} at Waypoint {}. It reaches this \
+                 stage because the journal that holds it is this Work's, not because anything \
+                 verified it.",
+                finding.run.0, finding.waypoint.0
+            ),
+        });
+    }
+
+    // Route 2: the estate's genuinely settled publications.
+    let (rows, health) = match read_findings_with_health(state) {
+        Ok(pair) => pair,
+        Err(_) => {
+            // The error's own `Display` carries a filesystem path no
+            // scope admitted, so none of it travels: the state is
+            // `Unreadable` and that is the whole disclosure (BUILD.md
+            // §9). What this Work's own journal holds is untouched.
+            return ConsultedSet {
+                findings,
+                note: wirk_core::FindingsIndexNote {
+                    state: wirk_core::FindingsIndexState::Unreadable,
+                    complete: false,
+                },
+                inadmissible: 0,
+                unreadable: true,
+            };
+        }
+    };
+    let mut inadmissible = 0usize;
+    let mut published: Vec<(String, wirk_core::ConsultedFinding)> = Vec::new();
+    for row in &rows {
+        if row.origin.work == requester.id {
+            // Already delivered from the journal that owns it, with its
+            // real status — the index is a derived projection of that
+            // journal, never a second, competing copy of it.
+            continue;
+        }
+        // The explicit selector: publication, and only publication, for
+        // every foreign row including one on this requester's lineage.
+        let Some(rendered) = published_row_scoped(state, &mut view, row) else {
+            inadmissible += 1;
+            continue;
+        };
+        // Belt and braces on the contract this route already promises:
+        // a row that came back with any part withheld is not published
+        // in halves, and a projection is the last place to discover that
+        // a future field slipped through.
+        if json_contains_withheld(&rendered) {
+            inadmissible += 1;
+            continue;
+        }
+        let finding = &row.finding;
+        let recorded_generations = published_recorded_generations(row);
+        let current_generations: Vec<(String, String)> = recorded_generations
+            .iter()
+            .filter_map(|(membership, _)| {
+                captured
+                    .get(membership)
+                    .map(|current| (membership.clone(), current.clone()))
+            })
+            .collect();
+        let class = row
+            .settlement
+            .as_ref()
+            .map(|settlement| settlement_class_str(settlement.authority.class).to_string())
+            .unwrap_or_else(|| "unrecorded".to_string());
+        let status = match &row.superseded_by {
+            Some(by) => wirk_core::ConsultedStatus::Superseded { by: by.0.clone() },
+            None => wirk_core::ConsultedStatus::Settled { class },
+        };
+        published.push((
+            row.id.0.clone(),
+            wirk_core::ConsultedFinding {
+                id: finding.id.0.clone(),
+                origin: wirk_core::ConsultedOrigin::EstatePublication,
+                work: row.origin.work.0.clone(),
+                kind: finding_kind_str(finding.kind).to_string(),
+                claim: format!("recorded claim: {}, unverified", finding.claim),
+                claim_verified: false,
+                status,
+                generation_relation: generation_relation(&recorded_generations, &captured),
+                recorded_generations,
+                current_generations,
+                contradictions: consulted_contradictions(
+                    state,
+                    &mut view,
+                    finding,
+                    &bound_coordinates,
+                ),
+                // A published row's own frozen evidence entries are not
+                // part of what the publication route vouched for — it
+                // renders identity, settlement and application, not the
+                // raiser's evidence list — so none of them is delivered
+                // as a coordinate here. Counted, exactly as a withheld
+                // part is, rather than rendered through a gate that was
+                // never asked about them.
+                evidence: Vec::new(),
+                evidence_withheld: 0,
+                evidence_not_delivered: finding.evidence.len(),
+                reason: format!(
+                    "a settled EstateLocal publication of Work {}, reached through the estate \
+                     publication route this requester's own bindings already admit it by. \
+                     Settled says a policy-admitted check discharged; it does not say the \
+                     recorded sentence is true.",
+                    row.origin.work.0
+                ),
+            },
+        ));
+    }
+    // Deterministic delivery order, and one that is not iteration luck:
+    // by the row's own content-addressed id. Two rows for one finding
+    // (an assertion and a later application legitimately coexist) do not
+    // collapse into one record here, because only `Settled` rows reach
+    // this list at all — but a re-minted identical settlement would, and
+    // is deduplicated by the finding's own identity, keeping the first.
+    published.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut seen: HashSet<String> = findings.iter().map(|item| item.id.clone()).collect();
+    for (_, item) in published {
+        if seen.insert(item.id.clone()) {
+            findings.push(item);
+        }
+    }
+
+    ConsultedSet {
+        findings,
+        note: findings_index_note(&health),
+        inadmissible,
+        unreadable: false,
+    }
+}
+
+/// Whether any part of a rendered row is the one shape a withheld part
+/// takes. Structural, so it cannot be fooled by a claim that happens to
+/// contain the word.
+fn json_contains_withheld(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map.len() == 1 && map.get("withheld") == Some(&Value::Bool(true)) {
+                return true;
+            }
+            map.values().any(json_contains_withheld)
+        }
+        Value::Array(items) => items.iter().any(json_contains_withheld),
+        _ => false,
+    }
+}
+
+/// The `(membership, generation)` pairs a published row was settled
+/// against: the frozen review targets of an Actor review, whose exact
+/// memberships `published_row_scoped` has already admitted under this
+/// requester's own scope (`review_targets_admitted`). A settlement that
+/// records none — a `ValidatedClaim` whose proof is journal-side — names
+/// no source generation, and that is reported as the `Unknown` relation
+/// rather than invented.
+fn published_recorded_generations(row: &wirk_atlas::FindingRow) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Some(settlement) = &row.settlement else {
+        return out;
+    };
+    let SettlementCheck::ActorReview { proof, .. } = &settlement.check else {
+        return out;
+    };
+    for target in &proof.targets {
+        let pair = (target.membership.clone(), target.generation.clone());
+        if !out.contains(&pair) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
 /// The projection a reservation falls back to when the estate moved
 /// under the assembler often enough that it stopped re-observing, or
 /// when a prepared projection turns out to have been assembled for a
@@ -16337,6 +16882,12 @@ fn degraded_projection(
             returned: 0,
         },
         bound: Vec::new(),
+        // Nothing was observed, so nothing is claimed about what the
+        // estate holds: an empty consulted list beside an `Unobserved`
+        // note says the assembler never looked, which is a different
+        // fact from "there is nothing there".
+        consulted: Vec::new(),
+        findings_index: wirk_core::FindingsIndexNote::unobserved(),
         referenced: Vec::new(),
         reachable: Vec::new(),
         assumptions: vec![wirk_core::Statement {
@@ -16457,7 +17008,7 @@ fn finish_projection(
         waypoint,
         publication_revision,
         file: wirk_core::ProjectionFile {
-            content: wirk_core::DeliveredContent::V2(Box::new(content)),
+            content: wirk_core::DeliveredContent::V3(Box::new(content)),
             receipt,
         },
         reference,
@@ -16865,6 +17416,22 @@ fn prepare_projection(
     // digest.
     let artifacts = bind_prior_stage_artifacts(events, def, &mut bound, &mut omitted);
 
+    // Step 6 (§4.3, §6): consulted recorded learning, and the actual
+    // scoped health of the index it was read from — deliberately here,
+    // after `drop(atlas)`, because `published_row_scoped` reaches
+    // helpers that take the Atlas mutex and it is not reentrant
+    // (§4.2), and with no journal guard held anywhere in this function.
+    let consulted = consult_findings(state, events, bindings, &generations, &bound);
+    if consulted.inadmissible > 0 {
+        inadmissible += consulted.inadmissible;
+    }
+    if consulted.unreadable {
+        omitted.push(wirk_core::Omission::Unavailable {
+            coordinate: "the estate findings index".to_string(),
+            reason: wirk_core::UnavailableReason::FindingsIndexUnreadable,
+        });
+    }
+
     let shown_unknowns = unresolved.len().min(ASSEMBLY_UNKNOWN_MAX);
     for reference in &unresolved[..shown_unknowns] {
         unknowns.push(wirk_core::Statement {
@@ -16963,25 +17530,23 @@ fn prepare_projection(
     // already stated, exactly and per revision, by `reference.revision`;
     // what this sentence is for is the disclosure and the verb, and both
     // are revision-neutral facts.
-    assumptions.push(wirk_core::Statement {
-        text: "consulted estate findings and the findings-index health note are not assembled \
-               here: their absence from this projection is not evidence that the estate holds \
-               none. Expansion is: each revision is what one assembly delivered, and `wirk \
-               world expand` adds a later revision to this Run's own chain rather than editing \
-               this one or any before it."
-            .to_string(),
-        attributed_to: wirk_core::StatementOrigin::Assembly,
-    });
+    assumptions.push(consulted_statement(&consulted));
     if inadmissible > 0 {
         omitted.push(wirk_core::Omission::Inadmissible {
             count: inadmissible,
         });
     }
 
-    // Coverage comes only from admission denials, unavailability and
-    // unresolved references — never from a budget, a truncation, a retry
-    // count or a depth (ruling 0044).
-    let coverage = if omitted
+    // Coverage comes only from admission denials, unavailability,
+    // unresolved references and index health — never from a budget, a
+    // truncation, a retry count or a depth (ruling 0044, BUILD.md §4.7).
+    let coverage = if consulted.unreadable {
+        // Worst first: the consulted set is this Work's own journal and
+        // nothing else, and no other reason here is stronger than that.
+        wirk_core::EvidenceCoverage::Degraded {
+            reason: wirk_core::CoverageReason::FindingsIndexUnreadable,
+        }
+    } else if omitted
         .iter()
         .any(|item| matches!(item, wirk_core::Omission::Unavailable { .. }))
     {
@@ -17005,6 +17570,17 @@ fn prepare_projection(
     } else if !unresolved.is_empty() {
         wirk_core::EvidenceCoverage::Partial {
             reason: wirk_core::CoverageReason::UnresolvedReferences,
+        }
+    } else if !consulted.note.complete {
+        // The consulted set was read from an index this estate cannot
+        // attest is a complete projection of its journals. A parsable
+        // index is not proof of synchronization (ruling 0124) and a
+        // missing one is not an empty estate (ruling 0137), so the
+        // projection says its consulted set may be short rather than
+        // presenting it as everything there is. Not a budget and not a
+        // truncation: nothing a presentation number does can reach it.
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::IndexCannotAttestCompleteness,
         }
     } else {
         wirk_core::EvidenceCoverage::Complete
@@ -17038,13 +17614,87 @@ fn prepare_projection(
         coverage,
         truncated,
         // Revision 0, which expands nothing — and, absent from the
-        // document, serializes to exactly the bytes a C2 binary wrote.
+        // document, serializes without the field at all.
         expansion: None,
+        consulted: consulted.findings,
+        findings_index: consulted.note,
     };
     Some(finish_projection(
         content,
         ObservationSpan::measured(laps, started),
     ))
+}
+
+/// The exact fragment that makes a delivered sentence a *consulted*
+/// sentence. Written by `consulted_statement` and read by the expansion
+/// that must not carry a parent's copy of one, so the two cannot drift
+/// apart into a recognizer that stops recognizing.
+const CONSULTED_STATEMENT_MARK: &str = " record(s) of this Work's own journal and ";
+
+/// The Assembly-attributed sentence that says what step 6 actually did.
+///
+/// It replaced a placeholder that told every reader consulted findings
+/// and the index note "are not assembled here". Leaving that sentence
+/// standing while quietly adding the fields underneath would have been
+/// worse than either: a delivered context that describes itself
+/// incorrectly (ruling 0124's "no empty future schema pretending
+/// implemented semantics", one turn around).
+///
+/// Written once at the initial assembly and re-authored by each
+/// expansion for its own observation, because unlike the expansion
+/// disclosure beside it this sentence is about *this* revision's own
+/// read. Re-authored means the parent's copy is *dropped*, not merely
+/// appended to: two of these in one document would be two different
+/// counts of one consulted set, and only one of them would be about the
+/// read this revision made.
+fn consulted_statement(consulted: &ConsultedSet) -> wirk_core::Statement {
+    let own = consulted
+        .findings
+        .iter()
+        .filter(|item| item.origin == wirk_core::ConsultedOrigin::OwnWork)
+        .count();
+    let published = consulted.findings.len() - own;
+    let backing = match consulted.note.state {
+        wirk_core::FindingsIndexState::Unobserved => {
+            "this assembly observed no index at all, so the published half of that set is not \
+             short — it was never read"
+        }
+        wirk_core::FindingsIndexState::Synchronized => {
+            "the estate's findings index was a complete projection of its journals when this \
+             was read, so the published half of that set is what this requester may see of it"
+        }
+        wirk_core::FindingsIndexState::Unreconciled => {
+            "nothing has reconciled the estate's findings index in this daemon yet, so it is \
+             not an index known to be complete and the published half of that set may be short"
+        }
+        wirk_core::FindingsIndexState::DurabilityUnconfirmed => {
+            "the estate's findings index is visible to a reader and its directory entry is not \
+             confirmed on disk, so it is not known to be a complete projection and the \
+             published half of that set may be short"
+        }
+        wirk_core::FindingsIndexState::Behind => {
+            "the estate's findings index does not project every row its journals hold, or its \
+             completeness could not be established at all, so the published half of that set \
+             may be short"
+        }
+        wirk_core::FindingsIndexState::Unreadable => {
+            "the estate's findings index could not be read at this assembly, so the published \
+             half of that set is empty for that reason and not because the estate holds none"
+        }
+    };
+    wirk_core::Statement {
+        text: format!(
+            "{own}{CONSULTED_STATEMENT_MARK}{published} settled estate \
+             publication(s) were consulted: {backing}. A consulted record is delivered with the \
+             sentence its author recorded, captioned unverified, and nothing here asserts, \
+             endorses or invalidates any of it. Its recorded generations are stated beside the \
+             ones this assembly captured, and a difference between them is a fact about \
+             editions, never a verdict on the claim. Expansion is separate: each revision is \
+             what one assembly delivered, and `wirk world expand` adds a later revision to this \
+             Run's own chain rather than editing this one or any before it."
+        ),
+        attributed_to: wirk_core::StatementOrigin::Assembly,
+    }
 }
 
 /// What step 4 found: how many governing items it delivered, how many
@@ -17621,6 +18271,145 @@ fn family_label(family: wirk_atlas::ContentFamily) -> &'static str {
     }
 }
 
+/// How bad one coverage state is, for the one comparison that needs an
+/// order: an expansion's coverage is the worse of what it inherited and
+/// what it observed. Deliberately not `Ord` on the type — nothing else
+/// in this product ranks coverage, and a derived ordering would silently
+/// also rank the *reasons*, which have no order at all.
+fn coverage_severity(coverage: wirk_core::EvidenceCoverage) -> u8 {
+    match coverage {
+        wirk_core::EvidenceCoverage::Complete => 0,
+        wirk_core::EvidenceCoverage::Partial { .. } => 1,
+        wirk_core::EvidenceCoverage::Degraded { .. } => 2,
+    }
+}
+
+/// Which of the two facts a coverage reason is about.
+///
+/// `coverage` is one label over two independent things. One is about the
+/// **sources**: a reference that resolved nowhere, a binding this
+/// requester was refused, an evidence item that could not be read back,
+/// a governing record admitted outside the captured editions, a snapshot
+/// that could not be taken at all. Those are facts about `bound` and the
+/// captured generation vector, both of which an expansion inherits
+/// wholesale, so they are still true of every later revision whatever it
+/// observes — coverage never improves on them by expanding.
+///
+/// The other is about the **consultation**: the health of the findings
+/// index this assembly read its consulted set from. Nothing about that
+/// is inherited. `consulted` and `findings_index` are re-observed and
+/// replaced in full by every revision, so only this revision's own read
+/// is a true statement about this revision's consulted set, and it has
+/// to be free to recover as well as to worsen.
+///
+/// Carrying the second as if it were the first is the defect
+/// `loop-c4-consult-verify/VERDICT.md` records as V1: one transient
+/// unreadable index poisoned every later revision of that Run for the
+/// life of the chain, so a frozen document called its own index
+/// `synchronized`, listed a settled publication in `consulted`, and then
+/// told the actor in plain prose that the index could not be read and
+/// that no settled publication was consulted.
+fn reason_is_about_the_consultation(reason: wirk_core::CoverageReason) -> bool {
+    match reason {
+        wirk_core::CoverageReason::IndexCannotAttestCompleteness
+        | wirk_core::CoverageReason::FindingsIndexUnreadable => true,
+        wirk_core::CoverageReason::UnresolvedReferences
+        | wirk_core::CoverageReason::InadmissibleSources
+        | wirk_core::CoverageReason::EvidenceUnavailable
+        | wirk_core::CoverageReason::ConcurrentPublication
+        | wirk_core::CoverageReason::GovernanceOutsideCapturedEditions => false,
+    }
+}
+
+/// The source half of an expansion's coverage: everything this revision
+/// carries or observed that is *not* a statement about the findings
+/// index it just read.
+///
+/// It cannot simply be read off `parent.coverage`, because that field
+/// holds one reason and the consultation half is the more severe of the
+/// two whenever the index was unreadable — so a parent reading
+/// `degraded / findings_index_unreadable` says nothing at all about a
+/// source limitation underneath it. Dropping the parent's stale index
+/// reason without recovering what it hid would report a genuinely
+/// incomplete chain as `complete`, which is the same untruth pointing
+/// the other way.
+///
+/// So it is rebuilt from the facts the expansion actually carries.
+/// `omitted` and `unknowns` are both seeded from the parent and appended
+/// to by this revision, so between them they hold every source
+/// limitation this revision inherited *and* every one it found. The
+/// parent's own reason is preferred only where the two agree in
+/// severity: it is the chain's original wording and still true of this
+/// revision. `ConcurrentPublication` is the one source reason no
+/// omission records, and it is `Degraded`, so it is carried by the
+/// parent's own state and never masked by anything.
+///
+/// The precedence between reasons is the initial assembly's own, so one
+/// document's coverage does not depend on which of the two assemblers
+/// wrote it.
+fn carried_source_coverage(
+    parent: wirk_core::EvidenceCoverage,
+    omitted: &[wirk_core::Omission],
+    unknowns: &[wirk_core::Statement],
+) -> wirk_core::EvidenceCoverage {
+    let unavailable_beyond_the_index = omitted.iter().any(|item| {
+        matches!(
+            item,
+            wirk_core::Omission::Unavailable { reason, .. }
+                if *reason != wirk_core::UnavailableReason::FindingsIndexUnreadable
+        )
+    });
+    // A reference that did not resolve is a fact about the request, and
+    // the *budget* on how many of them are shown must not decide whether
+    // it is recorded — `OverBudget` carries the honest total precisely so
+    // a presentation cut cannot become a completeness oracle in either
+    // direction (BUILD.md §4.7).
+    let any_unresolved = !unknowns.is_empty()
+        || omitted.iter().any(|item| {
+            matches!(
+                item,
+                wirk_core::Omission::OverBudget { of, total, .. } if of == "unknowns" && *total > 0
+            )
+        });
+    let rebuilt = if unavailable_beyond_the_index {
+        Some(wirk_core::CoverageReason::EvidenceUnavailable)
+    } else if omitted
+        .iter()
+        .any(|item| matches!(item, wirk_core::Omission::Inadmissible { .. }))
+    {
+        Some(wirk_core::CoverageReason::InadmissibleSources)
+    } else if omitted
+        .iter()
+        .any(|item| matches!(item, wirk_core::Omission::AdmittedAtAnotherEdition { .. }))
+    {
+        Some(wirk_core::CoverageReason::GovernanceOutsideCapturedEditions)
+    } else if any_unresolved {
+        Some(wirk_core::CoverageReason::UnresolvedReferences)
+    } else {
+        None
+    };
+    let rebuilt = match rebuilt {
+        Some(reason) => wirk_core::EvidenceCoverage::Partial { reason },
+        None => wirk_core::EvidenceCoverage::Complete,
+    };
+    let carried = match parent {
+        wirk_core::EvidenceCoverage::Partial { reason }
+        | wirk_core::EvidenceCoverage::Degraded { reason }
+            if reason_is_about_the_consultation(reason) =>
+        {
+            // Not a source fact, and not this revision's observation
+            // either. Whatever it hid is in `rebuilt`.
+            wirk_core::EvidenceCoverage::Complete
+        }
+        other => other,
+    };
+    if coverage_severity(rebuilt) > coverage_severity(carried) {
+        rebuilt
+    } else {
+        carried
+    }
+}
+
 /// Step 8: one sentence about the **state of the delivered evidence**.
 ///
 /// Chosen only by `coverage` and whether anything went unresolved, so it
@@ -17650,6 +18439,22 @@ fn next_action_for(coverage: wirk_core::EvidenceCoverage, no_unknowns: bool) -> 
         } => {
             "something the captured vector or this Work's own record names could not be read \
              back at the identity it was recorded against"
+        }
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::IndexCannotAttestCompleteness,
+        } => {
+            "the estate's findings index is not a projection this estate can attest is \
+             complete, so the settled publications consulted here may be short of what the \
+             estate's journals hold"
+        }
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::FindingsIndexUnreadable,
+        }
+        | wirk_core::EvidenceCoverage::Degraded {
+            reason: wirk_core::CoverageReason::FindingsIndexUnreadable,
+        } => {
+            "the estate's findings index could not be read at this assembly, so no settled \
+             publication was consulted and this Work's own record is all that is here"
         }
         wirk_core::EvidenceCoverage::Partial {
             reason: wirk_core::CoverageReason::GovernanceOutsideCapturedEditions,
@@ -18507,7 +19312,7 @@ fn handle_world_expand(state: &Arc<WirkdState>, payload: super::WorldExpandPaylo
                 );
             }
         };
-        let Some(parent) = parent_file.content.v2() else {
+        let Some(parent) = parent_file.content.expandable() else {
             return err_reply(
                 "ProjectionUnavailable",
                 "the revision this expansion would extend was written in a format that carries \
@@ -18543,7 +19348,8 @@ fn handle_world_expand(state: &Arc<WirkdState>, payload: super::WorldExpandPaylo
         let prepared = prepare_expansion(
             state,
             &orient,
-            parent,
+            &events,
+            &parent,
             &parent_ref,
             &run_id,
             &fold(&events).repositories,
@@ -18672,11 +19478,9 @@ fn admitted_handle(
             // already checked by the caller.
             continue;
         };
-        let Some(content) = file.content.v2() else {
-            continue;
-        };
-        if let Some(entry) = content
-            .reachable
+        if let Some(entry) = file
+            .content
+            .reachable()
             .iter()
             .find(|entry| entry.handle == wanted)
         {
@@ -18739,6 +19543,11 @@ fn admitted_handle(
 fn prepare_expansion(
     state: &Arc<WirkdState>,
     orient: &wirk_core::OrientationRequest,
+    // This Work's own journal as this expansion observed it, for the
+    // same reason the initial assembly takes it: a record raised since
+    // the revision being expanded is this Work's own and belongs in this
+    // revision's consulted set.
+    events: &[Event],
     parent: &wirk_core::ProjectionContent,
     parent_ref: &wirk_core::EvidenceProjectionRef,
     run_id: &RunId,
@@ -18764,9 +19573,33 @@ fn prepare_expansion(
     // this revision's ranked material is `bound`, because this Run's own
     // actor asked for it by name rather than the assembler offering it.
     let referenced = parent.referenced.clone();
+    // The consultation half of a projection is re-observed in full by
+    // every revision — the consulted set, the index note, the coverage
+    // contribution, the omission that records an unreadable index, and
+    // the sentence that describes all four. So the parent's copies of
+    // the last two are not carried into a document that made its own
+    // observation: a revision that read a healthy index must not also
+    // deliver a sentence saying the index could not be read, or an
+    // omission saying it was unavailable, both of which are statements
+    // about a read some *other* revision made. Nothing is erased — the
+    // parent's own frozen document still says exactly what it said, and
+    // is still readable at `--revision`. Everything else the parent
+    // omitted or could not resolve is a fact about `bound` and the
+    // captured vector, and is carried.
     let mut assumptions = parent.assumptions.clone();
+    assumptions.retain(|statement| {
+        statement.attributed_to != wirk_core::StatementOrigin::Assembly
+            || !statement.text.contains(CONSULTED_STATEMENT_MARK)
+    });
     let mut unknowns = parent.unknowns.clone();
     let mut omitted = parent.omitted.clone();
+    omitted.retain(|item| {
+        !matches!(
+            item,
+            wirk_core::Omission::Unavailable { reason, .. }
+                if *reason == wirk_core::UnavailableReason::FindingsIndexUnreadable
+        )
+    });
     let mut added: Vec<wirk_core::EvidenceItem> = Vec::new();
     let mut inadmissible = 0usize;
 
@@ -18969,6 +19802,24 @@ fn prepare_expansion(
     }
     drop(atlas);
 
+    // Step 6, re-observed for **this** revision (BUILD.md §9): the note
+    // and its consulted set are frozen per revision, so an expansion
+    // records its own rather than inheriting the parent's — a health
+    // change is then visible as a difference between two frozen
+    // documents rather than as a silent edit of one. Outside every
+    // guard, for the same reentrancy reason the initial assembly runs it
+    // outside every guard.
+    let consulted = consult_findings(state, events, bindings, &parent.generations, &bound);
+    if consulted.inadmissible > 0 {
+        inadmissible += consulted.inadmissible;
+    }
+    if consulted.unreadable {
+        omitted.push(wirk_core::Omission::Unavailable {
+            coordinate: "the estate findings index".to_string(),
+            reason: wirk_core::UnavailableReason::FindingsIndexUnreadable,
+        });
+    }
+
     // What is genuinely new. A resource the chain already delivered is
     // not delivered again — its coordinate resolves to the same bytes it
     // always did — and the count says so rather than the list quietly
@@ -19078,6 +19929,11 @@ fn prepare_expansion(
         ),
         attributed_to: wirk_core::StatementOrigin::Assembly,
     });
+    // Re-authored, not carried: the parent's sentence describes the
+    // parent's own read of the index, and this revision made its own.
+    // The exact-duplicate collapse below keeps one copy when the two
+    // observations happened to say the same thing.
+    assumptions.push(consulted_statement(&consulted));
     if !authored_question {
         assumptions.push(wirk_core::Statement {
             text: "this expansion authored no question of its own: the terms it ranked with are \
@@ -19100,35 +19956,51 @@ fn prepare_expansion(
         });
     }
 
-    // Coverage never improves by expanding. A parent that was `Partial`
-    // because a reference did not resolve is still a context in which
-    // that reference did not resolve, whatever this revision found; and
-    // this revision's own denials and unavailabilities move it further
-    // if they are worse. Presentation cannot reach it: `truncated` and
-    // the `OverBudget` omissions are a separate field and a separate
+    // Two facts under one label, and only one of them is carried
+    // (`reason_is_about_the_consultation`).
+    //
+    // The source half never improves by expanding: a reference the
+    // parent could not resolve is still unresolved here, because `bound`
+    // and the captured vector are inherited whole. It is rebuilt from
+    // the omissions and unknowns this revision carries rather than read
+    // off the parent's single reason, so a parent whose index was
+    // unreadable does not take a genuine source limitation down with it
+    // when that index recovers.
+    //
+    // The consultation half is not carried at all. `consulted` and
+    // `findings_index` were re-observed above and replaced in full, so
+    // this revision's own read is the only true statement about this
+    // revision's consulted set, in both directions: a worse observation
+    // must be recorded (found by running the real binary, not by reading
+    // this), and so must a better one — carrying it was V1
+    // (`loop-c4-consult-verify/VERDICT.md`).
+    //
+    // Presentation cannot reach either half: `truncated` and the
+    // `OverBudget` omissions are a separate field and a separate
     // sentence (BUILD.md §4.7).
-    let local = if omitted.len() > parent.omitted.len()
-        && omitted[parent.omitted.len()..]
-            .iter()
-            .any(|item| matches!(item, wirk_core::Omission::Unavailable { .. }))
-    {
-        Some(wirk_core::EvidenceCoverage::Partial {
-            reason: wirk_core::CoverageReason::EvidenceUnavailable,
-        })
-    } else if inadmissible > 0 {
-        Some(wirk_core::EvidenceCoverage::Partial {
-            reason: wirk_core::CoverageReason::InadmissibleSources,
-        })
-    } else if !unresolved.is_empty() {
-        Some(wirk_core::EvidenceCoverage::Partial {
-            reason: wirk_core::CoverageReason::UnresolvedReferences,
-        })
+    let source = carried_source_coverage(parent.coverage, &omitted, &unknowns);
+    let consultation = if consulted.unreadable {
+        wirk_core::EvidenceCoverage::Degraded {
+            reason: wirk_core::CoverageReason::FindingsIndexUnreadable,
+        }
+    } else if !consulted.note.complete {
+        // An index that was synchronized when revision 0 read it and is
+        // behind now makes revision 1 partial, which is exactly the
+        // difference between two frozen records that BUILD.md §9 says a
+        // health change must be visible as.
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::IndexCannotAttestCompleteness,
+        }
     } else {
-        None
+        wirk_core::EvidenceCoverage::Complete
     };
-    let coverage = match (parent.coverage, local) {
-        (wirk_core::EvidenceCoverage::Complete, Some(local)) => local,
-        (parent_coverage, _) => parent_coverage,
+    // The worse of the two, and the source half wins a tie: it is the
+    // chain's own original reason and still true of this revision, and
+    // it is the order the initial assembly already resolves these in.
+    let coverage = if coverage_severity(consultation) > coverage_severity(source) {
+        consultation
+    } else {
+        source
     };
     let truncated = omitted
         .iter()
@@ -19174,6 +20046,8 @@ fn prepare_expansion(
         next_action: next_action_for(coverage, unknowns.is_empty()),
         coverage,
         truncated,
+        consulted: consulted.findings,
+        findings_index: consulted.note,
         expansion: Some(wirk_core::ExpansionRecord {
             parent_projection: parent_ref.projection.clone(),
             parent_observation: parent_ref.observation.clone(),

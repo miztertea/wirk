@@ -403,11 +403,15 @@ fn an_orienting_reservation_delivers_a_real_projection_an_actor_can_inspect() {
     for statement in unknowns {
         assert_eq!(statement["attributed_to"], "intent");
     }
-    // The assembler says what it did not do, rather than letting a
+    // The assembler says what it did, rather than letting a
     // literal-only projection read as a complete orientation. W-C3
-    // narrowed the sentence: expansion is no longer among the things
-    // this product cannot do, so the disclosure now names only what is
-    // genuinely absent, and says where the rest is.
+    // narrowed the sentence — expansion stopped being among the things
+    // this product cannot do — and W-C4 replaced its remaining half
+    // outright: consulted findings and the index note *are* assembled
+    // now, so the sentence states what was consulted and what the index
+    // backing it actually was. Leaving the old disclosure standing while
+    // adding the fields underneath would have left a delivered context
+    // describing itself incorrectly.
     let assumptions: Vec<&str> = projection["assumptions"]
         .as_array()
         .expect("assumptions")
@@ -415,17 +419,34 @@ fn an_orienting_reservation_delivers_a_real_projection_an_actor_can_inspect() {
         .map(|s| s["text"].as_str().unwrap_or_default())
         .collect();
     assert!(
+        !assumptions.iter().any(|text| text.contains(
+            "consulted estate findings and the findings-index health note are not \
+                      assembled here"
+        )),
+        "the wave's own limit is no longer a limit and must not still be claimed: {assumptions:?}"
+    );
+    assert!(
         assumptions
             .iter()
-            .any(|text| text.contains("consulted estate findings")
-                && text.contains("is not evidence that the estate holds none")),
-        "the projection must disclose the wave's own limit: {assumptions:?}"
+            .any(|text| text.contains("record(s) of this Work's own journal")
+                && text.contains("settled estate publication(s) were consulted")),
+        "the projection must say what it consulted: {assumptions:?}"
     );
     assert!(
         assumptions
             .iter()
             .any(|text| text.contains("`wirk world expand` adds a later revision")),
-        "and must not still claim there is no verb that adds to it: {assumptions:?}"
+        "and must not claim there is no verb that adds to it: {assumptions:?}"
+    );
+    // And the two fields are really there, with the estate's own state
+    // in the note rather than a placeholder.
+    assert!(
+        projection["consulted"].is_array(),
+        "a delivered projection carries a consulted list: {projection}"
+    );
+    assert_eq!(
+        projection["findings_index"]["state"], "synchronized",
+        "a real daemon reconciles its index at startup: {projection}"
     );
 
     estate.stop();
@@ -1197,10 +1218,17 @@ fn a_missing_or_corrupt_projection_file_reads_unavailable_and_is_not_regenerated
         .join("projections")
         .join(format!("{}.json", reference.observation.0));
 
-    // Corrupt one byte of the delivered content.
+    // Corrupt one byte of the delivered content. The edited value is
+    // deliberately a policy name no binary ever writes: editing it to
+    // the *next* real one would stop being a corruption the day that
+    // one ships, which is exactly what happened when W-C4 advanced the
+    // tag and this test silently started asserting nothing.
     let text = fs::read_to_string(&path).expect("read projection");
-    fs::write(&path, text.replace("wirk.assembly/v2", "wirk.assembly/v3"))
-        .expect("corrupt projection");
+    fs::write(
+        &path,
+        text.replace(wirk_core::ASSEMBLY_POLICY, "wirk.assembly/none"),
+    )
+    .expect("corrupt projection");
     let (code, shown, err) = world_show(&estate.root, &submitted.work_id, &submitted.run_id);
     assert_eq!(code, Some(0), "{err}");
     assert_eq!(shown["orientation"], "unavailable", "{shown}");
