@@ -310,9 +310,44 @@ pub enum ItemIdentity {
     ArtifactDigest { claim: String, digest: String },
 }
 
+/// Where inside the delivered resource the summary was actually taken
+/// from, when it was taken from a place a match located rather than from
+/// the head (ruling 0142).
+///
+/// The same block `atlas search` delivers beside a hit as `evidence`,
+/// and it means the same thing here: `coordinate` is a supported exact
+/// coordinate `wirk atlas resolve` returns those same committed bytes
+/// for, so the summary — a *presentation* string, newlines flattened —
+/// has an exact citation that resolves the source it was made from. The
+/// item's own `coordinate` above is untouched and still names the whole
+/// resource or ranked unit the item was delivered as.
+///
+/// `matched_terms` are terms that really are inside the shown bytes. An
+/// item nothing lexical located anything in carries no `ShownEvidence`
+/// at all rather than an empty one, so a semantically ranked row is
+/// never dressed up as a term match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShownEvidence {
+    pub coordinate: String,
+    pub byte_start: u64,
+    pub byte_end: u64,
+    pub line_start: u64,
+    pub line_end: u64,
+    pub matched_terms: Vec<String>,
+    /// False only where no bounded summary could carry the whole match:
+    /// the matched token is itself at least the summary budget.
+    pub whole_match_shown: bool,
+}
+
 /// One piece of evidence as delivered: the opaque coordinate the actor
 /// can resolve, a bounded summary, how long it stays true, and — never
 /// optional — which assembly step put it here.
+///
+/// `summary` is a presentation string and always was: it is bounded and
+/// its newlines are flattened, so it is not the resource's exact bytes.
+/// What ruling 0142 adds is that when it is taken from a place a match
+/// located, `shown` names those bytes exactly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceItem {
@@ -321,6 +356,18 @@ pub struct EvidenceItem {
     pub lifetime: Lifetime,
     pub reason: String,
     pub identity: ItemIdentity,
+    /// Ruling 0142: the exact source span the summary was taken from,
+    /// when it was chosen around a match rather than read off the head.
+    ///
+    /// Additive-and-skipped rather than a new format tag, exactly the
+    /// shape `ProjectionContent::expansion` already takes (R2): an item
+    /// with no located match serializes to byte-identical canonical
+    /// bytes with this field present in the struct and absent from the
+    /// document, so every projection already written — v1, v2 and v3
+    /// alike — still re-hashes to the `ProjectionId` its journal
+    /// recorded. A tag advance would have moved all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown: Option<ShownEvidence>,
 }
 
 /// Every uncertainty label says whose it is. `Assembly` is the
@@ -414,6 +461,28 @@ pub enum Omission {
     AdmittedAtAnotherEdition {
         count: usize,
     },
+    /// `count` resource(s) of the generations this assembly captured
+    /// record a genuine extraction failure: the extractor was asked for
+    /// retrieval units and could not produce them, so those bytes are in
+    /// the source and in no index. Part of the corpus this projection
+    /// describes was never searchable at the generation it names.
+    ///
+    /// A count, and only a count, for the reason `Inadmissible` is one:
+    /// the failing resource is not something this projection delivered,
+    /// and naming it would hand over a path the assembly never bound.
+    /// The extractor's own diagnostic never travels either — it carries
+    /// a budget and a size that say more about the estate than the
+    /// requester asked for. `wirk atlas status` is where a requester
+    /// already admitted to the source reads the detail.
+    ///
+    /// Deliberately **not** every resource a generation did not index:
+    /// a family no edition claims and a path the extractor deliberately
+    /// refuses are the declared shape of the corpus, and counting them
+    /// here "would obscure the map" (ruling 0135, qualification to
+    /// R12).
+    SourceExtractionIncomplete {
+        count: usize,
+    },
 }
 
 /// Why this projection's factual coverage is less than complete.
@@ -458,6 +527,14 @@ pub enum CoverageReason {
     /// a filesystem path no scope admitted and never travels (BUILD.md
     /// §9).
     FindingsIndexUnreadable,
+    /// A generation in the captured vector records a resource the
+    /// extractor could not turn into retrieval units at all, so part of
+    /// the corpus this projection describes was never searchable at the
+    /// generation it names. A fact about the captured vector, which an
+    /// expansion inherits wholesale — so, like every other source
+    /// reason, it stays true of every later revision of the chain and
+    /// only a newly captured vector can clear it (ruling 0135 C4-R12).
+    SourceExtractionIncomplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

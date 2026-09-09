@@ -5,6 +5,16 @@ const MAX_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_TEXT_UNITS: usize = 16 * 1024;
 const MAX_UNIT_BYTES: usize = 64 * 1024;
 const UNITIZER_ID: &str = "utf8-line-chunks-65536/v1";
+/// Edition v4's unitizer. `utf8-line-chunks-65536/v1` never packed more
+/// than one line into a unit despite its own "65536" name — a file with
+/// more lines than `MAX_TEXT_UNITS` (e.g. `wirk/src/wirkd/server.rs` at
+/// 16,857 lines) hit the unit-count budget while each unit sat far under
+/// the byte budget it was named for. This unitizer packs consecutive
+/// short lines into one unit up to the same 65536-byte budget — the
+/// budget the name always promised — so unit count now tracks bytes, not
+/// lines. A line that alone exceeds the budget still splits exactly as
+/// `v1` did. See `W4-EXTRACTOR-MULTILINE.md`.
+const MULTILINE_UNITIZER_ID: &str = "utf8-multiline-chunks-65536/v1";
 
 /// The content-family vocabulary of edition v3, derived mechanically from
 /// the installed `semble` 0.5.2's own
@@ -412,8 +422,8 @@ pub enum ExtractorEdition {
     RustMarkdownV2,
     /// Historical: Markdown only.
     MarkdownOnlyV2,
-    /// Current. Text line-chunk extraction over the complete
-    /// `semble` 0.5.2 code/docs/config vocabulary (`EXTENSION_FAMILY`).
+    /// Historical: same content-family vocabulary as v3, packed one line
+    /// per unit. Never produced again; still validated and resolved.
     ///
     /// The identity says `text-line-chunks` deliberately. This edition
     /// widens *which files are admitted*, not how they are cut: the
@@ -424,6 +434,17 @@ pub enum ExtractorEdition {
     /// (`W3-EXTRACTOR-COMPLETION.md`: "Do not infer semantic syntax
     /// claims from line chunks ... keep extractor identities explicit").
     ContentFamiliesV3,
+    /// Current. Same content-family vocabulary as v3, packed by bytes:
+    /// consecutive short lines share a unit up to the 65536-byte budget
+    /// `MULTILINE_UNITIZER_ID` names, rather than one unit per line
+    /// regardless of length. This is what fixes `server.rs` — 16,857
+    /// short lines that exceeded the per-blob unit-count budget under
+    /// `v3` despite the blob itself sitting well under the byte budget
+    /// (`W4-EXTRACTOR-MULTILINE.md`). Still text line chunks: a unit
+    /// never claims to know a function, a class or a section, and a
+    /// multi-line unit's `line_start`..`line_end` names exactly the
+    /// lines it packs.
+    ContentFamiliesV4,
 }
 
 impl ExtractorEdition {
@@ -433,6 +454,9 @@ impl ExtractorEdition {
             Self::MarkdownOnlyV2 => "utf8-lines/markdown+utf8-line-chunks-65536/v2",
             Self::ContentFamiliesV3 => {
                 "text-line-chunks/utf8-line-chunks-65536+semble-0.5.2-content-families/v3"
+            }
+            Self::ContentFamiliesV4 => {
+                "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families/v4"
             }
         }
     }
@@ -445,6 +469,7 @@ impl ExtractorEdition {
             Self::RustMarkdownV2,
             Self::MarkdownOnlyV2,
             Self::ContentFamiliesV3,
+            Self::ContentFamiliesV4,
         ]
         .into_iter()
         .find(|edition| edition.id() == id)
@@ -467,13 +492,27 @@ impl ExtractorEdition {
                     None
                 }
             }
-            Self::ContentFamiliesV3 => {
+            Self::ContentFamiliesV3 | Self::ContentFamiliesV4 => {
                 let suffix = path_suffix_lowercase(path)?;
                 EXTENSION_FAMILY
                     .binary_search_by_key(&suffix.as_str(), |(ext, _)| ext)
                     .ok()
                     .map(|index| EXTENSION_FAMILY[index].1)
             }
+        }
+    }
+    /// Whether this edition packs consecutive short lines into one unit
+    /// (`v4`) or bounds each unit to exactly one line (`v2`/`v3`,
+    /// historical). Governs both the unitizer id units are stamped with
+    /// and the chunking algorithm `ExtractorPolicy::units` runs.
+    pub(crate) fn multiline(self) -> bool {
+        matches!(self, Self::ContentFamiliesV4)
+    }
+    pub(crate) fn unitizer_id(self) -> &'static str {
+        if self.multiline() {
+            MULTILINE_UNITIZER_ID
+        } else {
+            UNITIZER_ID
         }
     }
 }
@@ -485,7 +524,7 @@ pub struct ExtractorPolicy {
 impl Default for ExtractorPolicy {
     fn default() -> Self {
         Self {
-            edition: ExtractorEdition::ContentFamiliesV3,
+            edition: ExtractorEdition::ContentFamiliesV4,
         }
     }
 }
@@ -501,6 +540,14 @@ impl ExtractorPolicy {
     pub fn rust_markdown_v2() -> Self {
         Self {
             edition: ExtractorEdition::RustMarkdownV2,
+        }
+    }
+    /// The historical one-line-per-unit `v3` edition, kept constructible
+    /// so a test can stage it on purpose and prove it still validates and
+    /// resolves under the current binary alongside `v4`.
+    pub fn content_families_v3() -> Self {
+        Self {
+            edition: ExtractorEdition::ContentFamiliesV3,
         }
     }
     pub(crate) fn id(&self) -> &str {
@@ -532,38 +579,69 @@ impl ExtractorPolicy {
         let family = self
             .family(path)
             .ok_or("path has no configured content family")?;
-        let mut units = Vec::new();
+        let unitizer = self.edition.unitizer_id();
+        let mut lines: Vec<(usize, usize, u64)> = Vec::new();
         let mut start = 0usize;
         let mut line = 1u64;
         for (index, byte) in bytes.iter().enumerate() {
             if *byte == b'\n' {
-                push_line_chunks(
-                    &mut units,
-                    text,
-                    start,
-                    index + 1,
-                    line,
-                    generation,
-                    path,
-                    object_id,
-                    family,
-                )?;
+                lines.push((start, index + 1, line));
                 start = index + 1;
                 line += 1;
             }
         }
         if start < bytes.len() || bytes.is_empty() {
-            push_line_chunks(
-                &mut units,
-                text,
-                start,
-                bytes.len(),
-                line,
-                generation,
-                path,
-                object_id,
-                family,
-            )?;
+            lines.push((start, bytes.len(), line));
+        }
+        let mut units = Vec::new();
+        if self.edition.multiline() {
+            let mut chunk: Option<(usize, u64, usize, u64)> = None; // (byte_start, line_start, byte_end, line_end)
+            for (line_start, line_end, line_no) in lines {
+                if line_end - line_start > MAX_UNIT_BYTES {
+                    if let Some((cs, csl, ce, cel)) = chunk.take() {
+                        push_unit(
+                            &mut units, generation, path, object_id, family, unitizer, cs, ce, csl,
+                            cel,
+                        )?;
+                    }
+                    push_line_chunks(
+                        &mut units, text, line_start, line_end, line_no, generation, path,
+                        object_id, family, unitizer,
+                    )?;
+                    continue;
+                }
+                chunk = Some(match chunk {
+                    None => (line_start, line_no, line_end, line_no),
+                    Some((cs, csl, _, _)) if line_end - cs > MAX_UNIT_BYTES => {
+                        push_unit(
+                            &mut units,
+                            generation,
+                            path,
+                            object_id,
+                            family,
+                            unitizer,
+                            cs,
+                            line_start,
+                            csl,
+                            line_no - 1,
+                        )?;
+                        (line_start, line_no, line_end, line_no)
+                    }
+                    Some((cs, csl, _, _)) => (cs, csl, line_end, line_no),
+                });
+            }
+            if let Some((cs, csl, ce, cel)) = chunk {
+                push_unit(
+                    &mut units, generation, path, object_id, family, unitizer, cs, ce, csl, cel,
+                )?;
+            }
+        } else {
+            for (line_start, line_end, line_no) in lines {
+                push_line_chunks(
+                    &mut units, text, line_start, line_end, line_no, generation, path, object_id,
+                    family, unitizer,
+                )?;
+            }
         }
         Ok(units)
     }
@@ -595,6 +673,7 @@ impl ExtractorPolicy {
         family: ContentFamily,
         byte_start: u64,
         byte_end: u64,
+        unitizer: &str,
     ) -> UnitId {
         let mut h = Sha256::new();
         for part in [
@@ -611,7 +690,7 @@ impl ExtractorPolicy {
             },
             byte_start.to_string().as_bytes(),
             byte_end.to_string().as_bytes(),
-            UNITIZER_ID.as_bytes(),
+            unitizer.as_bytes(),
         ] {
             h.update((part.len() as u64).to_be_bytes());
             h.update(part);
@@ -631,9 +710,12 @@ fn push_line_chunks(
     path: &[u8],
     object_id: &str,
     family: ContentFamily,
+    unitizer: &str,
 ) -> Result<(), &'static str> {
     if line_start == line_end {
-        push_unit(units, generation, path, object_id, family, 0, 0, line)?;
+        push_unit(
+            units, generation, path, object_id, family, unitizer, 0, 0, line, line,
+        )?;
         return Ok(());
     }
     let mut start = line_start;
@@ -645,7 +727,9 @@ fn push_line_chunks(
         if end == start {
             return Err("UTF-8 codepoint exceeds unit size budget");
         }
-        push_unit(units, generation, path, object_id, family, start, end, line)?;
+        push_unit(
+            units, generation, path, object_id, family, unitizer, start, end, line, line,
+        )?;
         start = end;
     }
     Ok(())
@@ -658,9 +742,11 @@ fn push_unit(
     path: &[u8],
     object_id: &str,
     family: ContentFamily,
+    unitizer: &str,
     byte_start: usize,
     byte_end: usize,
-    line: u64,
+    line_start: u64,
+    line_end: u64,
 ) -> Result<(), &'static str> {
     if units.len() == MAX_TEXT_UNITS {
         return Err("text blob exceeds bounded unit count");
@@ -673,13 +759,14 @@ fn push_unit(
             family,
             byte_start as u64,
             byte_end as u64,
+            unitizer,
         ),
         family,
-        unitizer: UNITIZER_ID.into(),
+        unitizer: unitizer.into(),
         byte_start: byte_start as u64,
         byte_end: byte_end as u64,
-        line_start: line,
-        line_end: line,
+        line_start,
+        line_end,
     });
     Ok(())
 }

@@ -137,6 +137,7 @@ fn item(coordinate: &str) -> EvidenceItem {
             generation: "gen-1".to_string(),
             object_id: "obj-1".to_string(),
         },
+        shown: None,
     }
 }
 
@@ -893,6 +894,61 @@ fn the_two_consulted_fields_are_required_and_never_reach_an_older_document() {
     assert!(
         serde_json::from_str::<ProjectionContent>(&v2_document).is_err(),
         "a v2 document lacks fields the current shape requires"
+    );
+}
+
+/// Ruling 0142, the same compatibility property one field lower: adding
+/// `EvidenceItem::shown` must not move the `ProjectionId` of a
+/// projection that was already delivered.
+///
+/// `EvidenceItem` is the one shape **all three** formats share, so this
+/// is the field that could have moved every projection ever written, in
+/// every format, at once. Three halves, and all three are needed. An
+/// item with no located match carries no `shown` key at all — not
+/// `"shown":null` — so its canonical bytes are the bytes the binary
+/// before this one wrote for the same context; a document that never had
+/// the key parses under this binary's shape and re-hashes to exactly the
+/// same id; and the **actual historical** v2 document a shipped binary
+/// wrote still re-hashes to the id that Run's journal is carrying today.
+///
+/// Give `shown` a plain `#[serde(default)]` instead of
+/// `skip_serializing_if` and all three fail at once.
+#[test]
+fn adding_a_shown_span_does_not_move_an_already_delivered_projection_id() {
+    let delivered = content(vec![item("src/server.rs")]);
+    assert!(delivered.bound[0].shown.is_none());
+
+    let bytes = delivered.canonical_bytes();
+    let text = String::from_utf8(bytes.clone()).expect("canonical bytes are utf-8");
+    assert!(
+        !text.contains("shown"),
+        "an item that located nothing must not carry the key at all: {text}"
+    );
+
+    let reparsed: ProjectionContent =
+        serde_json::from_slice(&bytes).expect("a keyless document still parses");
+    assert!(reparsed.bound[0].shown.is_none());
+    assert_eq!(
+        reparsed.projection_id(),
+        delivered.projection_id(),
+        "a document written before this field existed must re-hash to the id its journal \
+         recorded"
+    );
+
+    // The real one: a projection a shipped C3 binary wrote into a real
+    // estate, with the id and receipt that Run's journal recorded.
+    let historical: ProjectionFile =
+        serde_json::from_str(V2_DOCUMENT).expect("the historical v2 document still parses");
+    assert_eq!(
+        historical.content.projection_id(),
+        ProjectionId(V2_ID.to_string()),
+        "a document a shipped binary already delivered must still re-hash to its journal's id"
+    );
+    assert_eq!(historical.receipt.digest(), V2_RECEIPT);
+    assert_eq!(
+        serde_json::to_string(&historical).expect("re-serializes"),
+        V2_DOCUMENT.trim(),
+        "and must re-serialize to the very bytes on disk"
     );
 }
 

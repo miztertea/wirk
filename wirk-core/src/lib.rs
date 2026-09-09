@@ -41,8 +41,8 @@ pub use projection::{
     PROJECTION_FORMAT_V1, PROJECTION_FORMAT_V2, PresentationBudget, ProjectionContent,
     ProjectionContentV1, ProjectionContentV2, ProjectionFile, ProjectionId, ProjectionUnavailable,
     ProjectionWriteError, REACHABLE_DEFAULT, REFERENCED_DEFAULT, ReachableEntry, RetrievalNote,
-    SemanticQueryRequest, Statement, StatementOrigin, UnavailableReason, projection_path,
-    projections_dir,
+    SemanticQueryRequest, ShownEvidence, Statement, StatementOrigin, UnavailableReason,
+    projection_path, projections_dir,
 };
 
 // ---- Identity ----------------------------------------------------------

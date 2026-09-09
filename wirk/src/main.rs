@@ -657,6 +657,38 @@ fn print_world_show(result: &serde_json::Value) {
                     string(item, "coordinate")
                 ),
             }
+            // Ruling 0142: the summary above is a bounded presentation
+            // string. When it was taken from the place a match located
+            // rather than from the head of the resource, the reader is
+            // told which lines those are and that they have a coordinate
+            // of their own — otherwise the coordinate printed above (the
+            // whole resource, or the whole ranked unit) reads as the
+            // span that was shown. Absent when nothing located anything.
+            if let Some(terms) = item["shown"]["matched_terms"].as_array() {
+                let named = terms
+                    .iter()
+                    .filter_map(|term| term.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "      shown: lines {}-{} of that resource, around {}{}",
+                    item["shown"]["line_start"].as_u64().unwrap_or(0),
+                    item["shown"]["line_end"].as_u64().unwrap_or(0),
+                    if named.is_empty() {
+                        "the match".to_string()
+                    } else {
+                        named
+                    },
+                    if item["shown"]["whole_match_shown"].as_bool().unwrap_or(true) {
+                        ""
+                    } else {
+                        "; the match itself is wider than the summary budget and is cut"
+                    }
+                );
+                if let Some(coordinate) = item["shown"]["coordinate"].as_str() {
+                    println!("      shown coordinate {coordinate}");
+                }
+            }
         }
     }
     // A discovery handle is only useful if the line under it runs. The

@@ -60,7 +60,17 @@ fn work(names: &[&str], access: Access) -> wirk_atlas::QueryScope {
 
 #[test]
 fn zero_presentation_budget_is_truncated_not_reported_as_no_match() {
-    let (repo, rev) = repo_with(&[("README.md", "alpha one\nalpha two\nalpha three\n")]);
+    // Three separate files, not three lines of one file: the default (`v4`)
+    // extractor packs consecutive short lines of one file into a single
+    // unit up to its 65536-byte budget (`wirk-atlas/src/extract.rs`), so
+    // three short lines of one small file would derive as one unit, not
+    // three. Three distinct resources still derive three distinct units
+    // regardless of packing, which is what this positive control needs.
+    let (repo, rev) = repo_with(&[
+        ("one.md", "alpha one\n"),
+        ("two.md", "alpha two\n"),
+        ("three.md", "alpha three\n"),
+    ]);
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
     let membership = atlas.register_git("docs", repo.path(), "HEAD").unwrap();

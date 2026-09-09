@@ -574,6 +574,23 @@ fn search_command(rest: &[String]) -> ExitCode {
                          nothing was restarted"
                     );
                 }
+                // Ruling 0135 C4-R12: the plain surface is the one a
+                // human actually reads, so "part of what you are
+                // searching never became searchable" is a sentence here,
+                // not a JSON flag. It names no path and no source: the
+                // detail is `atlas status` for a source this caller is
+                // already admitted to.
+                if result["coverage"]["source_extraction_incomplete"]
+                    .as_bool()
+                    .unwrap_or(false)
+                {
+                    println!(
+                        "  part of an admitted source could not be extracted into anything \
+                         searchable at the generation this answer read, so those bytes are in \
+                         the source and in no index here; see `wirk atlas status --source \
+                         <name>` for the coverage counts of a source you are admitted to"
+                    );
+                }
                 for hit in hits {
                     println!(
                         "  {} {}:{}-{} rev {} score {}",
@@ -584,6 +601,51 @@ fn search_command(rest: &[String]) -> ExitCode {
                         hit["revision"].as_str().unwrap_or("?"),
                         hit["score"].as_f64().unwrap_or(0.0)
                     );
+                    // The snippet is cut for presentation; a reader who
+                    // never passes --json is still told the unit is
+                    // bigger than what was shown, and that the
+                    // coordinate above addresses all of it.
+                    if hit["snippet_truncated"].as_bool().unwrap_or(false) {
+                        println!(
+                            "    snippet cut for display; the unit is {} bytes and the \
+                             coordinate above names all of it",
+                            hit["unit_bytes"].as_u64().unwrap_or(0)
+                        );
+                    }
+                    // Ruling 0142: when the shown bytes are a window
+                    // chosen around the query's own matches, the plain
+                    // reader is told which lines those are and that the
+                    // window has a coordinate of its own — otherwise the
+                    // line range printed above (the whole unit) would
+                    // read as the range that was displayed.
+                    if let Some(terms) = hit["evidence"]["matched_terms"].as_array() {
+                        let named = terms
+                            .iter()
+                            .filter_map(|term| term.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!(
+                            "    shown: lines {}-{} of that unit, around {}{}",
+                            hit["evidence"]["line_start"].as_u64().unwrap_or(0),
+                            hit["evidence"]["line_end"].as_u64().unwrap_or(0),
+                            if named.is_empty() {
+                                "the match".to_string()
+                            } else {
+                                named
+                            },
+                            if hit["evidence"]["whole_match_shown"]
+                                .as_bool()
+                                .unwrap_or(true)
+                            {
+                                ""
+                            } else {
+                                "; the match itself is wider than the display budget and is cut"
+                            }
+                        );
+                        if let Some(coordinate) = hit["evidence"]["coordinate"].as_str() {
+                            println!("    shown coordinate {coordinate}");
+                        }
+                    }
                 }
                 if let Some(token) = result["continuation"].as_str() {
                     println!("continuation {token}");

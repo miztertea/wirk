@@ -162,7 +162,13 @@ fn exact_source_spans_are_blob_qualified_and_independent_of_retrieval_units() {
         .iter()
         .find(|resource| resource.path == b"code.rs")
         .unwrap();
-    assert_eq!(record.units.len(), 3);
+    // Packed by the current default edition (`v4`): all three short lines
+    // fit in one unit far under the 65536-byte budget. The point of this
+    // test is that the hand-built `line_start: 1, line_end: 2` coordinate
+    // below resolves against committed Git bytes independent of whatever
+    // shape the derived units happen to have — not that units are
+    // one-per-line.
+    assert_eq!(record.units.len(), 1);
     let coordinate = ExactCoordinate {
         estate: member.estate.clone(),
         membership: member.id.clone(),
@@ -225,7 +231,7 @@ fn long_utf8_lines_are_deterministic_bounded_lossless_derived_units() {
     let mut rebuilt = Vec::new();
     for unit in &record.units {
         assert!(unit.byte_end - unit.byte_start <= 64 * 1024);
-        assert_eq!(unit.unitizer, "utf8-line-chunks-65536/v1");
+        assert_eq!(unit.unitizer, "utf8-multiline-chunks-65536/v1");
         assert!(text.is_char_boundary(unit.byte_start as usize));
         assert!(text.is_char_boundary(unit.byte_end as usize));
         rebuilt

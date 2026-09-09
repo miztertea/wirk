@@ -27,7 +27,7 @@ pub use findings::{
 pub use query::{
     AnswerBudget, AnswerCoverage, EvidenceHit, HitGenerationIdentity, PathLookupOutcome,
     PathLookupRequest, PinnedProducer, SearchAnswer, SearchRequest, SemanticRequest,
-    SemanticStatus, resolve_path, search,
+    SemanticStatus, TermMatch, resolve_path, search,
 };
 pub use relationship::{
     FrontierRelationships, RelationshipError, RelationshipView, ResourceKey, admit_relationship,

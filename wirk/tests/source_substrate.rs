@@ -751,12 +751,19 @@ fn continuation_pins_generations_across_refresh_publish_and_restart() {
     fs::create_dir_all(&estate).unwrap();
     install_smoke_route(&estate);
 
+    // Two separate files, not one file with two lines: the default (`v4`)
+    // extractor packs consecutive short lines of one file into a single
+    // unit up to its 65536-byte budget (`wirk-atlas/src/extract.rs`), and
+    // `atlas search` returns at most one hit per unit — one file with both
+    // needle lines would derive one unit and one hit, not two. Two
+    // distinct resources still derive two distinct units and two hits
+    // regardless of packing, which is what this continuation/pinning
+    // check needs.
     let repo = dir.path().join("repo");
-    seed_repo(
-        &repo,
-        "lib.rs",
-        "// needle marker alpha\nfn one() {}\n// needle marker beta\nfn two() {}\n",
-    );
+    seed_repo(&repo, "alpha.rs", "// needle marker alpha\nfn one() {}\n");
+    fs::write(repo.join("beta.rs"), "// needle marker beta\nfn two() {}\n").expect("write beta");
+    git(&repo, &["add", "beta.rs"]);
+    git(&repo, &["commit", "-q", "-m", "beta"]);
 
     let mut wirkd_child = start_wirkd(&estate);
     let (ok, acquired, err) = atlas(
@@ -802,13 +809,15 @@ fn continuation_pins_generations_across_refresh_publish_and_restart() {
         page_1["hits"][0]["line_start"].as_u64().unwrap(),
     );
 
-    // Refresh and publish a genuinely new generation before continuing.
+    // Refresh and publish a genuinely new generation before continuing:
+    // add a third file with its own needle, so the refreshed generation
+    // has three needle-bearing units.
     fs::write(
-        repo.join("lib.rs"),
-        "// needle marker alpha\nfn one() {}\n// needle marker beta\nfn two() {}\n// needle marker gamma\nfn three() {}\n",
+        repo.join("gamma.rs"),
+        "// needle marker gamma\nfn three() {}\n",
     )
     .expect("write v2");
-    git(&repo, &["add", "lib.rs"]);
+    git(&repo, &["add", "gamma.rs"]);
     git(&repo, &["commit", "-q", "-m", "v2"]);
     let (ok, refreshed, err) = atlas(
         &estate,
@@ -1591,7 +1600,7 @@ fn the_admitted_corpus_covers_code_docs_and_config_without_widening_exclusions()
         .to_string();
     assert_eq!(
         acquired["generation"]["extractor_set"].as_str(),
-        Some("text-line-chunks/utf8-line-chunks-65536+semble-0.5.2-content-families/v3"),
+        Some("text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families/v4"),
         "the identity must name the edition and say plainly that it is text line chunks, not syntax"
     );
     let (ok, _, err) = atlas(
@@ -1689,9 +1698,12 @@ fn the_admitted_corpus_covers_code_docs_and_config_without_widening_exclusions()
     );
     assert!(ok, "resolve failed: {err}");
     assert_eq!(resolved["outcome"].as_str(), Some("resolved"));
+    // The default (`v4`) extractor packs both of this file's short lines
+    // into one unit (well under its 65536-byte budget), so the hit's
+    // coordinate spans the whole file, not just its first line.
     assert_eq!(
         resolved["text"].as_str(),
-        Some("def spandex_marker():\n"),
+        Some("def spandex_marker():\n    return 1\n"),
         "the span must be the real committed bytes, not a re-render"
     );
 

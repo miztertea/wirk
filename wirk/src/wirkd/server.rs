@@ -7100,7 +7100,222 @@ fn admitted_membership_for(
     }
 }
 
+/// The presentation budget on one hit's snippet.
+///
+/// The current default extractor edition packs consecutive short lines
+/// into one retrieval unit up to 65,536 bytes, so a hit's unit text is
+/// now routinely thousands of lines where the historical one-line-per-
+/// unit edition made it one. A reply that inlined all of it for every
+/// hit would hand a reader tens of thousands of bytes per hit and call
+/// it a snippet.
+///
+/// Presentation only, and disclosed: the cut never reaches `coverage`,
+/// `budget` or the hit's coordinate, so the caller keeps the exact
+/// byte/line range and can `atlas resolve` the whole span whenever it
+/// wants it (ruling 0126 F2 / 0044: a rendering budget must not become a
+/// completion oracle, in either direction).
+const SEARCH_SNIPPET_BYTES: usize = 2 * 1024;
+
+/// The first `SEARCH_SNIPPET_BYTES` of a unit, cut on a UTF-8 boundary,
+/// with the honest total beside it.
+///
+/// The fallback, not the rule: it is what a hit gets when there is no
+/// term location to be local to — a semantically ranked row, or a unit
+/// that fits the budget whole. `evidence_window` is what a lexical hit
+/// on a packed unit gets.
+fn bounded_snippet(snippet: &str) -> (String, bool, usize) {
+    let bytes = snippet.as_bytes();
+    if bytes.len() <= SEARCH_SNIPPET_BYTES {
+        return (snippet.to_string(), false, bytes.len());
+    }
+    let mut cap = SEARCH_SNIPPET_BYTES;
+    while cap > 0 && !snippet.is_char_boundary(cap) {
+        cap -= 1;
+    }
+    (snippet[..cap].to_string(), true, bytes.len())
+}
+
+/// The part of a unit that is actually shown, chosen so the query's own
+/// matches are inside it (ruling 0142).
+///
+/// Byte offsets are relative to the unit's text. `whole_match_shown` is
+/// false only in the one case where no bounded text can carry the whole
+/// match: the matched token is itself at least the display budget.
+struct EvidenceWindow {
+    start: usize,
+    end: usize,
+    matched_terms: Vec<String>,
+    whole_match_shown: bool,
+}
+
+/// The start of the line `offset` is on.
+fn line_begin(text: &str, offset: usize) -> usize {
+    text[..offset].rfind('\n').map_or(0, |index| index + 1)
+}
+
+/// Choose the displayed window for a lexical hit.
+///
+/// The anchor is the match after which the most *distinct* query terms
+/// fall inside one budget — so a two-term query shows where the two
+/// terms actually meet rather than wherever the first one happens to
+/// occur. Ties go to the earliest match, which keeps the choice
+/// deterministic and reading-order natural.
+///
+/// The window is then snapped to committed line boundaries, because a
+/// half line of source is not evidence a reader can act on and a line
+/// boundary is always a character boundary. Snapping never drops the
+/// anchor: the start falls back through "the anchor's own line" to "the
+/// anchor's first byte", and the end falls back from a line boundary to
+/// a character boundary rather than cutting the anchor away.
+fn evidence_window(
+    text: &str,
+    matches: &[wirk_atlas::TermMatch],
+    budget: usize,
+) -> Option<EvidenceWindow> {
+    if text.len() <= budget || matches.is_empty() || budget == 0 {
+        return None;
+    }
+    let offsets: Vec<(usize, usize)> = matches
+        .iter()
+        .map(|found| (found.offset as usize, found.len as usize))
+        .filter(|(offset, len)| offset + len <= text.len())
+        .collect();
+    let (anchor_at, anchor_len) = *offsets
+        .iter()
+        .max_by_key(|(offset, _)| {
+            let reach = offset + budget;
+            let distinct: std::collections::BTreeSet<&str> = matches
+                .iter()
+                .filter(|found| {
+                    found.offset as usize >= *offset && (found.offset + found.len) as usize <= reach
+                })
+                .map(|found| found.term.as_str())
+                .collect();
+            // Earliest wins a tie: `max_by_key` keeps the last maximum,
+            // so the tiebreak is the negated offset.
+            (distinct.len(), std::cmp::Reverse(*offset))
+        })
+        .expect("a lexical hit has at least one match inside its own unit");
+
+    // A token at least as wide as the budget cannot be shown whole by
+    // any bounded window. Show what fits, starting at the match itself.
+    if anchor_len >= budget {
+        let mut end = anchor_at + budget;
+        while end > anchor_at && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return Some(EvidenceWindow {
+            start: anchor_at,
+            end,
+            matched_terms: vec![
+                matches
+                    .iter()
+                    .find(|found| found.offset as usize == anchor_at)
+                    .map(|found| found.term.clone())
+                    .unwrap_or_default(),
+            ],
+            whole_match_shown: false,
+        });
+    }
+
+    let cluster_end = matches
+        .iter()
+        .map(|found| (found.offset + found.len) as usize)
+        .filter(|end| *end <= anchor_at + budget)
+        .max()
+        .unwrap_or(anchor_at + anchor_len);
+    let lead = budget.saturating_sub(cluster_end - anchor_at) / 2;
+    let start = [
+        line_begin(text, anchor_at.saturating_sub(lead)),
+        line_begin(text, anchor_at),
+        anchor_at,
+    ]
+    .into_iter()
+    .find(|candidate| candidate + budget >= anchor_at + anchor_len)
+    .unwrap_or(anchor_at);
+
+    let ceiling = (start + budget).min(text.len());
+    let mut end = ceiling;
+    if end < text.len() {
+        // Prefer a whole number of committed lines.
+        if let Some(index) = text[start..end].rfind('\n')
+            && start + index + 1 >= anchor_at + anchor_len
+        {
+            end = start + index + 1;
+        } else {
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+        }
+    }
+    let mut matched_terms: Vec<String> = matches
+        .iter()
+        .filter(|found| {
+            found.offset as usize >= start && (found.offset + found.len) as usize <= end
+        })
+        .map(|found| found.term.clone())
+        .collect();
+    matched_terms.sort();
+    matched_terms.dedup();
+    Some(EvidenceWindow {
+        start,
+        end,
+        matched_terms,
+        whole_match_shown: true,
+    })
+}
+
+/// The window's own exact coordinate over the same committed blob.
+///
+/// `whole` is the coordinate of the text the window is inside — a ranked
+/// unit for a search hit, the same unit or a resolved resource for an
+/// assembled item — and `text` is exactly the bytes that coordinate
+/// names.
+///
+/// R2: the line arithmetic is `wirk_atlas::actual_line_bounds`, the very
+/// function `AtlasStore::resolve_exact` validates a coordinate with, run
+/// over that text and rebased onto its own first line — so a span this
+/// builds is a span that resolver accepts, or none is returned at all.
+fn window_coordinate(
+    whole: &wirk_atlas::ExactCoordinate,
+    text: &str,
+    window: &EvidenceWindow,
+) -> Option<wirk_atlas::ExactCoordinate> {
+    let (line_start, line_end) =
+        wirk_atlas::actual_line_bounds(text.as_bytes(), window.start as u64, window.end as u64)?;
+    Some(wirk_atlas::ExactCoordinate {
+        byte_start: whole.byte_start + window.start as u64,
+        byte_end: whole.byte_start + window.end as u64,
+        line_start: whole.line_start + line_start - 1,
+        line_end: whole.line_start + line_end - 1,
+        ..whole.clone()
+    })
+}
+
 fn evidence_hit_json(hit: &wirk_atlas::EvidenceHit) -> Value {
+    let (mut snippet, mut snippet_truncated, unit_bytes) = bounded_snippet(&hit.snippet);
+    // What was shown, and exactly where it came from. Absent — and the
+    // reply falls back to the head of the unit — whenever there is no
+    // term location to be local to, so a semantic row is never dressed
+    // up as a lexical match.
+    let mut evidence = Value::Null;
+    if let Some(window) = evidence_window(&hit.snippet, &hit.matches, SEARCH_SNIPPET_BYTES)
+        && let Some(coordinate) = window_coordinate(&hit.coordinate, &hit.snippet, &window)
+    {
+        snippet = hit.snippet[window.start..window.end].to_string();
+        snippet_truncated = true;
+        evidence = json!({
+            "coordinate": encode_coordinate(&coordinate),
+            "byte_start": coordinate.byte_start,
+            "byte_end": coordinate.byte_end,
+            "line_start": coordinate.line_start,
+            "line_end": coordinate.line_end,
+            "matched_terms": window.matched_terms,
+            // False only when the matched token is itself at least the
+            // display budget, so no bounded text could carry it whole.
+            "whole_match_shown": window.whole_match_shown,
+        });
+    }
     json!({
         "coordinate": encode_coordinate(&hit.coordinate),
         "estate": hit.coordinate.estate.0,
@@ -7119,7 +7334,21 @@ fn evidence_hit_json(hit: &wirk_atlas::EvidenceHit) -> Value {
         "line_start": hit.coordinate.line_start,
         "line_end": hit.coordinate.line_end,
         "score": hit.score,
-        "snippet": hit.snippet,
+        "snippet": snippet,
+        // What was cut, said plainly. `unit_bytes` is the real size of
+        // the retrieval unit this hit addresses, so a truncated snippet
+        // is never mistaken for a short unit — and the coordinate above
+        // still names the whole span.
+        "snippet_truncated": snippet_truncated,
+        "unit_bytes": unit_bytes,
+        // Ruling 0142: when the shown bytes are a *part* of the ranked
+        // unit chosen around the query's own matches, this names that
+        // part exactly — a supported coordinate `atlas resolve` returns
+        // those same committed bytes for. Null when the snippet is the
+        // head of the unit (nothing lexical located anything inside it)
+        // or the whole unit; the hit's own `coordinate` above always
+        // names the whole ranked unit either way.
+        "evidence": evidence,
     })
 }
 
@@ -7229,6 +7458,13 @@ fn coverage_json(coverage: &wirk_atlas::AnswerCoverage) -> Value {
         // ranked through any more, so the page it asks for is refused
         // rather than silently reproduced from a different corpus.
         "continuation_unrecoverable": coverage.continuation_unrecoverable,
+        // Ruling 0135 C4-R12: at least one generation this answer read
+        // records a resource the extractor could not turn into retrieval
+        // units, so part of the admitted corpus was never searched. A
+        // flag and nothing more — which resource, in which source, at
+        // what size is `atlas status` for a source the caller is already
+        // admitted to, not something a search answer discloses.
+        "source_extraction_incomplete": coverage.source_extraction_incomplete,
         "complete": coverage.is_complete(),
     })
 }
@@ -16266,6 +16502,12 @@ const ASSEMBLY_CANDIDATES_PER_REFERENCE: usize = 12;
 /// carried in the projection. Neither is a coverage fact.
 const ASSEMBLY_LOOKUP_BYTES: u64 = 65_536;
 const ASSEMBLY_SUMMARY_BYTES: usize = 320;
+/// How many literal occurrences of one authored name are collected
+/// before a summary window is chosen around them (ruling 0142). One name
+/// is one distinct term, so the window falls on the earliest occurrence
+/// whatever this is; it exists so a name occurring thousands of times in
+/// one 64 KiB unit cannot turn summarising into a quadratic scan.
+const ASSEMBLY_MATCH_SCAN: usize = 64;
 
 /// A projection assembled outside the journal guard, together with the
 /// Waypoint it was assembled for and the Atlas publication revision it
@@ -17193,6 +17435,61 @@ fn bounded_summary(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..cap]).replace(['\n', '\r'], " ")
 }
 
+/// The same bounded summary, taken from where a match actually is, with
+/// the exact coordinate of the bytes it was taken from (ruling 0142).
+///
+/// R2 exactly: the window is `evidence_window` — the one the search
+/// reply already chooses its displayed bytes with — run at the
+/// assembler's own budget, and the span is `window_coordinate`, built
+/// through the resolver's own line arithmetic. No second tokenizer, no
+/// second query language, no separate relevance rule; the only
+/// difference is the budget, which belongs to the presentation layer
+/// that owns it.
+///
+/// `None` means nothing located anything inside this text — a
+/// semantically ranked row, or a resource that already fits the budget
+/// whole — and the caller falls back to the head of it. An item no term
+/// match put where it is therefore never acquires invented match terms
+/// and never names a narrower span.
+fn local_summary(
+    whole: &wirk_atlas::ExactCoordinate,
+    text: &str,
+    matches: &[wirk_atlas::TermMatch],
+) -> Option<(String, wirk_core::ShownEvidence)> {
+    let window = evidence_window(text, matches, ASSEMBLY_SUMMARY_BYTES)?;
+    let coordinate = window_coordinate(whole, text, &window)?;
+    Some((
+        bounded_summary(&text.as_bytes()[window.start..window.end]),
+        wirk_core::ShownEvidence {
+            coordinate: encode_coordinate(&coordinate),
+            byte_start: coordinate.byte_start,
+            byte_end: coordinate.byte_end,
+            line_start: coordinate.line_start,
+            line_end: coordinate.line_end,
+            matched_terms: window.matched_terms,
+            whole_match_shown: window.whole_match_shown,
+        },
+    ))
+}
+
+/// Where an authored name literally occurs in a candidate's text, as
+/// term locations the shared window can be chosen around.
+///
+/// This is the *same* literal containment test that admits the candidate
+/// in the first place, reported with its offsets instead of thrown away
+/// — not a second matcher, and nothing that could admit a resource the
+/// old test would not. Bounded by `ASSEMBLY_MATCH_SCAN`.
+fn literal_matches(text: &str, name: &str) -> Vec<wirk_atlas::TermMatch> {
+    text.match_indices(name)
+        .take(ASSEMBLY_MATCH_SCAN)
+        .map(|(offset, found)| wirk_atlas::TermMatch {
+            offset: offset as u64,
+            len: found.len() as u64,
+            term: name.to_string(),
+        })
+        .collect()
+}
+
 /// Assembles one stage projection: BUILD.md §4.3 steps 1-3, and no
 /// others.
 ///
@@ -17292,6 +17589,28 @@ fn prepare_projection(
         .iter()
         .map(|(membership, generation)| (membership.id.0.clone(), generation.id.0.clone()))
         .collect();
+    // Ruling 0135 C4-R12, the World half of the same fact `atlas
+    // search`'s `coverage.source_extraction_incomplete` carries: how many
+    // resources of the vector *this assembly captured* the extractor was
+    // asked for and could not produce retrieval units for. Those bytes
+    // are in the source and in no index, so the corpus this projection
+    // describes is short by that many resources.
+    //
+    // Counted over the admitted memberships only, so a failure in a
+    // source this requester was never shown cannot reach the count. Only
+    // `Error`: an unsupported family and a deliberately excluded path
+    // are the declared shape of the corpus, and counting them would
+    // "obscure the map" (ruling 0135's own qualification).
+    let unextractable = admitted
+        .iter()
+        .map(|(_, generation)| {
+            generation
+                .resources
+                .iter()
+                .filter(|resource| resource.disposition == wirk_atlas::CoverageDisposition::Error)
+                .count()
+        })
+        .sum::<usize>();
 
     // Step 3: literal references, resolved at the captured generations.
     let intent = def.intent.clone().unwrap_or_default();
@@ -17536,6 +17855,11 @@ fn prepare_projection(
             count: inadmissible,
         });
     }
+    if unextractable > 0 {
+        omitted.push(wirk_core::Omission::SourceExtractionIncomplete {
+            count: unextractable,
+        });
+    }
 
     // Coverage comes only from admission denials, unavailability,
     // unresolved references and index health — never from a budget, a
@@ -17552,6 +17876,16 @@ fn prepare_projection(
     {
         wirk_core::EvidenceCoverage::Partial {
             reason: wirk_core::CoverageReason::EvidenceUnavailable,
+        }
+    } else if unextractable > 0 {
+        // The captured vector holds a resource nothing could turn into
+        // retrieval units. Ranked below `EvidenceUnavailable` — bytes
+        // that were indexed and cannot be read back now is the stronger
+        // statement — and above the reasons that are about the request
+        // rather than about the corpus. Not a budget and not a
+        // truncation: nothing a presentation number does can reach it.
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::SourceExtractionIncomplete,
         }
     } else if inadmissible > 0 {
         wirk_core::EvidenceCoverage::Partial {
@@ -17900,6 +18234,7 @@ fn follow_governance(
                         generation: coordinate.generation.0.clone(),
                         object_id: coordinate.object_id.clone(),
                     },
+                    shown: None,
                 });
                 governance.delivered += 1;
                 if is_record && expanded.insert(key.clone()) {
@@ -18019,6 +18354,7 @@ fn bind_prior_stage_artifacts(
                     claim: claim.0.clone(),
                     digest: receipt.digest.clone(),
                 },
+                shown: None,
             });
             delivered += 1;
         }
@@ -18165,6 +18501,10 @@ fn retrieval_note(answer: Option<&wirk_atlas::SearchAnswer>) -> wirk_core::Retri
             coverage.continuation_unrecoverable,
             "continuation_unrecoverable",
         ),
+        (
+            coverage.source_extraction_incomplete,
+            "source_extraction_incomplete",
+        ),
     ] {
         if flag {
             degraded.push(label.to_string());
@@ -18195,9 +18535,19 @@ fn ranked_item(
     let (membership, generation) = admitted.iter().find(|(membership, generation)| {
         membership.id == hit.coordinate.membership && generation.id == hit.coordinate.generation
     })?;
+    // Ruling 0142: what the question's own terms located inside the
+    // ranked unit, not the head of it. The unit keeps its identity —
+    // `coordinate`, and the score and position that put it here are
+    // untouched; `shown` is what was displayed out of it. A row the
+    // ranker chose by vector carries no term location and falls back to
+    // the head, which is the honest summary of a row no term matched.
+    let (summary, shown) = local_summary(&hit.coordinate, &hit.snippet, &hit.matches).map_or_else(
+        || (bounded_summary(hit.snippet.as_bytes()), None),
+        |(summary, shown)| (summary, Some(shown)),
+    );
     Some(wirk_core::EvidenceItem {
         coordinate: encode_coordinate(&hit.coordinate),
-        summary: bounded_summary(hit.snippet.as_bytes()),
+        summary,
         lifetime: lifetime_of(generation, &hit.coordinate.path),
         reason: format!(
             "ranked for the authored question in source `{}` at the captured generation, \
@@ -18209,6 +18559,7 @@ fn ranked_item(
             generation: hit.coordinate.generation.0.clone(),
             object_id: hit.coordinate.object_id.clone(),
         },
+        shown,
     })
 }
 
@@ -18317,7 +18668,10 @@ fn reason_is_about_the_consultation(reason: wirk_core::CoverageReason) -> bool {
         | wirk_core::CoverageReason::InadmissibleSources
         | wirk_core::CoverageReason::EvidenceUnavailable
         | wirk_core::CoverageReason::ConcurrentPublication
-        | wirk_core::CoverageReason::GovernanceOutsideCapturedEditions => false,
+        | wirk_core::CoverageReason::GovernanceOutsideCapturedEditions
+        // A hole in the captured vector's own index. An expansion
+        // inherits that vector wholesale, so it inherits this.
+        | wirk_core::CoverageReason::SourceExtractionIncomplete => false,
     }
 }
 
@@ -18373,6 +18727,15 @@ fn carried_source_coverage(
         });
     let rebuilt = if unavailable_beyond_the_index {
         Some(wirk_core::CoverageReason::EvidenceUnavailable)
+    } else if omitted
+        .iter()
+        .any(|item| matches!(item, wirk_core::Omission::SourceExtractionIncomplete { .. }))
+    {
+        // Seeded from the parent and appended to by this revision like
+        // every other omission, so an extraction hole the parent
+        // recorded is recovered here even when the parent's own reason
+        // was a stale consultation one that masked it.
+        Some(wirk_core::CoverageReason::SourceExtractionIncomplete)
     } else if omitted
         .iter()
         .any(|item| matches!(item, wirk_core::Omission::Inadmissible { .. }))
@@ -18439,6 +18802,14 @@ fn next_action_for(coverage: wirk_core::EvidenceCoverage, no_unknowns: bool) -> 
         } => {
             "something the captured vector or this Work's own record names could not be read \
              back at the identity it was recorded against"
+        }
+        wirk_core::EvidenceCoverage::Partial {
+            reason: wirk_core::CoverageReason::SourceExtractionIncomplete,
+        } => {
+            "part of an admitted source could not be extracted into anything searchable at the \
+             generation this projection captured, so those bytes are in the source and in no \
+             index here; it is reported only as a count, and `wirk atlas status` for a source \
+             this Work is bound to is where the detail is"
         }
         wirk_core::EvidenceCoverage::Partial {
             reason: wirk_core::CoverageReason::IndexCannotAttestCompleteness,
@@ -18604,6 +18975,7 @@ fn bind_resource(
             generation: coordinate.generation.0.clone(),
             object_id: coordinate.object_id.clone(),
         },
+        shown: None,
     })
 }
 
@@ -18752,12 +19124,21 @@ fn attribute_candidates(
             if !text.contains(name) {
                 continue;
             }
+            // Ruling 0142: this item is delivered *because* the name
+            // occurs literally in these bytes, so the summary is taken
+            // from where it occurs. Same window, same coordinate
+            // arithmetic as everywhere else.
+            let (summary, shown) =
+                local_summary(&hit.coordinate, text, &literal_matches(text, name)).map_or_else(
+                    || (bounded_summary(unit), None),
+                    |(summary, shown)| (summary, Some(shown)),
+                );
             found
                 .entry(name.to_string())
                 .or_default()
                 .push(wirk_core::EvidenceItem {
                     coordinate: encode_coordinate(&hit.coordinate),
-                    summary: bounded_summary(unit),
+                    summary,
                     lifetime: lifetime_of(generation, &hit.coordinate.path),
                     reason: format!(
                         "the authored text names the identifier `{name}`, which occurs literally \
@@ -18768,6 +19149,7 @@ fn attribute_candidates(
                         generation: hit.coordinate.generation.0.clone(),
                         object_id: hit.coordinate.object_id.clone(),
                     },
+                    shown,
                 });
         }
     }

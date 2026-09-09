@@ -2197,3 +2197,281 @@ fn bound_artifact(projection: &Value, arm: &str) -> Value {
         .unwrap_or_else(|| panic!("a prior-stage artifact must be bound in {arm}: {projection}"))
         .clone()
 }
+
+// ---- source coverage the World is honest about ---------------------------
+
+/// Real, valid UTF-8 Rust text past `wirk-atlas/src/extract.rs`'s
+/// `MAX_TEXT_BYTES` (1 MiB). The extractor reads it, measures it and
+/// refuses it exactly as it refuses any other oversize blob — the same
+/// budget the actual product file `wirk/src/wirkd/server.rs` (902,199
+/// bytes at `73d6d2d`) is approaching.
+fn oversize_source_text() -> String {
+    let mut text = String::with_capacity(1_200_000);
+    let mut line = 0u32;
+    while text.len() <= 1024 * 1024 {
+        text.push_str(&format!(
+            "pub fn oversize_{line}(argument: u32) -> u32 {{ argument.wrapping_add({line}) }}\n"
+        ));
+        line += 1;
+    }
+    text
+}
+
+fn expand_world(estate: &Path, work: &str, run: &str, question: &str, reason: &str) -> Value {
+    let output = Command::new(wirk_bin())
+        .args([
+            "world",
+            "expand",
+            "--json",
+            "--question",
+            question,
+            "--reason",
+            reason,
+        ])
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", work)
+        .env("WIRK_RUN_ID", run)
+        .output()
+        .expect("wirk world expand runs");
+    assert!(
+        output.status.success(),
+        "world expand: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("expansion json")
+}
+
+/// Ruling 0135 C4-R12, on the assembled World rather than on `atlas
+/// search`: a captured generation that records a resource the extractor
+/// could not turn into retrieval units at all is a completeness fact
+/// about the delivered evidence, and the projection says so — as a
+/// count, never as a path.
+///
+/// It then proves the two halves the source-coverage brief names
+/// together: an **expansion** inherits the captured vector and therefore
+/// keeps saying it (publication alone does not rebase that chain), while
+/// a **repaired, republished** source assembled into a *new* World
+/// recovers — and the frozen document that was already delivered is
+/// untouched by either.
+#[test]
+fn a_world_over_a_generation_that_failed_to_extract_a_resource_discloses_it_as_a_count() {
+    let mut estate = Estate::new();
+    let holed = estate
+        .root
+        .parent()
+        .expect("estate parent")
+        .join("holed-repo");
+    fs::create_dir_all(&holed).expect("holed repo dir");
+    init_repo(&holed);
+    write_file(&holed, "engine.rs", "pub fn holedmarker() -> u8 { 7 }\n");
+    write_file(&holed, "quarantinedhuge.rs", &oversize_source_text());
+    commit_all(&holed);
+
+    // Positive control, from the estate's own acquisition reply: this is
+    // one genuine extraction failure, not an exclusion and not an
+    // unsupported family.
+    let acquired = publish_reporting(&estate.root, "holed", &holed);
+    let coverage = &acquired["generation"]["coverage"];
+    assert_eq!(coverage["total"], 2, "{coverage}");
+    assert_eq!(coverage["indexed"], 1, "{coverage}");
+    assert_eq!(coverage["error"], 1, "{coverage}");
+    assert_eq!(coverage["unsupported"], 0, "{coverage}");
+    assert_eq!(coverage["excluded"], 0, "{coverage}");
+
+    let route = one_stage_route_with(
+        &estate.root,
+        "holed-coverage",
+        "What decides holedmarker?",
+        r#"["holed"]"#,
+        "",
+    );
+    let submitted = submit_kind(
+        &estate.root,
+        route.to_str().unwrap(),
+        &estate.repo,
+        &["holed:write"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit holed");
+    let shown = world_show(&estate.root, &submitted.work_id, &submitted.run_id);
+    let projection = shown["projection"].clone();
+    // The delivered document's own content identity, so "untouched"
+    // below is a statement about bytes and not about a re-render.
+    let initial_projection_id = shown["reference"]["projection"]
+        .as_str()
+        .expect("an initial projection identity")
+        .to_string();
+
+    assert_eq!(
+        projection["coverage"]["state"], "partial",
+        "CONTRACT FAILURE (ruling 0135 C4-R12): the captured generation holds a \
+         resource nothing could extract, and the World called its evidence \
+         complete: {projection}"
+    );
+    assert_eq!(
+        projection["coverage"]["reason"], "source_extraction_incomplete",
+        "the reason must name the source limitation, not borrow another one: \
+         {projection}"
+    );
+    let omitted = omission(&projection, "source_extraction_incomplete")
+        .unwrap_or_else(|| panic!("a counted omission: {projection}"));
+    assert_eq!(omitted["count"], 1, "{omitted}");
+    assert!(
+        omitted.get("coordinate").is_none() && omitted.get("path").is_none(),
+        "a count, and only a count — naming the resource would disclose a path \
+         the projection never delivered: {omitted}"
+    );
+    assert!(
+        projection["next_action"]
+            .as_str()
+            .expect("a next_action sentence")
+            .contains("could not be extracted"),
+        "the plain sentence must say what is missing: {projection}"
+    );
+
+    // Not a leak, and not the extractor's own diagnostic either: the
+    // reason text carries a budget number no scope admitted.
+    let rendered = shown.to_string();
+    for needle in ["quarantinedhuge", "exceeds bounded", "holed-repo"] {
+        assert!(
+            !rendered.contains(needle),
+            "the failing resource leaked {needle:?} into the delivered World"
+        );
+    }
+
+    // An expansion inherits the captured vector, so it inherits the fact.
+    let expanded = expand_world(
+        &estate.root,
+        &submitted.work_id,
+        &submitted.run_id,
+        "What else decides holedmarker?",
+        "the first pass did not settle it",
+    );
+    assert_eq!(expanded["revision"], 1, "{expanded}");
+    assert_eq!(
+        expanded["projection"]["coverage"]["state"], "partial",
+        "an expansion keeps the captured vector, so it keeps what that vector \
+         could not deliver: {expanded}"
+    );
+    assert_eq!(
+        expanded["projection"]["coverage"]["reason"], "source_extraction_incomplete",
+        "{expanded}"
+    );
+
+    // A real refresh of the source: a new commit with no blob past the
+    // extractor's budget, acquired and published as a new generation.
+    // Nothing already recorded is edited.
+    fs::remove_file(holed.join("quarantinedhuge.rs")).expect("remove the oversize blob");
+    commit_all(&holed);
+    let repaired = publish_reporting(&estate.root, "holed", &holed);
+    let repaired_coverage = &repaired["generation"]["coverage"];
+    assert_eq!(repaired_coverage["error"], 0, "{repaired_coverage}");
+    assert_eq!(repaired_coverage["indexed"], 1, "{repaired_coverage}");
+
+    // A new Work, bound the same way, captures the repaired generation.
+    let recovered_route = one_stage_route_with(
+        &estate.root,
+        "holed-recovered",
+        "What decides holedmarker?",
+        r#"["holed"]"#,
+        "",
+    );
+    let recovered = submit_kind(
+        &estate.root,
+        recovered_route.to_str().unwrap(),
+        &estate.repo,
+        &["holed:write"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit recovered");
+    let recovered_projection =
+        world_show(&estate.root, &recovered.work_id, &recovered.run_id)["projection"].clone();
+    assert_eq!(
+        recovered_projection["coverage"]["state"], "complete",
+        "a repaired, republished source assembled into a new World recovers: \
+         {recovered_projection}"
+    );
+    assert!(
+        omission(&recovered_projection, "source_extraction_incomplete").is_none(),
+        "{recovered_projection}"
+    );
+
+    // And the document that was already delivered is untouched by
+    // either the expansion or the republication: revision 0 still hashes
+    // to exactly the bytes it was delivered with.
+    let frozen = world_show(&estate.root, &submitted.work_id, &submitted.run_id);
+    assert_eq!(
+        frozen["revisions"][0]["projection"], initial_projection_id,
+        "the initial revision is immutable: {frozen}"
+    );
+    assert_eq!(frozen["revisions"][0]["initial"], true, "{frozen}");
+
+    estate.stop();
+}
+
+/// The mirror control, on the World: `indexed < total` for the reasons a
+/// source declares — an unsupported family, a deliberately excluded path
+/// — is not a failure and must not move coverage (ruling 0135's own
+/// qualification to R12: "treating every intentionally unsupported file
+/// as failed would obscure the map").
+#[test]
+fn a_world_over_declared_exclusions_and_unsupported_families_stays_complete() {
+    let mut estate = Estate::new();
+    let declared = estate
+        .root
+        .parent()
+        .expect("estate parent")
+        .join("declared-repo");
+    fs::create_dir_all(&declared).expect("declared repo dir");
+    init_repo(&declared);
+    write_file(
+        &declared,
+        "engine.rs",
+        "pub fn declaredmarker() -> u8 { 7 }\n",
+    );
+    write_file(&declared, "table.xyz", "declaredmarker\n");
+    write_file(
+        &declared,
+        "deploy.pem",
+        "-----BEGIN KEY-----\ndeclaredmarker\n",
+    );
+    commit_all(&declared);
+
+    let acquired = publish_reporting(&estate.root, "declared", &declared);
+    let coverage = &acquired["generation"]["coverage"];
+    assert_eq!(coverage["indexed"], 1, "{coverage}");
+    assert_eq!(coverage["unsupported"], 1, "{coverage}");
+    assert_eq!(coverage["excluded"], 1, "{coverage}");
+    assert_eq!(coverage["error"], 0, "{coverage}");
+
+    let route = one_stage_route_with(
+        &estate.root,
+        "declared-coverage",
+        "What decides declaredmarker?",
+        r#"["declared"]"#,
+        "",
+    );
+    let submitted = submit_kind(
+        &estate.root,
+        route.to_str().unwrap(),
+        &estate.repo,
+        &["declared:write"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit declared");
+    let projection =
+        world_show(&estate.root, &submitted.work_id, &submitted.run_id)["projection"].clone();
+    assert_eq!(
+        projection["coverage"]["state"], "complete",
+        "declared coverage is not a hole: {projection}"
+    );
+    assert!(
+        omission(&projection, "source_extraction_incomplete").is_none(),
+        "{projection}"
+    );
+
+    estate.stop();
+}

@@ -92,6 +92,27 @@ pub struct AnswerCoverage {
     /// retained verified state where available or explicitly refuse
     /// unrecoverable continuation").
     pub continuation_unrecoverable: bool,
+    /// At least one generation this answer actually read records a
+    /// resource the extractor could not turn into retrieval units at all
+    /// (`CoverageDisposition::Error`). Part of the admitted corpus was
+    /// therefore never searched, whatever the hit list says.
+    ///
+    /// Ruling 0135 C4-R12, with the ruling's own qualification. It is
+    /// **not** `indexed < total`: a family no edition claims
+    /// (`Unsupported`) and a path the extractor deliberately refuses
+    /// (`Excluded`) are declared coverage, and "treating every
+    /// intentionally unsupported file as failed would obscure the map".
+    /// Only a genuine failure — the extractor was asked for units and
+    /// could not produce them — sets this.
+    ///
+    /// Deliberately a fact about the *admitted* vector and nothing else:
+    /// it is derived only from generations this answer's own scope
+    /// resolved, so it never discloses that some other source in the
+    /// estate is broken, and it never carries a path, an object id or a
+    /// count that would say which resource failed. A caller learns that
+    /// this answer is short, and is told to look at `atlas status` for
+    /// the source it is already admitted to.
+    pub source_extraction_incomplete: bool,
 }
 impl AnswerCoverage {
     pub fn is_complete(&self) -> bool {
@@ -103,7 +124,8 @@ impl AnswerCoverage {
             || self.denied
             || self.no_sources
             || self.spent
-            || self.continuation_unrecoverable)
+            || self.continuation_unrecoverable
+            || self.source_extraction_incomplete)
     }
 }
 
@@ -120,12 +142,43 @@ pub struct HitGenerationIdentity {
     pub extractor_set: String,
 }
 
+/// Where one of the *query's own* terms actually occurs inside a ranked
+/// unit's text.
+///
+/// Produced by the same tokenizer the BM25 scorer counts with
+/// (`tokens_with_offsets`, of which `tokenize` is now the projection),
+/// so a match reported here is a token the ranking actually paid for —
+/// never a second, ad-hoc substring detector that could disagree with
+/// what was scored.
+///
+/// Offsets are relative to the unit's own text, i.e. to
+/// `EvidenceHit::snippet` and to `coordinate.byte_start`. The crate
+/// deliberately does not choose a display window from these: the
+/// presentation budget belongs to the surface that renders a reply, and
+/// this is the location fact that surface needs to render a *local*
+/// one (ruling 0142).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TermMatch {
+    /// Byte offset of the token inside the ranked unit's text.
+    pub offset: u64,
+    /// Length in bytes of the token as it appears in the unit — the
+    /// committed bytes, not the lowercased form that was scored.
+    pub len: u64,
+    /// The normalised term, exactly as the scorer keyed it.
+    pub term: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceHit {
     pub coordinate: ExactCoordinate,
     pub score: f64,
     pub snippet: String,
     pub generation_identity: HitGenerationIdentity,
+    /// Every occurrence of a query term inside `snippet`, in ascending
+    /// offset order. Empty when the hit was not selected by lexical
+    /// term matching — a semantically ranked row is *not* a term match
+    /// and must not be relabelled as one.
+    pub matches: Vec<TermMatch>,
 }
 
 /// The evidence budget an answer actually used (W3-CORRECTION.md item 4):
@@ -392,6 +445,23 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
     }
     generations.sort_by(|a, b| a.0.0.cmp(&b.0.0));
     let saw_any_generation = !resolved.is_empty();
+    // Ruling 0135 C4-R12: a resource the extractor was asked for and
+    // could not produce units for is a hole in this answer's corpus, and
+    // the answer says so. Read off exactly the generations resolved
+    // above — the ones this scope admitted and this answer reads — so a
+    // failure in a source the caller was never shown cannot reach it,
+    // and so a continuation pinned to an older generation keeps
+    // reporting what was true of *that* generation.
+    //
+    // `Unsupported` and `Excluded` are deliberately not counted: they
+    // are the declared shape of the corpus, not a failure to build it
+    // (ruling 0135's own qualification to R12).
+    coverage.source_extraction_incomplete = resolved.iter().any(|(_, generation)| {
+        generation
+            .resources
+            .iter()
+            .any(|resource| resource.disposition == CoverageDisposition::Error)
+    });
 
     // ---- ranking mode ----------------------------------------------------
     let mut editions_used: Vec<(MembershipId, EditionId)> = Vec::new();
@@ -504,13 +574,18 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
         && !coverage.spent
         && !coverage.source_unavailable
         && !coverage.generation_unavailable
+        // A resource that never became searchable was never searched, so
+        // this answer cannot assert the corpus genuinely held nothing —
+        // the same reason an unread source disqualifies `no_match`.
+        && !coverage.source_extraction_incomplete
     {
         coverage.no_match = true;
     }
     coverage.partial = coverage.partial
         || truncated
         || coverage.source_unavailable
-        || coverage.generation_unavailable;
+        || coverage.generation_unavailable
+        || coverage.source_extraction_incomplete;
 
     Ok(SearchAnswer {
         publication_revision,
@@ -702,6 +777,10 @@ fn semantic_attempt(
             // shown is what the repository holds at this coordinate.
             snippet: String::from_utf8_lossy(&row.bytes).into_owned(),
             generation_identity: identity.clone(),
+            // A semantic row was chosen by a vector, not by a term. It
+            // carries no term match, so no surface can window it as
+            // though a lexical query had located something inside it.
+            matches: Vec::new(),
         });
     }
     // The candidate pool is frozen so paging is a slice of one list. When
@@ -843,11 +922,20 @@ fn score(query: &str, candidates: Vec<Candidate>) -> Vec<EvidenceHit> {
                 let denom = tf + K1 * (1.0 - B + B * candidate.length as f64 / avgdl.max(1.0));
                 total += idf * (tf * (K1 + 1.0)) / denom;
             }
+            // Only a candidate that actually scored is ever returned, so
+            // the second tokenizer pass runs on the returned pool, not on
+            // every unit of every admitted source.
+            let matches = if total > 0.0 {
+                term_matches(&candidate.snippet, &query_terms)
+            } else {
+                Vec::new()
+            };
             EvidenceHit {
                 coordinate: candidate.coordinate,
                 score: total,
                 snippet: candidate.snippet,
                 generation_identity: candidate.generation_identity,
+                matches,
             }
         })
         .filter(|hit| hit.score > 0.0)
@@ -862,10 +950,48 @@ fn score(query: &str, candidates: Vec<Candidate>) -> Vec<EvidenceHit> {
     hits
 }
 
+/// The one splitting rule this crate has: a token is a maximal run of
+/// alphanumerics and `_`, normalised by `to_lowercase`.
+///
+/// R2/R6: `tokenize` is this function with the positions dropped, so
+/// there is exactly one tokenizer. Adding a second one that agreed only
+/// by inspection is how a reported match location comes to name bytes
+/// the ranker never scored.
+fn tokens_with_offsets(text: &str) -> Vec<(String, usize, usize)> {
+    let mut tokens = Vec::new();
+    let mut open: Option<usize> = None;
+    for (index, character) in text.char_indices() {
+        if character.is_alphanumeric() || character == '_' {
+            open.get_or_insert(index);
+        } else if let Some(begin) = open.take() {
+            tokens.push((text[begin..index].to_lowercase(), begin, index - begin));
+        }
+    }
+    if let Some(begin) = open {
+        tokens.push((text[begin..].to_lowercase(), begin, text.len() - begin));
+    }
+    tokens
+}
+
 fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_lowercase())
+    tokens_with_offsets(text)
+        .into_iter()
+        .map(|(token, _, _)| token)
+        .collect()
+}
+
+/// The occurrences of `query_terms` inside one unit's text, in ascending
+/// offset order. Same tokenizer, same normalisation, same terms the
+/// scorer summed over.
+fn term_matches(text: &str, query_terms: &[String]) -> Vec<TermMatch> {
+    tokens_with_offsets(text)
+        .into_iter()
+        .filter(|(token, _, _)| query_terms.iter().any(|term| term == token))
+        .map(|(term, offset, len)| TermMatch {
+            offset: offset as u64,
+            len: len as u64,
+            term,
+        })
         .collect()
 }
 

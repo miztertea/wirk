@@ -344,8 +344,35 @@ struct Estate {
 }
 
 fn estate() -> Estate {
+    estate_with(fixture_repo())
+}
+
+/// Like `fixture_repo`, but `code.rs` is padded past the 65536-byte
+/// packed-unit budget (`wirk-atlas/src/extract.rs`'s `MAX_UNIT_BYTES`)
+/// with more short lines, so the default (`v4`) extractor edition is
+/// forced to derive more than one raw unit for it. `fixture_repo`'s
+/// `code.rs` alone (a few hundred bytes) now packs into exactly one raw
+/// unit under `v4`, which would make a covering run that spans more than
+/// one unit unreachable — the thing `c_the_unit_run_covers_the_range_...`
+/// exists to exercise.
+fn large_fixture_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    let mut code = String::new();
+    for i in 0..2500 {
+        code.push_str(&format!("fn f{i}() {{ let admitted = {i}; }}\n"));
+    }
+    assert!(code.len() > 65536, "fixture must force more than one unit");
+    fs::write(repo.path().join("code.rs"), code).unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    repo
+}
+
+fn estate_with(repo: TempDir) -> Estate {
     let temporary = TempDir::new().unwrap();
-    let repo = fixture_repo();
     let mut store =
         AtlasStore::open(temporary.path(), temporary.path().display().to_string()).unwrap();
     let membership = store
@@ -501,7 +528,7 @@ fn b_a_transformed_resource_keeps_two_digests_and_names_the_transformation() {
 /// it is contiguous within the row's own resource.
 #[test]
 fn c_the_unit_run_covers_the_range_without_claiming_to_equal_it() {
-    let mut estate = estate();
+    let mut estate = estate_with(large_fixture_repo());
     let edition = staged(build(&mut estate, "honest"));
     let rows = read_rows(&estate, &edition);
     let generation = estate.store.generation(&edition.generation).unwrap();

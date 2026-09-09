@@ -89,8 +89,14 @@ fn utf8_rust_and_markdown_units_have_exact_committed_byte_and_line_coordinates()
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     let member = atlas.register_git("source", repo.path(), "HEAD").unwrap();
+    // Explicitly the historical one-line-per-unit edition: this test
+    // addresses individual line units by index (`code.units[0]`, `1`),
+    // which only holds under a one-line-per-unit unitizer. The current
+    // default (`v4`) packs short consecutive lines into one unit; that
+    // packing is exercised in `extract.rs`'s own unit tests and in the
+    // multiline-specific coverage tests, not here.
     let generation = atlas
-        .acquire(&member, "HEAD", ExtractorPolicy::default())
+        .acquire(&member, "HEAD", ExtractorPolicy::content_families_v3())
         .unwrap()
         .staged()
         .unwrap();

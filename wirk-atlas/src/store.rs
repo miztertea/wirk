@@ -585,9 +585,11 @@ impl AtlasStore {
                         "indexed resource lacks a blob identity".into(),
                     ));
                 };
+                let expected_unitizer = edition.unitizer_id();
                 let mut previous_end = 0;
+                let mut previous_end_line = 0;
                 for unit in &resource.units {
-                    if unit.unitizer != "utf8-line-chunks-65536/v1"
+                    if unit.unitizer != expected_unitizer
                         || Some(unit.family) != edition.family(&resource.path)
                         || unit.id
                             != ExtractorPolicy::unit_id(
@@ -597,18 +599,23 @@ impl AtlasStore {
                                 unit.family,
                                 unit.byte_start,
                                 unit.byte_end,
+                                &unit.unitizer,
                             )
                         || unit.byte_start != previous_end
                         || unit.byte_end < unit.byte_start
                         || unit.byte_end - unit.byte_start > 64 * 1024
                         || unit.line_start == 0
-                        || unit.line_start != unit.line_end
+                        || unit.line_start > unit.line_end
+                        || (unit.line_start != previous_end_line
+                            && unit.line_start != previous_end_line + 1)
+                        || (!edition.multiline() && unit.line_start != unit.line_end)
                     {
                         return Err(AtlasError::Generation(
                             "derived retrieval unit identity or bounds are inconsistent".into(),
                         ));
                     }
                     previous_end = unit.byte_end;
+                    previous_end_line = unit.line_end;
                 }
                 if resource.byte_len != Some(previous_end) {
                     return Err(AtlasError::Generation(
