@@ -1111,7 +1111,14 @@ fn a_settled_proofs_receipt_reaches_a_narrowed_child_without_its_sources() {
     let family = build_family(&["scratch:write", "open:read", "helper:write"]);
     let estate = &family.estate;
 
-    write_file(&family.dir.path().join("parent-repo"), "a.md", "a\n");
+    // P3 execution-recovery item 1: the parent's own Deterministic
+    // leaf now runs in this Work's own worktree, not the caller's
+    // shared --repo-path checkout.
+    write_file(
+        &family.estate.join("worktrees").join(&family.parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(
         estate,
         &family.parent.work_id,
@@ -4975,7 +4982,14 @@ fn an_off_lineage_settled_publication_needs_the_producers_own_admission() {
     )
     .unwrap();
 
-    write_file(&family.dir.path().join("parent-repo"), "a.md", "a\n");
+    // P3 execution-recovery item 1: the parent's own Deterministic
+    // leaf now runs in this Work's own worktree, not the caller's
+    // shared --repo-path checkout.
+    write_file(
+        &family.estate.join("worktrees").join(&family.parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(
         estate,
         &family.parent.work_id,
@@ -5850,7 +5864,13 @@ fn verify_a_publication_route_relation_is_withheld_from_a_narrowed_child() {
         None,
     )
     .unwrap();
-    write_file(&producer_repo, "a.md", "a\n");
+    // P3 execution-recovery item 1: same reasoning — the producer's own
+    // Deterministic leaf runs in its own worktree, not `producer_repo`.
+    write_file(
+        &estate.join("worktrees").join(&producer.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(estate, &producer.work_id, &producer.run_id, "a.md=a.md");
     let basis = obligation_basis_for(estate, &producer.work_id, "outer/leaf-a");
     write_policy_admitting(estate, "a-produced", "1", &basis);

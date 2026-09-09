@@ -146,10 +146,10 @@ fn retrying_a_leaf_inside_a_closed_nested_container_reopens_it_and_blocks_false_
     assert_eq!(work.waypoint, "outer/inner/leaf");
 
     // inner closes on its own leaf, outer advances to its lead leaf.
-    write_file(&repo, "b.md", "b\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "b.md", "b\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "b.md=b.md");
     let lead_run = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "a.md", "a\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &lead_run, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "waiting");
 
@@ -185,7 +185,11 @@ fn retrying_a_leaf_inside_a_closed_nested_container_reopens_it_and_blocks_false_
         }),
     )
     .expect("child submit");
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child.work_id,
@@ -217,10 +221,18 @@ fn retrying_a_leaf_inside_a_closed_nested_container_reopens_it_and_blocks_false_
     // Re-execute the reopened stage: inner recloses, lead re-runs, outer closes.
     let reopened_leaf_run = current_run(&pointer.socket, &work.work_id);
     assert_ne!(reopened_leaf_run, work.run_id);
-    write_file(&repo, "b.md", "b again\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "b.md",
+        "b again\n",
+    );
     claim_ok(&estate, &work.work_id, &reopened_leaf_run, "b.md=b.md");
     let second_lead_run = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "a.md", "a again\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "a.md",
+        "a again\n",
+    );
     claim_ok(&estate, &work.work_id, &second_lead_run, "a.md=a.md");
 
     // The re-execution superseded the Run that requested the child, so
@@ -244,7 +256,11 @@ fn retrying_a_leaf_inside_a_closed_nested_container_reopens_it_and_blocks_false_
         }),
     )
     .expect("second child submit");
-    write_file(&child_repo2, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child2.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child2.work_id,
@@ -298,13 +314,13 @@ fn reopen_invalidates_ancestor_container_closure_at_grandchild_depth() {
     .expect("submit deep");
     assert_eq!(work.waypoint, "top/outer/a/leaf");
 
-    write_file(&repo, "b.md", "b\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "b.md", "b\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "b.md=b.md");
     let lead_run = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "a.md", "a\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &lead_run, "a.md=a.md");
     let tail_run = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "t.md", "t\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "t.md", "t\n");
     claim_ok(&estate, &work.work_id, &tail_run, "t.md=t.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "waiting");
 
@@ -344,7 +360,11 @@ fn reopen_invalidates_ancestor_container_closure_at_grandchild_depth() {
         }),
     )
     .expect("child submit");
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child.work_id,
@@ -359,13 +379,25 @@ fn reopen_invalidates_ancestor_container_closure_at_grandchild_depth() {
 
     // Re-execute every reopened level.
     let leaf2 = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "b.md", "b2\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "b.md",
+        "b2\n",
+    );
     claim_ok(&estate, &work.work_id, &leaf2, "b.md=b.md");
     let lead2 = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "a.md", "a2\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "a.md",
+        "a2\n",
+    );
     claim_ok(&estate, &work.work_id, &lead2, "a.md=a.md");
     let tail2 = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "t.md", "t2\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "t.md",
+        "t2\n",
+    );
     claim_ok(&estate, &work.work_id, &tail2, "t.md=t.md");
 
     // As in the one-level case: the Run that requested the child was
@@ -388,7 +420,11 @@ fn reopen_invalidates_ancestor_container_closure_at_grandchild_depth() {
         }),
     )
     .expect("second child submit");
-    write_file(&child_repo2, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child2.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child2.work_id,
@@ -429,10 +465,10 @@ fn a_reopened_activation_survives_a_daemon_restart_without_fabricating_closure()
         None,
     )
     .expect("submit wa_reopen");
-    write_file(&repo, "b.md", "b\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "b.md", "b\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "b.md=b.md");
     let lead_run = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "a.md", "a\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &lead_run, "a.md=a.md");
 
     let (code, out) = retry_run_cli(&estate, &work.work_id, &work.run_id);
@@ -460,10 +496,18 @@ fn a_reopened_activation_survives_a_daemon_restart_without_fabricating_closure()
     );
 
     // And the correction path still finishes after the restart.
-    write_file(&repo, "b.md", "b after restart\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "b.md",
+        "b after restart\n",
+    );
     claim_ok(&estate, &work.work_id, &reopened_run, "b.md=b.md");
     let lead2 = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "a.md", "a after restart\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "a.md",
+        "a after restart\n",
+    );
     claim_ok(&estate, &work.work_id, &lead2, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "waiting");
 
@@ -483,7 +527,11 @@ fn a_reopened_activation_survives_a_daemon_restart_without_fabricating_closure()
         }),
     )
     .expect("child submit");
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child.work_id,
@@ -520,7 +568,11 @@ fn closure_records_validated_artifact_digest_and_reports_changed_bytes_unavailab
         None,
     )
     .expect("submit");
-    write_file(&repo, "a.md", "ORIGINAL-CLAIMED-BYTES\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "a.md",
+        "ORIGINAL-CLAIMED-BYTES\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "waiting");
 
@@ -535,7 +587,11 @@ fn closure_records_validated_artifact_digest_and_reports_changed_bytes_unavailab
     assert_eq!(entry["available"].as_bool(), Some(true), "{before}");
 
     // Rewrite the file while the container is held.
-    write_file(&repo, "a.md", "TAMPERED-AFTER-THE-CLAIM\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "a.md",
+        "TAMPERED-AFTER-THE-CLAIM\n",
+    );
 
     let child_repo = dir.path().join("child-repo");
     init_repo(&child_repo);
@@ -553,7 +609,11 @@ fn closure_records_validated_artifact_digest_and_reports_changed_bytes_unavailab
         }),
     )
     .expect("child submit");
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child.work_id,
@@ -604,14 +664,19 @@ fn a_removed_artifact_reads_unavailable_and_history_survives_restart() {
         None,
     )
     .expect("submit");
-    write_file(&repo, "a.md", "kept bytes\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "a.md",
+        "kept bytes\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "a.md=a.md");
     let recorded = status(&pointer.socket, &work.work_id)["evidence"][0]["artifacts"][0]["digest"]
         .as_str()
         .expect("digest recorded")
         .to_string();
 
-    fs::remove_file(repo.join("a.md")).expect("remove the claimed artifact");
+    fs::remove_file(estate.join("worktrees").join(&work.work_id).join("a.md"))
+        .expect("remove the claimed artifact");
     stop_wirkd(&estate, wirkd_child);
     let (wirkd_child, pointer) = start_wirkd(&estate);
 
@@ -649,7 +714,7 @@ fn an_unrelated_completed_work_cannot_be_credited_as_a_child_receipt() {
         None,
     )
     .expect("submit");
-    write_file(&repo, "a.md", "a\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "waiting");
 
@@ -664,7 +729,11 @@ fn an_unrelated_completed_work_cannot_be_credited_as_a_child_receipt() {
         None,
     )
     .expect("independent submit");
-    write_file(&loose_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&loose.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &loose.work_id,
@@ -720,7 +789,11 @@ fn an_unrelated_completed_work_cannot_be_credited_as_a_child_receipt() {
         }),
     )
     .expect("child submit");
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child.work_id,
@@ -755,10 +828,10 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
         None,
     )
     .expect("submit roles");
-    write_file(&repo, "b.md", "b\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "b.md", "b\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "b.md=b.md");
     let lead_run = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "a.md", "a\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &lead_run, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "waiting");
 
@@ -799,7 +872,11 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
         }),
     )
     .expect("child submit at the current activation");
-    write_file(&helper_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&helper.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &helper.work_id,
@@ -807,7 +884,7 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
         "helper.md=helper.md",
     );
     let tail_run = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "t.md", "t\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "t.md", "t\n");
     claim_ok(&estate, &work.work_id, &tail_run, "t.md=t.md");
     assert_eq!(
         state_of(&pointer.socket, &work.work_id),
@@ -823,10 +900,18 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
     assert_eq!(activations(&events, "top/outer"), vec![1, 2]);
 
     let leaf2 = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "b.md", "b2\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "b.md",
+        "b2\n",
+    );
     claim_ok(&estate, &work.work_id, &leaf2, "b.md=b.md");
     let lead2 = current_run(&pointer.socket, &work.work_id);
-    write_file(&repo, "a.md", "a2\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "a.md",
+        "a2\n",
+    );
     claim_ok(&estate, &work.work_id, &lead2, "a.md=a.md");
 
     let events = journal_events(&estate, &work.work_id);
@@ -854,7 +939,11 @@ fn a_child_bound_to_a_superseded_container_activation_is_refused_and_never_credi
         }),
     )
     .expect("child submit at the reopened activation");
-    write_file(&helper2_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&helper2.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &helper2.work_id,
@@ -930,7 +1019,11 @@ fn a_container_mixing_actor_and_deterministic_leaves_closes_with_exact_receipts(
         }),
     )
     .expect("child submit");
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child.work_id,
@@ -978,7 +1071,7 @@ fn restarting_does_not_duplicate_an_unchanged_stage_held() {
         None,
     )
     .expect("submit");
-    write_file(&repo, "a.md", "a\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "waiting");
     let before = stage_events(&journal_events(&estate, &work.work_id), "outer");
@@ -1009,7 +1102,11 @@ fn a_claim_against_a_terminal_work_is_refused_and_journals_nothing() {
     let repo = dir.path().join("repo");
     init_repo(&repo);
     let work = submit(&estate, "wa_simple_leaf", &repo, &["demo:write"], None).expect("submit");
-    write_file(&repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "helper.md=helper.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "completed");
     let before = journal_events(&estate, &work.work_id).len();

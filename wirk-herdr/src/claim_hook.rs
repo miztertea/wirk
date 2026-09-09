@@ -105,7 +105,13 @@ pub fn wirk_claim_plugin_js(exe: &Path) -> String {
 /// path can hold — spaces, `$`, `` ` ``, `"`, `\`, glob characters — not
 /// only the ones this estate happens to use today. R3: no crate adopted
 /// for one function.
-fn shell_quote(path: &Path) -> String {
+///
+/// `pub(crate)` since P3 runtime-guidance: the standing prompt
+/// (`run_loop::compose_first_prompt`) hands the actor the same absolute
+/// pinned-`wirk` path as a command to type, and must quote it by the
+/// identical rule the claude `Stop` hook already quotes it by — one
+/// function, not a second spelling of the same escape.
+pub(crate) fn shell_quote(path: &Path) -> String {
     let s = path.to_string_lossy();
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');

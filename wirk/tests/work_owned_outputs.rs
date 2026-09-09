@@ -647,7 +647,11 @@ fn a_read_bound_child_reviewer_closes_its_parents_held_container() {
         None,
     )
     .expect("submit parent");
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(
         state_of(&pointer.socket, &parent.work_id),

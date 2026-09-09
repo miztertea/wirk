@@ -417,7 +417,17 @@ fn a_child_receipt_settled_publication_carries_its_admitted_source_generation_to
     .expect("parent submits");
     let container_basis = obligation_basis_for(&estate, &parent.work_id, "outer");
 
-    write_file(&parent_repo, "a.md", "a\n");
+    // P3 native closeout integration: this test was written against a
+    // `main` that predates execution-recovery item 1, where a Work ran
+    // in the caller's shared `--repo-path` checkout. A Work now
+    // materializes and runs in its own worktree
+    // (`<estate>/worktrees/<work_id>`), so a declared output written
+    // into the shared repo is genuinely missing from the checkout the
+    // Claim is validated against — the same correction that commit made
+    // to its eleven sibling integration tests, applied here where the
+    // two accepted branches meet.
+    let parent_worktree = estate.join("worktrees").join(&parent.work_id);
+    write_file(&parent_worktree, "a.md", "a\n");
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
 
     let helper_repo = dir.path().join("helper-repo");
@@ -440,7 +450,8 @@ fn a_child_receipt_settled_publication_carries_its_admitted_source_generation_to
 
     write_child_chain_policy(&estate, &container_basis, &check_basis);
 
-    write_file(&helper_repo, "socket-mode.txt", "0775\n");
+    let helper_worktree = estate.join("worktrees").join(&helper.work_id);
+    write_file(&helper_worktree, "socket-mode.txt", "0775\n");
     claim_ok(
         &estate,
         &helper.work_id,
@@ -501,7 +512,7 @@ fn a_child_receipt_settled_publication_carries_its_admitted_source_generation_to
     assert_eq!(code, Some(0), "{stderr}");
     let legit = raised["id"].as_str().unwrap().to_string();
 
-    write_file(&helper_repo, "report.md", "done\n");
+    write_file(&helper_worktree, "report.md", "done\n");
     claim_ok(
         &estate,
         &helper.work_id,

@@ -162,15 +162,23 @@ fn claude_run_gets_a_settings_flag_naming_a_wirk_owned_stop_hook_under_the_estat
     let inner = stop[0]["hooks"].as_array().expect("hooks array");
     assert_eq!(inner.len(), 1, "exactly one hook command: {settings}");
     assert_eq!(inner[0]["type"], "command");
-    // Rule 4 (`native-progress-contract-use/HANDOFF.md` §1.4): the
-    // command names this test binary's own `current_exe()` by absolute
-    // path (the same value `start_actor_agent` reads, since this test
-    // runs in the same process), shell-quoted, followed by bare
-    // `claim` (W1's flagless form self-populates from wirkd's own
-    // declared-output contract) — never the bare name `wirk`, which is
+    // Rule 4 (`native-progress-contract-use/HANDOFF.md` §1.4), corrected
+    // by the P3 execution-recovery connected-gap close: the command
+    // names this Run's own *pinned* `wirk` — not this test binary's raw
+    // `current_exe()` — shell-quoted, followed by bare `claim` (W1's
+    // flagless form self-populates from wirkd's own declared-output
+    // contract) — never the bare name `wirk` (PATH-resolved, so
     // `command not found` whenever the driver binary is preserved or
-    // renamed.
+    // renamed) and never the driver's own mutable `exe` directly (the
+    // one thing item 1's pin exists to stop a hook from bypassing).
     let exe = std::env::current_exe().expect("current_exe");
+    let pinned = estate
+        .path()
+        .join(".wirk")
+        .join("runtime")
+        .join(&run.id.0)
+        .join("bin")
+        .join("wirk");
     let command = inner[0]["command"].as_str().expect("command is a string");
     assert!(
         command.ends_with(" claim"),
@@ -181,9 +189,18 @@ fn claude_run_gets_a_settings_flag_naming_a_wirk_owned_stop_hook_under_the_estat
         "the Stop hook must not name the bare, PATH-resolved binary `wirk`: {command:?}"
     );
     assert!(
-        command.contains(&exe.to_string_lossy().into_owned()),
-        "the Stop hook's command must name the driver's own absolute binary \
-         path: {command:?}"
+        command.contains(&pinned.to_string_lossy().into_owned()),
+        "the Stop hook's command must name this Run's own pinned wirk at {pinned:?}: {command:?}"
+    );
+    assert!(
+        !command.contains(&exe.to_string_lossy().into_owned()),
+        "the Stop hook's command must not name the driver's mutable current_exe directly, \
+         only this Run's pinned copy of it: {command:?}"
+    );
+    assert_eq!(
+        std::fs::read(&pinned).expect("this Run's pinned wirk exists"),
+        std::fs::read(&exe).expect("current_exe readable"),
+        "this Run's pinned wirk must hold the driver's own bytes"
     );
     assert!(
         inner[0].get("permissions").is_none(),

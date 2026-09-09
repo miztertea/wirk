@@ -402,8 +402,11 @@ mod batched_read_tests {
     /// time rather than baked into an executable.
     fn stub(stderr_bytes: usize, body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
-        std::fs::write(dir.path().join(".stub-stderr-bytes"), stderr_bytes.to_string())
-            .expect("stub stderr-bytes data");
+        std::fs::write(
+            dir.path().join(".stub-stderr-bytes"),
+            stderr_bytes.to_string(),
+        )
+        .expect("stub stderr-bytes data");
         std::fs::write(dir.path().join(".stub-body.sh"), body).expect("stub body data");
         let fixture = std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),

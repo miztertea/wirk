@@ -335,6 +335,35 @@ fn write_chars() -> u64 {
         .expect("/proc/thread-self/io names wchar")
 }
 
+/// P3 native closeout item 1b: the index file's own identity, as the
+/// filesystem reports it.
+///
+/// `write_chars()` reads `wchar:` from `/proc/thread-self/io`, which
+/// counts **every** byte the thread wrote, to any file. That is a fine
+/// order-of-magnitude witness for the quadratic shape below, and it is
+/// used that way — deliberately tolerantly. It is not an attribution:
+/// the exact `== 0` assertion this replaces failed on 68 bytes written
+/// by something else entirely on the same thread
+/// (`p3-world-loop/loop-c1-build/raw/10-full-suite.txt:1133`), and those
+/// 68 bytes were never located.
+///
+/// The file's inode is the file-specific fact the contract is actually
+/// about. `rewrite_rows` publishes the index by writing a
+/// `.tmp-findings-<ulid>` and `rename`ing it over `findings.ndjson`, so
+/// **every** rewrite through the real seam replaces the inode — a
+/// byte-identical rewrite included, which is exactly the case size and
+/// mtime cannot see. A sweep that writes nothing leaves the inode it
+/// found. That the observation really does catch a same-content rewrite
+/// is not asserted from this comment: the test below drives one through
+/// the real `rebuild_finding_rows` seam and watches the inode move.
+#[cfg(target_os = "linux")]
+fn index_inode(estate: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(estate.join("atlas").join("findings.ndjson"))
+        .expect("the index file exists")
+        .ino()
+}
+
 fn asserted_row(finding_id: &str, event: &str) -> FindingRow {
     FindingRow {
         id: wirk_atlas::FindingRowId::compute(
@@ -408,16 +437,43 @@ fn one_sweep_rewrites_the_index_once_not_once_per_row() {
     // The same offered rows again: nothing is missing, so the sweep must
     // write nothing at all. This is the common case — every mutation
     // after the first re-offers everything already indexed.
-    let before = write_chars();
+    //
+    // Measured on the file, not on the thread (item 1b). The inode is
+    // the index file's own identity, and `rewrite_rows` can only publish
+    // through `rename`, so a no-op sweep must leave the very same file
+    // in place — no tolerance, no size or mtime comparison, and nothing
+    // any unrelated write on this thread can perturb.
+    let inode_before = index_inode(estate.path());
     assert_eq!(
         atlas.append_finding_rows(&rows).unwrap().appended,
         0,
         "an already-complete index needs no rewrite"
     );
     assert_eq!(
-        write_chars() - before,
-        0,
+        index_inode(estate.path()),
+        inode_before,
         "a sweep that finds nothing missing must not touch the file"
+    );
+
+    // And the measurement itself, proved rather than asserted: a real
+    // rewrite of the *identical* rows through the real replacement seam
+    // produces a file of identical size and identical content — the
+    // rewrite size and mtime would hide — and the inode moves. So the
+    // assertion above is a contract about writes, not about slop.
+    let size_before = std::fs::metadata(&file).unwrap().len();
+    let same_rows: Vec<FindingRow> = atlas.findings().unwrap();
+    let inode_before_rewrite = index_inode(estate.path());
+    atlas.rebuild_finding_rows(same_rows).unwrap();
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().len(),
+        size_before,
+        "the control rewrite is deliberately content-identical"
+    );
+    assert_ne!(
+        index_inode(estate.path()),
+        inode_before_rewrite,
+        "an identical rewrite must be visible to this measurement, or the no-op assertion above \
+         proves nothing"
     );
 
     // And the shape being replaced, measured on the identical rows in

@@ -32,6 +32,11 @@ pub enum GitError {
         status: String,
         stderr: String,
     },
+    #[error("could not canonicalize resolved Git common directory {path}: {source}")]
+    Canonicalize {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 /// `git worktree add -b <branch> <path> <base_sha>` run inside `repo`,
@@ -98,6 +103,86 @@ pub fn worktree_remove(repo: &Path, path: &Path) -> Result<(), GitError> {
     let path_str = path.to_string_lossy().into_owned();
     run_git(repo, &["worktree", "remove", &path_str])?;
     Ok(())
+}
+
+/// `git rev-parse --abbrev-ref HEAD` run inside `worktree` — the branch
+/// currently checked out there, or a detached-HEAD marker
+/// (`"HEAD"`) git itself prints when none is. P3 execution-recovery
+/// item 2: `wirk run`'s reattachment check (`executor.rs`) needs this to
+/// tell a Run's own worktree, now ahead of its reserved base by the
+/// actor's own commits, from one whose checkout was pointed somewhere
+/// foreign — the two states `git rev-parse HEAD` alone cannot
+/// distinguish.
+pub fn current_branch(worktree: &Path) -> Result<String, GitError> {
+    let branch = run_git(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    Ok(branch.trim().to_string())
+}
+
+/// `git merge-base --is-ancestor <ancestor> <descendant>` run inside
+/// `repo`, true on exit 0, false on exit 1 (git's own documented
+/// contract for this verb — the two outcomes plumbing exists to test
+/// without parsing output) and a hard error on any other exit or a
+/// failure to spawn. P3 execution-recovery item 2: this is the
+/// distinction between the actor's own forward commits on its own
+/// branch (an ancestor of the current HEAD — legitimate in-Work
+/// progress a recovering `wirk run` may reattach to) and a genuinely
+/// foreign or rewritten base (no ancestor relation — refused exactly as
+/// before).
+/// `git -C <path> rev-parse --path-format=absolute --git-common-dir`,
+/// canonicalized (R2: the exact same call and shape
+/// `wirkd::server::canonical_repository_identity` already makes at
+/// submit time — reused here, not reinvented, so the executor's own
+/// reattachment check answers "is this genuinely the same repository"
+/// the identical way admission already does). Two worktrees of one
+/// repository share one common Git directory and resolve identically;
+/// an unrelated repository placed at a coincidentally-matching path
+/// does not. P3 execution-recovery item 2 (root's correction): path
+/// equality and branch-name equality alone do not establish this —
+/// this is the actual identity check, checked on every reattachment,
+/// not only a recovering one.
+pub fn repository_identity(path: &Path) -> Result<String, GitError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()?;
+    if !output.status.success() {
+        return Err(GitError::Command {
+            args: "rev-parse --path-format=absolute --git-common-dir".to_string(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    std::fs::canonicalize(&raw)
+        .map(|p| p.display().to_string())
+        .map_err(|source| GitError::Canonicalize { path: raw, source })
+}
+
+/// `git merge-base --is-ancestor <ancestor> <descendant>` run inside
+/// `repo`, true on exit 0, false on exit 1 (git's own documented
+/// contract for this verb — the two outcomes plumbing exists to test
+/// without parsing output) and a hard error on any other exit or a
+/// failure to spawn. P3 execution-recovery item 2: this is the
+/// distinction between the actor's own forward commits on its own
+/// branch (an ancestor of the current HEAD — legitimate in-Work
+/// progress a recovering `wirk run` may reattach to) and a genuinely
+/// foreign or rewritten base (no ancestor relation — refused exactly as
+/// before).
+pub fn is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(GitError::Command {
+            args: format!("merge-base --is-ancestor {ancestor} {descendant}"),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+    }
 }
 
 /// The worktree's own no-progress signal (ruling 0044/D133's "no

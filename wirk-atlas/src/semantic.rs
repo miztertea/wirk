@@ -1042,7 +1042,44 @@ pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
 /// is the identity of stored bytes and must never move, while this is the
 /// identity of the implementation that ranked one answer, computed fresh
 /// on every query and pinned into that answer's own continuation.
-pub const QUERY_PRODUCER_SCHEME: &str = "wirk-query-producer/v1";
+///
+/// `v2` because the identity now covers `QUERY_ORDERING_POLICY` as well
+/// as the backend's own bytes (0163). The scheme is versioned rather than
+/// left alone so that a digest computed here can never be read as if it
+/// had been computed under the older, narrower rule.
+pub const QUERY_PRODUCER_SCHEME: &str = "wirk-query-producer/v2";
+
+/// The ordering and runtime policy this build *actually applies* to a
+/// semantic answer, in the words the digest absorbs and a refusal prints.
+///
+/// Two halves, and both of them are the product's own decision rather
+/// than the backend's:
+///
+/// * `selection` — the child is started with a fixed `PYTHONHASHSEED`, so
+///   the native ranker's own candidate set iterates in one order and the
+///   rows it selects at its `top_k` cut are the same rows in every
+///   process. Without it the cut is drawn through whatever order that
+///   process's randomly seeded hashing produced, and two pages of one
+///   walk are slices of two different candidate pools
+///   (`knowledge/rulings/0163`, measured at a real equal-score boundary).
+/// * `order` — the total order this crate then imposes on the pool before
+///   any page is cut from it (`query::order_ranked`).
+///
+/// Neither is visible in the backend's bytes: the same executable, the
+/// same arguments and the same loaded modules rank differently under a
+/// different policy. So a continuation whose first page was produced
+/// under another policy cannot be reproduced under this one, and the
+/// producer *configuration* digest — the half that is checked before a
+/// child is started — absorbs this string to say so.
+pub const QUERY_ORDERING_POLICY: &str = "selection:PYTHONHASHSEED=0 \
+     order:score-desc,membership,path,byte-start";
+
+/// The value `QUERY_ORDERING_POLICY`'s `selection` half names, in the
+/// form the child's environment takes it. Kept beside the policy string
+/// and pinned to it by a test, so the environment a query actually runs
+/// under and the policy its continuation is digested under cannot drift
+/// apart.
+pub const QUERY_HASH_SEED: &str = "0";
 
 /// What a query producer identity measures, and what it does not, written
 /// into the answer so a reader does not have to infer it from the fields
@@ -1212,6 +1249,9 @@ pub(crate) fn query_producer_configuration_digest(
     absorb(&mut hasher, QUERY_PRODUCER_SCHEME.as_bytes());
     absorb(&mut hasher, b"configuration");
     absorb(&mut hasher, QUERY_PROTOCOL.as_bytes());
+    // The effective policy, absorbed beside the bytes it governs: the
+    // backend can be byte-identical and still rank a different list.
+    absorb(&mut hasher, QUERY_ORDERING_POLICY.as_bytes());
     absorb(&mut hasher, program.configured.as_bytes());
     absorb(&mut hasher, program.canonical.as_bytes());
     absorb(&mut hasher, program.digest.as_bytes());
@@ -3593,6 +3633,83 @@ mod tests {
         assert_eq!(
             producer_basis(&BackendEnvironment::Reported(Box::new(measured))),
             QueryProducerBasis::ImplementationMeasured
+        );
+    }
+
+    /// Ruling 0163: the producer *configuration* digest is what a continuation
+    /// is
+    /// refused on before any child is started, and until now it covered
+    /// only the backend's bytes and its argv. The ordering and runtime
+    /// policy this build applies is not in either of those: the same
+    /// executable, the same arguments and the same loaded modules select
+    /// and order a different list under a different policy, and a token
+    /// that crossed that boundary silently was resumed against a list it
+    /// was never cut from.
+    ///
+    /// Red before the correction: the digest equalled the same computation
+    /// with the policy left out.
+    #[test]
+    fn b_the_producer_configuration_digest_binds_the_effective_ordering_policy() {
+        let program = ConfiguredPath {
+            configured: "/env/bin/python3".into(),
+            canonical: "/env/bin/python3".into(),
+            digest: "a".repeat(64),
+            byte_len: 4096,
+            file_count: 1,
+        };
+        let argv = vec![BackendArgument::Literal {
+            value: "--backend".into(),
+        }];
+
+        // The same absorption, with the policy left out: what the digest
+        // was before this correction, recomputed here rather than quoted
+        // as a frozen hex string so it stays honest if the surrounding
+        // scheme moves.
+        let without_policy = {
+            let mut hasher = Sha256::new();
+            absorb(&mut hasher, QUERY_PRODUCER_SCHEME.as_bytes());
+            absorb(&mut hasher, b"configuration");
+            absorb(&mut hasher, QUERY_PROTOCOL.as_bytes());
+            absorb(&mut hasher, program.configured.as_bytes());
+            absorb(&mut hasher, program.canonical.as_bytes());
+            absorb(&mut hasher, program.digest.as_bytes());
+            absorb(&mut hasher, &program.byte_len.to_be_bytes());
+            absorb(&mut hasher, &(argv.len() as u64).to_be_bytes());
+            for argument in &argv {
+                match argument {
+                    BackendArgument::Literal { value } => {
+                        absorb(&mut hasher, b"literal");
+                        absorb(&mut hasher, value.as_bytes());
+                    }
+                    BackendArgument::File { value, file } => {
+                        absorb(&mut hasher, b"file");
+                        absorb(&mut hasher, value.as_bytes());
+                        absorb(&mut hasher, file.canonical.as_bytes());
+                        absorb(&mut hasher, file.digest.as_bytes());
+                        absorb(&mut hasher, &file.byte_len.to_be_bytes());
+                    }
+                }
+            }
+            hex(&hasher.finalize())
+        };
+
+        assert_ne!(
+            query_producer_configuration_digest(&program, &argv),
+            without_policy,
+            "a configuration digest that does not absorb the effective ordering policy cannot \
+             refuse a token that crossed one"
+        );
+    }
+
+    /// The environment a query child actually runs under and the policy
+    /// its continuation is digested under are two places one value is
+    /// written. This is the pin that keeps them one value.
+    #[test]
+    fn c_the_declared_policy_names_the_seed_the_child_is_given() {
+        assert!(
+            QUERY_ORDERING_POLICY.contains(&format!("PYTHONHASHSEED={QUERY_HASH_SEED}")),
+            "the declared policy must name the seed the query child is actually given; \
+             policy is {QUERY_ORDERING_POLICY:?} and the seed is {QUERY_HASH_SEED:?}"
         );
     }
 }

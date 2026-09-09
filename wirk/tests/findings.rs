@@ -448,7 +448,11 @@ fn deterministic_verified_proves_the_named_obligation_and_refuses_every_nearby_s
     init_repo(&repo);
     let work = submit(&estate, "two_leaf", &repo, &["demo:write"], None).unwrap();
     assert_eq!(work.waypoint, "wp-1");
-    write_file(&repo, "out1.md", "one\n");
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "out1.md",
+        "one\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "out1.md=out1.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "active");
 
@@ -753,7 +757,14 @@ fn a_leaf_declaring_no_obligation_settles_nothing_however_successful() {
     let repo = dir.path().join("repo");
     init_repo(&repo);
     let work = submit(&estate, "two_leaf", &repo, &["demo:write"], None).unwrap();
-    write_file(&repo, "out1.md", "one\n");
+    // P3 execution-recovery item 1: the leaf's own Deterministic
+    // Git-basis command runs in this Work's own worktree, not the
+    // caller's shared checkout.
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "out1.md",
+        "one\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "out1.md=out1.md");
 
     // The policy admits an obligation by that name at a basis derived
@@ -819,7 +830,14 @@ fn estate_local_settlement_without_policy_file_settles_nothing() {
     let repo = dir.path().join("repo");
     init_repo(&repo);
     let work = submit(&estate, "two_leaf", &repo, &["demo:write"], None).unwrap();
-    write_file(&repo, "out1.md", "one\n");
+    // P3 execution-recovery item 1: the leaf's own Deterministic
+    // Git-basis command runs in this Work's own worktree, not the
+    // caller's shared checkout.
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "out1.md",
+        "one\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "out1.md=out1.md");
 
     let claim_id = claim_event_id(&estate, &work.work_id);
@@ -992,7 +1010,11 @@ fn child_investigation_confirmed_proves_the_named_obligation_and_refuses_every_n
     // The container's own declared output still needs its leaf's Claim;
     // claiming it first holds the container on the child role, so the
     // settlement below rides on the child-driven close.
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
@@ -1032,7 +1054,11 @@ fn child_investigation_confirmed_proves_the_named_obligation_and_refuses_every_n
 
     // The child really runs the admitted check and really settles its
     // own verification against it.
-    write_file(&helper_repo, "socket-mode.txt", "0775\n");
+    write_file(
+        &estate.join("worktrees").join(&helper.work_id),
+        "socket-mode.txt",
+        "0775\n",
+    );
     claim_ok(
         &estate,
         &helper.work_id,
@@ -1109,7 +1135,11 @@ fn child_investigation_confirmed_proves_the_named_obligation_and_refuses_every_n
         None,
     )
     .unwrap();
-    write_file(&stranger_repo, "socket-mode.txt", "0775\n");
+    write_file(
+        &estate.join("worktrees").join(&stranger.work_id),
+        "socket-mode.txt",
+        "0775\n",
+    );
     claim_ok(
         &estate,
         &stranger.work_id,
@@ -1204,7 +1234,11 @@ fn child_investigation_confirmed_proves_the_named_obligation_and_refuses_every_n
     ]);
 
     // The helper completes; `outer` closes on its receipt.
-    write_file(&helper_repo, "report.md", "done\n");
+    write_file(
+        &estate.join("worktrees").join(&helper.work_id),
+        "report.md",
+        "done\n",
+    );
     claim_ok(
         &estate,
         &helper.work_id,
@@ -1356,9 +1390,17 @@ fn a_colliding_container_basis_confers_no_authority_without_the_admitted_mechani
          is worth, not about preventing it"
     );
 
-    write_file(&honest_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&honest.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &honest.work_id, &honest.run_id, "a.md=a.md");
-    write_file(&rogue_repo, "a.md", "totally-unrelated\n");
+    write_file(
+        &estate.join("worktrees").join(&rogue.work_id),
+        "a.md",
+        "totally-unrelated\n",
+    );
     claim_ok(&estate, &rogue.work_id, &rogue.run_id, "a.md=a.md");
 
     // Discover both children's check bases, then admit ONLY the honest
@@ -1422,7 +1464,11 @@ fn a_colliding_container_basis_confers_no_authority_without_the_admitted_mechani
         (&honest_helper, &honest_helper_repo, &honest, true),
         (&rogue_helper, &rogue_helper_repo, &rogue, false),
     ] {
-        write_file(repo, "socket-mode.txt", "x\n");
+        write_file(
+            &estate.join("worktrees").join(&helper.work_id),
+            "socket-mode.txt",
+            "x\n",
+        );
         claim_ok(
             &estate,
             &helper.work_id,
@@ -1504,8 +1550,12 @@ fn a_colliding_container_basis_confers_no_authority_without_the_admitted_mechani
     }
 
     // Both helpers complete; both containers close on real receipts.
-    for (child_work, _, _, report_run, repo) in &child_findings {
-        write_file(repo, "report.md", "done\n");
+    for (child_work, _, _, report_run, _repo) in &child_findings {
+        write_file(
+            &estate.join("worktrees").join(child_work),
+            "report.md",
+            "done\n",
+        );
         claim_ok(&estate, child_work, report_run, "report.md=report.md");
         assert_eq!(state_of(&pointer.socket, child_work), "completed");
     }
@@ -1592,7 +1642,11 @@ fn every_obligated_container_role_must_close_with_its_own_settled_mechanism() {
         )
         .unwrap();
         let basis = obligation_basis_for(&estate, &parent.work_id, "outer");
-        write_file(&parent_repo, "a.md", "a\n");
+        write_file(
+            &estate.join("worktrees").join(&parent.work_id),
+            "a.md",
+            "a\n",
+        );
         claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
 
         // Submit every role's child first, so each one's own check World
@@ -1627,7 +1681,11 @@ fn every_obligated_container_role_must_close_with_its_own_settled_mechanism() {
         // verification.
         let mut settled_children = Vec::new();
         for (role, child, _, repo) in &children {
-            write_file(repo, "socket-mode.txt", "0775\n");
+            write_file(
+                &estate.join("worktrees").join(&child.work_id),
+                "socket-mode.txt",
+                "0775\n",
+            );
             claim_ok(
                 &estate,
                 &child.work_id,
@@ -1698,8 +1756,12 @@ fn every_obligated_container_role_must_close_with_its_own_settled_mechanism() {
         assert_eq!(code, Some(0), "{stderr}");
         let parent_finding = raised["id"].as_str().unwrap().to_string();
 
-        for (child_work, _, report_run, repo) in &settled_children {
-            write_file(repo, "report.md", "done\n");
+        for (child_work, _, report_run, _repo) in &settled_children {
+            write_file(
+                &estate.join("worktrees").join(child_work),
+                "report.md",
+                "done\n",
+            );
             claim_ok(&estate, child_work, report_run, "report.md=report.md");
         }
         assert_eq!(
@@ -3102,7 +3164,11 @@ fn a_container_obligation_accepts_an_actor_review_and_a_deterministic_check_side
     )
     .unwrap();
     let container_basis = obligation_basis_for(&estate, &parent.work_id, "outer");
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
 
     // The auditor child: a real Actor review.
@@ -3217,7 +3283,11 @@ fn a_container_obligation_accepts_an_actor_review_and_a_deterministic_check_side
     let auditor_finding_id = auditor_finding["id"].as_str().unwrap().to_string();
 
     // Run the scribe's deterministic check.
-    write_file(&scribe_repo, "socket-mode.txt", "0600\n");
+    write_file(
+        &estate.join("worktrees").join(&scribe.work_id),
+        "socket-mode.txt",
+        "0600\n",
+    );
     claim_ok(
         &estate,
         &scribe.work_id,
@@ -3293,7 +3363,11 @@ fn a_container_obligation_accepts_an_actor_review_and_a_deterministic_check_side
         &auditor_file_run,
         "done.md=done.md",
     );
-    write_file(&scribe_repo, "report.md", "done\n");
+    write_file(
+        &estate.join("worktrees").join(&scribe.work_id),
+        "report.md",
+        "done\n",
+    );
     claim_ok(
         &estate,
         &scribe.work_id,
@@ -3968,16 +4042,36 @@ fn claim_attribution_binds_the_exact_execution_source_and_whole_after_bytes() {
     // The real fix, claimed by `wp-1` itself, then committed and
     // republished unchanged.
     let fixed = "fn bind_socket() { set_permissions(0o600); }\nfn untouched_tail() { /* outside every hit span */ }\n";
+    // P3 execution-recovery item 1: `work`'s own Deterministic leaf now
+    // executes in this Work's own worktree, not `repo` directly — but
+    // `repo` is *also* the Atlas source `republish` reads from below
+    // (this test's own stated premise, "one repository plays both
+    // roles"), so the fixed bytes are written to both: the worktree, so
+    // the Claim below finds them, and `repo` itself, so the republish
+    // step still sees the same fix it did before this item.
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "bind.rs",
+        fixed,
+    );
     write_file(&repo, "bind.rs", fixed);
     claim_ok(&estate, &work.work_id, &wp1_run, "bind.rs=bind.rs");
-    write_file(&clone_repo, "bind.rs", fixed);
+    write_file(
+        &estate.join("worktrees").join(&clone_work.work_id),
+        "bind.rs",
+        fixed,
+    );
     claim_ok(
         &estate,
         &clone_work.work_id,
         &clone_work.run_id,
         "bind.rs=bind.rs",
     );
-    write_file(&ro_repo, "bind.rs", fixed);
+    write_file(
+        &estate.join("worktrees").join(&work_ro.work_id),
+        "bind.rs",
+        fixed,
+    );
     claim_ok(
         &estate,
         &work_ro.work_id,
@@ -3992,6 +4086,11 @@ fn claim_attribution_binds_the_exact_execution_source_and_whole_after_bytes() {
         .as_str()
         .unwrap()
         .to_string();
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "notes.md",
+        "notes\n",
+    );
     write_file(&repo, "notes.md", "notes\n");
     claim_ok(&estate, &work.work_id, &wp2_run, "notes.md=notes.md");
     fs::remove_file(repo.join("notes.md")).unwrap();
@@ -4185,7 +4284,14 @@ fn malformed_index_row_is_a_hard_error_and_rebuild_repairs_it() {
     let repo = dir.path().join("repo");
     init_repo(&repo);
     let work = submit(&estate, "two_leaf", &repo, &["demo:write"], None).unwrap();
-    write_file(&repo, "out1.md", "one\n");
+    // P3 execution-recovery item 1: the leaf's own Deterministic
+    // Git-basis command runs in this Work's own worktree, not the
+    // caller's shared checkout.
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "out1.md",
+        "one\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "out1.md=out1.md");
     write_policy_admitting(
         &estate,
@@ -4654,7 +4760,14 @@ fn restart_under_a_changed_policy_never_rewrites_an_existing_settlement() {
     let repo_1 = dir.path().join("repo-1");
     init_repo(&repo_1);
     let work_1 = submit(&estate, "two_leaf", &repo_1, &["demo:write"], None).unwrap();
-    write_file(&repo_1, "out1.md", "one\n");
+    // P3 execution-recovery item 1: the leaf's own Deterministic
+    // Git-basis command runs in this Work's own worktree, not the
+    // caller's shared checkout.
+    write_file(
+        &estate.join("worktrees").join(&work_1.work_id),
+        "out1.md",
+        "one\n",
+    );
     claim_ok(&estate, &work_1.work_id, &work_1.run_id, "out1.md=out1.md");
     // Policy A admits Work 1's own obligation basis. Each Work here has
     // its own repository and so its own real `base_sha`, which the World
@@ -4706,7 +4819,14 @@ fn restart_under_a_changed_policy_never_rewrites_an_existing_settlement() {
     let repo_2 = dir.path().join("repo-2");
     init_repo(&repo_2);
     let work_2 = submit(&estate, "two_leaf", &repo_2, &["demo:write"], None).unwrap();
-    write_file(&repo_2, "out1.md", "one\n");
+    // P3 execution-recovery item 1: the leaf's own Deterministic
+    // Git-basis command runs in this Work's own worktree, not the
+    // caller's shared checkout.
+    write_file(
+        &estate.join("worktrees").join(&work_2.work_id),
+        "out1.md",
+        "one\n",
+    );
     claim_ok(&estate, &work_2.work_id, &work_2.run_id, "out1.md=out1.md");
     let claim_2 = claim_event_id(&estate, &work_2.work_id);
     let wp2_run_2 = status(&pointer.socket, &work_2.work_id)["run_id"]
@@ -5055,7 +5175,11 @@ fn application_requires_a_current_admitted_producer_and_the_callers_own_grants()
     // is spent. It is still `latest_run_for_waypoint(wp-1)` — the only
     // currency the candidate checked — but ruling 0095 already decided
     // that a spent action produces no new assertion.
-    write_file(&work_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&owner.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &owner.work_id, &owner.run_id, "a.md=a.md");
     let wp2_run = status(&pointer.socket, &owner.work_id)["run_id"]
         .as_str()
@@ -5429,6 +5553,15 @@ fn a_later_admitted_work_cites_a_completed_childs_closing_claim() {
     )
     .unwrap();
     let fixed = "fn bind_socket() { set_permissions(0o600); }\nfn untouched_tail() { /* outside every hit span */ }\n";
+    // P3 execution-recovery item 1: `repo` plays both roles (this
+    // Work's own execution checkout and the Atlas source `republish`
+    // reads below), so the fix lands both in the fixer's own worktree
+    // (for the Claim) and in `repo` itself (for the republish).
+    write_file(
+        &estate.join("worktrees").join(&fixer.work_id),
+        "bind.rs",
+        fixed,
+    );
     write_file(&repo, "bind.rs", fixed);
     claim_ok(&estate, &fixer.work_id, &fixer.run_id, "bind.rs=bind.rs");
     assert_eq!(
@@ -6179,6 +6312,13 @@ fn a_failure_that_arrives_mid_append_is_ordered_behind_the_application_it_races(
     let finding = raise_bind_finding(&estate, &fixer.work_id, &fixer.run_id, &coordinate);
 
     let fixed = "fn bind_socket() { set_permissions(0o600); }\nfn untouched_tail() { /* outside every hit span */ }\n";
+    // P3 execution-recovery item 1: same double-role reasoning as this
+    // fixture's own sibling test above.
+    write_file(
+        &estate.join("worktrees").join(&fixer.work_id),
+        "bind.rs",
+        fixed,
+    );
     write_file(&repo, "bind.rs", fixed);
     claim_ok(&estate, &fixer.work_id, &fixer.run_id, "bind.rs=bind.rs");
     assert_eq!(
@@ -6713,7 +6853,14 @@ fn work_obligations_not_ready_reason_matches_finding_settle_pending_reason() {
     let repo = dir.path().join("repo");
     init_repo(&repo);
     let work = submit(&estate, "two_leaf", &repo, &["demo:write"], None).unwrap();
-    write_file(&repo, "out1.md", "one\n");
+    // P3 execution-recovery item 1: the leaf's own Deterministic
+    // Git-basis command runs in this Work's own worktree, not the
+    // caller's shared checkout.
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "out1.md",
+        "one\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "out1.md=out1.md");
 
     // Evidence naming the `WorkSubmitted` event, not the `ClaimRecorded`
@@ -9563,6 +9710,13 @@ fn a_managed_receipt_never_attests_a_source_coordinate_that_collides_with_its_pa
         .unwrap()
         .to_string();
     assert_ne!(wp2_run, wp1_run);
+    // P3 execution-recovery item 1: `repo` is also the Atlas source
+    // `republish` reads below, but the worktree Claim itself validates
+    // against this Work's own worktree — write the colliding bytes to
+    // both.
+    let worktree_path = estate.join("worktrees").join(&work.work_id);
+    fs::create_dir_all(worktree_path.join(&managed_path).parent().unwrap()).unwrap();
+    fs::write(worktree_path.join(&managed_path), REPORT).unwrap();
     fs::write(repo.join(&managed_path), REPORT).unwrap();
     let (code, stdout) = claim(
         &estate,
@@ -9724,7 +9878,14 @@ fn the_readiness_reason_ladder_is_walked_end_to_end_and_both_verbs_agree() {
     let repo = dir.path().join("repo");
     init_repo(&repo);
     let work = submit(&estate, "two_leaf", &repo, &["demo:write"], None).unwrap();
-    write_file(&repo, "out1.md", "one\n");
+    // P3 execution-recovery item 1: the leaf's own Deterministic
+    // Git-basis command runs in this Work's own worktree, not the
+    // caller's shared checkout.
+    write_file(
+        &estate.join("worktrees").join(&work.work_id),
+        "out1.md",
+        "one\n",
+    );
     claim_ok(&estate, &work.work_id, &work.run_id, "out1.md=out1.md");
     let wp2_run = status(&pointer.socket, &work.work_id)["run_id"]
         .as_str()

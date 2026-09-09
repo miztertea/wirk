@@ -783,6 +783,16 @@ fn semantic_attempt(
             matches: Vec::new(),
         });
     }
+    // The native ranker's own order is kept for everything its scores
+    // decide, and completed into a total order where they decide nothing.
+    // `semble` 0.5.6 builds its candidate pool as
+    // `sorted({..set of Chunk..}, key=lambda c: c.start_line)`, so rows
+    // sharing a `start_line` keep the iteration order of a `set` of
+    // hash-randomised values: a different order in every process, and
+    // every page of a walk is its own process. This runs over the whole
+    // returned pool, before the `offset`/`limit` slice below and before
+    // any hit is dropped, so what is paged is one list.
+    order_ranked(&mut hits);
     // The candidate pool is frozen so paging is a slice of one list. When
     // the native ranker fills it, more candidates may exist beyond it and
     // the answer says so rather than implying completeness.
@@ -962,6 +972,32 @@ fn score(query: &str, candidates: Vec<Candidate>) -> Vec<EvidenceHit> {
         })
         .filter(|hit| hit.score > 0.0)
         .collect();
+    order_ranked(&mut hits);
+    hits
+}
+
+/// The one ranked-order policy this crate has: the primary score,
+/// descending, and then — only where that decides nothing — the row's own
+/// canonical coordinate.
+///
+/// The tie-break is `(membership, path, byte_start)`: the membership
+/// first, so two sources holding the same relative path can never take
+/// each other's place; then the path and the row's byte offset inside it,
+/// which are unique within one membership because two rows of one blob
+/// cannot start at the same byte. So this is a *total* order over any
+/// admitted view, and running it twice over the same rows in any order
+/// gives the same list.
+///
+/// It has to hold for both ranking modes, and for the same reason. Paging
+/// is a slice of one ranked list taken across processes: page two is a
+/// second process ranking the same corpus and skipping `offset` rows. A
+/// ranker that leaves equal scores in whatever order they arrived in
+/// hands those two processes two different lists, and the slices then
+/// overlap and leave gaps — the audited walk returned one file twice and
+/// another never (`knowledge/work/p3-parity/tie-order-audit/RESULT.json`).
+/// Ordering here, over the whole candidate pool, is *before* the offset
+/// and limit that `search` applies, and before nothing else is dropped.
+pub(crate) fn order_ranked(hits: &mut [EvidenceHit]) {
     hits.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
@@ -969,7 +1005,6 @@ fn score(query: &str, candidates: Vec<Candidate>) -> Vec<EvidenceHit> {
             .then_with(|| a.coordinate.path.cmp(&b.coordinate.path))
             .then_with(|| a.coordinate.byte_start.cmp(&b.coordinate.byte_start))
     });
-    hits
 }
 
 /// The one splitting rule this crate has: a token is a maximal run of

@@ -129,6 +129,48 @@ fn pane_info(pane_id: &str, agent_status: AgentStatus, revision: u64) -> PaneInf
     }
 }
 
+/// A real, writable estate root for this binary's fixtures, created
+/// once and shared. P3 execution-recovery correction item 1: an actor
+/// launch pins this Run's own `wirk` under `<estate_root>/.wirk/
+/// runtime/` and *refuses* the launch when it cannot, so the former
+/// `/estate` placeholder (never writable, the pin's failure formerly
+/// swallowed) no longer stands in for a real estate.
+fn fixture_estate_root() -> &'static std::path::Path {
+    static ESTATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ESTATE
+        .get_or_init(|| tempfile::tempdir().expect("fixture estate tempdir"))
+        .path()
+}
+
+/// The selection flags in a claude `agent.start` argv, with the Claim
+/// hook's own `--settings <path>` pair (appended last by
+/// `start_actor_agent`) checked and removed. P3 execution-recovery
+/// correction item 1: these fixtures' estate root is now real and
+/// writable, so the hook is genuinely delivered where the former
+/// `/estate` placeholder made the write fail and the argv look bare —
+/// the settings pair is asserted here by name and Run rather than
+/// dropped from what these tests check.
+fn selection_args_without_claim_hook(args: &[String], run_id: &str) -> Vec<String> {
+    let split = args
+        .iter()
+        .position(|arg| arg == "--settings")
+        .unwrap_or_else(|| panic!("claude argv must carry the Claim hook's --settings: {args:?}"));
+    let path = args
+        .get(split + 1)
+        .unwrap_or_else(|| panic!("--settings must be followed by a path: {args:?}"));
+    let expected_tail = format!(".wirk/claude/{run_id}/settings.json");
+    assert!(
+        path.ends_with(&expected_tail),
+        "--settings must name this Run's own claude settings ({expected_tail}): {path}"
+    );
+    assert_eq!(
+        split + 2,
+        args.len(),
+        "the --settings pair is appended last: {args:?}"
+    );
+    args[..split].to_vec()
+}
+
 fn actor_world(run: &Run) -> wirk_core::World {
     wirk_core::World::Actor(wirk_core::ActorWorld {
         repository: "wirk".to_string(),
@@ -139,7 +181,7 @@ fn actor_world(run: &Run) -> wirk_core::World {
             base: "abc123".to_string(),
         },
         triple: wirk_core::ExecutionTriple {
-            estate_root: "/estate".to_string(),
+            estate_root: fixture_estate_root().to_string_lossy().into_owned(),
             work_id: wirk_core::WorkId("work-1".to_string()),
             run_id: run.id.clone(),
         },
@@ -333,7 +375,7 @@ fn claude_with_no_selection_launches_with_no_model_or_effort_flag() {
     );
     assert_eq!(calls[0].kind, "claude");
     assert_eq!(
-        calls[0].args,
+        selection_args_without_claim_hook(&calls[0].args, "run-1"),
         Vec::<String>::new(),
         "no selection requested: no --model, no --effort, no invented default"
     );
@@ -381,7 +423,7 @@ fn claude_with_requested_model_sends_the_real_model_flag() {
 
     let calls = executor.client().start_agent_calls.lock().unwrap();
     assert_eq!(
-        calls[0].args,
+        selection_args_without_claim_hook(&calls[0].args, "run-1"),
         vec!["--model".to_string(), "opus".to_string()]
     );
 }
@@ -410,7 +452,7 @@ fn claude_with_requested_model_and_effort_sends_both_real_flags() {
 
     let calls = executor.client().start_agent_calls.lock().unwrap();
     assert_eq!(
-        calls[0].args,
+        selection_args_without_claim_hook(&calls[0].args, "run-1"),
         vec![
             "--model".to_string(),
             "sonnet".to_string(),

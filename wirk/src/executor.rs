@@ -29,7 +29,7 @@ use serde::Deserialize;
 
 use wirk_core::{EventKind, Run, RunId, RunState, WorkId, WorkState, World, WorldHash};
 use wirk_herdr::SocketClient;
-use wirk_herdr::run_loop::{Outcome, RunLoop, RunStatusEntry, WirkdApi, WorkStatus};
+use wirk_herdr::run_loop::{Outcome, RecordOutcome, RunLoop, RunStatusEntry, WirkdApi, WorkStatus};
 
 use crate::wirkd::{self, RecordPayload, Reply, Request, StatusPayload, WatchPayload};
 
@@ -114,6 +114,40 @@ struct StatusRunEntry {
     /// `world` already has.
     #[serde(default)]
     selection: Option<wirk_core::AuthoredSelection>,
+    /// Ruling 0159 (recovery preserves explicit selection): the
+    /// immediately-preceding Run's own bound kind/selection, sent only
+    /// when this Run has not yet had its own launch admitted and its
+    /// predecessor at this Waypoint actually reached one
+    /// (`server.rs`'s `prior_launch_for_waypoint`). `None` for a first
+    /// attempt, an already-launch-requested Run, and a genuinely
+    /// unlaunched retry — nothing fabricated in any of those cases.
+    #[serde(default)]
+    prior_selection: Option<PriorSelection>,
+    /// Ruling 0160 item 2 (interrupted materialization): this Run's own
+    /// already-journaled `WorktreeCreated`, when the journal carries
+    /// one (`server.rs`'s `handle_status`). `None` when this Run has
+    /// not created its worktree yet — the ordinary first-materialization
+    /// case. Same `#[serde(default)]` tolerance as the fields above.
+    #[serde(default)]
+    worktree_created: Option<WorktreeCreatedFact>,
+}
+
+/// Wire shape of `StatusRunEntry.worktree_created` (ruling 0160): the
+/// `repo`/`base_sha` pair this Run's own `WorktreeCreated` was admitted
+/// with, exactly as `handle_status` serializes them (`server.rs`).
+#[derive(Debug, Deserialize)]
+struct WorktreeCreatedFact {
+    repo: String,
+    base_sha: String,
+}
+
+/// Wire shape of `StatusRunEntry.prior_selection` (ruling 0159): the
+/// prior Run's own `kind`/`selection`, exactly as `handle_status`
+/// serializes them (`server.rs`).
+#[derive(Debug, Deserialize)]
+struct PriorSelection {
+    kind: wirk_core::ActorKind,
+    selection: wirk_core::ActorSelection,
 }
 
 /// Calls wirkd's `status` verb and parses its reply into `StatusReply`
@@ -154,11 +188,53 @@ fn fetch_status(socket: &Path, work_id: &WorkId) -> Result<StatusReply, Executor
 /// itself. Errors when there is no open Run (nothing to drive) or the
 /// open Run's Waypoint carries no reserved World (a malformed journal
 /// this wave's own writers never produce).
-fn fetch_open_run(
-    socket: &Path,
-    work_id: &WorkId,
-) -> Result<(Run, World, Option<wirk_core::AuthoredSelection>), ExecutorError> {
+/// A prior Run's own bound kind/selection (ruling 0159), carried
+/// forward only when that predecessor actually reached an admitted
+/// launch.
+type PriorLaunch = (wirk_core::ActorKind, wirk_core::ActorSelection);
+
+/// `fetch_open_run`'s result: the open Run, its reserved World, the
+/// Waypoint's own Route-authored default selection (if any), a
+/// carried-forward prior launch (ruling 0159/0160, `None` outside a
+/// same-waypoint retry whose lineage holds an admitted launch), and
+/// this Run's own already-journaled `WorktreeCreated`, if it has one
+/// (ruling 0160 item 2). A struct rather than a fifth tuple slot: five
+/// anonymous positions at three call sites is how the wrong one gets
+/// read.
+struct OpenRun {
+    run: Run,
+    world: World,
+    authored: Option<wirk_core::AuthoredSelection>,
+    prior: Option<PriorLaunch>,
+    worktree_created: Option<WorktreeCreatedFact>,
+}
+
+fn fetch_open_run(socket: &Path, work_id: &WorkId) -> Result<OpenRun, ExecutorError> {
     let parsed = fetch_status(socket, work_id)?;
+    // P3 native closeout item 2 (`native-closeout/TRIAGE.md` §2, from
+    // the independent reviewer's own observation in
+    // `p3-world-loop/native-learning-use/raw/recovery-acceptance/
+    // recovery-check.md`): a `wirk work cancel` leaves the Work
+    // `canceled` while its Run stays `Open` — cancelling is a decision
+    // about the Work, and `fold` deliberately does not rewrite Run
+    // states. Selecting a Run purely on `RunState::Open` therefore
+    // reattached a canceled Work and drove it on, printing "recovering
+    // in-Work progress ... reattaching without resetting" for work its
+    // owner had explicitly stopped. The Work's own state is already in
+    // this same reply and already decoded (`parse_work_state`), so this
+    // needs no new field and no new verb: a Work that has reached a
+    // terminal state refuses reattachment and names the state, rather
+    // than resuming a leftover Run. A non-terminal Work is unaffected —
+    // `pending`, `active`, `waiting`, `needs_input` and `blocked` all
+    // still select their open Run exactly as before.
+    let work_state = parse_work_state(&parsed.state)?;
+    if work_state.is_terminal() {
+        return Err(ExecutorError::Wirkd(format!(
+            "work {} is {}: a terminal Work is not reattached, and its leftover Run is not \
+             resumed — `wirk work retry` is refused for it too, so a new Work is the only way on",
+            work_id.0, parsed.state
+        )));
+    }
     let entry = parsed
         .runs
         .into_iter()
@@ -167,7 +243,16 @@ fn fetch_open_run(
     let world = entry.world.ok_or_else(|| {
         ExecutorError::Wirkd("the open Run's Waypoint has no reserved World".to_string())
     })?;
-    Ok((entry.run, world, entry.selection))
+    let prior_selection = entry
+        .prior_selection
+        .map(|prior| (prior.kind, prior.selection));
+    Ok(OpenRun {
+        run: entry.run,
+        world,
+        authored: entry.selection,
+        prior: prior_selection,
+        worktree_created: entry.worktree_created,
+    })
 }
 
 fn parse_work_state(state: &str) -> Result<WorkState, ExecutorError> {
@@ -194,7 +279,7 @@ fn wirkd_record(
     work_id: &WorkId,
     run: Option<RunId>,
     kind: EventKind,
-) -> Result<(), ExecutorError> {
+) -> Result<RecordOutcome, ExecutorError> {
     let reply = wirkd::client::call(
         socket,
         &Request::record(RecordPayload {
@@ -204,13 +289,27 @@ fn wirkd_record(
         }),
     )?;
     match reply {
-        Reply::Ok { .. } => Ok(()),
+        Reply::Ok { .. } => Ok(RecordOutcome::Accepted),
+        // P3 native closeout item 1a: wirkd now names which of its three
+        // record refusals this is. `RunSettled` — the Run this write
+        // names already reached its own outcome — is handed back as the
+        // answer it is rather than flattened into an error string the
+        // driver cannot read. Every other refusal, the superseded-Run
+        // one included, stays an error exactly as before.
+        Reply::Err { error, .. } if error.code == RUN_SETTLED_CODE => {
+            Ok(RecordOutcome::RunSettled(error.message))
+        }
         Reply::Err { error, .. } => Err(ExecutorError::Wirkd(format!(
             "record refused: {} {}",
             error.code, error.message
         ))),
     }
 }
+
+/// wirkd's own code for "the Run this record names has already settled"
+/// (`server.rs`'s `handle_record`). Named once, here, because this is
+/// the only place the wire code is interpreted.
+const RUN_SETTLED_CODE: &str = "RunSettled";
 
 /// `wirk_herdr::run_loop::WirkdApi` over the same wirkd `record`/
 /// `status` verbs `run_command` itself uses for setup — `RunLoop`'s own
@@ -236,7 +335,12 @@ impl WirkdApi for WirkdRunLoopApi {
         Ok(WorkStatus { work_state, runs })
     }
 
-    fn record(&self, work_id: &WorkId, run_id: &RunId, kind: EventKind) -> Result<(), Self::Error> {
+    fn record(
+        &self,
+        work_id: &WorkId,
+        run_id: &RunId,
+        kind: EventKind,
+    ) -> Result<RecordOutcome, Self::Error> {
         wirkd_record(&self.socket, work_id, Some(run_id.clone()), kind)
     }
 
@@ -320,8 +424,14 @@ pub fn run_command(rest: &[String]) -> ExitCode {
         }
     };
 
-    let (mut run, world, authored_selection) = match fetch_open_run(&pointer.socket, &work_id) {
-        Ok(triple) => triple,
+    let OpenRun {
+        mut run,
+        world,
+        authored: authored_selection,
+        prior: prior_selection,
+        worktree_created,
+    } = match fetch_open_run(&pointer.socket, &work_id) {
+        Ok(quad) => quad,
         Err(err) => {
             eprintln!("wirk run: {err}");
             return ExitCode::from(2);
@@ -371,8 +481,28 @@ pub fn run_command(rest: &[String]) -> ExitCode {
             );
         }
     } else {
+        // Ruling 0159 (recovery preserves explicit selection): a
+        // supported retry's fresh Run reaches here with `prior_selection`
+        // set to the latest *admitted* launch in this Waypoint's own
+        // retry lineage — ruling 0160's correction: not merely the
+        // immediate predecessor, so an intervening attempt that was
+        // opened and abandoned before launch does not erase a choice
+        // that was actually made (`server.rs`'s
+        // `prior_launch_for_waypoint`; `None` for a first attempt or a
+        // lineage that never admitted one). That prior
+        // resolution already folded in whatever this Waypoint's own
+        // precedence produced at the time — an explicit CLI override
+        // included — so it stands in for the Route's own authored
+        // default rather than beside it: `resolve_selection_source`
+        // below picks whichever of the two actually applies, and the
+        // existing same-harness boundary scoping
+        // (`resolve_launch_selection`'s own `authored_applies`) still
+        // governs it unchanged, now keyed on the *prior Run's* harness
+        // instead of the Route's.
+        let (effective_authored, origin) =
+            resolve_selection_source(authored_selection, prior_selection);
         let (kind, selection, provenance) =
-            resolve_launch_selection(cli_kind, cli_model, cli_effort, authored_selection);
+            resolve_launch_selection(cli_kind, cli_model, cli_effort, effective_authored, origin);
         if let Some(provenance) = provenance {
             println!("launch selection: {provenance}");
         }
@@ -422,19 +552,78 @@ pub fn run_command(rest: &[String]) -> ExitCode {
 
     let mut updated_actor = actor.clone();
     if actor.worktree_path.as_os_str().is_empty() {
-        if let Err(err) = wirkd_record(
-            &pointer.socket,
-            &work_id,
-            Some(run.id.clone()),
-            EventKind::WorktreeCreated {
-                repo: actor.repository.clone(),
-                base_sha: head.clone(),
-            },
-        ) {
-            eprintln!("wirk run: {err}");
-            return ExitCode::from(2);
+        // Ruling 0160 item 2 (the observed interrupted materialization,
+        // `native-selection-retry-verify/VERIFIED.md`'s own crash-window
+        // observation, retained at
+        // `/var/tmp/wirk-p3-selection-retry-verify/evidence/w5a1.log`).
+        // Materialization is two journal records: `WorktreeCreated`,
+        // then `WaypointReserved` — and only the second one puts a
+        // `worktree_path` on the World. So "is this Run's worktree
+        // already created?" was being answered by a fact that only
+        // becomes true one record *later*, and a caller killed in
+        // between (there, `head`'s SIGPIPE on the `println!` that
+        // immediately follows the first record) re-entered this branch
+        // on its next invocation, re-emitted `WorktreeCreated`, and was
+        // refused by `handle_record`'s at-most-one-per-Run guard:
+        // `InvalidTransition WorktreeCreated does not match this Run's
+        // unmaterialized Actor binding`. That refusal is correct — the
+        // event really is a duplicate — but nothing else could make
+        // progress either: the Work is still `active`, so `wirk work
+        // retry` and `wirk work fail` both refuse it, and the Run was
+        // wedged for the rest of its life with its worktree sitting
+        // complete on disk.
+        //
+        // The missing piece was never a new transition; it was reading
+        // the durable fact that already existed. wirkd now reports this
+        // Run's own admitted `WorktreeCreated` in `status`
+        // (`worktree_created`), so an interrupted materialization is
+        // finished from the journal: `git worktree add` above is
+        // idempotent and has already re-established (or found) the same
+        // checkout, and this invocation simply skips the half that is
+        // already durable and records the half that is not. No second
+        // creation event, no reset, no journal surgery, and the
+        // *content* is still checked — a durable record naming a
+        // different repository or a different base sha than the
+        // checkout this invocation just materialized is refused rather
+        // than resumed onto.
+        match &worktree_created {
+            Some(created) if created.repo == actor.repository && created.base_sha == head => {
+                println!(
+                    "WorktreeCreated already journaled for this Run (repo {repo}, base {base}) \
+                     — completing an interrupted materialization from the journal rather than \
+                     creating it a second time",
+                    repo = created.repo,
+                    base = created.base_sha
+                );
+            }
+            Some(created) => {
+                eprintln!(
+                    "wirk run: this Run already journaled WorktreeCreated for repo {repo} at \
+                     base {base}, but this invocation materialized {here} at {head} — an \
+                     interrupted materialization is only resumed onto the checkout it actually \
+                     recorded",
+                    repo = created.repo,
+                    base = created.base_sha,
+                    here = actor.repository
+                );
+                return ExitCode::from(2);
+            }
+            None => {
+                if let Err(err) = wirkd_record(
+                    &pointer.socket,
+                    &work_id,
+                    Some(run.id.clone()),
+                    EventKind::WorktreeCreated {
+                        repo: actor.repository.clone(),
+                        base_sha: head.clone(),
+                    },
+                ) {
+                    eprintln!("wirk run: {err}");
+                    return ExitCode::from(2);
+                }
+                println!("WorktreeCreated");
+            }
         }
-        println!("WorktreeCreated");
 
         // The first materialization is a run-scoped legal transition.
         // Location remains excluded from the content fingerprint.
@@ -454,9 +643,86 @@ pub fn run_command(rest: &[String]) -> ExitCode {
             eprintln!("wirk run: {err}");
             return ExitCode::from(2);
         }
-    } else if actor.worktree_path != worktree_path || head != actor.base_sha {
+    } else if actor.worktree_path != worktree_path {
         eprintln!("wirk run: the existing Run binding does not match the reusable checkout");
         return ExitCode::from(2);
+    } else {
+        // P3 execution-recovery item 2, with root's own correction: an
+        // actor that has committed on its own branch in this Run's own
+        // worktree since it was materialized must not be treated the
+        // same as a genuinely foreign checkout — the prior
+        // exact-equality check refused both alike, losing daemon/Claim
+        // delivery for legitimate in-Work progress
+        // (MECHANISM-REPORT.md qualification 4, `executor.rs:457`). But
+        // path equality alone (checked above) is not identity: this
+        // block runs on *every* reattachment, `head == actor.base_sha`
+        // included, not only a recovering one, and verifies the
+        // worktree's checked-out branch and its actual git-common-dir
+        // repository identity — never ancestry alone, and never trusted
+        // merely because the path matched. Neither `actor.base_sha` nor
+        // `actor.worktree_path` is widened or replaced here: the World
+        // reattached to is the same one already reserved, and every
+        // other check (foreign branch, foreign repository, wrong
+        // destination, a superseded Run — refused earlier by
+        // `fetch_open_run` before this function is ever reached) is
+        // unchanged or strengthened, never relaxed.
+        match wirk_herdr::git::current_branch(&worktree_path) {
+            Ok(checked_out) if checked_out == actor.branch => {}
+            Ok(checked_out) => {
+                eprintln!(
+                    "wirk run: the existing Run binding does not match the reusable checkout \
+                     (worktree HEAD is on branch {checked_out}, not this Run's own \
+                     {branch})",
+                    branch = actor.branch
+                );
+                return ExitCode::from(2);
+            }
+            Err(err) => {
+                eprintln!("wirk run: {err}");
+                return ExitCode::from(2);
+            }
+        }
+        match (
+            wirk_herdr::git::repository_identity(&worktree_path),
+            wirk_herdr::git::repository_identity(Path::new(&actor.repository)),
+        ) {
+            (Ok(here), Ok(reserved)) if here == reserved => {}
+            (Ok(_), Ok(_)) => {
+                eprintln!(
+                    "wirk run: the existing Run binding does not match the reusable checkout \
+                     (worktree at {} is not this Run's own repository)",
+                    worktree_path.display()
+                );
+                return ExitCode::from(2);
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                eprintln!("wirk run: {err}");
+                return ExitCode::from(2);
+            }
+        }
+        if head != actor.base_sha {
+            match wirk_herdr::git::is_ancestor(&worktree_path, &actor.base_sha, &head) {
+                Ok(true) => {
+                    println!(
+                        "recovering in-Work progress: worktree HEAD {head} is ahead of this \
+                         Run's reserved base {base} on its own branch {branch} — reattaching \
+                         without resetting",
+                        base = actor.base_sha,
+                        branch = actor.branch
+                    );
+                }
+                Ok(false) => {
+                    eprintln!(
+                        "wirk run: the existing Run binding does not match the reusable checkout"
+                    );
+                    return ExitCode::from(2);
+                }
+                Err(err) => {
+                    eprintln!("wirk run: {err}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
     }
     let updated_world = World::Actor(updated_actor);
 
@@ -570,6 +836,67 @@ fn parse_actor_kind_override(rest: &[String]) -> Option<wirk_core::ActorKind> {
     flag_value(rest, "--actor-kind").map(wirk_core::ActorKind)
 }
 
+/// Ruling 0159 (recovery preserves explicit selection): which middle
+/// precedence tier feeds `resolve_launch_selection` — the Route's own
+/// authored default, or a carried-forward prior Run's already-effective
+/// kind/selection. A prior Run's effective selection is not *beside*
+/// the Route's own default, it *is* whichever the Route/CLI precedence
+/// already produced for the original launch (an explicit CLI override
+/// included, since that is exactly what `run.selection` binds once
+/// `RunLaunchRequested` folds) — so when one is carried forward it
+/// stands in for the Route's authored tier entirely rather than being
+/// merged field-by-field against it. `prior` is `None` for a first
+/// attempt and for a genuinely unlaunched retry (nothing effective to
+/// carry — `server.rs`'s `prior_launch_for_waypoint` never sends one
+/// then), so that ordinary case is unchanged: the Route's own authored
+/// default, exactly as before this ruling.
+fn resolve_selection_source(
+    authored: Option<wirk_core::AuthoredSelection>,
+    prior: Option<PriorLaunch>,
+) -> (Option<wirk_core::AuthoredSelection>, SelectionOrigin) {
+    match prior {
+        Some((kind, selection)) => (
+            Some(wirk_core::AuthoredSelection {
+                harness: Some(kind),
+                model: selection.model,
+                effort: selection.effort,
+                args: selection.args,
+            }),
+            SelectionOrigin::PriorRun,
+        ),
+        None => (authored, SelectionOrigin::RouteAuthored),
+    }
+}
+
+/// Ruling 0160: which of the two sources `resolve_selection_source`
+/// actually chose, so the boundary disclosure names it correctly.
+/// `native-selection-retry-verify/VERIFIED.md` §3 caught the drop
+/// message calling a carried-forward prior selection "this Waypoint's
+/// authored selection" — in the one path ruling 0159 added, that is
+/// the wrong source, and a provenance line that misnames its own
+/// source is read and believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionOrigin {
+    /// This Waypoint's own Route-authored `selection`, as submitted.
+    RouteAuthored,
+    /// A prior Run at this same Waypoint whose launch was admitted —
+    /// whatever the Route/CLI precedence resolved to *then*.
+    PriorRun,
+}
+
+impl SelectionOrigin {
+    /// How the drop disclosure names this source, in the subject
+    /// position of its own sentence.
+    fn describe(self) -> &'static str {
+        match self {
+            Self::RouteAuthored => "this Waypoint's authored selection",
+            Self::PriorRun => {
+                "the selection carried forward from this Waypoint's last admitted launch"
+            }
+        }
+    }
+}
+
 /// P3 native launch selection: `wirk run`'s own precedence, applied
 /// once per field (BUILD-BRIEF.md item 1 — "explicit CLI override and
 /// documented precedence"). CLI-explicit wins when given; otherwise
@@ -585,6 +912,7 @@ fn resolve_launch_selection(
     cli_model: Option<String>,
     cli_effort: Option<String>,
     authored: Option<wirk_core::AuthoredSelection>,
+    origin: SelectionOrigin,
 ) -> (
     wirk_core::ActorKind,
     wirk_core::ActorSelection,
@@ -622,9 +950,10 @@ fn resolve_launch_selection(
                     || !authored.args.is_empty()) =>
         {
             Some(format!(
-                "this Waypoint's authored selection is scoped to harness {authored_kind}; \
+                "{source} is scoped to harness {authored_kind}; \
                  this invocation launches {kind}, so its model/effort/raw args are not \
-                 inherited"
+                 inherited",
+                source = origin.describe()
             ))
         }
         _ => None,
@@ -757,6 +1086,7 @@ mod tests {
             Some("cli-model".to_string()),
             None,
             Some(authored),
+            SelectionOrigin::RouteAuthored,
         );
         assert_eq!(kind, wirk_core::ActorKind("codex".to_string()));
         assert_eq!(selection.model.as_deref(), Some("cli-model"));
@@ -774,7 +1104,8 @@ mod tests {
 
     #[test]
     fn resolve_with_nothing_given_falls_back_to_native_default() {
-        let (kind, selection, provenance) = resolve_launch_selection(None, None, None, None);
+        let (kind, selection, provenance) =
+            resolve_launch_selection(None, None, None, None, SelectionOrigin::RouteAuthored);
         assert_eq!(kind, wirk_core::ActorKind::claude());
         assert_eq!(selection, wirk_core::ActorSelection::default());
         assert_eq!(provenance, None);
@@ -795,6 +1126,7 @@ mod tests {
             None,
             None,
             Some(authored),
+            SelectionOrigin::RouteAuthored,
         );
         assert_eq!(kind, wirk_core::ActorKind::opencode());
         assert_eq!(
@@ -824,6 +1156,7 @@ mod tests {
             Some("provider/real".to_string()),
             None,
             Some(authored),
+            SelectionOrigin::RouteAuthored,
         );
         assert_eq!(kind, wirk_core::ActorKind::opencode());
         assert_eq!(
@@ -847,6 +1180,7 @@ mod tests {
             None,
             None,
             Some(authored),
+            SelectionOrigin::RouteAuthored,
         );
         assert_eq!(kind, wirk_core::ActorKind("codex".to_string()));
         assert_eq!(
@@ -913,5 +1247,176 @@ mod tests {
             .expect("a conflicting --actor-model must be refused");
         assert!(reason.contains("opus"));
         assert!(reason.contains("sonnet"));
+    }
+
+    // ---- Ruling 0159: recovery preserves explicit selection ----
+    //
+    // Reproduces the measured defect exactly: an original Run launched
+    // with an explicit CLI selection (kind=claude, model=sonnet,
+    // effort=medium); the Waypoint's Route carries no authored
+    // selection at all. A supported retry's fresh Run must resolve to
+    // the identical kind/model/effort, not the harness's native
+    // default — end to end through `resolve_selection_source` and then
+    // `resolve_launch_selection`, the same two calls `run_command`
+    // itself makes.
+
+    #[test]
+    fn retry_carries_forward_the_prior_explicit_selection_over_the_harness_default() {
+        let prior = Some((
+            wirk_core::ActorKind::claude(),
+            wirk_core::ActorSelection {
+                model: Some("sonnet".to_string()),
+                effort: Some("medium".to_string()),
+                args: vec![],
+            },
+        ));
+        // No Route-authored selection at all — the only way the bug's
+        // fallback ("the harness's hardcoded default model/effort")
+        // could have been reached, exactly as ruling 0159 describes it.
+        let (effective, origin) = resolve_selection_source(None, prior);
+        assert_eq!(origin, SelectionOrigin::PriorRun);
+        let (kind, selection, provenance) =
+            resolve_launch_selection(None, None, None, effective, origin);
+        assert_eq!(kind, wirk_core::ActorKind::claude());
+        assert_eq!(
+            selection.model.as_deref(),
+            Some("sonnet"),
+            "the retry must not fall back to the harness's hardcoded default model"
+        );
+        assert_eq!(selection.effort.as_deref(), Some("medium"));
+        assert_eq!(provenance, None, "same harness both sides: nothing dropped");
+    }
+
+    #[test]
+    fn a_genuinely_unlaunched_retry_carries_nothing_forward() {
+        // `prior_launch_for_waypoint` sends `None` when the predecessor
+        // Run never reached `launch_requested` — nothing explicit was
+        // ever decided for it, so nothing is fabricated here either.
+        // Route-authored default (if any) governs exactly as a first
+        // attempt would.
+        let authored = Some(wirk_core::AuthoredSelection {
+            harness: None,
+            model: Some("route-default-model".to_string()),
+            effort: None,
+            args: vec![],
+        });
+        let (effective, origin) = resolve_selection_source(authored.clone(), None);
+        assert_eq!(origin, SelectionOrigin::RouteAuthored);
+        assert_eq!(
+            effective, authored,
+            "with no prior launch to carry, the Route's own authored default is unchanged"
+        );
+    }
+
+    #[test]
+    fn retry_across_an_explicit_different_harness_does_not_inherit_the_prior_models_flags() {
+        // The existing same-harness boundary rule stays intact: this
+        // invocation explicitly asks for a different harness than the
+        // prior Run actually launched under, so the prior model/effort
+        // (that harness's own vocabulary) must not silently cross over
+        // — the same rule an authored selection scoped to one harness
+        // already obeys.
+        let prior = Some((
+            wirk_core::ActorKind::claude(),
+            wirk_core::ActorSelection {
+                model: Some("sonnet".to_string()),
+                effort: Some("medium".to_string()),
+                args: vec!["--dangerously-skip-permissions".to_string()],
+            },
+        ));
+        let (effective, origin) = resolve_selection_source(None, prior);
+        let (kind, selection, provenance) = resolve_launch_selection(
+            Some(wirk_core::ActorKind::opencode()),
+            None,
+            None,
+            effective,
+            origin,
+        );
+        assert_eq!(kind, wirk_core::ActorKind::opencode());
+        assert_eq!(
+            selection,
+            wirk_core::ActorSelection::default(),
+            "claude's carried-forward model/effort/args are not opencode's to inherit"
+        );
+        let provenance = provenance.expect("the drop is announced, never silent");
+        assert!(provenance.contains("claude"), "{provenance}");
+        // Ruling 0160: the disclosure names the source it actually
+        // used. The carried selection came from a prior Run, not from
+        // anything this Waypoint's Route authored, and saying otherwise
+        // in a provenance line is a false statement about where a
+        // binding came from.
+        assert!(
+            provenance.contains("carried forward from this Waypoint's last admitted launch"),
+            "{provenance}"
+        );
+        assert!(
+            !provenance.contains("authored selection"),
+            "a prior Run's selection is not the Waypoint's authoring: {provenance}"
+        );
+    }
+
+    // ---- Ruling 0160: the whole retry lineage, not one hop ----
+
+    /// The measured defect (`native-selection-retry-verify/VERIFIED.md`
+    /// §1): launched/admitted, then one attempt abandoned before
+    /// launch, then a retry. The abandoned attempt decided nothing, so
+    /// it must not erase what attempt 1 decided — and in particular
+    /// must not swap an operator's explicit harness for the hardcoded
+    /// default. Driven through the exact same pair of calls
+    /// `run_command` makes, with the input `prior_launch_for_waypoint`
+    /// now produces for that lineage.
+    #[test]
+    fn an_intervening_unlaunched_attempt_does_not_erase_the_lineages_admitted_selection() {
+        let prior = Some((
+            wirk_core::ActorKind("codex".to_string()),
+            wirk_core::ActorSelection {
+                model: Some("gpt-5-codex".to_string()),
+                effort: Some("high".to_string()),
+                args: vec![],
+            },
+        ));
+        let (effective, origin) = resolve_selection_source(None, prior);
+        assert_eq!(origin, SelectionOrigin::PriorRun);
+        let (kind, selection, _) = resolve_launch_selection(None, None, None, effective, origin);
+        assert_eq!(
+            kind,
+            wirk_core::ActorKind("codex".to_string()),
+            "attempt 3 must not launch the harness default in place of the operator's codex"
+        );
+        assert_eq!(selection.model.as_deref(), Some("gpt-5-codex"));
+        assert_eq!(selection.effort.as_deref(), Some("high"));
+    }
+
+    /// The other half of the same rule: an explicit same-harness
+    /// override that is itself admitted becomes the lineage's operative
+    /// choice, so a later retry carries the override, not the older
+    /// admission it replaced. (Which of two admissions wins is decided
+    /// by `prior_launch_for_waypoint`'s newest-first walk; this pins
+    /// what `run_command` then does with the answer.)
+    #[test]
+    fn a_later_admitted_override_is_what_a_further_retry_carries() {
+        let prior = Some((
+            wirk_core::ActorKind("codex".to_string()),
+            wirk_core::ActorSelection {
+                model: Some("gpt-5".to_string()),
+                effort: Some("low".to_string()),
+                args: vec![],
+            },
+        ));
+        // The Waypoint's Route authored something else entirely; the
+        // admitted override still governs (ruling 0160: "an override
+        // actually admitted becomes the choice carried on later
+        // retries").
+        let authored = Some(wirk_core::AuthoredSelection {
+            harness: Some(wirk_core::ActorKind("codex".to_string())),
+            model: Some("gpt-5-codex".to_string()),
+            effort: Some("high".to_string()),
+            args: vec![],
+        });
+        let (effective, origin) = resolve_selection_source(authored, prior);
+        assert_eq!(origin, SelectionOrigin::PriorRun);
+        let (_, selection, _) = resolve_launch_selection(None, None, None, effective, origin);
+        assert_eq!(selection.model.as_deref(), Some("gpt-5"));
+        assert_eq!(selection.effort.as_deref(), Some("low"));
     }
 }

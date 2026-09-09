@@ -54,7 +54,8 @@ fn container_closes_with_leaf_receipts_and_advances_to_next_waypoint() {
         submit(&estate, "wa_container", &repo, &["demo:write"], None).expect("submit wa_container");
     assert_eq!(work.waypoint, "outer/leaf-a");
 
-    write_file(&repo, "a.md", "a\n");
+    let worktree = estate.join("worktrees").join(&work.work_id);
+    write_file(&worktree, "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "a.md=a.md");
     // The container's own outcome contract is not yet satisfied
     // (leaf-b hasn't claimed): the Work must not complete, and no
@@ -74,7 +75,7 @@ fn container_closes_with_leaf_receipts_and_advances_to_next_waypoint() {
         .as_str()
         .expect("run_id")
         .to_string();
-    write_file(&repo, "b.md", "b\n");
+    write_file(&worktree, "b.md", "b\n");
     claim_ok(&estate, &work.work_id, &leaf_b_run, "b.md=b.md");
 
     let events = journal_events(&estate, &work.work_id);
@@ -99,7 +100,7 @@ fn container_closes_with_leaf_receipts_and_advances_to_next_waypoint() {
     assert_eq!(after["current_waypoint"].as_str().unwrap(), "after");
 
     let after_run = after["run_id"].as_str().unwrap().to_string();
-    write_file(&repo, "c.md", "c\n");
+    write_file(&worktree, "c.md", "c\n");
     claim_ok(&estate, &work.work_id, &after_run, "c.md=c.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "completed");
 
@@ -127,7 +128,7 @@ fn last_leaf_done_holds_container_when_required_artifact_missing() {
     )
     .expect("submit");
 
-    write_file(&repo, "a.md", "a\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "a.md=a.md");
 
     let after = status(&pointer.socket, &work.work_id);
@@ -170,7 +171,11 @@ fn child_submit_wider_than_parent_is_refused_and_narrower_accepted() {
         None,
     )
     .expect("submit parent");
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
@@ -238,7 +243,11 @@ fn child_submit_naming_superseded_parent_run_is_refused() {
         None,
     )
     .expect("submit parent");
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
@@ -293,7 +302,11 @@ fn held_container_closes_when_child_completes_and_receipt_binds_current_run() {
         None,
     )
     .expect("submit parent");
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
@@ -321,7 +334,11 @@ fn held_container_closes_when_child_completes_and_receipt_binds_current_run() {
         "the parent's journal must name this exact child for this exact role and Run"
     );
 
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child.work_id,
@@ -378,7 +395,11 @@ fn retried_parent_leaf_cannot_reuse_earlier_attempts_child_receipt() {
     )
     .expect("submit parent");
     let first_run = parent.run_id.clone();
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &first_run, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
@@ -409,12 +430,20 @@ fn retried_parent_leaf_cannot_reuse_earlier_attempts_child_receipt() {
         .unwrap()
         .to_string();
     assert_ne!(second_run, first_run);
-    write_file(&parent_repo, "a.md", "a again\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a again\n",
+    );
     claim_ok(&estate, &parent.work_id, &second_run, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
     // Now complete the *first* attempt's child.
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &child.work_id,
@@ -484,7 +513,11 @@ fn dangling_spawn_without_child_journal_is_missing_not_credited() {
     );
     let (wirkd_child, pointer) = start_wirkd(&estate);
 
-    write_file(&repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
 
     let after = status(&pointer.socket, &parent.work_id);
@@ -526,7 +559,11 @@ fn restart_reevaluates_held_container_after_crash_between_journals() {
         None,
     )
     .expect("submit parent");
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
@@ -623,7 +660,11 @@ fn cancel_refuses_open_child_without_cascade_and_cascades_with_attribution() {
         None,
     )
     .expect("submit parent");
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
 
     let child_repo = dir.path().join("child-repo");
@@ -703,7 +744,11 @@ fn retried_child_leaf_mints_fresh_world_and_receipt_is_unaffected() {
         None,
     )
     .expect("submit parent");
-    write_file(&parent_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
 
     let child_repo = dir.path().join("child-repo");
@@ -736,7 +781,11 @@ fn retried_child_leaf_mints_fresh_world_and_receipt_is_unaffected() {
         .to_string();
     assert_ne!(second_run, child.run_id);
 
-    write_file(&child_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&child.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(&estate, &child.work_id, &second_run, "helper.md=helper.md");
     assert_eq!(state_of(&pointer.socket, &child.work_id), "completed");
 
@@ -767,7 +816,7 @@ fn grandchild_container_closes_and_cascades_closure_to_outer_container() {
         .expect("submit wa_grandchild");
     assert_eq!(work.waypoint, "outer/lead");
 
-    write_file(&repo, "a.md", "a\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "a.md", "a\n");
     claim_ok(&estate, &work.work_id, &work.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &work.work_id), "active");
 
@@ -781,7 +830,7 @@ fn grandchild_container_closes_and_cascades_closure_to_outer_container() {
             .unwrap(),
         "outer/inner/leaf"
     );
-    write_file(&repo, "b.md", "b\n");
+    write_file(&estate.join("worktrees").join(&work.work_id), "b.md", "b\n");
     claim_ok(&estate, &work.work_id, &leaf_run, "b.md=b.md");
 
     let events = journal_events(&estate, &work.work_id);
@@ -843,7 +892,11 @@ fn child_work_can_itself_spawn_a_child_and_the_full_chain_completes() {
         None,
     )
     .expect("submit grandparent G");
-    write_file(&g_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&grandparent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(
         &estate,
         &grandparent.work_id,
@@ -875,7 +928,11 @@ fn child_work_can_itself_spawn_a_child_and_the_full_chain_completes() {
         }),
     )
     .expect("submit middle child P, itself asking G for a child role");
-    write_file(&p_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(
         state_of(&pointer.socket, &parent.work_id),
@@ -902,7 +959,11 @@ fn child_work_can_itself_spawn_a_child_and_the_full_chain_completes() {
     )
     .expect("submit grandchild GC under P");
 
-    write_file(&gc_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&grandchild.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &grandchild.work_id,
@@ -991,7 +1052,11 @@ fn a_superseded_grandchild_receipt_is_refused_and_never_reaches_the_level_above(
         None,
     )
     .expect("submit grandparent G");
-    write_file(&g_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&grandparent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(
         &estate,
         &grandparent.work_id,
@@ -1018,7 +1083,11 @@ fn a_superseded_grandchild_receipt_is_refused_and_never_reaches_the_level_above(
     )
     .expect("submit middle child P");
     let p_first_run = parent.run_id.clone();
-    write_file(&p_repo, "a.md", "a\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate, &parent.work_id, &p_first_run, "a.md=a.md");
     assert_eq!(
         state_of(&pointer.socket, &parent.work_id),
@@ -1056,12 +1125,20 @@ fn a_superseded_grandchild_receipt_is_refused_and_never_reaches_the_level_above(
         p_second_run, p_first_run,
         "the retry must really open a second Run of P's leaf"
     );
-    write_file(&p_repo, "a.md", "a again\n");
+    write_file(
+        &estate.join("worktrees").join(&parent.work_id),
+        "a.md",
+        "a again\n",
+    );
     claim_ok(&estate, &parent.work_id, &p_second_run, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
     // Only now does GC complete — for real.
-    write_file(&gc_repo, "helper.md", "helper\n");
+    write_file(
+        &estate.join("worktrees").join(&grandchild.work_id),
+        "helper.md",
+        "helper\n",
+    );
     claim_ok(
         &estate,
         &grandchild.work_id,

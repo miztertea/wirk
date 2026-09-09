@@ -320,7 +320,42 @@ reply = {{
 }}
 if FLAVOUR == "out_of_range":
     reply["returned"] = len(rows) + 1
+if FLAVOUR == "cut":
+    reply["returned"] = len(rows) - 1
 print(json.dumps(reply))
+if FLAVOUR == "runtime":
+    # The environment the product handed this child, written where the
+    # test can read it. Nothing is ranked differently because of it.
+    with open(os.path.abspath(__file__) + ".env.json", "w") as handle:
+        json.dump({{"PYTHONHASHSEED": os.environ.get("PYTHONHASHSEED")}}, handle)
+if FLAVOUR == "cut":
+    # `semble` 0.5.6's candidate cut, in miniature and with nothing else
+    # in it: the candidates are unioned into a `set`, that set is sorted
+    # on a key which decides nothing between them, and the first K of the
+    # order that survives are the ones the caller ever sees. The order a
+    # `set` of strings iterates in is derived from PYTHONHASHSEED, so
+    # without a fixed seed each process cuts a different pool -- and every
+    # page of a walk is its own process.
+    keys = {{row["ranking_path"] + ":" + str(row["slot"]) for row in rows}}
+    position = {{key: index for index, key in enumerate(sorted(keys, key=lambda k: 0))}}
+    ordered = sorted(rows, key=lambda r: position[r["ranking_path"] + ":" + str(r["slot"])])
+    for rank, row in enumerate(ordered[: len(rows) - 1], 1):
+        print(json.dumps({{"row": row["row"], "score": 0.5, "rank": rank}}))
+    sys.exit(0)
+if FLAVOUR.startswith("ties_"):
+    # Every admitted row scores exactly the same, and the order they are
+    # emitted in is this flavour's permutation. Two flavours over one view
+    # are two processes that agreed on every score and disagreed on the
+    # order of the tie -- which is what `semble`'s hash-seeded candidate
+    # set does across two pages of one walk.
+    emitted = list(rows)
+    if FLAVOUR == "ties_reverse":
+        emitted.reverse()
+    elif FLAVOUR == "ties_rotate":
+        emitted = emitted[1:] + emitted[:1]
+    for rank, row in enumerate(emitted, 1):
+        print(json.dumps({{"row": row["row"], "score": 0.5, "rank": rank}}))
+    sys.exit(0)
 for rank, row in enumerate(rows, 1):
     print(json.dumps({{"row": row["row"], "score": 1.0 / rank, "rank": rank}}))
 if FLAVOUR == "out_of_range":
@@ -2244,4 +2279,333 @@ fn tree_digest(root: &Path) -> String {
     walk(root, root, &mut entries);
     entries.sort();
     sha256(format!("{entries:?}").as_bytes())
+}
+
+// ---- the ranked-order contract -------------------------------------------
+//
+// `RESULT.json` under `knowledge/work/p3-parity/tie-order-audit`: three
+// serial one-row walks over one unchanged five-file corpus, same binary,
+// same producer, same generation, same edition. Two walks swapped an
+// exact-score tie between two adjacent rows; the third returned
+// `pagination.md` twice and never returned `embedding.rs` at all. The
+// cause is upstream and is not a score: `semble.search.search` orders its
+// candidate pool by `sorted({..set of Chunk..}, key=start_line)`, and for
+// rows sharing a `start_line` that key decides nothing, so the pool comes
+// out in the hash-seeded iteration order of a `set` — different in every
+// process, and every page of a walk is its own process.
+//
+// The permutation here is the control the real defect leaves to chance:
+// `ties_forward`, `ties_reverse` and `ties_rotate` are three processes
+// that agree on every score and disagree on the order of the tie. Nothing
+// in these checks is seeded, timed, or re-run until it fails.
+
+/// The canonical identity of a hit, in the order the ranked list is
+/// required to put equal scores in.
+fn coordinate_key(hit: &wirk_atlas::EvidenceHit) -> (String, Vec<u8>, u64) {
+    (
+        hit.coordinate.membership.0.clone(),
+        hit.coordinate.path.clone(),
+        hit.coordinate.byte_start,
+    )
+}
+
+fn tie_estate() -> Estate {
+    let mut estate = estate();
+    let edition = staged(build(&mut estate, "honest"));
+    estate
+        .store
+        .select_semantic(&estate.membership.clone(), &edition.id)
+        .unwrap()
+        .unwrap();
+    estate
+}
+
+/// A second source holding the *same relative paths* as the first, so a
+/// tie that crosses a source boundary cannot be resolved by the relative
+/// path alone.
+fn add_colliding_source(estate: &mut Estate) {
+    let second = TempDir::new().unwrap();
+    git(second.path(), &["init", "-q"]);
+    git(second.path(), &["config", "user.email", "a@b"]);
+    git(second.path(), &["config", "user.name", "A"]);
+    fs::write(
+        second.path().join("code.rs"),
+        "fn delta() { let other = 9; }\nfn theta() { let ranking = 10; }\n",
+    )
+    .unwrap();
+    fs::write(second.path().join("doc.md"), "# other\r\nbody three\r\n").unwrap();
+    git(second.path(), &["add", "."]);
+    git(second.path(), &["commit", "-qm", "collide"]);
+    let other = estate
+        .store
+        .register_git("second", second.path().display().to_string(), "HEAD")
+        .unwrap();
+    let staged_other = estate
+        .store
+        .acquire(&other, "HEAD", ExtractorPolicy::default())
+        .unwrap()
+        .staged()
+        .unwrap();
+    estate.store.publish(&other, &staged_other.id).unwrap();
+    let backend = chunk_backend(&estate.directory, "chunk-tie-collide.py", "honest");
+    let edition = staged(
+        estate
+            .store
+            .build_semantic(
+                &other,
+                &staged_other.id,
+                &SemanticBuildConfig {
+                    backend,
+                    backend_args: Vec::new(),
+                    model: estate.model.clone(),
+                    producer: "test/w4b".into(),
+                    chunking: SemanticChunking::Native,
+                },
+            )
+            .unwrap(),
+    );
+    estate
+        .store
+        .select_semantic(&other, &edition.id)
+        .unwrap()
+        .unwrap();
+    // The second repository must stay alive for the length of the test.
+    std::mem::forget(second);
+}
+
+/// R1. Rows that tie on score come back in one canonical order, whichever
+/// order the native ranker emitted them in — within one source.
+#[test]
+fn r1_an_equal_score_tie_is_ordered_the_same_whatever_order_the_ranker_emits() {
+    let estate = tie_estate();
+    let mut seen: Vec<Vec<(String, Vec<u8>, u64)>> = Vec::new();
+    for flavour in ["ties_forward", "ties_reverse", "ties_rotate"] {
+        let backend = query_backend(&estate.directory, &format!("query-{flavour}.py"), flavour);
+        let answer =
+            wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+        assert!(
+            matches!(answer.semantic, SemanticStatus::Applied),
+            "{flavour}: {:?}",
+            answer.semantic
+        );
+        assert!(answer.hits.len() > 1, "{flavour}: nothing to tie");
+        for pair in answer.hits.windows(2) {
+            assert_eq!(
+                pair[0].score, pair[1].score,
+                "{flavour}: this check needs every score equal"
+            );
+        }
+        seen.push(answer.hits.iter().map(coordinate_key).collect());
+    }
+    let mut canonical = seen[0].clone();
+    canonical.sort();
+    assert_eq!(seen[0], canonical, "the tie is not in canonical order");
+    assert_eq!(seen[0], seen[1], "forward and reverse disagree");
+    assert_eq!(seen[0], seen[2], "forward and rotate disagree");
+}
+
+/// R2. The same, across two sources whose relative paths collide: the tie
+/// is broken by the membership first, so `second/code.rs` can never take
+/// `fixture/code.rs`'s place.
+#[test]
+fn r2_a_tie_across_two_sources_with_colliding_paths_is_ordered_the_same() {
+    let mut estate = tie_estate();
+    add_colliding_source(&mut estate);
+    let mut seen: Vec<Vec<(String, Vec<u8>, u64)>> = Vec::new();
+    for flavour in ["ties_forward", "ties_reverse", "ties_rotate"] {
+        let backend = query_backend(
+            &estate.directory,
+            &format!("query-cross-{flavour}.py"),
+            flavour,
+        );
+        let answer =
+            wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+        assert_eq!(answer.editions.len(), 2, "{flavour}: both sources ranked");
+        let memberships: std::collections::BTreeSet<String> = answer
+            .hits
+            .iter()
+            .map(|hit| hit.coordinate.membership.0.clone())
+            .collect();
+        assert_eq!(
+            memberships.len(),
+            2,
+            "{flavour}: the tie must cross sources"
+        );
+        seen.push(answer.hits.iter().map(coordinate_key).collect());
+    }
+    let mut canonical = seen[0].clone();
+    canonical.sort();
+    assert_eq!(seen[0], canonical, "the cross-source tie is not canonical");
+    assert_eq!(seen[0], seen[1], "forward and reverse disagree");
+    assert_eq!(seen[0], seen[2], "forward and rotate disagree");
+}
+
+/// R3. The decisive one: a serial one-row walk whose pages are ranked by
+/// processes that disagree about the tie returns every coordinate exactly
+/// once — no duplicate, no gap. This is the audited defect in miniature.
+#[test]
+fn r3_a_serial_paged_walk_across_disagreeing_rankers_covers_each_row_once() {
+    let mut estate = tie_estate();
+    add_colliding_source(&mut estate);
+    let flavours = ["ties_forward", "ties_reverse", "ties_rotate"];
+    let backends: Vec<PathBuf> = flavours
+        .iter()
+        .map(|flavour| {
+            query_backend(
+                &estate.directory,
+                &format!("query-walk-{flavour}.py"),
+                flavour,
+            )
+        })
+        .collect();
+    let total = {
+        let answer =
+            wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backends[0])))
+                .unwrap();
+        answer.budget.total_candidates
+    };
+    assert!(total >= 4, "the walk needs a pool worth paging: {total}");
+    let mut walked: Vec<(String, Vec<u8>, u64)> = Vec::new();
+    for page in 0..total {
+        // Each page is ranked by a different process, exactly as each page
+        // of the audited walk was.
+        let backend = &backends[page % backends.len()];
+        let mut request = search_request(&estate, Some(backend));
+        request.limit = 1;
+        request.offset = page;
+        let answer = wirk_atlas::search(&estate.store, &request).unwrap();
+        assert_eq!(answer.budget.returned, 1, "page {page} returned nothing");
+        assert_eq!(answer.budget.total_candidates, total, "the pool moved");
+        walked.push(coordinate_key(&answer.hits[0]));
+    }
+    let mut unique = walked.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        walked.len(),
+        "the walk returned a coordinate twice: {walked:?}"
+    );
+    assert_eq!(unique.len(), total, "the walk did not cover the pool");
+    let mut canonical = walked.clone();
+    canonical.sort();
+    assert_eq!(walked, canonical, "the walk did not page one ranked list");
+}
+
+/// A repository with enough separate files that a cut which drops one of
+/// them by hash order lands somewhere different in almost every process:
+/// `s2`'s red is a disagreement between two permutations of this many
+/// rows, not a coin toss between two.
+fn cut_fixture_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    for i in 0..12 {
+        fs::write(
+            repo.path().join(format!("unit{i:02}.rs")),
+            format!("fn f{i}() {{ let admitted = {i}; }}\nfn g{i}() {{ let ranking = {i}; }}\n"),
+        )
+        .unwrap();
+    }
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "cut fixture"]);
+    repo
+}
+
+fn cut_estate() -> Estate {
+    let mut estate = estate_with(cut_fixture_repo());
+    let edition = staged(build(&mut estate, "honest"));
+    estate
+        .store
+        .select_semantic(&estate.membership.clone(), &edition.id)
+        .unwrap()
+        .unwrap();
+    estate
+}
+
+/// S1. The query child runs under the seed the declared ordering policy
+/// names. Measured on the child's own environment, not on the product's
+/// intention: the backend writes what it actually inherited.
+///
+/// Red before the correction: the child inherited no `PYTHONHASHSEED` at
+/// all, because `run_query_backend` clears the environment and set only
+/// the four offline/telemetry variables.
+#[test]
+fn s1_the_query_child_runs_under_the_pinned_hash_seed() {
+    let estate = tie_estate();
+    let backend = query_backend(&estate.directory, "query-runtime.py", "runtime");
+    let answer =
+        wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+    assert!(
+        matches!(answer.semantic, SemanticStatus::Applied),
+        "{:?}",
+        answer.semantic
+    );
+    let recorded: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(format!("{}.env.json", backend.display())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        recorded["PYTHONHASHSEED"].as_str(),
+        Some(wirk_atlas::QUERY_HASH_SEED),
+        "the child that ranked did not run under the declared selection policy: {recorded}"
+    );
+}
+
+/// S2. The decisive one for the cut itself. A backend whose *selection*
+/// is drawn through a hash-ordered set — `semble` 0.5.6's own shape —
+/// keeps the same rows in every process, and a serial walk over that pool
+/// returns every coordinate exactly once.
+///
+/// This is the half `order_ranked` cannot reach: sorting the rows that
+/// came back says nothing about which rows came back. Red before the
+/// correction, where two processes cut two different pools and the walk
+/// duplicated one coordinate while never returning another.
+#[test]
+fn s2_a_hash_ordered_candidate_cut_keeps_the_same_rows_in_every_process() {
+    let estate = cut_estate();
+    let backend = query_backend(&estate.directory, "query-cut.py", "cut");
+    let first =
+        wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+    let second =
+        wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+    let total = first.budget.total_candidates;
+    assert!(
+        total >= 8,
+        "the cut needs a pool a hash order can really shuffle: {total}"
+    );
+    let members = |answer: &wirk_atlas::SearchAnswer| -> Vec<(String, Vec<u8>, u64)> {
+        answer.hits.iter().map(coordinate_key).collect()
+    };
+    assert_eq!(
+        members(&first),
+        members(&second),
+        "two processes cut two different candidate pools"
+    );
+
+    // And the consequence the caller actually sees: one serial walk whose
+    // every page is its own process.
+    let mut walked: Vec<(String, Vec<u8>, u64)> = Vec::new();
+    for page in 0..total {
+        let mut request = search_request(&estate, Some(&backend));
+        request.limit = 1;
+        request.offset = page;
+        let answer = wirk_atlas::search(&estate.store, &request).unwrap();
+        assert_eq!(answer.budget.returned, 1, "page {page} returned nothing");
+        assert_eq!(answer.budget.total_candidates, total, "the pool moved");
+        walked.push(coordinate_key(&answer.hits[0]));
+    }
+    let mut unique = walked.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        walked.len(),
+        "the walk returned a coordinate twice: {walked:?}"
+    );
+    assert_eq!(unique.len(), total, "the walk did not cover the pool");
+    let mut canonical = walked.clone();
+    canonical.sort();
+    assert_eq!(walked, canonical, "the walk did not page one ranked list");
 }

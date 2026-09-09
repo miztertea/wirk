@@ -405,16 +405,26 @@ fn deterministic_then_actor_auto_advance_reserves_a_world_for_the_actor() {
     let World::Actor(actor) = world else {
         panic!("wp-2's World must be Actor, got: {world:?}");
     };
+    // P3 execution-recovery item 1: wp-1's own `cwd` is this Work's own
+    // worktree (`<estate>/worktrees/<work_id>`), not the caller's shared
+    // `--repo-path` checkout — a Deterministic Git-basis Waypoint now
+    // materializes and runs in an isolated worktree exactly like an
+    // Actor Waypoint does, so the caller's checkout (`repo`) is never
+    // touched and never shared between Works. wp-2 inherits that same
+    // worktree unchanged (one worktree per Work), which is also exactly
+    // what `wirk run`'s own computed path (`estate/worktrees/<work>`)
+    // expects — the prior refusal this test's own defect masked.
+    let worktree_path = estate.join("worktrees").join(&work_id);
     assert_eq!(
-        actor.worktree_path,
-        repo.clone(),
-        "wp-2's worktree_path must equal wp-1's own cwd \
-         (the verified deterministic Git checkout)"
+        actor.worktree_path, worktree_path,
+        "wp-2's worktree_path must equal wp-1's own cwd (this Work's own \
+         isolated worktree, not the shared --repo-path checkout)"
     );
     assert_eq!(
         actor.repository,
-        repo.display().to_string(),
-        "the Actor must inherit the deterministic Git checkout path"
+        worktree_path.display().to_string(),
+        "the Actor must inherit the deterministic stage's own worktree, never the caller's \
+         shared checkout"
     );
     assert!(
         actor.branch.starts_with("wirk/"),

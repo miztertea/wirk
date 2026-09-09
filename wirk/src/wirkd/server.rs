@@ -59,19 +59,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use wirk_core::{
-    Access, ActorReviewProof, ActorSelection, ActorWorld, AdmittedEvidence, ApplicationProducer,
-    ApplicationRef, ArtifactReceipt, ArtifactRef, ArtifactSpec, AssertedJudgement, AssertingAuthor,
-    Assertion, AttemptHolder, Attribution, AuthoredSelection, Boundary, ChildProof, Claim, ClaimId,
-    ClaimKind, ClaimRefusal, ClaimVerdict, ConfirmedBy, Decision, DeterministicWorld,
-    DischargedRole, Event, EventId, EventKind, EvidenceOutcome, EvidenceRef, ExecutionTriple,
-    FailureCause, Finding, FindingId, FindingKind, FindingRecord, FindingScope, FindingState,
-    GenerationPoint, Journal, JournalError, JournalReader, LaunchAttempt, ObligationRef,
-    OutcomeReceipt, OutputContract, ParentBinding, PeerIdentity, ReadySettlement, RelationRoute,
-    RelationStanding, RepositoryBinding, ReviewTarget, Route, RouteId, Run, RunId, RunState,
-    Settlement, SettlementAuthority, SettlementCheck, SettlementClass, SourceBasis, Timestamp,
-    UnreadFields, WaypointDefinition, WaypointId, WaypointKind, Work, WorkId, WorkState, World,
-    WorldHash, ancestor_chain, find_definition, finding_kind_name, first_dfs_leaf, flatten_leaves,
-    fold, load_route, obligation_basis, validate_claim,
+    Access, ActorKind, ActorReviewProof, ActorSelection, ActorWorld, AdmittedEvidence,
+    ApplicationProducer, ApplicationRef, ArtifactReceipt, ArtifactRef, ArtifactSpec,
+    AssertedJudgement, AssertingAuthor, Assertion, AttemptHolder, Attribution, AuthoredSelection,
+    Boundary, ChildProof, Claim, ClaimId, ClaimKind, ClaimRefusal, ClaimVerdict, ConfirmedBy,
+    Decision, DeterministicWorld, DischargedRole, Event, EventId, EventKind, EvidenceOutcome,
+    EvidenceRef, ExecutionTriple, FailureCause, Finding, FindingId, FindingKind, FindingRecord,
+    FindingScope, FindingState, GenerationPoint, Journal, JournalError, JournalReader,
+    LaunchAttempt, ObligationRef, OutcomeReceipt, OutputContract, ParentBinding, PeerIdentity,
+    ReadySettlement, RelationRoute, RelationStanding, RepositoryBinding, ReviewTarget, Route,
+    RouteId, Run, RunId, RunState, Settlement, SettlementAuthority, SettlementCheck,
+    SettlementClass, SourceBasis, Timestamp, UnreadFields, WaypointDefinition, WaypointId,
+    WaypointKind, Work, WorkId, WorkState, World, WorldHash, ancestor_chain, find_definition,
+    finding_kind_name, first_dfs_leaf, flatten_leaves, fold, load_route, obligation_basis,
+    validate_claim,
 };
 
 use super::boundary;
@@ -534,17 +535,30 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
         socket: wirk_dir.join("wirkd.sock"),
         source,
     })?;
+    // P3 execution-recovery item 3: canonicalized *before* the socket
+    // path is derived and written, not after. A relative `--estate`
+    // otherwise leaves `wirk_dir`/`socket_path` relative to whatever
+    // directory this process happened to start in, and that relative
+    // path is what `write_pointer` durably records in
+    // `.wirk/wirkd.json` — every later client resolves it against its
+    // *own* cwd instead (an actor's worktree, not the estate root),
+    // failing with `ENOENT` (MECHANISM-REPORT.md qualification 4, third
+    // bullet). `wirk_dir`'s directory already exists (`create_dir_all`
+    // just above), so canonicalizing this early is exactly as valid as
+    // the canonicalization this function already performed later for
+    // the same root — reused here, once, at the point that actually
+    // matters.
+    let estate_root = std::fs::canonicalize(&estate_root).map_err(|source| WirkdError::Bind {
+        socket: wirk_dir.join("wirkd.sock"),
+        source,
+    })?;
+    let wirk_dir = estate_root.join(".wirk");
     let socket_path = wirk_dir.join("wirkd.sock");
     let listener = bind_socket(&socket_path).map_err(|source| WirkdError::Bind {
         socket: socket_path.clone(),
         source,
     })?;
     write_pointer(&estate_root, &socket_path, std::process::id())?;
-
-    let estate_root = std::fs::canonicalize(&estate_root).map_err(|source| WirkdError::Bind {
-        socket: socket_path.clone(),
-        source,
-    })?;
     // P3 W3: the canonical estate scope Atlas checks every membership
     // against is this same canonicalized root — the filesystem identity
     // *is* the estate identity for this increment (BUILD-BRIEF.md:
@@ -964,6 +978,24 @@ fn handle_connection(stream: UnixStream, state: &Arc<WirkdState>, socket_path: &
     let peer = peer_credentials(&stream).unwrap_or(PeerIdentity { uid: 0, gid: 0 });
     let outcome = dispatch(&request, state, holder.as_ref(), peer);
 
+    // P3 execution-recovery item 3: for `stop`, the pointer/socket
+    // cleanup runs *before* the reply is sent, not after — the prior
+    // order let `wirk wirkd stop` return to its caller while this
+    // thread still owned an unremoved `.wirk/wirkd.sock`, so an
+    // immediate `start` right after a truthful "stopped" reply could
+    // still find the path occupied and fail `EADDRINUSE`
+    // (MECHANISM-REPORT.md qualification 4, second bullet). Unlinking
+    // the socket path here does not disturb this already-`accept`ed
+    // connection — a Unix domain socket's peer is the open file
+    // descriptor, not the pathname — so the reply below still reaches
+    // this same client. This makes the reply truthful (nothing is
+    // reachable at this estate's socket by the time it is sent) rather
+    // than adding an arbitrary sleep anywhere.
+    if matches!(outcome, Outcome::Stop(_)) {
+        remove_owned_containers(&state.estate_root);
+        remove_pointer_and_socket(&state.estate_root, socket_path);
+    }
+
     let reply = match &outcome {
         Outcome::Reply(reply) | Outcome::Stop(reply) => reply,
     };
@@ -975,8 +1007,6 @@ fn handle_connection(stream: UnixStream, state: &Arc<WirkdState>, socket_path: &
     let _ = stream.shutdown(std::net::Shutdown::Both);
 
     if matches!(outcome, Outcome::Stop(_)) {
-        remove_owned_containers(&state.estate_root);
-        remove_pointer_and_socket(&state.estate_root, socket_path);
         std::process::exit(0);
     }
 }
@@ -1903,10 +1933,40 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                             Err(detail) => return err_reply("GitError", &detail),
                         };
                     }
+                    // P3 execution-recovery item 1: this Deterministic
+                    // World's `cwd` must be this Work's own worktree,
+                    // never the caller's `--repo-path` checkout, which
+                    // every other Work using that same `--repo-path`
+                    // shares. Left as the shared checkout, a Deterministic
+                    // executor's own untracked outputs (`DeterministicWorld`'s
+                    // doc: "same worktree_path as ActorWorld") land in a
+                    // directory another Work's later Claim never wrote to
+                    // but is validated against, and an auto-advanced Actor
+                    // Waypoint on this same Work inherits the shared path
+                    // while `wirk run` computes `<estate>/worktrees/<work>`
+                    // and refuses to reattach (native-learning-use
+                    // MECHANISM-REPORT.md qualifications 1 and 3). Reuses
+                    // the exact worktree-establishment call and computed
+                    // path Actor Worlds use (`executor.rs`'s own Step 2,
+                    // `<estate>/worktrees/<work_id>`) — this Work's later
+                    // Actor Waypoint (if any) then finds the worktree
+                    // already materialized and `wirk run`'s own reuse arm
+                    // (`worktree_add`'s "path exists on disk" case) takes
+                    // it over unchanged, rather than a second module
+                    // reinventing worktree creation.
+                    let worktree_path = state.estate_root.join("worktrees").join(&work_id.0);
+                    if let Err(err) = wirk_herdr::git::worktree_add(
+                        Path::new(&repo_path),
+                        &worktree_path,
+                        &branch,
+                        &verified,
+                    ) {
+                        return err_reply("GitError", &err.to_string());
+                    }
                     (
                         verified.clone(),
                         SourceBasis::Git { base: verified },
-                        PathBuf::from(repo_path),
+                        worktree_path,
                     )
                 }
                 SourceBasis::OutputOnly { reference } => (
@@ -2575,14 +2635,56 @@ fn handle_record(
     let Some(run) = find_run(&events, run_id) else {
         return err_reply("InvalidTransition", "record names an unknown Run");
     };
-    if fold(&events).state.is_terminal()
-        || !matches!(run.state, RunState::Open)
-        || latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
-            != Some(run_id.clone())
-    {
+    // P3 native closeout item 1a (root qualification 1). This guard's
+    // three conditions are all kept — nothing here admits a write that
+    // was refused before — but they are no longer answered with one
+    // sentence. They are genuinely different facts, and the caller's
+    // correct response differs for each:
+    //
+    // * a *superseded* Run: a newer Run exists for this Waypoint, so
+    //   this record belongs to a Run that is no longer the Waypoint's.
+    //   Folding it would attribute an old attempt's observation to the
+    //   current one. Refused, and the superseding Run is named so the
+    //   driver learns it was replaced rather than guessing. The event is
+    //   never re-aimed at the new Run to make it land.
+    // * a *settled* Run (or Work): the Run this record names already
+    //   reached its own outcome. This is the condition the live
+    //   `run_verb` retry failures actually met — the actor's validated
+    //   `Done` Claim landing while its driver's `LifecycleObserved` was
+    //   in flight — and it is benign: the outcome stands, and the
+    //   observer stops observing. Its own code lets a driver read that
+    //   without parsing prose.
+    //
+    // Order matters: a retried Run is both superseded *and* failed, and
+    // supersession is the more specific fact, so it is answered first.
+    let work_state = fold(&events).state;
+    let current_for_waypoint = latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0);
+    if current_for_waypoint.as_ref() != Some(run_id) {
         return err_reply(
             "InvalidTransition",
-            "record does not target the current open Run",
+            &match &current_for_waypoint {
+                Some(current) => format!(
+                    "record names Run {}, but Waypoint {} has since opened Run {}: a superseded \
+                     Run's record is never folded into the current one",
+                    run_id.0, run.waypoint.0, current.0
+                ),
+                None => format!(
+                    "record names Run {}, which is not the current Run of Waypoint {}",
+                    run_id.0, run.waypoint.0
+                ),
+            },
+        );
+    }
+    if work_state.is_terminal() || !matches!(run.state, RunState::Open) {
+        return err_reply(
+            "RunSettled",
+            &format!(
+                "Run {} has already settled (run {}, work {}): a record made after a Run reached \
+                 its own outcome is not folded, and that outcome stands",
+                run_id.0,
+                run_state_name(&run.state),
+                work_state_name(work_state),
+            ),
         );
     }
 
@@ -3918,13 +4020,30 @@ fn reserve_next_leaf(
                     SourceBasis::Unknown => SourceBasis::Unknown,
                 },
                 cwd,
-                // Every cargo the child executor runs uses the one
-                // named-kept warm cache (0030; 0039 D126), not a
-                // cold build in the worktree (build-brief.md §7.5).
-                env: BTreeMap::from([(
-                    "CARGO_TARGET_DIR".to_string(),
-                    "/var/tmp/wirk-target".to_string(),
-                )]),
+                // P3 native closeout item 4. This used to compile one
+                // development box's absolute cache path
+                // (`/var/tmp/wirk-target`) into the product and set it
+                // on every auto-advanced Deterministic World, where it
+                // was content-addressed into the World hash with no
+                // supported override — the operator's own environment
+                // could not reach it, and the *first* Deterministic
+                // Waypoint (`handle_submit`'s Git arm) set no env at
+                // all, so the two paths disagreed about the same Route.
+                //
+                // The warm-cache policy itself is not the defect and is
+                // not abandoned: it is an estate choice (workspace
+                // rulings 0030, 0039 D126) about how *this* development
+                // box builds, and the mechanism for it already exists
+                // natively. `ChildExecutor` spawns with `command.envs
+                // (&det.env)` over an inherited environment, so a wirkd
+                // started with `CARGO_TARGET_DIR` in its own environment
+                // hands it to every deterministic child, first Waypoint
+                // and auto-advanced alike, with no product default, no
+                // new Route field and no host path in a World hash.
+                // Both Deterministic paths now reserve the same empty
+                // env, and the cache is configured where it belongs —
+                // outside the product, by whoever starts the daemon.
+                env: BTreeMap::new(),
                 expected_artifacts: OutputContract(next_def.declared_outputs.clone()),
             })),
             // Wave 1 (P2.6, orient/route.md §3): the same treatment
@@ -4288,11 +4407,51 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
             let selection: Option<AuthoredSelection> =
                 find_definition(&waypoint_defs, &run.waypoint)
                     .and_then(|def| def.selection.clone());
+            // Ruling 0159: only a Run that has not yet had its own
+            // launch admitted can usefully receive a carried-forward
+            // prior selection — one that already launched (or already
+            // has a `RunLaunchRequested` bound) resolves from its own
+            // durable `run.kind`/`run.selection`, not from this reply's
+            // pre-launch precedence layers at all (`wirk run`'s
+            // `launch_requested` branch never reads this field).
+            let prior_selection = if run.launch_requested {
+                None
+            } else {
+                prior_launch_for_waypoint(&events, &run.waypoint, run.attempt)
+                    .map(|(kind, selection)| json!({"kind": kind, "selection": selection}))
+            };
+            // Ruling 0160 item 2 (interrupted materialization): this
+            // Run's own already-journaled `WorktreeCreated`, when it
+            // has one. `Run::apply` deliberately folds nothing from
+            // that event (`wirk-core/src/lib.rs`: "`ClaimFiled` and
+            // `WorktreeCreated` change no state"), and the World only
+            // gains its `worktree_path` at the *following*
+            // `WaypointReserved` — so a caller killed between the two
+            // records had no way to learn that the first half of its
+            // own materialization is already durable, re-emitted
+            // `WorktreeCreated`, and was refused by `handle_record`'s
+            // at-most-one guard for the rest of the Run's life.
+            // Reporting the durable fact is what lets `wirk run`
+            // finish the interrupted materialization from the journal
+            // instead of duplicating its first half (`executor.rs`'s
+            // `run_command`). Journal identity only — the same
+            // `repo`/`base_sha` pair the reply's own `world` already
+            // carries, and withheld beside it under narrowing.
+            let worktree_created = events.iter().find_map(|event| match &event.kind {
+                EventKind::WorktreeCreated { repo, base_sha }
+                    if event.run.as_ref() == Some(&run.id) =>
+                {
+                    Some(json!({"repo": repo, "base_sha": base_sha}))
+                }
+                _ => None,
+            });
             Some(json!({
                 "run": serde_json::to_value(&run).ok()?,
                 "world": world,
                 "world_binding": world_binding,
                 "selection": selection,
+                "prior_selection": prior_selection,
+                "worktree_created": worktree_created,
                 "orientation": orientation,
             }))
         })
@@ -4509,6 +4668,13 @@ fn withhold_status_content(result: &mut Value) -> usize {
             hide(entry, "world", &mut withheld);
             hide(entry, "world_binding", &mut withheld);
             hide(entry, "selection", &mut withheld);
+            hide(entry, "prior_selection", &mut withheld);
+            // Ruling 0160 item 2: the durable materialization fact
+            // carries this Run's repository path and base sha — the
+            // same two fields `world` above already withholds — so it
+            // is narrowed with them rather than published beside a
+            // hidden copy of itself.
+            hide(entry, "worktree_created", &mut withheld);
             // W-C3: a narrowed reader learns *that* this Run's context
             // has a history and that it is not being shown it, the same
             // answer `world` already gives. The chain is hidden in both
@@ -5577,6 +5743,61 @@ fn discovery_events(dir: &Path) -> Option<Vec<Event>> {
 /// naming a different Run — `lib.rs` "An event whose `run` is not this
 /// Run's id is ignored"). `None` when no `RunOpened` names `run_id` at
 /// all — the fabricated/stale-triple case (D9#4).
+/// Ruling 0159 (recovery preserves explicit selection), corrected by
+/// ruling 0160 (retry lineage): the **latest admitted** launch at this
+/// same Waypoint — the most recent prior Run that actually reached an
+/// admitted `RunLaunchRequested` — and its own bound `kind`/`selection`.
+/// `wirk run` folds this in as a precedence tier between the Route's
+/// own authored default and the harness's native default
+/// (`resolve_launch_selection`'s own doc in `executor.rs`), so an
+/// explicit CLI selection bound at the original launch survives a
+/// supported retry instead of silently falling to the harness default.
+///
+/// 0160 corrected the original attempt-minus-one lookup, which asked
+/// only this retry's immediate predecessor and so returned `None` the
+/// moment one retry was opened and abandoned before launch — erasing,
+/// permanently and for every later attempt, a choice still sitting
+/// durable and unrewritten in the same journal this function reads
+/// (`native-selection-retry-verify/VERIFIED.md` §1: an explicit
+/// `codex` resolved to `claude` on attempt 3 and on every attempt
+/// after it). Admission is the durable selection boundary, so the walk
+/// goes back through the whole lineage, newest attempt first, and stops
+/// at the first prior Run whose launch was admitted. An intervening
+/// unlaunched attempt is passed over: it decided nothing, so it erases
+/// nothing.
+///
+/// `None` for the very first attempt (`attempt <= 1`: no prior Run
+/// exists at all) and for a lineage in which **no** attempt was ever
+/// admitted — nothing explicit was ever chosen here, so there is
+/// nothing to carry, and fabricating one would invent a choice nobody
+/// made; the fresh Run resolves exactly as a first launch does instead.
+/// The walk never leaves this Waypoint: a distinct Waypoint's own
+/// authoring is its own, never inherited from a sibling.
+fn prior_launch_for_waypoint(
+    events: &[Event],
+    waypoint_id: &WaypointId,
+    attempt: u32,
+) -> Option<(ActorKind, ActorSelection)> {
+    // Newest-first: the latest admitted selection is the operative one,
+    // so a later same-harness override that was itself admitted wins
+    // over the older admission it replaced.
+    (1..attempt).rev().find_map(|prior_attempt| {
+        let prior_run_id = events.iter().find_map(|event| match &event.kind {
+            EventKind::RunOpened {
+                run,
+                waypoint,
+                attempt: a,
+                ..
+            } if waypoint == waypoint_id && *a == prior_attempt => Some(run.clone()),
+            _ => None,
+        })?;
+        let prior = find_run(events, &prior_run_id)?;
+        prior
+            .launch_requested
+            .then_some((prior.kind, prior.selection))
+    })
+}
+
 fn find_run(events: &[Event], run_id: &RunId) -> Option<Run> {
     let mut run: Option<Run> = None;
     for event in events {
@@ -5692,6 +5913,19 @@ fn mint_id(prefix: &str) -> String {
         .as_nanos();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{nanos:x}-{seq:x}")
+}
+
+/// The one-word name of a Run's state, for the messages that must name
+/// it (`handle_record`'s settled refusal). The same four words
+/// `handle_status` already publishes for `run_state` (R2) — not a second
+/// vocabulary.
+fn run_state_name(state: &RunState) -> &'static str {
+    match state {
+        RunState::Open => "open",
+        RunState::Claimed(_) => "claimed",
+        RunState::Vanished => "vanished",
+        RunState::Failed(_) => "failed",
+    }
 }
 
 fn work_state_name(state: WorkState) -> &'static str {
@@ -7897,15 +8131,49 @@ enum ContinuationDecision {
     /// Hand back the caller's own token unchanged, so restoring whatever
     /// broke resumes the continuation it already holds.
     Preserved,
+    /// P3 native closeout item 3: this page returned no rows, so the
+    /// offset a fresh token would carry is the offset this request
+    /// already used (`offset + hits.len()`, with `hits` empty). Issuing
+    /// one would hand the caller a byte-identical request whose answer
+    /// is byte-identical again — the walk observed in
+    /// `p3-sources/source-coverage-verify/raw/p4-walk.txt`, where pages
+    /// 10 through 15 each "returned 0 of 18" and each still received a
+    /// token. There is nothing left to page to, so no token is issued.
+    Exhausted,
     /// Issue the token this answer's own page earned.
     Fresh,
 }
 
-fn continuation_decision(coverage: &wirk_atlas::AnswerCoverage) -> ContinuationDecision {
+/// P3 native closeout item 3, scoped exactly as root qualified it: the
+/// defect is a page that returns **zero rows and advances the offset by
+/// zero**, which is the precise no-progress condition — not a general
+/// "must never loop" rule and not a limit on how many valid finite pages
+/// a caller may walk.
+///
+/// Every page that returned at least one row still issues a fresh token,
+/// so a legitimately long walk continues to exhaustion. The two
+/// deliberate refusals are untouched and still answered first:
+/// `Withheld` (no sources, or denied) and `Preserved` (a continuation
+/// whose own ranking cannot be reproduced — its caller's token is what
+/// still resumes, and replacing it would be exactly the quiet
+/// substitution `VERDICT.md` V2 refuses).
+///
+/// `truncated` deliberately does not rescue an empty page. The ranked
+/// list is one deterministic list paged with `skip(offset).take(limit)`
+/// (`wirk-atlas::query`), so a window that yielded nothing at this
+/// offset yields nothing at the same offset again: `truncated` there
+/// says the corpus is larger than the window reached, not that another
+/// page exists beyond it.
+fn continuation_decision(
+    coverage: &wirk_atlas::AnswerCoverage,
+    rows_returned: usize,
+) -> ContinuationDecision {
     if coverage.no_sources || coverage.denied {
         ContinuationDecision::Withheld
     } else if coverage.continuation_unrecoverable {
         ContinuationDecision::Preserved
+    } else if rows_returned == 0 {
+        ContinuationDecision::Exhausted
     } else {
         ContinuationDecision::Fresh
     }
@@ -8110,8 +8378,13 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                 "coverage": coverage_json(&answer.coverage),
                 "truncated": answer.truncated,
                 "budget": budget_json(&answer.budget),
-                "continuation": match continuation_decision(&answer.coverage) {
+                "continuation": match continuation_decision(&answer.coverage, answer.hits.len()) {
                     ContinuationDecision::Withheld => None,
+                    // Item 3: the page returned nothing and the offset
+                    // did not move, so the only continuation this answer
+                    // could mint is the request that just produced it.
+                    // The walk ends here instead of repeating forever.
+                    ContinuationDecision::Exhausted => None,
                     // `VERDICT.md` V2. A refused continuation returned no
                     // hit, so a *fresh* token here would advance an offset
                     // over a page that was never served, and — carrying no
@@ -15773,6 +16046,140 @@ mod tests {
         no_journal_guard_held("this test");
     }
 
+    // ---- Ruling 0160: `prior_launch_for_waypoint` walks the lineage ----
+
+    /// Builds one attempt at `waypoint`: its `RunOpened`, and — when
+    /// `launch` is `Some` — the `RunLaunchRequested` that admits it.
+    /// The same two events, in the same order, the real journal
+    /// carries; nothing is stubbed, because `prior_launch_for_waypoint`
+    /// reads events and `find_run` folds them with the production
+    /// `Run::apply`.
+    fn attempt_events(
+        work: &WorkId,
+        waypoint: &str,
+        attempt: u32,
+        run_id: &str,
+        launch: Option<(&str, &str)>,
+    ) -> Vec<Event> {
+        let run = RunId(run_id.to_string());
+        let mut events = vec![new_event(
+            work,
+            Some(run.clone()),
+            EventKind::RunOpened {
+                run: run.clone(),
+                waypoint: WaypointId(waypoint.to_string()),
+                attempt,
+                world_hash: WorldHash("hash".to_string()),
+            },
+        )];
+        if let Some((kind, model)) = launch {
+            events.push(new_event(
+                work,
+                Some(run.clone()),
+                EventKind::RunLaunchRequested {
+                    run,
+                    actor_kind: ActorKind(kind.to_string()),
+                    selection: ActorSelection {
+                        model: Some(model.to_string()),
+                        effort: Some("high".to_string()),
+                        args: Vec::new(),
+                    },
+                },
+            ));
+        }
+        events
+    }
+
+    /// The blocking defect ruling 0160 named: attempt 1 admitted an
+    /// explicit `codex`, attempt 2 was opened and abandoned before
+    /// launch, and the attempt-minus-one lookup then answered attempt 3
+    /// with `None` — so `wirk run` resolved the hardcoded `claude`
+    /// default over an explicit choice still durable in this very event
+    /// list. The lineage walk must find attempt 1.
+    #[test]
+    fn an_intervening_unlaunched_attempt_does_not_hide_the_lineages_admitted_launch() {
+        let work = WorkId("work-lineage".to_string());
+        let wp = "lin/wp-1";
+        let mut events = attempt_events(&work, wp, 1, "run-1", Some(("codex", "gpt-5-codex")));
+        events.extend(attempt_events(&work, wp, 2, "run-2", None));
+        events.extend(attempt_events(&work, wp, 3, "run-3", None));
+
+        let carried = prior_launch_for_waypoint(&events, &WaypointId(wp.to_string()), 3)
+            .expect("attempt 1's admitted launch is still the lineage's latest admitted choice");
+        assert_eq!(carried.0, ActorKind("codex".to_string()));
+        assert_eq!(carried.1.model.as_deref(), Some("gpt-5-codex"));
+
+        // And it does not decay with distance: attempt 4, two
+        // unlaunched attempts out, is the case that showed the loss was
+        // permanent rather than a one-attempt blip.
+        let carried = prior_launch_for_waypoint(&events, &WaypointId(wp.to_string()), 4)
+            .expect("two abandoned attempts still decided nothing");
+        assert_eq!(carried.0, ActorKind("codex".to_string()));
+    }
+
+    /// Newest admitted wins: a later same-harness override that was
+    /// itself admitted is the lineage's operative choice, not the older
+    /// admission it replaced.
+    #[test]
+    fn the_latest_admitted_launch_is_the_one_carried() {
+        let work = WorkId("work-lineage".to_string());
+        let wp = "lin/wp-1";
+        let mut events = attempt_events(&work, wp, 1, "run-1", Some(("codex", "gpt-5-codex")));
+        events.extend(attempt_events(
+            &work,
+            wp,
+            2,
+            "run-2",
+            Some(("codex", "gpt-5")),
+        ));
+        events.extend(attempt_events(&work, wp, 3, "run-3", None));
+
+        let carried = prior_launch_for_waypoint(&events, &WaypointId(wp.to_string()), 4)
+            .expect("attempt 2's admitted override is the latest admitted choice");
+        assert_eq!(carried.1.model.as_deref(), Some("gpt-5"));
+    }
+
+    /// The allowed `None`s, kept `None`: a first attempt, and a lineage
+    /// in which nothing was ever admitted. Nothing is fabricated in
+    /// either case — that is what would invent a choice nobody made.
+    #[test]
+    fn a_lineage_that_never_admitted_a_launch_carries_nothing() {
+        let work = WorkId("work-lineage".to_string());
+        let wp = "lin/wp-1";
+        let mut events = attempt_events(&work, wp, 1, "run-1", None);
+        events.extend(attempt_events(&work, wp, 2, "run-2", None));
+        assert_eq!(
+            prior_launch_for_waypoint(&events, &WaypointId(wp.to_string()), 3),
+            None
+        );
+        assert_eq!(
+            prior_launch_for_waypoint(&events, &WaypointId(wp.to_string()), 1),
+            None,
+            "a first attempt has no prior Run at all"
+        );
+    }
+
+    /// A distinct Waypoint's lineage is its own: a sibling's admitted
+    /// launch is never inherited, however recent it is.
+    #[test]
+    fn a_distinct_waypoint_does_not_inherit_a_siblings_admitted_selection() {
+        let work = WorkId("work-lineage".to_string());
+        let mut events = attempt_events(
+            &work,
+            "lin/wp-1",
+            1,
+            "run-1",
+            Some(("codex", "gpt-5-codex")),
+        );
+        events.extend(attempt_events(&work, "lin/wp-2", 1, "run-2", None));
+        events.extend(attempt_events(&work, "lin/wp-2", 2, "run-3", None));
+        assert_eq!(
+            prior_launch_for_waypoint(&events, &WaypointId("lin/wp-2".to_string()), 3),
+            None,
+            "wp-2 authored nothing of its own; wp-1's choice is not its to inherit"
+        );
+    }
+
     /// A real `WirkdState` over a real, empty estate: a real
     /// `AtlasStore` on a real directory, so `record_index_projection`'s
     /// own listing of `atlas/` is a real listing and nothing here is a
@@ -16361,15 +16768,18 @@ mod tests {
     /// the implementation is restored.
     #[test]
     fn a_refused_continuation_preserves_the_callers_token() {
+        // These cases are about coverage, never about exhaustion, so
+        // each is asked with a page that really returned a row.
+        const ONE_ROW: usize = 1;
         let mut coverage = wirk_atlas::AnswerCoverage::default();
         assert_eq!(
-            continuation_decision(&coverage),
+            continuation_decision(&coverage, ONE_ROW),
             ContinuationDecision::Fresh
         );
 
         coverage.continuation_unrecoverable = true;
         assert_eq!(
-            continuation_decision(&coverage),
+            continuation_decision(&coverage, ONE_ROW),
             ContinuationDecision::Preserved
         );
 
@@ -16380,12 +16790,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            continuation_decision(&denied),
+            continuation_decision(&denied, ONE_ROW),
             ContinuationDecision::Withheld
         );
         denied.continuation_unrecoverable = true;
         assert_eq!(
-            continuation_decision(&denied),
+            continuation_decision(&denied, ONE_ROW),
             ContinuationDecision::Withheld
         );
 
@@ -16394,7 +16804,63 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            continuation_decision(&no_sources),
+            continuation_decision(&no_sources, ONE_ROW),
+            ContinuationDecision::Withheld
+        );
+    }
+
+    /// P3 native closeout item 3 (`p3-sources/source-coverage-verify/
+    /// raw/p4-walk.txt`): pages 10 through 15 each "returned 0 of 18"
+    /// and each still received a fresh continuation token, so the walk
+    /// could not end — the next request was byte-identical to the one
+    /// that produced nothing, because the offset advances by exactly the
+    /// number of rows returned.
+    ///
+    /// The condition is precisely "zero rows returned, so zero offset
+    /// advance", and nothing wider. A page with rows still continues; a
+    /// denied or source-less answer still withholds; an unrecoverable
+    /// continuation still hands back the caller's own token, because
+    /// that refusal is deliberate and returning no rows is exactly how
+    /// it presents.
+    #[test]
+    fn a_page_that_returned_nothing_issues_no_continuation_to_repeat_it() {
+        let coverage = wirk_atlas::AnswerCoverage::default();
+        assert_eq!(
+            continuation_decision(&coverage, 0),
+            ContinuationDecision::Exhausted,
+            "a page that returned no rows advances no offset, so a token would repeat it"
+        );
+        assert_eq!(
+            continuation_decision(&coverage, 1),
+            ContinuationDecision::Fresh,
+            "one row is progress: a long walk still continues to its real end"
+        );
+
+        // The two deliberate refusals are answered first and are
+        // untouched, both of which also return zero rows.
+        let unrecoverable = wirk_atlas::AnswerCoverage {
+            continuation_unrecoverable: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            continuation_decision(&unrecoverable, 0),
+            ContinuationDecision::Preserved,
+            "an unrecoverable continuation still hands back the caller's own token"
+        );
+        let denied = wirk_atlas::AnswerCoverage {
+            denied: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            continuation_decision(&denied, 0),
+            ContinuationDecision::Withheld
+        );
+        let no_sources = wirk_atlas::AnswerCoverage {
+            no_sources: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            continuation_decision(&no_sources, 0),
             ContinuationDecision::Withheld
         );
     }

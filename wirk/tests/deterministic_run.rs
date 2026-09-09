@@ -229,6 +229,100 @@ fn run_deterministic_child_completes_and_fails() {
     assert!(!estate.join(".wirk").join("wirkd.sock").exists());
 }
 
+/// P3 native closeout item 4. The auto-advanced Deterministic World
+/// used to carry a compiled-in absolute cache path for this one
+/// development box (`CARGO_TARGET_DIR=/var/tmp/wirk-target`,
+/// `server.rs`), content-addressed into the World hash with no supported
+/// override — while the *first* Deterministic Waypoint carried no env at
+/// all, so the two paths disagreed about the same Route.
+///
+/// The warm-cache policy is not abandoned; it moves to where it belongs.
+/// A deterministic child is a real OS child of whoever runs it, so it
+/// inherits that process's environment natively (`ChildExecutor` spawns
+/// with `command.envs(&det.env)` over an inherited environment — the
+/// same mechanism `wirk-herdr` already uses to hand an actor pane the
+/// driver's own `CARGO_TARGET_DIR`). This drives it: the value the
+/// child sees is the one its caller was started with, and nothing about
+/// it is compiled in.
+///
+/// Red before the change on the second half — the World's own reserved
+/// `env` — for the auto-advanced path; the first Waypoint asserted here
+/// was already empty and is pinned so the two stay consistent.
+#[test]
+fn a_deterministic_child_inherits_its_callers_cargo_target_dir_and_pins_no_host_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().to_path_buf();
+    let cache = dir.path().join("this-callers-own-cache");
+
+    let mut wirkd_child = KillOnDrop(
+        Command::new(wirk_bin())
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_wirkd(&estate);
+
+    let (work, _run) = submit_deterministic(
+        &estate,
+        &["sh", "-c", "printf '%s' \"$CARGO_TARGET_DIR\" > report.md"],
+    );
+
+    // The reserved World pins no environment of its own: no host path is
+    // compiled into the product, and nothing about one box's cache is
+    // content-addressed into a World hash.
+    let journal = Journal::open(estate.join("works").join(&work)).expect("open journal");
+    let events = journal.replay().expect("journal replays cleanly");
+    let reserved = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            EventKind::WaypointReserved { world, .. } => Some(world.clone()),
+            _ => None,
+        })
+        .expect("a reserved World");
+    let cwd = match reserved {
+        wirk_core::World::Deterministic(det) => {
+            assert!(
+                det.env.is_empty(),
+                "a Deterministic World must pin no host cache path of its own: {:?}",
+                det.env
+            );
+            det.cwd
+        }
+        wirk_core::World::Actor(_) => panic!("expected a Deterministic World"),
+    };
+
+    // And the caller's own configuration reaches the child, natively.
+    let output = Command::new(wirk_bin())
+        .args(["run-deterministic", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work, "--executor", "child"])
+        .env("CARGO_TARGET_DIR", &cache)
+        .output()
+        .expect("run-deterministic runs");
+    assert!(
+        output.status.success(),
+        "run-deterministic failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen = std::fs::read_to_string(cwd.join("report.md"))
+        .expect("the child's own command wrote its report into this World's cwd");
+    assert_eq!(
+        seen,
+        cache.display().to_string(),
+        "the child must see the cache its caller configured, not one compiled into the product"
+    );
+
+    let _ = Command::new(wirk_bin())
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output();
+    let _ = wirkd_child.0.wait();
+}
+
 /// Fix 2 (ruling 0044, item E): `run-deterministic` blocks on the
 /// child's own exit with no deadline anywhere — proven directly against
 /// a child that exits only after a real delay of its own (`sh -c

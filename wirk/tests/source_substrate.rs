@@ -186,13 +186,18 @@ fn submit_work_with_run(
 }
 
 /// Writes `report.md` into the deterministic Waypoint's own checkout
-/// (`cwd` for a Git-basis Deterministic World is `repo_path` itself,
-/// module doc) and files a real `wirk claim` for it — the "real
-/// admitted producing action" `atlas relate` now requires (ruling
-/// 0093, W3-CORRECTION.md item 2) before a Work may assert a
-/// relationship.
-fn claim_report(estate: &Path, work_id: &str, run_id: &str, repo_path: &Path) {
-    fs::write(repo_path.join("report.md"), "produced by this Work\n").expect("write report.md");
+/// (`cwd` for a Git-basis Deterministic World is this Work's own
+/// worktree, `<estate>/worktrees/<work_id>` — P3 execution-recovery
+/// item 1, superseding this comment's own prior "`repo_path` itself")
+/// and files a real `wirk claim` for it — the "real admitted producing
+/// action" `atlas relate` now requires (ruling 0093, W3-CORRECTION.md
+/// item 2) before a Work may assert a relationship.
+fn claim_report(estate: &Path, work_id: &str, run_id: &str) {
+    fs::write(
+        estate.join("worktrees").join(work_id).join("report.md"),
+        "produced by this Work\n",
+    )
+    .expect("write report.md");
     claim_report_existing(estate, work_id, run_id);
 }
 
@@ -443,7 +448,7 @@ fn two_estate_search_resolve_relate_round_trip_with_work_derived_admission() {
     // digest still matches — the structural defect the correction-verify
     // VERDICT recorded as R1.
     fs::write(
-        wirk_repo.join("report.md"),
+        estate_a.join("worktrees").join(&work_id).join("report.md"),
         format!(
             "asserted {} under {}\n",
             relationship["id"].as_str().unwrap(),
@@ -1039,7 +1044,7 @@ fn relate_binds_the_producer_to_the_current_run_and_world_not_a_past_claim() {
     // Negative that ruling 0095 turns on: once the producing action is
     // spent, the Claim it produced is history, not standing authority to
     // assert something new.
-    claim_report(&estate, &work_id, &run_id, &out_repo);
+    claim_report(&estate, &work_id, &run_id);
     let (ok, _, err) = relate(&work_id, vec![]);
     assert!(
         !ok,
@@ -1515,6 +1520,58 @@ fn an_exhausted_continuation_window_is_spent_not_a_no_match() {
     assert!(
         !spent["coverage"]["no_match"].as_bool().unwrap(),
         "and must not also claim the corpus held nothing it just returned {total} candidates from"
+    );
+
+    // P3 native closeout item 3. The spent page returned zero rows, so
+    // the offset a token would carry is the offset it already used and
+    // the next request would be byte-identical to this one. It hands
+    // back no continuation, so the walk ends here.
+    //
+    // Red before the change, and the shape observed live in
+    // `p3-sources/source-coverage-verify/raw/p4-walk.txt`: this page
+    // carried a fresh token, and following it produced this same page
+    // again, forever.
+    assert!(
+        spent["continuation"].is_null(),
+        "a page that returned nothing must not hand back a token that repeats it: {spent}"
+    );
+
+    // The walk itself, driven to its end rather than described: from the
+    // first page, follow every token handed back. It must stop, and it
+    // must stop having seen every candidate — a walk that ends early
+    // would be this change trading a loop for lost coverage.
+    let mut seen = 0u64;
+    let mut next = Some(
+        atlas(&estate, &["search", "--query", "alpha", "--limit", "1"])
+            .1
+            .clone(),
+    );
+    let mut pages = 0;
+    while let Some(page) = next.take() {
+        pages += 1;
+        assert!(pages <= 20, "the walk did not terminate: {page}");
+        seen += page["budget"]["returned"].as_u64().unwrap();
+        if let Some(token) = page["continuation"].as_str() {
+            let token = token.to_string();
+            let (ok, following, err) = atlas(
+                &estate,
+                &[
+                    "search",
+                    "--query",
+                    "alpha",
+                    "--limit",
+                    "1",
+                    "--continue",
+                    &token,
+                ],
+            );
+            assert!(ok, "following the walk failed: {err}");
+            next = Some(following);
+        }
+    }
+    assert_eq!(
+        seen, total,
+        "the walk must end having returned every candidate, not early: saw {seen} of {total}"
     );
 
     // A genuine no-match over the same corpus is still a no-match.

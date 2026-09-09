@@ -62,7 +62,13 @@ fn required_child_sharing_the_parents_own_repository_via_a_real_worktree_is_admi
         None,
     )
     .expect("submit parent");
-    write_file(&repo, "a.md", "a\n");
+    // P3 execution-recovery item 1: the parent's own first leaf is
+    // Deterministic with a Git basis, which now executes in this Work's
+    // own worktree (`<estate>/worktrees/<work_id>`), never the caller's
+    // shared `--repo-path` checkout named by `repo` above — write where
+    // the real command's own `cwd` now is.
+    let parent_worktree = estate.join("worktrees").join(&parent.work_id);
+    write_file(&parent_worktree, "a.md", "a\n");
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 
@@ -86,7 +92,11 @@ fn required_child_sharing_the_parents_own_repository_via_a_real_worktree_is_admi
         "a genuine worktree of the parent's own repository must be admitted under the parent's own execution alias",
     );
 
-    write_file(&child_worktree, "helper.md", "helper\n");
+    // Same reasoning again: the child's own Deterministic leaf runs in
+    // the *child Work's own* worktree, materialized from `child_worktree`
+    // as source — not `child_worktree` itself.
+    let child_own_worktree = estate.join("worktrees").join(&child.work_id);
+    write_file(&child_own_worktree, "helper.md", "helper\n");
     claim_ok(
         &estate,
         &child.work_id,
@@ -125,7 +135,11 @@ fn required_child_under_a_disconnected_repository_with_the_parents_own_alias_is_
         None,
     )
     .expect("submit parent");
-    write_file(&repo, "a.md", "a\n");
+    // P3 execution-recovery item 1: same reasoning as the sibling test
+    // above — write where the Deterministic leaf's own worktree cwd now
+    // is, not the caller's shared checkout.
+    let parent_worktree = estate.join("worktrees").join(&parent.work_id);
+    write_file(&parent_worktree, "a.md", "a\n");
     claim_ok(&estate, &parent.work_id, &parent.run_id, "a.md=a.md");
     assert_eq!(state_of(&pointer.socket, &parent.work_id), "waiting");
 

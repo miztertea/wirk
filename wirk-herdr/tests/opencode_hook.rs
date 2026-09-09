@@ -160,17 +160,26 @@ fn opencode_run_gets_a_wirk_owned_claim_plugin_with_no_worktree_or_home_write() 
     assert!(plugin_path.starts_with(estate.path()));
 
     let plugin_contents = std::fs::read_to_string(plugin_path).expect("plugin file exists");
-    // Rule 4 (`native-progress-contract-use/HANDOFF.md` §1.4): the
-    // written plugin invokes this very test binary's own
-    // `current_exe()` by absolute path — the same value `actor_pane`
-    // reads, since this test runs in the same process — never the bare
-    // name `wirk`, which breaks the moment the driver binary is
-    // preserved or renamed under a different name.
+    // Rule 4 (`native-progress-contract-use/HANDOFF.md` §1.4), corrected
+    // by the P3 execution-recovery connected-gap close: the written
+    // plugin invokes this Run's own *pinned* `wirk` — not this test
+    // binary's raw `current_exe()` — by absolute path, never the bare
+    // name `wirk` (breaks the moment the driver binary is preserved or
+    // renamed) and never the driver's own mutable `exe` directly (the
+    // one thing item 1's pin exists to stop a hook from bypassing).
     let exe = std::env::current_exe().expect("current_exe");
+    let pinned = estate
+        .path()
+        .join(".wirk")
+        .join("runtime")
+        .join(&run.id.0)
+        .join("bin")
+        .join("wirk");
     assert_eq!(
         plugin_contents,
-        wirk_claim_plugin_js(&exe),
-        "the written plugin file matches the template with this driver's own exe path spliced in"
+        wirk_claim_plugin_js(&pinned),
+        "the written plugin file matches the template with this Run's pinned wirk path \
+         spliced in"
     );
     assert!(
         plugin_contents.contains("execFile(WIRK_CLAIM_BIN"),
@@ -179,8 +188,18 @@ fn opencode_run_gets_a_wirk_owned_claim_plugin_with_no_worktree_or_home_write() 
          {plugin_contents}"
     );
     assert!(
-        plugin_contents.contains(&exe.to_string_lossy().into_owned()),
-        "the plugin must name the driver's own absolute binary path: {plugin_contents}"
+        plugin_contents.contains(&pinned.to_string_lossy().into_owned()),
+        "the plugin must name this Run's own pinned wirk at {pinned:?}: {plugin_contents}"
+    );
+    assert!(
+        !plugin_contents.contains(&exe.to_string_lossy().into_owned()),
+        "the plugin must not name the driver's mutable current_exe directly, only this Run's \
+         pinned copy of it: {plugin_contents}"
+    );
+    assert_eq!(
+        std::fs::read(&pinned).expect("this Run's pinned wirk exists"),
+        std::fs::read(&exe).expect("current_exe readable"),
+        "this Run's pinned wirk must hold the driver's own bytes"
     );
 }
 

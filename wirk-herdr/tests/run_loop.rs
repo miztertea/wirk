@@ -30,7 +30,9 @@ use wirk_herdr::fake::FakeHerdrClient;
 use wirk_herdr::run_loop::{
     FakeWirkdApi, Outcome, RunLoop, RunLoopError, RunStatusEntry, WorkStatus,
 };
-use wirk_herdr::{AgentStatus, HerdrError, HerdrEvent, HerdrExecutor, PaneInfo};
+use wirk_herdr::{
+    AgentStatus, HerdrError, HerdrEvent, HerdrExecutor, PaneInfo, ensure_pinned_wirk_bin,
+};
 
 fn work_id() -> WorkId {
     WorkId("work-1".to_string())
@@ -53,6 +55,21 @@ fn open_run(run_id: &str) -> Run {
     }
 }
 
+/// A real, writable estate root for this binary's fixtures, created
+/// once and shared. P3 execution-recovery correction item 1: an actor
+/// launch pins this Run's own `wirk` under `<estate_root>/.wirk/
+/// runtime/` and *refuses* the launch when it cannot, so the former
+/// `/estate` placeholder no longer stands in for a real estate. It is
+/// deliberately not the worktree these fixtures pass in: wirk's own
+/// Run-scoped runtime and hook directories live under the estate root,
+/// never inside the actor's boundary-checked worktree.
+fn fixture_estate_root() -> &'static std::path::Path {
+    static ESTATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ESTATE
+        .get_or_init(|| tempfile::tempdir().expect("fixture estate tempdir"))
+        .path()
+}
+
 fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
     World::Actor(ActorWorld {
         repository: "wirk".to_string(),
@@ -63,7 +80,7 @@ fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
             base: "abc123".to_string(),
         },
         triple: ExecutionTriple {
-            estate_root: "/estate".to_string(),
+            estate_root: fixture_estate_root().to_string_lossy().into_owned(),
             work_id: work_id(),
             run_id: run.id.clone(),
         },
@@ -282,6 +299,96 @@ fn the_run2_bug_a_second_identical_idle_is_still_prompted() {
     wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
     let outcome = handle.join().unwrap().expect("drive");
     assert_eq!(outcome, Outcome::Claimed);
+}
+
+/// P3 native closeout item 1a, the exact live failure, deterministically.
+///
+/// In `p3-world-loop/index-health-correct/raw/71-full-suite-final.txt`
+/// (lines 753-774) two `run_verb` retry tests exited 5 with `record
+/// refused: InvalidTransition record does not target the current open
+/// Run`, mid-drive, with the scripted actor's own claim step next. The
+/// condition is a race the driver cannot avoid and must not fail on:
+/// the actor files its validated `Done` Claim — settling the Run — while
+/// the driver's `LifecycleObserved` for the status it just saw is in
+/// flight. wirkd correctly refuses to fold an observation into a settled
+/// Run; the driver used to read that refusal as a fatal error.
+///
+/// Here the refusal is made certain rather than raced for: the fake
+/// answers every subsequent `record` the way wirkd answers a settled
+/// Run, and the Claim then arrives on the watch stream. The drive must
+/// report `Claimed` — the outcome that actually happened. Red before the
+/// change: the refusal became `RunLoopError::Wirkd` and the drive
+/// returned `Err`.
+#[test]
+fn an_observation_refused_because_the_run_settled_is_not_a_drive_failure() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+    wait_until("the agent launched", || {
+        client.start_agent_calls.lock().unwrap().len() == 1
+    });
+
+    // The Run settles under the driver: from here every record is
+    // answered exactly as wirkd answers one against a settled Run.
+    wirkd.refuse_records_as_settled(
+        "Run run-1 has already settled (run claimed, work completed): a record made after a Run          reached its own outcome is not folded, and that outcome stands",
+    );
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    // The Claim that settled it, arriving where a driver really learns
+    // of it — the watch stream.
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+
+    let outcome = handle
+        .join()
+        .unwrap()
+        .expect("a Run that settled under its own driver is not a drive failure");
+    assert_eq!(
+        outcome,
+        Outcome::Claimed,
+        "the outcome reported is the one that actually happened"
+    );
+}
+
+/// The other side of the same change, so the tolerance cannot be read as
+/// blanket: a refusal that is **not** the settled-Run one still stops
+/// the drive. A superseded-Run refusal is a different fact — this driver
+/// has been replaced — and absorbing it would let a replaced driver keep
+/// prompting a pane it no longer owns.
+#[test]
+fn a_refusal_that_is_not_settlement_still_stops_the_drive() {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+    wait_until("the agent launched", || {
+        client.start_agent_calls.lock().unwrap().len() == 1
+    });
+    wirkd.fail_records("record names Run run-1, but Waypoint wp-1 has since opened Run run-2");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+
+    let err = handle
+        .join()
+        .unwrap()
+        .expect_err("a superseded driver stops");
+    assert!(
+        err.to_string().contains("has since opened Run run-2"),
+        "{err}"
+    );
 }
 
 // ---- (2) Working then Blocked across many events: zero prompts, one notify
@@ -1491,8 +1598,14 @@ fn the_prompt_carries_the_artifact_name_and_the_claim_instruction() {
     let calls = client.prompt_agent_calls.lock().unwrap();
     let text = &calls.first().expect("one prompt sent").text;
     assert!(text.contains("report.md"), "missing artifact name: {text}");
+    // P3 runtime-guidance: the claim instruction is still literally
+    // here, but the command is now the Run's own pinned executable by
+    // absolute path rather than the bare name a login shell resolves
+    // (`compose_first_prompt`'s own doc; item 4). The assertion follows
+    // the contract it always pinned — "the claim instruction is in the
+    // text" — to the form that instruction actually takes now.
     assert!(
-        text.contains("wirk claim"),
+        text.contains("/bin/wirk' claim"),
         "missing the literal claim instruction: {text}"
     );
     assert!(
@@ -2086,6 +2199,219 @@ fn a_reinvocation_with_no_live_agent_launches_under_the_already_bound_request() 
     }
 }
 
+/// Where `ensure_pinned_wirk_bin` puts this Run's own pinned `wirk`,
+/// mirroring `actor_pane`'s own path construction so these tests never
+/// duplicate that logic incorrectly.
+fn pinned_wirk_path(estate_root: &std::path::Path, run_id: &str) -> std::path::PathBuf {
+    estate_root
+        .join(".wirk")
+        .join("runtime")
+        .join(run_id)
+        .join("bin")
+        .join("wirk")
+}
+
+/// Like `actor_world`, but against a **private, per-test** estate root
+/// rather than the file-wide shared `fixture_estate_root()`. The two
+/// pin-restore/refusal tests below delete files under
+/// `.wirk/runtime/images/<digest>/` — content-addressed by this test
+/// *process's* own `current_exe()` bytes, so every test in this binary
+/// that pins a Run shares the very same digest. Doing that against the
+/// shared fixture would corrupt other tests' already-installed image
+/// out from under them if they happened to run concurrently (`cargo
+/// test`'s default); a private estate keeps each test's own image
+/// store — and any damage it deliberately does to it — fully isolated.
+fn actor_world_with_estate(
+    run: &Run,
+    worktree_path: &std::path::Path,
+    estate_root: &std::path::Path,
+) -> World {
+    World::Actor(ActorWorld {
+        repository: "wirk".to_string(),
+        worktree_path: worktree_path.to_path_buf(),
+        branch: "p1/herdr-executor".to_string(),
+        base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::Git {
+            base: "abc123".to_string(),
+        },
+        triple: ExecutionTriple {
+            estate_root: estate_root.to_string_lossy().into_owned(),
+            work_id: work_id(),
+            run_id: run.id.clone(),
+        },
+        intent: "write report.md summarizing the repo".to_string(),
+        output_contract: OutputContract(vec![ArtifactSpec {
+            name: "report.md".to_string(),
+            required: true,
+        }]),
+        boundary: Boundary(vec!["src/**".to_string()]),
+        review_targets: Vec::new(),
+        evidence: None,
+    })
+}
+
+/// P3 execution-recovery connected-gap close: a live reattach
+/// (`observe_admitted_launch`'s `Reconciled` branch, taken when Herdr
+/// already reports this Run's agent alive) never called `actor_pane`,
+/// so `ensure_pinned_wirk_bin` — the one call that validates or
+/// restores this Run's pin — was skipped entirely. Red on the
+/// uncorrected path: deleting the pinned file before a reattach left it
+/// missing, because reconciliation returned `Ok` without ever looking
+/// at it (RECOVERY-CHILD-CHECK.md, "Restore-on-reattach for a Run whose
+/// pane is already live"). Green here: the very first reconciling
+/// `launch` call establishes the pin (there is no earlier `actor_pane`
+/// call in this fixture either — reconciliation is the *only* launch
+/// path exercised), and a second reconciling call after the pinned file
+/// is deleted restores it from the same shared image, byte-identical,
+/// before returning `Ok`.
+#[test]
+fn a_live_reattach_restores_this_runs_pin_when_its_own_file_is_missing() {
+    let mut run = open_run("run-pin-restore-1");
+    run.launch_requested = true;
+    let dir = tempdir().expect("tempdir");
+    let estate = tempdir().expect("private estate tempdir");
+    let world = actor_world_with_estate(&run, dir.path(), estate.path());
+    let client = FakeHerdrClient::default()
+        .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+        .with_get_pane_response(&run.id.0, Ok(pane_info("p9", AgentStatus::Working, 3)));
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let client = Arc::new(client);
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    // First reconciliation: nothing pinned this Run before now (this
+    // fixture never calls `actor_pane`/`launch_actor` at all), so this
+    // call is the one that installs the pin.
+    assert!(
+        loop_.launch(&work_id(), &run, &world).is_ok(),
+        "first reconciliation establishes this Run's pin"
+    );
+    let pinned = pinned_wirk_path(estate.path(), &run.id.0);
+    assert!(pinned.is_file(), "reconciliation must have pinned a wirk");
+    let original_bytes = std::fs::read(&pinned).expect("read pinned bytes");
+    assert_eq!(
+        original_bytes,
+        std::fs::read(std::env::current_exe().expect("current_exe")).expect("read current_exe"),
+        "the pin holds this driver's own bytes"
+    );
+
+    // Simulate the actor's own pane surviving while its pinned file is
+    // deleted from under it (a disk cleanup, an unrelated process, an
+    // adversarial actor) — the shared image it was bound to is left
+    // alone.
+    std::fs::remove_file(&pinned).expect("remove pinned file");
+    assert!(!pinned.exists(), "pinned file really is gone");
+
+    // Second reconciliation: same admitted, still-live Run.
+    assert!(
+        loop_.launch(&work_id(), &run, &world).is_ok(),
+        "reconciliation must restore, not ignore, a missing pin"
+    );
+    assert!(
+        pinned.is_file(),
+        "the pin must be restored before the reattach continues"
+    );
+    assert_eq!(
+        std::fs::read(&pinned).expect("read restored pinned bytes"),
+        original_bytes,
+        "restored from this Run's own recorded image, not re-derived from anything else"
+    );
+}
+
+/// The other half of the same gap: when the pin cannot be restored at
+/// all (its own file is gone *and* the shared image its digest names is
+/// also gone), a live reattach must fail clearly rather than continuing
+/// to attach an actor whose `wirk` resolution is now unvalidated — "no
+/// capability fallback" (the brief's own words for this item), matching
+/// `RuntimePinError::Unrestorable`'s existing refusal posture for a
+/// fresh launch.
+#[test]
+fn a_live_reattach_refuses_rather_than_continue_when_its_pin_is_unrestorable() {
+    let mut run = open_run("run-pin-refuse-1");
+    run.launch_requested = true;
+    let dir = tempdir().expect("tempdir");
+    let estate = tempdir().expect("private estate tempdir");
+    let world = actor_world_with_estate(&run, dir.path(), estate.path());
+    let client = FakeHerdrClient::default()
+        .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+        .with_get_pane_response(&run.id.0, Ok(pane_info("p9", AgentStatus::Working, 3)));
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let client = Arc::new(client);
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    assert!(
+        loop_.launch(&work_id(), &run, &world).is_ok(),
+        "first reconciliation establishes this Run's pin"
+    );
+    let pinned = pinned_wirk_path(estate.path(), &run.id.0);
+    let digest = std::fs::read_to_string(pinned.with_file_name("wirk.pin"))
+        .expect("wirk.pin recorded")
+        .trim()
+        .to_string();
+    let image = estate
+        .path()
+        .join(".wirk")
+        .join("runtime")
+        .join("images")
+        .join(&digest)
+        .join("wirk");
+    assert!(image.is_file(), "the shared image this Run bound to");
+
+    // Both the Run's own file and the shared image it names are gone —
+    // there is nothing left this Run's pin could be restored from.
+    std::fs::remove_file(&pinned).expect("remove pinned file");
+    std::fs::remove_file(&image).expect("remove the shared image too");
+
+    let result = loop_.launch(&work_id(), &run, &world);
+    assert!(
+        result.is_err(),
+        "an unrestorable pin must refuse the reattach, not continue under an unvalidated wirk"
+    );
+    let message = result.err().unwrap().to_string();
+    assert!(
+        message.contains("not available to restore"),
+        "the refusal must name the unrestorable pin, not a generic failure: {message}"
+    );
+
+    // Exactly one "launch-reconciled" total, from the first (legitimate)
+    // call — the refused second call must not add a second one, which
+    // would mean the refusal was only reached *after* already
+    // reconciling onto the pane.
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    let reconciled_count = recorded
+        .iter()
+        .filter(
+            |kind| matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "launch-reconciled"),
+        )
+        .count();
+    assert_eq!(
+        reconciled_count, 1,
+        "a refused pin must not be recorded as a second successful reconciliation: {recorded:?}"
+    );
+}
+
+/// Sanity check that `pinned_wirk_path`/`ensure_pinned_wirk_bin` above
+/// agree on the same layout `actor_pane` uses — guards the two helper
+/// tests above against silently testing the wrong path if either
+/// changes independently.
+#[test]
+fn pinned_wirk_path_matches_ensure_pinned_wirk_bins_own_layout() {
+    let dir = tempdir().expect("tempdir");
+    let estate_root = dir.path().to_string_lossy().into_owned();
+    let exe = std::env::current_exe().expect("current_exe");
+    let returned_dir = ensure_pinned_wirk_bin(&estate_root, "run-layout-check", &exe)
+        .expect("ensure_pinned_wirk_bin succeeds against a real writable estate");
+    assert_eq!(
+        returned_dir.join("wirk"),
+        dir.path()
+            .join(".wirk")
+            .join("runtime")
+            .join("run-layout-check")
+            .join("bin")
+            .join("wirk"),
+        "this test file's own path construction must match the product's"
+    );
+}
+
 // ---- P3 native launch attempt admission (the review's N1) -----------
 //
 // wirkd owns the admission itself (`server.rs`, its own tests). These
@@ -2259,6 +2585,116 @@ fn a_launched_run_whose_agent_is_gone_is_not_launched_a_second_time() {
     assert!(matches!(err, RunLoopError::LaunchUnresolved(_)), "{err:?}");
     assert!(err.to_string().contains("wirk work retry"), "{err}");
     assert_eq!(client.start_agent_calls.lock().unwrap().len(), 0);
+}
+
+/// P3 native closeout D2 (`runtime-guidance-review/raw/
+/// DEFECT-vanished-agent-no-recovery.txt`; ruling 0156's retained gap).
+/// Refusing the second launch was only half an answer: the Work stayed
+/// `active`, so the `wirk work retry` the message names refused with
+/// `NotNeedsInput` and the two supported verbs pointed at each other.
+///
+/// Herdr's own definite absence for a Run that already launched is now
+/// reconciled into the Run's own outcome — `RunFailed{status:
+/// "agent-gone"}` — which `fold` surfaces as a `NeedsInput` Work naming
+/// this Run: exactly what `handle_retry` admits. Red before the change:
+/// only a `LifecycleObserved` was written, so `fold` left the Work
+/// `Active` and no retry was admissible.
+#[test]
+fn a_launched_runs_definite_absence_is_reconciled_into_a_retryable_outcome() {
+    let mut run = open_run("run-1");
+    run.launch_requested = true;
+    run.launched = true;
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = Arc::new(
+        FakeHerdrClient::default()
+            .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+            .with_start_agent_responses(vec![Ok(vec!["opencode".to_string()])]),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default().with_journal(vec![
+        watch_event(None, work_submitted()),
+        watch_event(Some(&run.id), run_opened(&run)),
+        watch_event(Some(&run.id), run_launched(&run)),
+    ]));
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let err = loop_
+        .launch(&work_id(), &run, &world)
+        .err()
+        .expect("this Run already ran");
+    assert!(matches!(err, RunLoopError::LaunchUnresolved(_)), "{err:?}");
+    assert_eq!(
+        client.start_agent_calls.lock().unwrap().len(),
+        0,
+        "a second agent is never started under the same Run"
+    );
+
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    assert!(
+        recorded.iter().any(|kind| matches!(
+            kind,
+            EventKind::LifecycleObserved { status, .. } if status == "launch-agent-gone"
+        )),
+        "what Herdr said is journaled as its own observation: {recorded:?}"
+    );
+    assert!(
+        recorded.iter().any(|kind| matches!(
+            kind,
+            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("agent-gone")
+        )),
+        "the absence is reconciled into this Run's own outcome: {recorded:?}"
+    );
+
+    // The point of the reconciliation, checked where it matters: the
+    // folded Work is now in exactly the state `wirkd`'s `handle_retry`
+    // admits — `NeedsInput`, naming this Run.
+    let work = wirk_core::fold(&wirkd.journal());
+    assert_eq!(work.state, wirk_core::WorkState::NeedsInput, "{work:?}");
+    assert_eq!(
+        work.needs_input.as_ref().map(|cause| &cause.run),
+        Some(&run.id),
+        "the retry `wirk run` names must be admissible against this Run: {work:?}"
+    );
+    assert!(err.to_string().contains("wirk work retry"), "{err}");
+}
+
+/// The adverse control for the same change, kept adjacent to it: a Run
+/// whose agent Herdr reports **live** still reconciles onto the existing
+/// pane, starts nothing, and — the assertion this change adds — records
+/// no outcome at all. A live agent must never be failed into
+/// retryability.
+#[test]
+fn a_live_agent_is_reattached_and_never_recorded_failed() {
+    let mut run = open_run("run-1");
+    run.launch_requested = true;
+    run.launched = true;
+    let dir = tempdir().expect("tempdir");
+    let world = actor_world(&run, dir.path());
+    let client = Arc::new(
+        FakeHerdrClient::default()
+            .with_split_pane_response(pane_info("p1", AgentStatus::Idle, 1))
+            .with_start_agent_responses(vec![Ok(vec!["opencode".to_string()])])
+            .with_get_pane_response(&run.id.0, Ok(pane_info("p9", AgentStatus::Working, 3))),
+    );
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let mut loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    assert!(
+        loop_.launch(&work_id(), &run, &world).is_ok(),
+        "a live agent reattaches"
+    );
+    assert_eq!(
+        client.start_agent_calls.lock().unwrap().len(),
+        0,
+        "reattaching never duplicates the agent"
+    );
+    let recorded: Vec<EventKind> = wirkd.recorded().into_iter().map(|(_, _, k)| k).collect();
+    assert!(
+        !recorded
+            .iter()
+            .any(|kind| matches!(kind, EventKind::RunFailed { .. })),
+        "a live agent is not an absence and is never recorded failed: {recorded:?}"
+    );
 }
 
 /// A start error compounded with a Herdr that will not answer: two
@@ -2766,4 +3202,159 @@ fn resuming_a_working_pane_continues_without_prompting_it() {
         client.prompt_agent_calls.lock().unwrap().is_empty(),
         "a Working actor is not interrupted"
     );
+}
+
+// ---- P3 runtime-guidance: the standing prompt delivers this Run's own
+// runtime, by absolute path ----------------------------------------------
+//
+// Original execution-recovery item 4: "Prove a fresh native actor can
+// use the supported wirk commands without hunting build trees". The
+// `runtime-consumers` pass pinned the two *hook* consumers, which are
+// absolute paths and were never subject to `PATH`; it left the actor's
+// own commands named only as a bare `wirk`, resolved by a login shell
+// that rebuilds `PATH` from the operator's profile ahead of the pin
+// (`native-learning-use/ROOT-RECOVERY-REVIEW.md`). These two tests pin
+// the missing seam for both supported hook kinds, and render it through
+// the same `client.prompt_agent_calls` seam every other prompt test in
+// this file reads rather than calling `compose_first_prompt` directly,
+// so the wrong `ActorWorld` reaching the call would fail them too.
+
+/// The exact absolute invocation this Run's actor must be handed: the
+/// same layout `ensure_pinned_wirk_bin` installs into and both Claim
+/// hooks name.
+fn expected_pinned_wirk(estate_root: &std::path::Path, run: &Run) -> String {
+    estate_root
+        .join(".wirk")
+        .join("runtime")
+        .join(&run.id.0)
+        .join("bin")
+        .join("wirk")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn first_prompt_text(
+    mut run: Run,
+    kind: wirk_core::ActorKind,
+    estate_root: &std::path::Path,
+) -> String {
+    run.kind = kind;
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world_with_estate(&run, dir.path(), estate_root);
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+
+    let calls = client.prompt_agent_calls.lock().unwrap();
+    calls[0].text.clone()
+}
+
+/// Red on `127b995a` (this commit's own parent): the prompt there names
+/// no runtime at all, so the actor is left to resolve `wirk` by name.
+#[test]
+fn a_claude_actor_is_handed_its_own_runs_pinned_wirk_by_absolute_path() {
+    let estate = tempdir().expect("estate tempdir");
+    let run = open_run("run-guidance-claude-1");
+    let text = first_prompt_text(run.clone(), wirk_core::ActorKind::claude(), estate.path());
+    let pinned = expected_pinned_wirk(estate.path(), &run);
+
+    assert!(
+        text.contains(&pinned),
+        "the prompt must name this Run's own pinned wirk by absolute path \
+         ({pinned}), not leave the actor to resolve a name: {text:?}"
+    );
+    assert!(
+        !text.contains("`wirk claim`"),
+        "no bare-name wirk command survives in the prompt — a login shell \
+         can resolve it to a different build: {text:?}"
+    );
+    assert!(
+        !text.contains("`wirk claim --question"),
+        "the --question escape is given as the absolute invocation too: {text:?}"
+    );
+    assert!(
+        text.contains("report.md"),
+        "the required output is still named: {text:?}"
+    );
+}
+
+/// The same obligation for the other supported hook kind: both harnesses
+/// receive the guidance, from the one text both are prompted with.
+#[test]
+fn an_opencode_actor_is_handed_its_own_runs_pinned_wirk_by_absolute_path() {
+    let estate = tempdir().expect("estate tempdir");
+    let run = open_run("run-guidance-opencode-1");
+    assert_eq!(
+        run.kind,
+        wirk_core::ActorKind::opencode(),
+        "this test's premise: open_run's default kind is opencode"
+    );
+    let text = first_prompt_text(run.clone(), wirk_core::ActorKind::opencode(), estate.path());
+    let pinned = expected_pinned_wirk(estate.path(), &run);
+
+    assert!(
+        text.contains(&pinned),
+        "the prompt must name this Run's own pinned wirk by absolute path \
+         ({pinned}): {text:?}"
+    );
+    assert!(
+        !text.contains("`wirk claim"),
+        "no bare-name wirk command survives in the prompt: {text:?}"
+    );
+}
+
+/// A Run whose kind has no Claim hook still files by hand — and that
+/// by-hand command is the absolute pinned invocation too, not a name.
+#[test]
+fn an_unhooked_actors_by_hand_claim_command_is_the_pinned_absolute_path() {
+    let estate = tempdir().expect("estate tempdir");
+    let run = open_run("run-guidance-plain-1");
+    let kind = wirk_core::ActorKind("codex".to_string());
+    assert!(
+        !wirk_herdr::claim_hook::hook_installed_for(&kind),
+        "this test's premise: this kind has no Claim hook installed"
+    );
+    let text = first_prompt_text(run.clone(), kind, estate.path());
+    let pinned = expected_pinned_wirk(estate.path(), &run);
+
+    assert!(
+        text.contains(&format!("run '{pinned}' claim.")),
+        "the by-hand claim instruction must be the Run's own pinned \
+         executable, shell-quoted: {text:?}"
+    );
+}
+
+/// The prompt's path and the pin the installer actually creates are the
+/// same file — the layout function is not a second spelling that can
+/// drift from `ensure_pinned_wirk_bin`'s own.
+#[test]
+fn the_prompts_path_is_the_file_the_installer_actually_pins() {
+    let estate = tempdir().expect("estate tempdir");
+    let run = open_run("run-guidance-agree-1");
+    let exe = std::env::current_exe().expect("current exe");
+    let dir = wirk_herdr::ensure_pinned_wirk_bin(&estate.path().to_string_lossy(), &run.id.0, &exe)
+        .expect("pin installs");
+    let installed = dir.join("wirk");
+    assert!(installed.exists(), "the installer really created it");
+    assert_eq!(
+        installed.to_string_lossy(),
+        expected_pinned_wirk(estate.path(), &run),
+        "the prompt names exactly the file the installer pins"
+    );
+
+    let text = first_prompt_text(run.clone(), wirk_core::ActorKind::claude(), estate.path());
+    assert!(text.contains(&installed.to_string_lossy().into_owned()));
 }

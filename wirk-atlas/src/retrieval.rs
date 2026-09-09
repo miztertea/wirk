@@ -31,10 +31,10 @@
 use crate::domain::{EstateScope, GenerationId, MembershipId};
 use crate::semantic::{
     BackendArgument, BackendEnvironment, BackendIdentity, CANDIDATE_LIMIT, EditionId, MappingRow,
-    QUERY_PRODUCER_BASIS_MISSING, QUERY_PROTOCOL, QueryProducerBasis, QueryProducerPin,
-    ReportedEnvironment, SemanticEdition, configured_file, digest_bytes, measure_environment,
-    normalize_ranking_text, producer_basis, query_producer_configuration_digest,
-    query_producer_identity_digest,
+    QUERY_HASH_SEED, QUERY_ORDERING_POLICY, QUERY_PRODUCER_BASIS_MISSING, QUERY_PROTOCOL,
+    QueryProducerBasis, QueryProducerPin, ReportedEnvironment, SemanticEdition, configured_file,
+    digest_bytes, measure_environment, normalize_ranking_text, producer_basis,
+    query_producer_configuration_digest, query_producer_identity_digest,
 };
 use crate::{AtlasError, AtlasStore, ContentFamily, Membership, SemanticAvailability};
 use serde::{Deserialize, Serialize};
@@ -541,10 +541,11 @@ pub(crate) fn rank(
     if let Some(pinned) = pinned_producer {
         if pinned.configuration != configuration {
             return Ok(Err(format!(
-                "this continuation was ranked by query producer configuration {} and the backend \
-                 configured now is {}; the executable or an argument at the same configured path \
-                 is not the bytes that produced the first page, so the page it asks for cannot be \
-                 reproduced",
+                "this continuation was ranked by query producer configuration {} and the \
+                 configuration in force now is {}; either the executable or an argument at the \
+                 same configured path is not the bytes that produced the first page, or this \
+                 build's effective ordering and runtime policy ({QUERY_ORDERING_POLICY}) is not \
+                 the one that ranked it, so the page it asks for cannot be reproduced",
                 pinned.configuration, configuration
             )));
         }
@@ -843,6 +844,25 @@ fn run_query_backend(
         .env("TRANSFORMERS_OFFLINE", "1")
         .env("HF_HUB_DISABLE_TELEMETRY", "1")
         .env("PYTHONNOUSERSITE", "1")
+        // The selection half of `QUERY_ORDERING_POLICY`, applied where it
+        // has to be applied: on the child, before it ranks anything.
+        //
+        // R5, the installed runtime's own control rather than a change to
+        // the ranker. `semble` 0.5.6 unions its two candidate lists into a
+        // `set` and sorts that set on `start_line` alone; rows sharing a
+        // start line — every whole-file row does — keep the set's own
+        // iteration order, which CPython derives from a per-process random
+        // hash seed. That order survives every later stable sort, so it
+        // decides which rows `rerank_topk` keeps at its `top_k` cut when
+        // penalised scores tie there. Each page of a walk is its own
+        // process, so without this the pages are slices of two different
+        // candidate pools (0163; measured at a real equal-score boundary).
+        //
+        // It fixes *which rows are selected*, not what order they are
+        // served in: `query::order_ranked` still imposes this crate's own
+        // canonical total order on the pool. No score is touched, nothing
+        // is re-ranked here, and the installed `semble` is not patched.
+        .env("PYTHONHASHSEED", QUERY_HASH_SEED)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

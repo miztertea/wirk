@@ -18,6 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -752,6 +753,325 @@ fn is_agent_pane_busy(err: &HerdrExecutorError) -> bool {
     )
 }
 
+/// Why a Run's own pinned runtime could not be established. Every
+/// variant is a refusal, never a degrade: `actor_pane` surfaces it as
+/// `HerdrExecutorError::RuntimePin` *before* any pane is created, so an
+/// actor never launches under a weaker `wirk` guarantee than the one
+/// its Run was promised (P3 execution-recovery correction item 1 —
+/// "refuse an unfulfilled required pin before launching rather than
+/// changing capability silently or merely logging").
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RuntimePinError {
+    /// `std::env::current_exe` gave nothing to pin.
+    #[error(
+        "this driver cannot read its own executable path (current_exe): there is nothing to pin \
+         as this Run's own `wirk`"
+    )]
+    NoCurrentExe,
+    /// A filesystem step (read, install, link, verify) failed.
+    #[error("{step} at {path} failed: {reason}")]
+    Io {
+        step: String,
+        path: String,
+        reason: String,
+    },
+    /// This Run already has a pinned runtime whose bytes no longer match
+    /// the digest recorded when it was pinned, and the image it was
+    /// bound to is gone too. Replacing it with the *current* driver's
+    /// bytes would silently change this Run's runtime identity mid-Run,
+    /// so the launch is refused instead.
+    #[error(
+        "this Run's pinned runtime at {path} no longer matches its recorded digest {expected} \
+         (found {found}) and image {image} is not available to restore it — refusing to \
+         re-pin a different binary into a Run already bound to one"
+    )]
+    Unrestorable {
+        path: String,
+        expected: String,
+        found: String,
+        image: String,
+    },
+}
+
+/// SHA-256 of a file's bytes, lowercase hex. R5: `sha2`, already this
+/// crate's own declared dependency, used the ordinary way and in the
+/// same shape `wirkd::server`'s own `sha256_hex` uses it.
+fn sha256_file(path: &Path) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    // A fixed buffer rather than reading the whole binary into memory:
+    // these are tens of megabytes of debug binary, hashed on an actor
+    // launch path.
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn pin_io(step: &str, path: &Path, err: &io::Error) -> RuntimePinError {
+    RuntimePinError::Io {
+        step: step.to_string(),
+        path: path.display().to_string(),
+        reason: err.to_string(),
+    }
+}
+
+/// Install `exe`'s bytes, once, as a shared immutable image at
+/// `<estate_root>/.wirk/runtime/images/<sha256>/wirk`, and return that
+/// path. Content-addressed, so a driver image already installed by an
+/// earlier Run is reused byte-for-byte rather than copied again — the
+/// estate owns exactly one copy per *distinct* driver binary that has
+/// ever launched an actor in it, not one per Run and not one per
+/// reattach.
+///
+/// Durable and atomic (item 1, "std/platform atomic durable install/
+/// verification primitives"): the bytes go to a uniquely-named
+/// temporary file in the image's own directory, are flushed and
+/// `sync_all`'d, and only then `rename`d onto the final name —
+/// `rename(2)` within one directory is atomic, so a concurrent Run
+/// either sees no image or sees a complete one, never a half-written
+/// file. An image that already exists is verified by digest and left
+/// exactly as it is.
+fn install_runtime_image(estate_root: &str, exe: &Path) -> Result<PathBuf, RuntimePinError> {
+    let digest =
+        sha256_file(exe).map_err(|err| pin_io("reading this driver's own binary", exe, &err))?;
+    let dir = Path::new(estate_root)
+        .join(".wirk")
+        .join("runtime")
+        .join("images")
+        .join(&digest);
+    let image = dir.join("wirk");
+    if image.exists() {
+        // Already installed by this or an earlier Run. Verify rather
+        // than trust the path: a truncated or replaced image is a
+        // re-install, never a silent hand-off.
+        match sha256_file(&image) {
+            Ok(found) if found == digest => return Ok(image),
+            Ok(_) | Err(_) => {}
+        }
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| pin_io("creating the runtime image directory", &dir, &err))?;
+    let staged = dir.join(format!(
+        "wirk.staged.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    // `std::fs::copy` preserves the source's Unix permission bits, so
+    // the staged file (and the image it becomes) stays executable.
+    std::fs::copy(exe, &staged)
+        .map_err(|err| pin_io("staging the runtime image", &staged, &err))?;
+    {
+        let file = std::fs::File::open(&staged)
+            .map_err(|err| pin_io("opening the staged runtime image", &staged, &err))?;
+        file.sync_all()
+            .map_err(|err| pin_io("flushing the staged runtime image", &staged, &err))?;
+    }
+    let staged_digest = sha256_file(&staged)
+        .map_err(|err| pin_io("verifying the staged runtime image", &staged, &err))?;
+    if staged_digest != digest {
+        let _ = std::fs::remove_file(&staged);
+        return Err(RuntimePinError::Io {
+            step: "verifying the staged runtime image".to_string(),
+            path: staged.display().to_string(),
+            reason: format!("staged bytes hash {staged_digest}, not the source's own {digest}"),
+        });
+    }
+    std::fs::rename(&staged, &image).map_err(|err| {
+        let _ = std::fs::remove_file(&staged);
+        pin_io("installing the runtime image", &image, &err)
+    })?;
+    Ok(image)
+}
+
+/// Bind `image` into this Run's own `bin` directory as a file literally
+/// named `wirk`. A hard link first (`std::fs::hard_link`, R3): the Run
+/// gets its own durable directory entry to an immutable inode, at the
+/// cost of zero additional bytes, and the bytes survive the image
+/// directory being removed for as long as this Run's link exists. A
+/// full copy is the fallback for a filesystem that refuses the link
+/// (a cross-device image store, a filesystem without hard links) —
+/// correctness first, bytes second.
+fn bind_runtime_image(image: &Path, pinned: &Path) -> Result<(), RuntimePinError> {
+    match std::fs::hard_link(image, pinned) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let staged = pinned.with_extension(format!("staged.{}", std::process::id()));
+            std::fs::copy(image, &staged)
+                .map_err(|err| pin_io("staging this Run's own wirk", &staged, &err))?;
+            std::fs::rename(&staged, pinned).map_err(|err| {
+                let _ = std::fs::remove_file(&staged);
+                pin_io("installing this Run's own wirk", pinned, &err)
+            })
+        }
+    }
+}
+
+/// Where one Run's own pinned `wirk` lives, as a pure path
+/// computation with no I/O: the directory
+/// `<estate_root>/.wirk/runtime/<run_id>/bin/`, and inside it a file
+/// literally named `wirk`. The same precedent
+/// `claim_hook::claude_settings_path` already sets for claude's
+/// settings file — one function owning the layout, so two call sites
+/// that share no state still name the identical file instead of each
+/// re-spelling the joins.
+///
+/// P3 runtime-guidance: three consumers now need this layout without
+/// having a `PathBuf` threaded to them — the installer
+/// (`ensure_pinned_wirk_bin`, which computes it and then does the
+/// I/O), and the standing prompt (`run_loop::compose_first_prompt`),
+/// which tells the actor the exact absolute command to invoke for its
+/// own Run and is a formatting function with no access to the
+/// installer's return value. Deriving it from the execution triple the
+/// actor already carries (`WIRK_ESTATE_ROOT`/`WIRK_RUN_ID`, 0022 D73)
+/// is not a fourth authority variable: it is the same two values, read
+/// through the one layout function the installer itself uses.
+pub fn run_wirk_bin_dir(estate_root: &str, run_id: &str) -> PathBuf {
+    Path::new(estate_root)
+        .join(".wirk")
+        .join("runtime")
+        .join(run_id)
+        .join("bin")
+}
+
+/// The Run's own pinned `wirk` file itself — `run_wirk_bin_dir` plus
+/// the literal name `wirk` the pin is always bound as.
+pub fn run_wirk_bin(estate_root: &str, run_id: &str) -> PathBuf {
+    run_wirk_bin_dir(estate_root, run_id).join("wirk")
+}
+
+/// A directory scoped to one Run
+/// (`<estate_root>/.wirk/runtime/<run_id>/bin/`, the same `.wirk`
+/// convention `claim_hook::run_dir` already uses under the estate root
+/// wirk already owns — never the worktree, never `~/`) holding a file
+/// literally named `wirk`, whose bytes are this Run's runtime for the
+/// whole life of the Run. `actor_pane` prepends the returned directory
+/// to the pane's own `PATH`, ahead of `exe.parent()`, so `command -v
+/// wirk` in that pane resolves to exactly the binary this Run is bound
+/// to regardless of what that binary's own on-disk filename is — this
+/// estate's own review discipline preserves candidate binaries under
+/// commit-named files, which broke the bare-name assumption
+/// `exe.parent()` alone makes (native-progress-contract-use/HANDOFF.md
+/// §1.4).
+///
+/// P3 execution-recovery **correction**, item 1. The prior version
+/// removed and re-copied `exe` on *every* call, so a reattach (or any
+/// second `wirk run` for the same Run, from a different driver image)
+/// silently replaced bytes the Run was already using, and a failure
+/// only printed a line and let the pane launch under the weaker
+/// `exe.parent()` guarantee. Both are corrected here:
+///
+/// - **Stable.** An existing pin whose bytes still match the digest
+///   recorded in `wirk.pin` beside it is returned untouched — a
+///   reattach, a second driver image, a rebuilt/renamed/deleted
+///   original `exe`, none of them can change what this Run's `wirk`
+///   is. Only an *unpinned* Run installs anything.
+/// - **Restorable, not re-pinnable.** If the Run's own file is missing
+///   or corrupt, it is restored from the shared image its `wirk.pin`
+///   names — the same bytes, not the current driver's. Only if that
+///   image is gone too is the launch refused
+///   (`RuntimePinError::Unrestorable`), rather than quietly binding
+///   the Run to a different binary.
+/// - **Refusing, not degrading.** Every failure returns `Err`;
+///   `actor_pane` turns it into `HerdrExecutorError::RuntimePin` before
+///   any pane exists.
+/// - **Bounded.** One shared immutable image per *distinct* driver
+///   binary in the estate (`install_runtime_image`), one hard link plus
+///   a ~70-byte `wirk.pin` record per Run — not one full binary copy
+///   per Run, and not one per reattach.
+pub fn ensure_pinned_wirk_bin(
+    estate_root: &str,
+    run_id: &str,
+    exe: &Path,
+) -> Result<PathBuf, RuntimePinError> {
+    let dir = run_wirk_bin_dir(estate_root, run_id);
+    let pinned = run_wirk_bin(estate_root, run_id);
+    let record = dir.join("wirk.pin");
+
+    // Already pinned? Then this Run's runtime is decided, and nothing
+    // about the driver now attaching gets to change it.
+    if let Ok(recorded) = std::fs::read_to_string(&record) {
+        let recorded = recorded.trim().to_string();
+        if !recorded.is_empty() {
+            if let Ok(found) = sha256_file(&pinned)
+                && found == recorded
+            {
+                return Ok(dir);
+            }
+            // The file is missing or no longer holds the pinned bytes:
+            // restore it from the image that digest names, never from
+            // whatever `exe` happens to be now.
+            let image = Path::new(estate_root)
+                .join(".wirk")
+                .join("runtime")
+                .join("images")
+                .join(&recorded)
+                .join("wirk");
+            let restorable = sha256_file(&image).map(|d| d == recorded).unwrap_or(false);
+            if restorable {
+                let _ = std::fs::remove_file(&pinned);
+                bind_runtime_image(&image, &pinned)?;
+                let found = sha256_file(&pinned)
+                    .map_err(|err| pin_io("verifying this Run's own wirk", &pinned, &err))?;
+                if found != recorded {
+                    return Err(RuntimePinError::Io {
+                        step: "verifying this Run's own wirk".to_string(),
+                        path: pinned.display().to_string(),
+                        reason: format!("restored bytes hash {found}, not the pinned {recorded}"),
+                    });
+                }
+                return Ok(dir);
+            }
+            let found = sha256_file(&pinned).unwrap_or_else(|_| "<absent>".to_string());
+            return Err(RuntimePinError::Unrestorable {
+                path: pinned.display().to_string(),
+                expected: recorded,
+                found,
+                image: image.display().to_string(),
+            });
+        }
+    }
+
+    // Not pinned yet: this is the one call that decides the Run's
+    // runtime. Install the shared image, bind it, record the digest.
+    let image = install_runtime_image(estate_root, exe)?;
+    let digest = image
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| pin_io("creating this Run's own bin directory", &dir, &err))?;
+    let _ = std::fs::remove_file(&pinned);
+    bind_runtime_image(&image, &pinned)?;
+    let found = sha256_file(&pinned)
+        .map_err(|err| pin_io("verifying this Run's own wirk", &pinned, &err))?;
+    if found != digest {
+        return Err(RuntimePinError::Io {
+            step: "verifying this Run's own wirk".to_string(),
+            path: pinned.display().to_string(),
+            reason: format!("bound bytes hash {found}, not the image's own {digest}"),
+        });
+    }
+    std::fs::write(&record, format!("{digest}\n"))
+        .map_err(|err| pin_io("recording this Run's own runtime digest", &record, &err))?;
+    Ok(dir)
+}
+
 impl<C: HerdrClient> HerdrExecutor<C> {
     pub fn new(client: C) -> Self {
         Self { client }
@@ -896,7 +1216,46 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // invocation resolvable when the binary is renamed — see the
         // absolute-path hook delivery below.
         let mut path_entries = Vec::new();
-        if let Some(dir) = exe.as_deref().and_then(Path::parent) {
+        // P3 execution-recovery item 4, as corrected: a Run-scoped
+        // directory holding a file literally named `wirk`, whose bytes
+        // are pinned for the life of the Run, prepended ahead of
+        // everything else. D151's own `exe.parent()` prepend (kept,
+        // just below) only resolves `wirk` when the file *in* that
+        // directory happens to be named `wirk`; this estate's own
+        // review discipline preserves candidate binaries under
+        // commit-named files (`wirk-96f5a6a-verify`, ...), so a fresh
+        // actor pane launched from one of those sees the right
+        // directory on `PATH` and still gets `command not found` —
+        // then, observed live, falls back to whatever else is already
+        // on its inherited `PATH`, which can be an unrelated, mutable
+        // shared `debug/wirk` (native-progress-contract-use/
+        // HANDOFF.md §1.4; MECHANISM-REPORT.md qualification 4, fourth
+        // bullet).
+        //
+        // The pin is **required**, not best-effort: an unfulfilled pin
+        // is refused here, before any pane is created, rather than
+        // launching the actor under the weaker guarantee with a line
+        // printed about it (correction item 1). Nothing about this
+        // Run's runtime changes on a reattach — `ensure_pinned_wirk_bin`
+        // returns an already-pinned Run's own directory untouched.
+        let exe = exe.as_deref().ok_or(HerdrExecutorError::RuntimePin(
+            RuntimePinError::NoCurrentExe,
+        ))?;
+        let pinned_dir = ensure_pinned_wirk_bin(&actor.triple.estate_root, &run.id.0, exe)?;
+        // The Run's own pinned `wirk`, not the driver's mutable `exe`:
+        // every consumer downstream of the launch decision — the actor's
+        // by-hand `wirk claim` via `PATH` (just below), and both
+        // Claim-hook writers (opencode here, claude in
+        // `start_actor_agent`) — must resolve to the *same* stable
+        // bytes `ensure_pinned_wirk_bin` just decided for this Run, or
+        // pinning the `PATH` entry alone leaves the hook itself invoking
+        // whatever `exe` happened to be at launch time, unpinned
+        // (RECOVERY-CHILD-CHECK.md's read of `c4936910`: the opencode
+        // hook at old line 1267 and the claude hook at old line 1390
+        // both still threaded raw `exe`/`current_exe()`).
+        let pinned_wirk = pinned_dir.join("wirk");
+        path_entries.push(pinned_dir);
+        if let Some(dir) = exe.parent() {
             path_entries.push(dir.to_path_buf());
         }
         path_entries.extend(std::env::split_paths(
@@ -935,16 +1294,24 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // env var, claude's is an argv element built in
         // `start_actor_agent` below — the two kinds share the "is a
         // hook installed" predicate for the standing prompt, never the
-        // delivery mechanism itself. The plugin invokes `exe` (this
-        // driver's own absolute binary) directly, not the bare name
-        // `wirk` — HANDOFF.md §1.4, Rule 4 — so a write is skipped
-        // (same degrade posture) when `current_exe` could not be read,
-        // exactly as a `PATH`-prepend write above would have nothing
-        // to add.
+        // delivery mechanism itself. **The plugin invokes this Run's own
+        // pinned `wirk` (`pinned_wirk`, just installed above), not the
+        // driver's mutable `exe`** — the pin exists precisely so this
+        // Run's runtime cannot be silently swapped by a later reattach
+        // or by the original `exe` being replaced/removed, and a hook
+        // that ran `exe` instead would defeat that for the one path a
+        // real opencode actor actually invokes (P3 execution-recovery
+        // correction, connected-gap close). A write is skipped (same
+        // degrade posture) when `current_exe` could not be read, exactly
+        // as a `PATH`-prepend write above would have nothing to add —
+        // this arm is unreachable in that case anyway, since `exe` above
+        // is unwrapped before `pinned_dir`/`pinned_wirk` exist.
         if run.kind == wirk_core::ActorKind::opencode()
-            && let Some(exe) = exe.as_deref()
-            && let Ok(config_path) =
-                claim_hook::write_wirk_claim_hook(&actor.triple.estate_root, &run.id.0, exe)
+            && let Ok(config_path) = claim_hook::write_wirk_claim_hook(
+                &actor.triple.estate_root,
+                &run.id.0,
+                &pinned_wirk,
+            )
         {
             env.insert(
                 claim_hook::OPENCODE_CONFIG_ENV.to_string(),
@@ -1057,17 +1424,30 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // worktree's own `.claude/settings.json` already declare. Same
         // "degrade, don't block" posture as opencode's env-var delivery
         // above: a write failure (including `current_exe` itself being
-        // unreadable) leaves the launch unaffected, just without the
-        // hook. The hook's own command invokes this same `current_exe`
-        // by absolute path, not the bare name `wirk` — HANDOFF.md §1.4,
-        // Rule 4 — resolved fresh here rather than threaded from
-        // `actor_pane`, a separate call with no shared state (0001 D9's
-        // own boundary between the two methods).
+        // unreadable, or this Run's own pin having become unrestorable
+        // since `actor_pane` ran) leaves the launch unaffected, just
+        // without the hook. **The hook's own command invokes this Run's
+        // own pinned `wirk`, not the driver's mutable `current_exe`** —
+        // resolved fresh here via `ensure_pinned_wirk_bin` rather than
+        // threaded from `actor_pane`, a separate call with no shared
+        // state (0001 D9's own boundary between the two methods), but by
+        // the time this call is reached `actor_pane` has already pinned
+        // this Run, so the call here is the same "already pinned, return
+        // untouched" no-op read `ensure_pinned_wirk_bin`'s own doc
+        // describes — never a second install, never a re-pin (P3
+        // execution-recovery correction, connected-gap close: a Stop
+        // hook that ran `current_exe` bypassed the pin for the one
+        // command a real claude actor's own turn end actually fires).
         if run.kind == wirk_core::ActorKind::claude()
             && let wirk_core::World::Actor(actor) = world
             && let Ok(exe) = std::env::current_exe()
-            && let Ok(settings_path) =
-                claim_hook::write_claude_claim_hook(&actor.triple.estate_root, &run.id.0, &exe)
+            && let Ok(pinned_dir) =
+                ensure_pinned_wirk_bin(&actor.triple.estate_root, &run.id.0, &exe)
+            && let Ok(settings_path) = claim_hook::write_claude_claim_hook(
+                &actor.triple.estate_root,
+                &run.id.0,
+                &pinned_dir.join("wirk"),
+            )
         {
             args.push("--settings".to_string());
             args.push(settings_path.to_string_lossy().into_owned());
@@ -1128,6 +1508,15 @@ pub enum HerdrExecutorError {
     /// guessed or silently-dropped setting.
     #[error(transparent)]
     Selection(#[from] SelectionError),
+    /// P3 execution-recovery correction item 1: this Run's own `wirk`
+    /// runtime could not be pinned, or an existing pin could not be
+    /// honoured. Refused before the pane is created — an actor never
+    /// launches with an ambiguous or mutable `wirk` on its PATH.
+    #[error(
+        "wirk run: refusing to launch this actor: {0}. The pane would have had to resolve \
+         `wirk` from a mutable or ambiguous location instead of this Run's own pinned runtime"
+    )]
+    RuntimePin(#[from] RuntimePinError),
 }
 
 /// Every way `build_selection_args` refuses a requested model/effort

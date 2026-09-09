@@ -493,6 +493,20 @@ fn deterministic_waypoint_after_a_committing_actor_validates() {
                  not orient's original base carried forward"
             );
             assert_eq!(det.cwd, worktree, "verify runs in the same shared worktree");
+            // P3 native closeout item 4: this is the *auto-advanced*
+            // Deterministic path, the one that used to reserve a
+            // compiled-in `CARGO_TARGET_DIR=/var/tmp/wirk-target` — one
+            // development box's absolute cache path, content-addressed
+            // into this World's hash, with no supported override, and
+            // disagreeing with the first Waypoint's own empty env. The
+            // warm-cache policy survives as an estate choice the daemon
+            // and its callers are started with (`ChildExecutor` spawns
+            // over an inherited environment); the product pins nothing.
+            assert!(
+                det.env.is_empty(),
+                "an auto-advanced Deterministic World must pin no host cache path: {:?}",
+                det.env
+            );
         }
         World::Actor(_) => panic!("expected a Deterministic World for verify"),
     }
@@ -651,9 +665,19 @@ fn deterministic_retry_carries_the_branch_tip_as_base() {
     .expect("fail call succeeds");
     assert!(matches!(fail_reply, Reply::Ok { .. }), "{fail_reply:?}");
 
-    // The branch moves ahead before the retry.
-    fs::write(repo.join("advance.txt"), b"advance\n").expect("write advance.txt");
-    let base_sha1 = git_commit_all(repo, "advance past the failed Run's base");
+    // P3 execution-recovery item 1: a Deterministic Git-basis Work now
+    // executes in its own isolated worktree
+    // (`<estate>/worktrees/<work_id>`, `deterministic.cwd`) rather than
+    // the caller's own checkout — the same isolation an Actor World's
+    // `worktree_path` already has, and the same place this retry's own
+    // `resolve_git_sha` reads HEAD from, symmetrically with the Actor
+    // arm just above. The branch that moves ahead before the retry is
+    // therefore this Work's own worktree branch, not `repo` — advancing
+    // `repo` directly (the caller's own checkout) must have no effect,
+    // which is exactly the isolation this item exists to guarantee.
+    let worktree = repo.join("worktrees").join(&work_id);
+    fs::write(worktree.join("advance.txt"), b"advance\n").expect("write advance.txt");
+    let base_sha1 = git_commit_all(&worktree, "advance past the failed Run's base");
     assert_ne!(base_sha0, base_sha1);
 
     let events_before = journal_events(repo, &work_id);

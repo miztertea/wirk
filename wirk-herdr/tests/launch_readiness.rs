@@ -42,17 +42,26 @@ fn run_id() -> Run {
     }
 }
 
-fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
+fn actor_world(run: &Run, estate_root: &std::path::Path) -> World {
+    let worktree_path = estate_root.join("worktrees").join("work-1");
     World::Actor(ActorWorld {
         repository: "wirk".to_string(),
-        worktree_path: worktree_path.to_path_buf(),
+        worktree_path,
         branch: "p2/w2-launch-readiness".to_string(),
         base_sha: "abc123".to_string(),
         source_basis: wirk_core::SourceBasis::Git {
             base: "abc123".to_string(),
         },
         triple: ExecutionTriple {
-            estate_root: "/estate".to_string(),
+            // P3 execution-recovery correction item 1: a real, writable
+            // estate root, not the former `/estate` placeholder. An
+            // actor launch now *pins* this Run's own `wirk` under
+            // `<estate_root>/.wirk/runtime/`, and refuses the launch
+            // when it cannot — so a fixture naming an unwritable path
+            // no longer stands in for a real estate. The tempdir these
+            // tests already own is the estate; the worktree is inside
+            // it, as it is in a real estate.
+            estate_root: estate_root.to_string_lossy().into_owned(),
             work_id: WorkId("work-1".to_string()),
             run_id: run.id.clone(),
         },
@@ -285,23 +294,49 @@ fn actor_pane_env_path_begins_with_the_running_executable_directory() {
         .expect("exe has a parent dir")
         .to_path_buf();
     let path_value = env.get("PATH").unwrap();
-    let first_entry = std::env::split_paths(path_value)
-        .next()
-        .expect("PATH has at least one entry");
+    let entries: Vec<std::path::PathBuf> = std::env::split_paths(path_value).collect();
+    // P3 execution-recovery item 4 as corrected: this Run's own pinned
+    // runtime directory comes first (a file literally named `wirk`,
+    // whose bytes are this Run's for the life of the Run), with D151's
+    // own `exe.parent()` prepend kept immediately behind it.
+    let pinned_dir = dir
+        .path()
+        .join(".wirk")
+        .join("runtime")
+        .join(&run.id.0)
+        .join("bin");
     assert_eq!(
-        first_entry, exe_dir,
-        "PATH's first entry must be the running executable's own directory: {path_value:?}"
+        entries.first(),
+        Some(&pinned_dir),
+        "PATH's first entry must be this Run's own pinned runtime directory: {path_value:?}"
     );
-    // The triple stays alongside it, plus `CARGO_TARGET_DIR` only when
-    // this test process's own env carries one (P2.6 W3: `actor_pane`
-    // passes it through exactly when set, same mechanism as `PATH`
-    // above) — asserted by content, not a fixed count, since whether
-    // `CARGO_TARGET_DIR` is set is this test run's own environment, not
-    // this test's own concern.
+    assert_eq!(
+        entries.get(1),
+        Some(&exe_dir),
+        "PATH's second entry must be the running executable's own directory: {path_value:?}"
+    );
+    let pinned = pinned_dir.join("wirk");
+    assert!(
+        pinned.is_file(),
+        "the pinned directory must actually hold a file named `wirk`: {pinned:?}"
+    );
+    assert_eq!(
+        std::fs::read(&pinned).expect("read the pinned wirk"),
+        std::fs::read(std::env::current_exe().expect("current_exe")).expect("read current_exe"),
+        "the pinned `wirk` must be this driver's own bytes"
+    );
+    // The triple stays alongside it (P2.6 W3: `actor_pane` passes
+    // `CARGO_TARGET_DIR` through exactly when set, same mechanism as
+    // `PATH` above).
+    // The triple (3) + PATH + `OPENCODE_CONFIG` (this fixture's Run is
+    // an opencode kind, and the estate root is now real and writable,
+    // so the Claim hook is genuinely delivered where the former
+    // `/estate` placeholder silently failed to write it) + and
+    // `CARGO_TARGET_DIR` only when this test run's own env carries one.
     let expected_len = if std::env::var("CARGO_TARGET_DIR").is_ok() {
-        5
+        6
     } else {
-        4
+        5
     };
     assert_eq!(
         env.len(),

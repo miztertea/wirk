@@ -538,7 +538,11 @@ fn produce_claimed_leaf(estate: &Estate, route: &str, name: &str, bindings: &[&s
     commit_all(&repo);
     let work = submit(&estate.root, route, &repo, bindings, None)
         .unwrap_or_else(|err| panic!("submit {name}: {err}"));
-    write_file(&repo, "a.md", "a\n");
+    write_file(
+        &estate.root.join("worktrees").join(&work.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(&estate.root, &work.work_id, &work.run_id, "a.md=a.md");
     let basis = obligation_basis_for(&estate.root, &work.work_id, "outer/leaf-a");
     let claim_event = journal_events(&estate.root, &work.work_id)
@@ -988,8 +992,14 @@ fn a_settled_estate_finding_is_consulted_by_a_later_work_through_the_publication
     )
     .expect("submit producer");
 
-    // The leaf really claims, out of the producing checkout.
-    write_file(&producer_repo, "a.md", "a\n");
+    // The leaf really claims, out of the producing checkout — now this
+    // Work's own worktree (P3 execution-recovery item 1), not
+    // `producer_repo` directly.
+    write_file(
+        &estate.root.join("worktrees").join(&producer.work_id),
+        "a.md",
+        "a\n",
+    );
     claim_ok(
         &estate.root,
         &producer.work_id,

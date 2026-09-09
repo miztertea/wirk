@@ -139,7 +139,8 @@ use wirk_core::{
 
 use crate::{
     AgentStatus, EventSubscription, HerdrClient, HerdrError, HerdrEvent, HerdrExecutor,
-    HerdrExecutorError, Notify, PromptAgent, PromptGate, validate_selection,
+    HerdrExecutorError, Notify, PromptAgent, PromptGate, RuntimePinError, ensure_pinned_wirk_bin,
+    validate_selection,
 };
 
 // ---- WirkdApi -------------------------------------------------------------
@@ -177,10 +178,49 @@ pub struct WorkStatus {
 /// type-complexity lint) readable — not a new abstraction.
 pub type WatchEvents<E> = Box<dyn Iterator<Item = Result<Event, E>> + Send>;
 
+/// What wirkd did with one offered journal write, as its own reply says
+/// — not as this loop guesses from an opaque error string.
+///
+/// P3 native closeout item 1a (`native-closeout/TRIAGE.md` §1a, root's
+/// qualification 1): `handle_record`'s guard refuses three genuinely
+/// different situations, and the driver used to read all three as one
+/// fatal error. The one it actually met in the live `run_verb` failures
+/// is benign and expected: the actor filed its own validated `Done`
+/// Claim between this loop's status observation and the
+/// `LifecycleObserved` it was already writing about that observation, so
+/// the Run was `Claimed` — settled, by this same driver's own actor —
+/// before the observation arrived. Treating that as a drive failure
+/// turned a Run that reached exactly its intended outcome into `exit 5`
+/// (`p3-world-loop/index-health-correct/raw/71-full-suite-final.txt`,
+/// lines 753-774: `record refused: InvalidTransition record does not
+/// target the current open Run`, stdout showing the driver mid-prompt
+/// and the scripted actor's own claim step next).
+///
+/// The guard itself is **not** weakened: wirkd still refuses the write,
+/// still never folds an observation into a settled Run, and still
+/// refuses a superseded Run's record separately and by its own name.
+/// What changes is that the refusal now says which of the three it is,
+/// so an observer that raced its own Run's outcome can stop observing
+/// instead of failing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordOutcome {
+    /// wirkd appended the event.
+    Accepted,
+    /// wirkd refused it because the Run it names has already reached its
+    /// own outcome (claimed, failed, vanished), or its Work has. Carries
+    /// wirkd's own sentence verbatim; never synthesized here.
+    RunSettled(String),
+}
+
 pub trait WirkdApi: Send + Sync {
     type Error: std::error::Error + Send + 'static;
     fn status(&self, work_id: &WorkId) -> Result<WorkStatus, Self::Error>;
-    fn record(&self, work_id: &WorkId, run_id: &RunId, kind: EventKind) -> Result<(), Self::Error>;
+    fn record(
+        &self,
+        work_id: &WorkId,
+        run_id: &RunId,
+        kind: EventKind,
+    ) -> Result<RecordOutcome, Self::Error>;
     /// Item B: a **blocking** iterator over `work_id`'s journal — every
     /// event already appended, then one more per line as wirkd pushes
     /// it (`server::handle_watch_connection`), ending only when the
@@ -197,7 +237,12 @@ impl<T: WirkdApi + ?Sized> WirkdApi for Arc<T> {
     fn status(&self, work_id: &WorkId) -> Result<WorkStatus, Self::Error> {
         (**self).status(work_id)
     }
-    fn record(&self, work_id: &WorkId, run_id: &RunId, kind: EventKind) -> Result<(), Self::Error> {
+    fn record(
+        &self,
+        work_id: &WorkId,
+        run_id: &RunId,
+        kind: EventKind,
+    ) -> Result<RecordOutcome, Self::Error> {
         (**self).record(work_id, run_id, kind)
     }
     fn watch(&self, work_id: &WorkId) -> Result<WatchEvents<Self::Error>, Self::Error> {
@@ -261,6 +306,13 @@ pub enum RunLoopError<W: WirkdApi> {
     /// than a recovery.
     #[error("{0}")]
     LaunchUnresolved(String),
+    /// P3 native closeout item 1a: wirkd refused a write this loop
+    /// requires because the Run it names has already settled. Only the
+    /// writes that *must* land raise this — an observation that lost the
+    /// race with its own Run's outcome is handled where it happens, not
+    /// turned into a drive failure.
+    #[error("this Run has already settled: {0}")]
+    RunSettled(String),
 }
 
 /// One live Herdr subscription, as `launch`/`launch_actor` hand it back
@@ -524,6 +576,29 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
     /// actor's pane before `agent.start` (D51's ordering, fix 3): `drive`
     /// hands this to its own forwarding reader thread and never opens a
     /// second one.
+    /// One journal write this loop **requires** to land, with wirkd's
+    /// three refusals kept apart (P3 native closeout item 1a): a
+    /// settled-Run refusal becomes `RunLoopError::RunSettled`, naming
+    /// what wirkd said, rather than an opaque transport-shaped error.
+    /// The observation sites that can legitimately lose a race with
+    /// their own Run's outcome do not use this — they match
+    /// `RecordOutcome` where they stand.
+    fn record_required(
+        &self,
+        work_id: &WorkId,
+        run_id: &RunId,
+        kind: EventKind,
+    ) -> Result<(), RunLoopError<W>> {
+        match self
+            .wirkd
+            .record(work_id, run_id, kind)
+            .map_err(RunLoopError::Wirkd)?
+        {
+            RecordOutcome::Accepted => Ok(()),
+            RecordOutcome::RunSettled(detail) => Err(RunLoopError::RunSettled(detail)),
+        }
+    }
+
     pub fn launch(
         &mut self,
         work_id: &WorkId,
@@ -551,17 +626,15 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         // `RunFailed` to the admitted owner's Run.
         let already_bound = run.launch_requested;
         if !already_bound {
-            self.wirkd
-                .record(
-                    work_id,
-                    &run.id,
-                    EventKind::RunLaunchRequested {
-                        run: run.id.clone(),
-                        actor_kind: run.kind.clone(),
-                        selection: run.selection.clone(),
-                    },
-                )
-                .map_err(RunLoopError::Wirkd)?;
+            self.record_required(
+                work_id,
+                &run.id,
+                EventKind::RunLaunchRequested {
+                    run: run.id.clone(),
+                    actor_kind: run.kind.clone(),
+                    selection: run.selection.clone(),
+                },
+            )?;
         }
 
         // Step 2 (the independent review's N1): admitting the *request*
@@ -582,17 +655,15 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         // `holder` is left default deliberately: wirkd mints it from
         // this connection's own kernel-reported peer credentials and
         // discards whatever a client sends.
-        self.wirkd
-            .record(
-                work_id,
-                &run.id,
-                EventKind::RunLaunchAttempted {
-                    run: run.id.clone(),
-                    destination: self.executor.client().destination(),
-                    holder: AttemptHolder::default(),
-                },
-            )
-            .map_err(RunLoopError::Wirkd)?;
+        self.record_required(
+            work_id,
+            &run.id,
+            EventKind::RunLaunchAttempted {
+                run: run.id.clone(),
+                destination: self.executor.client().destination(),
+                holder: AttemptHolder::default(),
+            },
+        )?;
 
         if already_bound {
             // An earlier invocation's request was admitted. Whether it
@@ -600,7 +671,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             // question this invocation must answer before it can
             // launch anything — and the only place the answer can come
             // from is Herdr.
-            match self.observe_admitted_launch(work_id, run)? {
+            match self.observe_admitted_launch(work_id, run, world)? {
                 AdmittedLaunch::Reconciled(events) => return Ok(events),
                 AdmittedLaunch::Absent => {}
             }
@@ -610,18 +681,16 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         match self.executor.launch_actor(run, world) {
             Ok(launched) => {
                 self.launched_pane = Some(launched.pane.pane_id.clone());
-                self.wirkd
-                    .record(
-                        work_id,
-                        &run.id,
-                        EventKind::RunLaunched {
-                            run: run.id.clone(),
-                            actor_kind: run.kind.clone(),
-                            selection: run.selection.clone(),
-                            launch_argv: launched.argv.clone(),
-                        },
-                    )
-                    .map_err(RunLoopError::Wirkd)?;
+                self.record_required(
+                    work_id,
+                    &run.id,
+                    EventKind::RunLaunched {
+                        run: run.id.clone(),
+                        actor_kind: run.kind.clone(),
+                        selection: run.selection.clone(),
+                        launch_argv: launched.argv.clone(),
+                    },
+                )?;
                 Ok(launched.events)
             }
             Err(err) => {
@@ -677,20 +746,18 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                         );
                     }
                     Err(_) => {
-                        self.wirkd
-                            .record(
-                                work_id,
-                                &run.id,
-                                EventKind::RunFailed {
-                                    cause: FailureCause {
-                                        status: None,
-                                        request_id: None,
-                                        at: Timestamp(0),
-                                        detail: Some(detail),
-                                    },
+                        self.record_required(
+                            work_id,
+                            &run.id,
+                            EventKind::RunFailed {
+                                cause: FailureCause {
+                                    status: None,
+                                    request_id: None,
+                                    at: Timestamp(0),
+                                    detail: Some(detail),
                                 },
-                            )
-                            .map_err(RunLoopError::Wirkd)?;
+                            },
+                        )?;
                     }
                 }
                 Err(RunLoopError::Herdr(err))
@@ -728,26 +795,92 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         &mut self,
         work_id: &WorkId,
         run: &Run,
+        world: &World,
     ) -> Result<AdmittedLaunch, RunLoopError<W>> {
         let pane = match self.executor.client().get_agent(&run.id.0) {
             Ok(pane) => pane,
             Err(HerdrError::NotFound(detail)) => {
                 if run.launched {
-                    let detail = format!(
+                    // P3 native closeout D2 (`runtime-guidance-review/
+                    // raw/DEFECT-vanished-agent-no-recovery.txt`, ruling
+                    // 0156): this Run launched, and Herdr — asked by
+                    // name, answering with its own `agent_not_found`,
+                    // never an error standing in for one — says its
+                    // agent is gone. Refusing a second launch under the
+                    // same Run is right and unchanged. What was missing
+                    // is the other half: the Work stayed `active`, so
+                    // the `wirk work retry` this message names refused
+                    // with `NotNeedsInput`, and the two supported verbs
+                    // pointed at each other with no way out but
+                    // cancelling the Work.
+                    //
+                    // The absence is reconciled here, causally, from the
+                    // one system that can answer it: a launched Run
+                    // whose agent Herdr definitely does not have has
+                    // ended without claiming, which is exactly
+                    // `RunFailed`. `fold` then surfaces the Work as
+                    // `NeedsInput` naming this Run, which is precisely
+                    // what `handle_retry` admits — and its retry keeps
+                    // this Work's materialized worktree and re-reads its
+                    // HEAD as the new Run's base, so committed but
+                    // unclaimed progress carries forward rather than
+                    // being discarded.
+                    //
+                    // Deliberately narrow. Only Herdr's own definite
+                    // absence reaches here: the transport-error arm
+                    // below still records uncertainty and writes no
+                    // outcome, and a Run whose agent is *live*
+                    // reconciles onto the existing pane above. The
+                    // observation is journaled first, so what Herdr said
+                    // survives independently of the consequence drawn
+                    // from it.
+                    let observed = format!(
                         "this Run's launch is already recorded (RunLaunched) and Herdr reports \
                          no agent named {} ({detail}); it will not be launched a second time \
-                         under the same Run — `wirk work retry` opens a new one",
+                         under the same Run",
                         run.id.0
                     );
-                    self.log_line(&detail);
                     let _ = self.wirkd.record(
                         work_id,
                         &run.id,
                         EventKind::LifecycleObserved {
                             status: "launch-agent-gone".to_string(),
-                            detail: Some(detail.clone()),
+                            detail: Some(observed.clone()),
                         },
                     );
+                    let reconciled = match self.wirkd.record(
+                        work_id,
+                        &run.id,
+                        EventKind::RunFailed {
+                            cause: FailureCause {
+                                status: Some("agent-gone".to_string()),
+                                request_id: None,
+                                at: Timestamp(0),
+                                detail: Some(observed.clone()),
+                            },
+                        },
+                    ) {
+                        Ok(RecordOutcome::Accepted) => {
+                            " — this Run is now recorded failed (agent-gone), so `wirk work \
+                             retry` opens a fresh Run that keeps this Work's own worktree and \
+                             its committed progress"
+                                .to_string()
+                        }
+                        // Already settled by someone else: the Run's
+                        // outcome is journaled, which is the state this
+                        // reconciliation was trying to reach.
+                        Ok(RecordOutcome::RunSettled(refusal)) => {
+                            format!(" — this Run had already settled ({refusal})")
+                        }
+                        // Say what could not be done rather than name a
+                        // recovery that will refuse.
+                        Err(err) => format!(
+                            " — and this Run could not be recorded failed ({err}), so `wirk work \
+                             retry` will still refuse; the Run's own outcome is unresolved"
+                        ),
+                    };
+                    let detail = format!("{observed}{reconciled}");
+                    self.log_line(&detail);
                     return Err(RunLoopError::LaunchUnresolved(detail));
                 }
                 return Ok(AdmittedLaunch::Absent);
@@ -772,6 +905,37 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                 return Err(RunLoopError::LaunchUnresolved(detail));
             }
         };
+
+        // P3 execution-recovery correction, connected-gap close: the
+        // agent is live, so `actor_pane` is never called on this path
+        // and its own `ensure_pinned_wirk_bin` call — the one that
+        // validates or restores this Run's pin — is skipped entirely.
+        // Left unchecked, a live reattach onto a pane whose pinned
+        // `wirk` was deleted (or corrupted) since it launched would
+        // resume actor commands under an unvalidated runtime with no
+        // one ever having refused it (RECOVERY-CHILD-CHECK.md's own
+        // "restore-on-reattach for a Run whose pane is already live"
+        // gap). So this reattach validates/restores the pin itself,
+        // before continuing to attach: the same call `actor_pane`
+        // makes, an already-pinned Run's own bytes still matching their
+        // recorded digest returns untouched (no re-pin, no capability
+        // fallback — item 1's refusal posture, not degrade-and-log),
+        // and a pin that cannot be restored fails this reattach clearly
+        // rather than letting actor commands continue under whatever
+        // `wirk` the pane's own `PATH` now happens to resolve.
+        let World::Actor(actor) = world else {
+            return Err(RunLoopError::Herdr(
+                HerdrExecutorError::NotDeterministicKind,
+            ));
+        };
+        let exe = std::env::current_exe().map_err(|_| {
+            RunLoopError::Herdr(HerdrExecutorError::RuntimePin(
+                RuntimePinError::NoCurrentExe,
+            ))
+        })?;
+        ensure_pinned_wirk_bin(&actor.triple.estate_root, &run.id.0, &exe)
+            .map_err(|err| RunLoopError::Herdr(HerdrExecutorError::RuntimePin(err)))?;
+
         let events = self
             .executor
             .client()
@@ -986,10 +1150,25 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                     }
                 }
                 Ok(LoopMsg::HerdrEnded(_detail)) => {
-                    self.wirkd
+                    // Item 1a again, on the pane-end path: a pane that
+                    // ends *because* its actor claimed and exited is not
+                    // a vanished Run. wirkd refuses `RunVanished` on a
+                    // settled Run, and the settled outcome — already on
+                    // the watch stream — is the one this loop reports,
+                    // so the receive below continues rather than
+                    // overwriting a real outcome with `Vanished`.
+                    match self
+                        .wirkd
                         .record(work_id, &run.id, EventKind::RunVanished)
-                        .map_err(RunLoopError::Wirkd)?;
-                    return Ok(Outcome::Vanished);
+                        .map_err(RunLoopError::Wirkd)?
+                    {
+                        RecordOutcome::Accepted => return Ok(Outcome::Vanished),
+                        RecordOutcome::RunSettled(refusal) => {
+                            self.log_line(&format!(
+                                "the actor's pane ended after this Run had already settled                                  ({refusal}); its journaled outcome stands"
+                            ));
+                        }
+                    }
                 }
                 Ok(LoopMsg::Watch(event)) => {
                     if let Some(outcome) = self.observe_watch(&event) {
@@ -1093,7 +1272,20 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         } else {
             None
         };
-        self.wirkd
+        // P3 native closeout item 1a: this is the write the live
+        // `run_verb` retry failures actually lost. Between the status
+        // this observation describes and the write itself, the actor can
+        // file its own validated `Done` Claim — settling the Run — and
+        // wirkd then correctly refuses to fold an observation into a Run
+        // that has already reached its outcome. That refusal is not a
+        // drive failure: the Run got exactly the outcome it was driven
+        // for, it is already on the watch stream, and `drive_channel`
+        // reads it there on the next message. Only a settled-Run refusal
+        // is absorbed; every other error still stops the drive, and the
+        // observation is never re-aimed at some other Run to make it
+        // land.
+        match self
+            .wirkd
             .record(
                 work_id,
                 &run.id,
@@ -1102,7 +1294,16 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                     detail,
                 },
             )
-            .map_err(RunLoopError::Wirkd)?;
+            .map_err(RunLoopError::Wirkd)?
+        {
+            RecordOutcome::Accepted => {}
+            RecordOutcome::RunSettled(refusal) => {
+                self.log_line(&format!(
+                    "this Run settled while its {agent_status:?} observation was in flight, so                      wirkd did not fold it ({refusal}); the outcome already journaled stands and                      this driver stops observing"
+                ));
+                return Ok(None);
+            }
+        }
 
         // P2.3 W4 (build-brief.md §8 finding 2): the loop never prompts
         // a Blocked pane (below, `maybe_prompt`'s own guard, unchanged),
@@ -1154,8 +1355,14 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                      fingerprint {} unchanged",
                     baseline.fingerprint
                 );
-                self.stuck_observation = Some(observation.clone());
-                self.wirkd
+                // Same race, decisive side (item 1a): if this Run
+                // settled while the no-progress check was running, the
+                // actor did make progress — it claimed — and calling it
+                // stuck would be false. wirkd refuses the write; this
+                // loop drops its own stuck verdict with it rather than
+                // reporting `NeedsInput` over a settled Run.
+                match self
+                    .wirkd
                     .record(
                         work_id,
                         &run.id,
@@ -1168,7 +1375,17 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                             },
                         },
                     )
-                    .map_err(RunLoopError::Wirkd)?;
+                    .map_err(RunLoopError::Wirkd)?
+                {
+                    RecordOutcome::Accepted => {}
+                    RecordOutcome::RunSettled(refusal) => {
+                        self.log_line(&format!(
+                            "this Run settled before the no-progress observation could be                              journaled ({refusal}); it is not stuck, and its own outcome stands"
+                        ));
+                        return Ok(None);
+                    }
+                }
+                self.stuck_observation = Some(observation.clone());
                 self.notify_needs_input(work_id, "stuck", &observation);
                 return Ok(Some(Outcome::NeedsInput));
             }
@@ -1636,8 +1853,38 @@ fn spawn_watch_reader<E: std::error::Error + Send + 'static>(
 ///   the real, flagless form W1 built (`wirk claim` alone asks wirkd
 ///   for the Waypoint's declared outputs and claims each by name).
 ///
-/// Both forms keep the same "ask for input" escape: `wirk claim
-/// --question "..."`, a real flag today and unchanged by this wave.
+/// Both forms keep the same "ask for input" escape (`claim --question
+/// "..."`, a real flag today and unchanged by this wave).
+///
+/// P3 runtime-guidance (original execution-recovery item 4, the half
+/// `runtime-consumers` left open). Item 4's obligation is that "a fresh
+/// native actor can use the supported wirk commands without hunting
+/// build trees" — and until now nothing in this text ever told the
+/// actor *which* `wirk`. `actor_pane` prepends the Run's pinned
+/// directory to the pane's `PATH`, but the pane runs a login shell that
+/// rebuilds `PATH` from the operator's own profile, and observed live
+/// that put four of the operator's directories ahead of the pin
+/// (`native-learning-use/ROOT-RECOVERY-REVIEW.md`: "the live actor
+/// profile also prepends directories ahead of the pin; current machine
+/// has no competing wirk there, which is a positive observation not a
+/// guarantee"). A bare `wirk` in this text was therefore an *ambiguous*
+/// instruction that happened to work, and the fix is not to fight the
+/// operator's shell (a global profile/`PATH` rewrite is exactly what
+/// item 4 forbids) but to stop relying on name resolution at all: the
+/// prompt every supported harness already receives now names the Run's
+/// own pinned executable by absolute path, and every command it tells
+/// the actor to run is that path, shell-quoted by
+/// `claim_hook::shell_quote` — the same rule, and the same file, the
+/// claude `Stop` hook and the opencode plugin already invoke.
+///
+/// No new env var, no new schema, no harness-specific wrapper: the
+/// path is derived from the execution triple the `ActorWorld` already
+/// carries, through `run_wirk_bin` — the one layout function
+/// `ensure_pinned_wirk_bin` itself computes the pin's location with.
+/// Because `actor_pane` refuses the launch outright unless that pin is
+/// installed and validated (correction item 1), the file this text
+/// names is guaranteed to exist and to hold the Run's own bytes by the
+/// time any prompt is sent.
 pub fn compose_first_prompt(actor: &ActorWorld, kind: &ActorKind) -> String {
     let required: Vec<&str> = actor
         .output_contract
@@ -1651,17 +1898,34 @@ pub fn compose_first_prompt(actor: &ActorWorld, kind: &ActorKind) -> String {
     } else {
         format!("\n\nRequired artifacts (by name): {}", required.join(", "))
     };
+    let wirk = crate::claim_hook::shell_quote(&crate::run_wirk_bin(
+        &actor.triple.estate_root,
+        &actor.triple.run_id.0,
+    ));
+    let runtime_line = format!(
+        "This Run's own `wirk` is the executable at {wirk} — invoke it by that exact \
+         absolute path for every wirk command. It is pinned for the whole life of this \
+         Run and does not change when anything else on this machine is rebuilt, renamed, \
+         or removed. Do not run a bare `wirk` (this pane's PATH may resolve it to a \
+         different build), and do not go looking for one in a build tree or anywhere \
+         else."
+    );
     let claim_line = if crate::claim_hook::hook_installed_for(kind) {
-        "A claim is attempted automatically at the end of every turn and is refused until \
-         the required outputs above exist, so end your turn once they do — a refusal before \
-         then is a normal record, not a failure. If you need input before you can finish, \
-         file `wirk claim --question \"...\"` instead."
+        format!(
+            "A claim is attempted automatically at the end of every turn and is refused \
+             until the required outputs above exist, so end your turn once they do — a \
+             refusal before then is a normal record, not a failure. If you need input \
+             before you can finish, run {wirk} claim --question \"...\" instead."
+        )
     } else {
-        "When you are done, file the claim from this pane: `wirk claim`. If you need input \
-         before you can finish, file `wirk claim --question \"...\"` instead."
+        format!(
+            "When you are done, file the claim from this pane: run {wirk} claim. If you \
+             need input before you can finish, run {wirk} claim --question \"...\" \
+             instead."
+        )
     };
     format!(
-        "{intent}{artifacts_line}\n\n{claim_line}",
+        "{intent}{artifacts_line}\n\n{runtime_line}\n\n{claim_line}",
         intent = actor.intent,
     )
 }
@@ -1699,6 +1963,15 @@ pub struct FakeWirkdApi {
     watch_tx: Mutex<Option<mpsc::Sender<Result<Event, FakeWirkdError>>>>,
     watch_rx: Mutex<Option<mpsc::Receiver<Result<Event, FakeWirkdError>>>>,
     status_calls: Mutex<u32>,
+    /// P3 native closeout item 1a: when set, every `record` this fake is
+    /// offered answers `RecordOutcome::RunSettled` with this sentence,
+    /// the way a real `wirkd` answers a write against a Run that already
+    /// reached its outcome. Nothing is journaled on that path, exactly
+    /// as wirkd journals nothing when it refuses.
+    settled_refusal: Mutex<Option<String>>,
+    /// When set, every `record` fails with this message — a refusal that
+    /// is not a settlement, which a driver must still stop on.
+    record_error: Mutex<Option<String>>,
 }
 
 impl Default for FakeWirkdApi {
@@ -1711,11 +1984,33 @@ impl Default for FakeWirkdApi {
             watch_tx: Mutex::new(Some(tx)),
             watch_rx: Mutex::new(Some(rx)),
             status_calls: Mutex::new(0),
+            settled_refusal: Mutex::new(None),
+            record_error: Mutex::new(None),
         }
     }
 }
 
 impl FakeWirkdApi {
+    /// Makes every subsequent `record` answer as wirkd's settled-Run
+    /// refusal does (item 1a).
+    pub fn refusing_records_as_settled(self, refusal: &str) -> Self {
+        *self.settled_refusal.lock().unwrap() = Some(refusal.to_string());
+        self
+    }
+
+    /// The same, after construction — for the race the defect is
+    /// actually about, where the Run settles part-way through a drive.
+    pub fn refuse_records_as_settled(&self, refusal: &str) {
+        *self.settled_refusal.lock().unwrap() = Some(refusal.to_string());
+    }
+
+    /// Every `record` fails outright, the way wirkd's *other* refusals
+    /// reach a driver — the adverse control for the settled-Run
+    /// tolerance.
+    pub fn fail_records(&self, error: &str) {
+        *self.record_error.lock().unwrap() = Some(error.to_string());
+    }
+
     pub fn with_status(self, status: WorkStatus) -> Self {
         *self.status_response.lock().unwrap() = Some(status);
         self
@@ -1738,6 +2033,13 @@ impl FakeWirkdApi {
 
     pub fn recorded(&self) -> Vec<(WorkId, RunId, EventKind)> {
         self.recorded.lock().unwrap().clone()
+    }
+
+    /// The journal as it now stands — the seeded history plus everything
+    /// `record` appended. A test that needs to know what `fold` makes of
+    /// this loop's writes reads it here rather than re-deriving it.
+    pub fn journal(&self) -> Vec<Event> {
+        self.journal.lock().unwrap().clone()
     }
 
     /// How many times `status` was actually called — test (3)'s own
@@ -1835,7 +2137,18 @@ impl WirkdApi for FakeWirkdApi {
         })
     }
 
-    fn record(&self, work_id: &WorkId, run_id: &RunId, kind: EventKind) -> Result<(), Self::Error> {
+    fn record(
+        &self,
+        work_id: &WorkId,
+        run_id: &RunId,
+        kind: EventKind,
+    ) -> Result<RecordOutcome, Self::Error> {
+        if let Some(error) = self.record_error.lock().unwrap().clone() {
+            return Err(FakeWirkdError(error));
+        }
+        if let Some(refusal) = self.settled_refusal.lock().unwrap().clone() {
+            return Ok(RecordOutcome::RunSettled(refusal));
+        }
         let mut journal = self.journal.lock().unwrap();
         let seq = journal.len();
         journal.push(Event {
@@ -1850,7 +2163,7 @@ impl WirkdApi for FakeWirkdApi {
             .lock()
             .unwrap()
             .push((work_id.clone(), run_id.clone(), kind));
-        Ok(())
+        Ok(RecordOutcome::Accepted)
     }
 
     fn watch(&self, _work_id: &WorkId) -> Result<WatchEvents<Self::Error>, Self::Error> {

@@ -800,9 +800,14 @@ fn git_deterministic_unavailable_then_repaired_checkout_is_fail_closed() {
     let (work, run, _waypoint) = parse_submit(&output);
     let before = journal_len(&estate, &work);
 
-    fs::write(repo.join("report.md"), "present before inspection\n").expect("write output");
-    let git_dir = repo.join(".git");
-    let hidden_git = repo.join(".git-hidden");
+    // P3 execution-recovery item 1: this Deterministic Git-basis Work
+    // now executes in its own worktree, not `repo` directly — the
+    // artifact this test inspects git-unavailability/repair against
+    // lives there.
+    let worktree = estate.join("worktrees").join(&work);
+    fs::write(worktree.join("report.md"), "present before inspection\n").expect("write output");
+    let git_dir = worktree.join(".git");
+    let hidden_git = worktree.join(".git-hidden");
     fs::rename(&git_dir, &hidden_git).expect("hide git metadata");
     let refused = wirkd::client::call(
         &pointer.socket,
@@ -815,7 +820,7 @@ fn git_deterministic_unavailable_then_repaired_checkout_is_fail_closed() {
             kind: ClaimKind::Done,
             artifacts: BTreeMap::from([(
                 "report.md".to_string(),
-                repo.join("report.md").display().to_string(),
+                worktree.join("report.md").display().to_string(),
             )]),
             outputs: Default::default(),
         }),
@@ -829,7 +834,7 @@ fn git_deterministic_unavailable_then_repaired_checkout_is_fail_closed() {
     );
 
     fs::rename(&hidden_git, &git_dir).expect("repair git metadata");
-    fs::write(repo.join("report.md"), "repaired\n").expect("write output");
+    fs::write(worktree.join("report.md"), "repaired\n").expect("write output");
     let repaired = wirkd::client::call(
         &pointer.socket,
         &Request::claim(ClaimPayload {
@@ -841,7 +846,7 @@ fn git_deterministic_unavailable_then_repaired_checkout_is_fail_closed() {
             kind: ClaimKind::Done,
             artifacts: BTreeMap::from([(
                 "report.md".to_string(),
-                repo.join("report.md").display().to_string(),
+                worktree.join("report.md").display().to_string(),
             )]),
             outputs: Default::default(),
         }),
