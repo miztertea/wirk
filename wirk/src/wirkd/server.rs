@@ -17480,7 +17480,7 @@ fn consult_findings(
             continue;
         }
         let finding = &row.finding;
-        let recorded_generations = published_recorded_generations(row);
+        let recorded_generations = published_recorded_generations(state, &mut view, row);
         let current_generations: Vec<(String, String)> = recorded_generations
             .iter()
             .filter_map(|(membership, _)| {
@@ -17576,22 +17576,55 @@ fn json_contains_withheld(value: &Value) -> bool {
 }
 
 /// The `(membership, generation)` pairs a published row was settled
-/// against: the frozen review targets of an Actor review, whose exact
-/// memberships `published_row_scoped` has already admitted under this
-/// requester's own scope (`review_targets_admitted`). A settlement that
-/// records none — a `ValidatedClaim` whose proof is journal-side — names
-/// no source generation, and that is reported as the `Unknown` relation
-/// rather than invented.
-fn published_recorded_generations(row: &wirk_atlas::FindingRow) -> Vec<(String, String)> {
+/// against.
+///
+/// An `ActorReview` names them directly: the frozen review targets,
+/// whose exact memberships `published_row_scoped` has already admitted
+/// under this requester's own scope (`review_targets_admitted`). That
+/// behavior is unchanged.
+///
+/// Every other settlement shape's own check fields name no generation at
+/// all — a `ChildReceipt`'s `ChildProof` carries an obligation and a
+/// confirming `FindingId`, never a source coordinate (ROOT-CURRENTNESS-
+/// CAUSE.md). What such a row can still carry is the underlying
+/// `Finding`'s own admitted source evidence — `FindingRow` stores the
+/// complete `Finding`, evidence included — raised and confirmed under
+/// the frozen policy at RECOVERY-ACCEPTANCE.md. Using it here derives
+/// only a generation *identity*, gated by this requester's own current
+/// disclosure view exactly as `consulted_contradictions` gates a
+/// coordinate: an entry the view does not admit contributes nothing.
+/// This never delivers the evidence coordinate or object id themselves —
+/// the publication route's deliberate omission of authored evidence
+/// content is unchanged — and a `ValidatedClaim` or `SupersededBy` row
+/// whose evidence is journal-side, or whose evidence this requester is
+/// not admitted to, still names no source generation, reported as the
+/// `Unknown` relation rather than invented.
+fn published_recorded_generations(
+    state: &Arc<WirkdState>,
+    view: &mut DisclosureView,
+    row: &wirk_atlas::FindingRow,
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let Some(settlement) = &row.settlement else {
         return out;
     };
-    let SettlementCheck::ActorReview { proof, .. } = &settlement.check else {
+    if let SettlementCheck::ActorReview { proof, .. } = &settlement.check {
+        for target in &proof.targets {
+            let pair = (target.membership.clone(), target.generation.clone());
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
         return out;
-    };
-    for target in &proof.targets {
-        let pair = (target.membership.clone(), target.generation.clone());
+    }
+    for item in &row.finding.evidence {
+        if !view.admits_evidence(state, item) {
+            continue;
+        }
+        let Some((coordinate, generation, _)) = recorded_source_identity(item) else {
+            continue;
+        };
+        let pair = (coordinate.membership.0.clone(), generation);
         if !out.contains(&pair) {
             out.push(pair);
         }
