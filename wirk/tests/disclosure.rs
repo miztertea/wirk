@@ -5988,3 +5988,217 @@ fn verify_a_publication_route_relation_is_withheld_from_a_narrowed_child() {
     let Family { estate, wirkd, .. } = family;
     stop_wirkd(&estate, wirkd);
 }
+
+/// **Red on the pre-correction tree.** `--json` was accepted on the
+/// command line of both named status entry points — `wirk work status`
+/// and `wirk wirkd status` — and then ignored: the human lines were
+/// printed instead, so every `json.load` over that stdout failed at
+/// character 0 (ruling 0135, "work status ignores --json"). The flag
+/// must render the daemon's own reply, on both doors, without moving
+/// the human surface, the scope, the withholding or the exit codes.
+#[test]
+fn status_json_renders_the_daemon_reply_on_both_entry_points() {
+    let family = build_launch_family(&["scratch:write", "open:read", "helper:write"]);
+    let estate = &family.estate;
+    let estate_str = estate.to_str().unwrap().to_string();
+    let embargoed_path = format!("{}/embargoed.md", family.closed_checkout);
+
+    // Content on the parent worth withholding: what a scoped `--json`
+    // read must be seen to keep back, not merely fail to print.
+    record_launch_events(
+        &family.pointer.socket,
+        &family.parent.work_id,
+        &family.parent.run_id,
+        wirk_core::ActorSelection {
+            model: Some("opus".to_string()),
+            effort: Some("medium".to_string()),
+            args: vec!["--add-dir".to_string(), embargoed_path.clone()],
+        },
+        &format!("{}/.herdr/embargo-session.sock", family.closed_checkout),
+        &["claude", "--add-dir", &embargoed_path],
+    );
+
+    // An unrelated neighbour: the out-of-lineage target the denied
+    // control names, and a second row the operator's listing must hold.
+    let stranger_dir = tempfile::tempdir().unwrap();
+    let stranger_repo = stranger_dir.path().join("stranger-repo");
+    init_repo(&stranger_repo);
+    let stranger = submit(
+        estate,
+        "disclosure_launch",
+        &stranger_repo,
+        &["scratch:write", "open:read", "helper:write"],
+        None,
+    )
+    .unwrap();
+
+    // Both doors, driven exactly as an operator's script drives them.
+    let run = |verb: &[&str], args: &[&str]| -> (Option<i32>, String, String) {
+        let mut full: Vec<&str> = verb.to_vec();
+        full.extend_from_slice(&["--estate", estate_str.as_str()]);
+        full.extend_from_slice(args);
+        let output = wirk_cli(&[])
+            .args(&full)
+            .output()
+            .expect("wirk status runs");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        )
+    };
+    let work_status = |args: &[&str]| run(&["work", "status"], args);
+    let wirkd_status = |args: &[&str]| run(&["wirkd", "status"], args);
+
+    // 1. The one the prepared operator script actually calls. Pure
+    //    JSON on stdout, one object, the daemon's own field names.
+    let (code, out, err) = work_status(&["--work", &family.parent.work_id, "--admin", "--json"]);
+    assert_eq!(code, Some(0), "{out} {err}");
+    let admin: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|why| panic!("stdout must be JSON ({why}): {out}"));
+    assert!(admin.is_object(), "one named Work is one object: {admin}");
+    assert_eq!(
+        admin["scope"],
+        serde_json::json!("administrative"),
+        "the administrative reply is rendered, not reshaped: {admin}"
+    );
+    assert!(
+        admin["state"].is_string() && admin["current_waypoint"].is_string(),
+        "the fields a caller reads must be the daemon's own: {admin}"
+    );
+
+    // 2. The same request through the other named door, byte for byte:
+    //    `wirk work status` is an alias, and a flag honoured on one
+    //    surface only is the shared-path defect this closes.
+    let (code, aliased, err) =
+        wirkd_status(&["--work", &family.parent.work_id, "--admin", "--json"]);
+    assert_eq!(code, Some(0), "{aliased} {err}");
+    assert_eq!(
+        aliased, out,
+        "both status entry points must render the same JSON for the same request"
+    );
+
+    // 3. The human surface, unflagged, is untouched: the same lines,
+    //    and no JSON leaking onto them.
+    let (code, human, err) = work_status(&["--work", &family.parent.work_id, "--admin"]);
+    assert_eq!(code, Some(0), "{human} {err}");
+    assert!(
+        human.starts_with(&format!("work_id {} state ", family.parent.work_id))
+            && human.contains("scope administrative"),
+        "the human lines must survive the flag's arrival: {human}"
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&human).is_err(),
+        "the unflagged surface is human text, not JSON: {human}"
+    );
+
+    // 4. The operator's estate walk: one JSON document, not a line per
+    //    Work, each answer addressable by the id it was asked about.
+    let (code, listed, err) = wirkd_status(&["--admin", "--json"]);
+    assert_eq!(code, Some(0), "{listed} {err}");
+    let rows: serde_json::Value = serde_json::from_str(&listed)
+        .unwrap_or_else(|why| panic!("the listing must be one JSON document ({why}): {listed}"));
+    let rows = rows.as_array().expect("the listing is an array").clone();
+    let named: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row["work_id"].as_str())
+        .collect();
+    for work in [
+        &family.parent.work_id,
+        &family.child.work_id,
+        &stranger.work_id,
+    ] {
+        assert!(
+            named.contains(&work.as_str()),
+            "the administrative listing must carry {work}: {listed}"
+        );
+    }
+    let parent_row = rows
+        .iter()
+        .find(|row| row["work_id"].as_str() == Some(family.parent.work_id.as_str()))
+        .expect("the parent's row");
+    assert_eq!(
+        parent_row["status"], admin,
+        "a listed answer is the same reply the single read renders: {parent_row}"
+    );
+
+    // 5. A scoped read renders too — and renders *less*. `--json` is a
+    //    rendering flag: it must not reach past the withholding the
+    //    scoped surface applies.
+    let (code, scoped, err) = work_status(&[
+        "--work",
+        &family.parent.work_id,
+        "--requesting-work",
+        &family.child.work_id,
+        "--json",
+    ]);
+    assert_eq!(code, Some(0), "{scoped} {err}");
+    let scoped_value: serde_json::Value = serde_json::from_str(&scoped)
+        .unwrap_or_else(|why| panic!("a scoped read must render JSON too ({why}): {scoped}"));
+    assert_eq!(
+        scoped_value["scope"],
+        serde_json::json!("requester"),
+        "the scoped reply must say which surface answered: {scoped_value}"
+    );
+    assert_eq!(
+        scoped_value["work_id"],
+        serde_json::json!(family.parent.work_id),
+        "the scoped reply names the Work it is about: {scoped_value}"
+    );
+    assert!(
+        scoped_value["disclosure"]["withheld"].as_u64().unwrap_or(0) > 0,
+        "this scoped read has parts withheld and must say how many: {scoped_value}"
+    );
+    for needle in family.closed_secrets_slice() {
+        assert!(
+            !scoped.contains(needle),
+            "the JSON rendering disclosed {needle:?}: {scoped}"
+        );
+    }
+
+    // 6. The denied control. A refused read prints no JSON at all: a
+    //    caller checks the exit status, and never has to tell an answer
+    //    apart from an apology on the same stream.
+    let (code, denied, err) = work_status(&[
+        "--work",
+        &stranger.work_id,
+        "--requesting-work",
+        &family.child.work_id,
+        "--json",
+    ]);
+    assert_eq!(
+        code,
+        Some(2),
+        "an out-of-lineage target must be refused: {denied}"
+    );
+    assert!(
+        denied.is_empty(),
+        "a refused read must print nothing on stdout: {denied:?}"
+    );
+    assert!(
+        err.contains("InadmissibleEvidence"),
+        "the refusal keeps its code and message on stderr: {err}"
+    );
+
+    // 7. The command-line refusal, which happens before wirkd is even
+    //    located, is equally silent on stdout under `--json`.
+    let (code, both, err) = work_status(&[
+        "--work",
+        &family.child.work_id,
+        "--admin",
+        "--requesting-work",
+        &family.child.work_id,
+        "--json",
+    ]);
+    assert_eq!(
+        code,
+        Some(1),
+        "naming both scopes stays refused: {both} {err}"
+    );
+    assert!(
+        both.is_empty(),
+        "a command-line refusal must print nothing on stdout: {both:?}"
+    );
+
+    stop_wirkd(estate, family.wirkd);
+}

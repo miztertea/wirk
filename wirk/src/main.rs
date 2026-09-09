@@ -104,7 +104,7 @@ fn main() -> ExitCode {
         Some("world") => world_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json]"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json]"
             );
             ExitCode::FAILURE
         }
@@ -923,6 +923,7 @@ fn wirkd_command(rest: &[String]) -> ExitCode {
             flag_value(&rest[1..], "--work"),
             flag_value(&rest[1..], "--requesting-work"),
             rest[1..].iter().any(|arg| arg == "--admin"),
+            rest[1..].iter().any(|arg| arg == "--json"),
         ),
         // Item B/G, ruling 0044: prints one line per journal append,
         // starting with what is already there, blocking (no timeout) for
@@ -1155,11 +1156,17 @@ fn wirkd_usage() -> ExitCode {
     // estate" and answered with nothing of the sort. The scope flag is
     // named exactly once here: the integration review's V-2.
     eprintln!(
-        "usage: wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin]
+        "usage: wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json]
 
   ping    daemon health only: the protocol version and pid of the running
           wirkd. It reports nothing about any Work.
-  status  a Work's state, waypoint, needs_input and evidence.
+  status  a Work's state, waypoint, needs_input and evidence. --json
+          renders the daemon's own reply instead of the human lines: one
+          object for a single Work, an array of {{work_id, status}} for
+          the administrative estate walk. Refusals stay on stderr. A
+          refused or failed single read prints no JSON; the
+          administrative estate walk prints the rows that answered and
+          reports the rest on stderr and in the exit code.
   watch   that Work's journal appends, streamed as they land.
 
 scope of status and watch:
@@ -1385,11 +1392,49 @@ fn wirkd_watch_command(
 /// proves nothing about who is asking (the same uid runs both), and no
 /// approval is added here; what it buys is that a scoped consultation
 /// can never silently fall through to the unscoped answer.
+///
+/// `--json` (ruling 0135's observed defect: "work status ignores
+/// --json") renders the daemon's own `status` reply instead of the
+/// human lines, on both named entry points — `wirk wirkd status` and
+/// its `wirk work status` alias reach this one function, so the flag
+/// cannot honour one surface and ignore the other. It is a *rendering*
+/// flag and nothing else (R2, the shape `wirk work obligations --json`
+/// already established): the same request is made, the same scope is
+/// resolved first, the same refusals happen, the same exit codes come
+/// back, and no field of the daemon's reply is added, renamed or
+/// recased on the way out.
+///
+/// Two shapes, chosen by the *request* and never by how many Works
+/// happen to exist:
+///
+/// - one Work asked about — `--work <id>`, or an actor's own Work
+///   resolved from its injected context — prints that Work's reply
+///   `result` verbatim, a single JSON object;
+/// - the operator's estate walk (administrative, no `--work`) prints a
+///   JSON array of `{"work_id": <the id asked about>, "status":
+///   <result verbatim>}`. The daemon's administrative reply carries no
+///   `work_id` of its own (only the scoped reply does, and it stays
+///   exactly as sent), so the enumeration wraps each answer beside the
+///   id this command asked for — the same id the human line prints
+///   from the same loop variable — rather than editing a reply body to
+///   make the array addressable.
+///
+/// Everything that is not the answer stays on stderr in `--json` mode:
+/// the resolved-scope note, the behind-projection sentence, and a
+/// refusal's `code`/`message`. A refused or failed single read
+/// therefore prints *no* JSON at all and exits non-zero. The
+/// administrative estate walk is different: it prints the array of
+/// rows that answered and reports the rest on stderr and in the exit
+/// code, so a non-zero exit there can still carry a partial array on
+/// stdout — a script reads the exit status first and parses stdout
+/// only on success, and never has to tell an answer apart from an
+/// apology.
 fn wirkd_status_command(
     estate: &str,
     work_filter: Option<String>,
     requesting: Option<String>,
     admin: bool,
+    json: bool,
 ) -> ExitCode {
     // Ruling 0117: settle the scope first. A refusal here happens
     // before wirkd is located, before any Work directory is listed and
@@ -1413,6 +1458,12 @@ fn wirkd_status_command(
         }
     };
     let requesting = scope.requesting;
+    // Which of the two `--json` shapes this request asks for, settled
+    // here with the request itself: the estate walk is a listing and
+    // renders an array, a named or inherited single target renders that
+    // Work's own object. An estate that happens to hold exactly one
+    // Work does not change the shape of its listing.
+    let mut enumerated = false;
     let work_ids: Vec<String> = match (work_filter, &scope.default_target) {
         (Some(id), _) => vec![id],
         // The actor's own Work is the target it did not have to name.
@@ -1421,7 +1472,10 @@ fn wirkd_status_command(
         // 0117 names, and it used to happen before any admission.
         (None, Some(own)) => vec![own.clone()],
         (None, None) => match list_work_ids(Path::new(estate)) {
-            Ok(ids) => ids,
+            Ok(ids) => {
+                enumerated = true;
+                ids
+            }
             Err(err) => {
                 eprintln!("wirk wirkd status: {err}");
                 return ExitCode::from(2);
@@ -1430,6 +1484,10 @@ fn wirkd_status_command(
     };
 
     let mut exit = ExitCode::SUCCESS;
+    // The estate walk's rows, held until every Work has answered: one
+    // JSON document is printed, not a line per Work that a `json.load`
+    // would choke on.
+    let mut rows: Vec<serde_json::Value> = Vec::new();
     for work_id in work_ids {
         let payload = match &requesting {
             Some(requester) => StatusPayload::scoped(WorkId(work_id.clone()), requester.clone()),
@@ -1438,6 +1496,21 @@ fn wirkd_status_command(
         let reply = wirkd::client::status(&pointer.socket, payload);
         match reply {
             Ok(Reply::Ok { result, .. }) => {
+                if json {
+                    // The daemon's own answer, unedited. The listing
+                    // wraps it beside the id it was asked about; the
+                    // single read is the object itself, which is what a
+                    // caller that named one Work asked for.
+                    if enumerated {
+                        rows.push(serde_json::json!({
+                            "work_id": work_id,
+                            "status": result,
+                        }));
+                    } else {
+                        println!("{result}");
+                    }
+                    continue;
+                }
                 // P2.3 W1 (states.md §2): `needs_input` is absent from
                 // the reply when the Work never has been NeedsInput
                 // (`handle_status`'s own additive field) — printed as
@@ -1562,6 +1635,13 @@ fn wirkd_status_command(
                 exit = ExitCode::from(2);
             }
         }
+    }
+    // A listing that refused or failed on some Work has already said so
+    // on stderr and set the exit code; the array it prints holds the
+    // Works that did answer, and the caller reads the status before the
+    // stdout — the same contract the single read keeps.
+    if json && enumerated {
+        println!("{}", serde_json::Value::Array(rows));
     }
     exit
 }
@@ -1692,6 +1772,7 @@ fn work_command(rest: &[String]) -> ExitCode {
                 Some(work_id),
                 flag_value(&rest[1..], "--requesting-work"),
                 rest[1..].iter().any(|arg| arg == "--admin"),
+                rest[1..].iter().any(|arg| arg == "--json"),
             )
         }
         // P2.3 W2 (decide.md §1): `wirk work retry --estate <root>
@@ -2200,7 +2281,7 @@ fn work_obligations_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json]"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json]"
     );
     ExitCode::from(1)
 }
