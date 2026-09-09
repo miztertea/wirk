@@ -275,6 +275,11 @@ pub(crate) struct ViewRow {
     pub slot: u64,
     pub text: String,
     pub language: Option<String>,
+    /// The digest this row's ranking text was just re-verified against.
+    /// Carried rather than recomputed: it is the exact per-row identity a
+    /// built index is a function of, and it has already been checked
+    /// against the committed bytes on the way in.
+    pub ranking_text_digest: String,
 }
 
 /// One completed native ranking: the view that was handed over, the order
@@ -296,6 +301,14 @@ struct QueryHeader<'a> {
     dimensions: u64,
     query: &'a str,
     top_k: u64,
+    /// Where this exact view's built index may be kept, and the identity
+    /// it is kept under. Both absent means "build it and keep nothing",
+    /// which is what every backend older than this field already does
+    /// with a header field it does not read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_cache: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -358,6 +371,125 @@ pub struct SemanticApplication {
     /// pins. `configuration` is checked before a child is started;
     /// `identity` once it has answered.
     pub producer_pin: QueryProducerPin,
+}
+
+/// The scheme the reusable-index identity below is digested under. Its own
+/// label, so a digest computed for this purpose can never be mistaken for
+/// an edition id, a producer identity or a retrieval digest.
+const QUERY_INDEX_IDENTITY: &str = "wirk-query-index/v1";
+
+/// How many built query indexes are kept. The product owns this
+/// directory's growth, not the backend: a backend that is handed a path
+/// writes one index there and nothing else, and this is the only place
+/// that decides how many such paths survive.
+const QUERY_INDEX_CACHE_ENTRIES: usize = 8;
+
+/// The exact identity of the admitted view a backend's built index is a
+/// function of.
+///
+/// Everything the ranking representation of these rows depends on, and
+/// nothing else: the producer configuration (which is the tokenizer and
+/// enrichment implementation, digested from the bytes at the configured
+/// path), the retrieval identity every planned edition agrees on, and,
+/// per row in view order, the coordinate the native ranker keys on plus
+/// the digest of the ranking text — the same digest this query has just
+/// re-derived from the committed bytes and checked. Two views with this
+/// digest cannot differ in a way any index over them could see; a view
+/// that differs anywhere gets a different digest and therefore a
+/// different, empty directory.
+fn view_index_identity(configuration: &str, retrieval_digest: &str, view: &[ViewRow]) -> String {
+    let mut identity = Vec::with_capacity(view.len() * 128);
+    for field in [
+        QUERY_INDEX_IDENTITY,
+        QUERY_PROTOCOL,
+        configuration,
+        retrieval_digest,
+    ] {
+        identity.extend_from_slice(field.as_bytes());
+        identity.push(0);
+    }
+    for row in view {
+        identity.extend_from_slice(row.ranking_path.as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(row.slot.to_string().as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(row.line_start.to_string().as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(row.line_end.to_string().as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(row.language.as_deref().unwrap_or("").as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(row.ranking_text_digest.as_bytes());
+        identity.push(b'\n');
+    }
+    digest_bytes(&identity)
+}
+
+/// The directory this view's index may be reused from, or `None` — in
+/// which case the backend builds one and the query costs exactly what it
+/// cost before.
+///
+/// A stable path in a shared temporary directory is pre-creatable by
+/// anyone who can write there, and an index is bytes a ranking is read
+/// from, so the root is private (`0700`) and is used only if what is
+/// actually on disk is a directory this user owns, at those permissions,
+/// reached without following a symlink. Anything else and this returns
+/// `None`: no reuse is a slower query, a poisoned index would be a
+/// different answer.
+fn query_index_cache(key: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    // SAFETY: `getuid` takes no arguments, cannot fail, and touches no
+    // memory this process owns — the same call, made the same way, as
+    // `wirk/src/executors/docker.rs`.
+    let own = unsafe { libc::getuid() };
+    let root = std::env::temp_dir().join(format!("wirk-atlas-query-index-{own}"));
+    if !root.exists() {
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&root);
+    }
+    let found = std::fs::symlink_metadata(&root).ok()?;
+    if !found.is_dir() || found.uid() != own || found.permissions().mode() & 0o777 != 0o700 {
+        return None;
+    }
+    prune_query_index_cache(&root, key, own);
+    let entry = root.join(key);
+    if !entry.exists() {
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&entry);
+    }
+    let entry_found = std::fs::symlink_metadata(&entry).ok()?;
+    if !entry_found.is_dir() || entry_found.uid() != own {
+        return None;
+    }
+    Some(entry)
+}
+
+/// Keep the newest `QUERY_INDEX_CACHE_ENTRIES` entries, always including
+/// the one this query is about to use. Every entry is reproducible from
+/// its own view, so removing one costs a rebuild and nothing else.
+fn prune_query_index_cache(root: &Path, keep: &str, own: u32) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy() != keep)
+        .filter_map(|entry| {
+            let found = std::fs::symlink_metadata(entry.path()).ok()?;
+            if !found.is_dir() || found.uid() != own {
+                // Not ours and not a directory we made: left exactly
+                // where it is, and never reused.
+                return None;
+            }
+            Some((found.modified().ok()?, entry.path()))
+        })
+        .collect();
+    if found.len() < QUERY_INDEX_CACHE_ENTRIES {
+        return;
+    }
+    found.sort_by_key(|found| std::cmp::Reverse(found.0));
+    for (_, path) in found.into_iter().skip(QUERY_INDEX_CACHE_ENTRIES - 1) {
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
 
 /// Build the exact admitted view and rank it.
@@ -478,26 +610,43 @@ pub(crate) fn rank(
                 admitted.edition.vectors.rows as usize * stride
             )));
         }
-        let mut cache: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        // One `git cat-file --batch-command` session reads every unique
+        // object this edition's rows address, instead of one `git`
+        // process spawn per unique object (the per-row lazy fetch this
+        // replaced). Same bytes, same per-object error surfaced the same
+        // way; only how many processes are started to get them changes.
+        let mut unique_oids: Vec<String> = Vec::new();
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for row in &admitted.rows {
-            let bytes = match cache.get(&row.object_id) {
-                Some(bytes) => bytes.clone(),
-                None => {
-                    let bytes = match crate::git::blob(Path::new(&admitted.locator), &row.object_id)
-                    {
-                        Ok(bytes) => bytes,
-                        Err(AtlasError::GitUnavailable(detail)) => {
-                            return Ok(Err(format!(
-                                "the committed bytes edition {} ranks over are unavailable: \
-                                 {detail}",
-                                admitted.edition.id.0
-                            )));
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    cache.insert(row.object_id.clone(), bytes.clone());
-                    bytes
+            if seen.insert(row.object_id.as_str()) {
+                unique_oids.push(row.object_id.clone());
+            }
+        }
+        let cache: BTreeMap<String, Vec<u8>> =
+            match crate::git::blobs(Path::new(&admitted.locator), &unique_oids) {
+                Ok(cache) => cache,
+                Err(AtlasError::GitUnavailable(detail)) => {
+                    return Ok(Err(format!(
+                        "the committed bytes edition {} ranks over are unavailable: {detail}",
+                        admitted.edition.id.0
+                    )));
                 }
+                Err(error) => return Err(error),
+            };
+        for row in &admitted.rows {
+            // Borrowed, not cloned: one blob backs every row that
+            // addresses a range inside it, and cloning it per row copied
+            // the whole object once per chunk of it.
+            let Some(bytes) = cache.get(&row.object_id) else {
+                // What is actually known: the batched read returned no
+                // bytes for this object. Naming a `git` message this
+                // process never received would put an invented diagnosis
+                // in an answer whose whole job is to say what it read.
+                return Ok(Err(format!(
+                    "the committed bytes edition {} ranks over are unavailable: object {} was not \
+                     returned by the batched read of {}",
+                    admitted.edition.id.0, row.object_id, admitted.locator
+                )));
             };
             let (start, end) = (row.byte_start as usize, row.byte_end as usize);
             if end > bytes.len() || start > end {
@@ -508,7 +657,8 @@ pub(crate) fn rank(
             }
             let slice = &bytes[start..end];
             let text = normalize_ranking_text(slice);
-            if digest_bytes(text.as_bytes()) != row.ranking_text_digest() {
+            let text_digest = digest_bytes(text.as_bytes());
+            if text_digest != row.ranking_text_digest() {
                 return Ok(Err(format!(
                     "edition {} row {} no longer re-derives to the text it recorded; the committed \
                      bytes behind it are not the bytes it was built from",
@@ -539,6 +689,7 @@ pub(crate) fn rank(
                 slot: row.slot.unwrap_or(0),
                 text,
                 language: row.language.clone(),
+                ranking_text_digest: text_digest,
             });
         }
     }
@@ -551,6 +702,18 @@ pub(crate) fn rank(
     // Nothing under the estate is touched.
     let scratch = std::env::temp_dir().join(format!("wirk-atlas-query-{}", ulid::Ulid::generate()));
     std::fs::create_dir_all(&scratch)?;
+    // What this view is, exactly, so a backend can recognise an index it
+    // has already built over these same rows instead of building the
+    // same one again. The identity is the product's to compute — it is
+    // the one side that knows what was admitted and has just verified
+    // every row's bytes — and the directory is the product's to bound.
+    let planned_retrieval = editions[0]
+        .edition
+        .retrieval
+        .as_ref()
+        .expect("a planned edition always carries a retrieval identity");
+    let index_key = view_index_identity(&configuration, &planned_retrieval.digest, &view);
+    let index_cache = query_index_cache(&index_key);
     let outcome = (|| -> Result<Result<(Vec<RankedRow>, QueryReply), String>, AtlasError> {
         let vectors_path = scratch.join("view.bin");
         std::fs::write(&vectors_path, &vectors)?;
@@ -562,6 +725,8 @@ pub(crate) fn rank(
             dimensions,
             query,
             &view,
+            index_cache.as_deref(),
+            &index_key,
         ))
     })();
     let _ = std::fs::remove_dir_all(&scratch);
@@ -666,6 +831,8 @@ fn run_query_backend(
     dimensions: u64,
     query: &str,
     view: &[ViewRow],
+    index_cache: Option<&Path>,
+    index_key: &str,
 ) -> Result<(Vec<RankedRow>, QueryReply), String> {
     use std::process::{Command, Stdio};
     let mut command = Command::new(&config.backend);
@@ -694,6 +861,8 @@ fn run_query_backend(
         dimensions,
         query,
         top_k: CANDIDATE_LIMIT,
+        index_cache: index_cache.map(|path| path.to_str()).unwrap_or(None),
+        index_key: index_cache.and(Some(index_key)),
     })
     .map_err(|error| format!("query request could not be encoded: {error}"))?;
     let write = (|| -> std::io::Result<()> {
@@ -768,4 +937,102 @@ fn run_query_backend(
         ));
     }
     Ok((ranked, reply))
+}
+
+#[cfg(test)]
+mod query_index_identity_tests {
+    use super::*;
+    use crate::{EstateScope, GenerationId, MembershipId, SourceId};
+
+    fn row(path: &str, slot: u64, text: &str) -> ViewRow {
+        ViewRow {
+            membership: MembershipId("m-x".into()),
+            estate: EstateScope("/estate".into()),
+            source: SourceId("s-x".into()),
+            generation: GenerationId("g-x".into()),
+            path: path.as_bytes().to_vec(),
+            object_id: "0".repeat(40),
+            byte_start: 0,
+            byte_end: text.len() as u64,
+            line_start: 1,
+            line_end: 2,
+            bytes: text.as_bytes().to_vec(),
+            ranking_path: path.to_owned(),
+            slot,
+            text: text.to_owned(),
+            language: Some("rust".into()),
+            ranking_text_digest: crate::semantic::digest_bytes(text.as_bytes()),
+        }
+    }
+
+    /// The identity is a function of the view, and of everything in the
+    /// view an index over it could see. Same rows, same key; any change
+    /// to the ranked text, the coordinate it is ranked under, or the
+    /// implementation that would tokenise it, and the key moves — which
+    /// is the whole invalidation rule: a moved key names a directory that
+    /// holds nothing.
+    #[test]
+    fn a_view_that_differs_anywhere_gets_a_different_index_identity() {
+        let base = vec![row("a/one.rs", 0, "alpha"), row("a/two.rs", 0, "beta")];
+        let key = view_index_identity("configuration-1", "retrieval-1", &base);
+        assert_eq!(
+            key,
+            view_index_identity("configuration-1", "retrieval-1", &base),
+            "the same view digests to the same identity"
+        );
+        assert_eq!(key.len(), 64, "an identity is a sha256 in hex");
+
+        for (what, moved) in [
+            (
+                "the ranking text",
+                vec![row("a/one.rs", 0, "ALPHA"), row("a/two.rs", 0, "beta")],
+            ),
+            (
+                "the ranking path",
+                vec![row("a/renamed.rs", 0, "alpha"), row("a/two.rs", 0, "beta")],
+            ),
+            (
+                "the slot",
+                vec![row("a/one.rs", 1, "alpha"), row("a/two.rs", 0, "beta")],
+            ),
+            (
+                "the row order",
+                vec![row("a/two.rs", 0, "beta"), row("a/one.rs", 0, "alpha")],
+            ),
+            ("a dropped row", vec![row("a/one.rs", 0, "alpha")]),
+        ] {
+            assert_ne!(
+                key,
+                view_index_identity("configuration-1", "retrieval-1", &moved),
+                "{what} changed and the index identity did not"
+            );
+        }
+        assert_ne!(
+            key,
+            view_index_identity("configuration-2", "retrieval-1", &base),
+            "the producer configuration changed and the index identity did not"
+        );
+        assert_ne!(
+            key,
+            view_index_identity("configuration-1", "retrieval-2", &base),
+            "the retrieval identity changed and the index identity did not"
+        );
+    }
+
+    /// Two rows that differ only in a field the identity does not read
+    /// would be a hole in it. This pins the two that are deliberately not
+    /// read — where the bytes live — because the ranking never sees them.
+    #[test]
+    fn the_identity_reads_what_a_ranking_reads_and_not_where_it_came_from() {
+        let mut moved = row("a/one.rs", 0, "alpha");
+        let base = vec![row("a/one.rs", 0, "alpha")];
+        moved.object_id = "1".repeat(40);
+        moved.byte_start = 4096;
+        moved.byte_end = 4096 + 5;
+        assert_eq!(
+            view_index_identity("c", "r", &base),
+            view_index_identity("c", "r", &[moved]),
+            "the same ranked text at the same coordinate is the same document to rank"
+        );
+    }
 }

@@ -810,7 +810,6 @@ fn lexical_hits(
     resolved: &[(crate::AdmittedSource, crate::SourceGeneration)],
     coverage: &mut AnswerCoverage,
 ) -> Result<(Vec<EvidenceHit>, usize), AtlasError> {
-    let mut blob_cache: BTreeMap<(String, String), Vec<u8>> = BTreeMap::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     let _ = store;
     for (source, generation) in resolved {
@@ -819,6 +818,17 @@ fn lexical_hits(
             content: generation.content.clone(),
             extractor_set: generation.extractor_set.clone(),
         };
+        // One `git cat-file --batch-command` session per (source,
+        // generation) pair reads every indexed, family-matched object
+        // this generation's resources address, instead of one `git`
+        // process spawn per unique object -- this is the scan that runs
+        // on every lexical search, over every indexed resource in scope,
+        // so it is the hottest of the two batched sites. Same bytes,
+        // same per-object tolerance (a missing object still degrades
+        // `coverage.source_unavailable` and is skipped, never a hard
+        // failure); only how many processes read them changes.
+        let mut wanted_oids: Vec<String> = Vec::new();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for resource in &generation.resources {
             if resource.disposition != CoverageDisposition::Indexed {
                 continue;
@@ -830,21 +840,33 @@ fn lexical_hits(
                 continue;
             }
             let object_id = resource.object_id.clone().unwrap_or_default();
-            let key = (generation.id.0.clone(), object_id.clone());
-            let bytes = if let Some(bytes) = blob_cache.get(&key) {
-                bytes.clone()
-            } else {
-                match crate::git::blob(Path::new(&source.membership.locator), &object_id) {
-                    Ok(bytes) => {
-                        blob_cache.insert(key, bytes.clone());
-                        bytes
-                    }
-                    Err(AtlasError::GitUnavailable(_)) => {
-                        coverage.source_unavailable = true;
-                        continue;
-                    }
-                    Err(error) => return Err(error),
+            if seen.insert(object_id.clone()) {
+                wanted_oids.push(object_id);
+            }
+        }
+        let blob_cache =
+            match crate::git::blobs(Path::new(&source.membership.locator), &wanted_oids) {
+                Ok(blob_cache) => blob_cache,
+                Err(AtlasError::GitUnavailable(_)) => {
+                    coverage.source_unavailable = true;
+                    BTreeMap::new()
                 }
+                Err(error) => return Err(error),
+            };
+        for resource in &generation.resources {
+            if resource.disposition != CoverageDisposition::Indexed {
+                continue;
+            }
+            let Some(family) = resource.units.first().map(|unit| unit.family) else {
+                continue;
+            };
+            if !request.families.is_empty() && !request.families.contains(&family) {
+                continue;
+            }
+            let object_id = resource.object_id.clone().unwrap_or_default();
+            let Some(bytes) = blob_cache.get(&object_id) else {
+                coverage.source_unavailable = true;
+                continue;
             };
             for unit in &resource.units {
                 let start = unit.byte_start as usize;

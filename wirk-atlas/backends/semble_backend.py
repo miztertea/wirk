@@ -79,9 +79,12 @@ import hashlib
 import json
 import os
 import platform
+import secrets
+import shutil
 import struct
 import sys
 import tempfile
+from pathlib import Path
 
 EMBED_PROTOCOL = "wirk-embed/v2"
 QUERY_PROTOCOL = "wirk-query/v1"
@@ -774,6 +777,117 @@ def run_embed(header: dict) -> None:
 # ---- wirk-query/v1 -------------------------------------------------------
 
 
+
+def cached_index_identity(header: dict) -> "tuple[Path, str] | None":
+    """The directory Wirk owns for this exact view's index, and the key it
+    is kept under -- or None when Wirk offered neither, which is every
+    caller older than this field and every call where the product declined
+    to keep anything."""
+    directory = header.get("index_cache")
+    key = header.get("index_key")
+    if not directory or not key:
+        return None
+    return Path(directory), str(key)
+
+
+def load_cached_bm25(header: dict, chunk_ids: "list[str]") -> "BM25 | None":
+    """A previously built index for exactly these rows, or None.
+
+    Refused unless four things hold: the identity Wirk computed for this
+    view is the identity the stored index was written under, the `semble`
+    that would rank through it is the `semble` that built it, the stored
+    `index.json` bytes hash to the digest recorded alongside them (so a
+    postings file replaced, truncated, or torn from its identity file is
+    caught here rather than ranked on), and the documents it actually
+    holds are the documents this view sends. Any other outcome -- absent,
+    unreadable, from another version, from another view, mismatched --
+    is not a failure, it is a build.
+
+    The digest is checked against the exact bytes handed to `BM25.load`:
+    they are read once, verified, then loaded from a private copy so a
+    second, unchecked read of `index.json` off disk never happens."""
+    from semble.index.bm25 import BM25  # noqa: PLC0415
+    import semble  # noqa: PLC0415
+
+    identity = cached_index_identity(header)
+    if identity is None:
+        return None
+    directory, key = identity
+    try:
+        stored = json.loads((directory / "identity.json").read_bytes())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stored, dict):
+        return None
+    if (
+        stored.get("protocol") != QUERY_PROTOCOL
+        or stored.get("index_key") != key
+        or stored.get("native") != f"semble/{getattr(semble, '__version__', 'unknown')}"
+    ):
+        return None
+    expected_digest = stored.get("index_sha256")
+    if not isinstance(expected_digest, str) or not expected_digest:
+        return None
+    try:
+        index_bytes = (directory / "index.json").read_bytes()
+    except OSError:
+        return None
+    if sha256_hex(index_bytes) != expected_digest:
+        return None
+    verified = directory / f".tmp-verified-{os.getpid()}-{secrets.token_hex(8)}"
+    try:
+        verified.mkdir(parents=True, exist_ok=False)
+        (verified / "index.json").write_bytes(index_bytes)
+        index = BM25.load(verified)
+    except Exception:  # noqa: BLE001 - a damaged index is a rebuild, never an error
+        return None
+    finally:
+        shutil.rmtree(verified, ignore_errors=True)
+    if index.doc_order != chunk_ids:
+        return None
+    return index
+
+
+def save_cached_bm25(header: dict, index: "BM25", chunk_ids: "list[str]") -> None:
+    """Keep this index where Wirk said to, or keep nothing.
+
+    Written through a private temporary directory and renamed into place,
+    so a reader either sees a whole index or sees none: two queries over
+    the same view race to write the same bytes, and neither may show the
+    other a half-written one. Failing to keep it costs the next query a
+    rebuild and nothing else, so nothing here raises."""
+    import semble  # noqa: PLC0415
+
+    identity = cached_index_identity(header)
+    if identity is None:
+        return
+    directory, key = identity
+    staging = directory / f".tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    try:
+        index.save(staging)
+        # The digest of the exact bytes `index.save` just wrote -- not a
+        # digest of the in-memory index -- so `load_cached_bm25` verifies
+        # what it is actually about to decode, not a description of it.
+        index_digest = sha256_hex((staging / "index.json").read_bytes())
+        (staging / "identity.json").write_bytes(
+            json.dumps(
+                {
+                    "protocol": QUERY_PROTOCOL,
+                    "index_key": key,
+                    "native": f"semble/{getattr(semble, '__version__', 'unknown')}",
+                    "documents": len(chunk_ids),
+                    "index_sha256": index_digest,
+                }
+            ).encode()
+        )
+        for name in ("index.json", "identity.json"):
+            os.replace(staging / name, directory / name)
+    except OSError:
+        pass
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def run_query(header: dict) -> None:
     import numpy as np  # noqa: PLC0415
     from vicinity.backends.basic import BasicArgs  # noqa: PLC0415
@@ -840,15 +954,26 @@ def run_query(header: dict) -> None:
         seen[key] = index
     back: dict[int, int] = {id(chunk): index for index, chunk in enumerate(chunks)}
 
-    bm25_index = BM25()
-    chunk_ids = []
-    for row, chunk in zip(rows, chunks):
-        chunk_id = make_chunk_id(row["ranking_path"], int(row["slot"]))
-        chunk_ids.append(chunk_id)
-        bm25_index.add_document(chunk_id, tokenize(enrich_for_bm25(chunk)))
+    chunk_ids = [make_chunk_id(row["ranking_path"], int(row["slot"])) for row in rows]
     if len(set(chunk_ids)) != len(chunk_ids):
         fail("admitted rows collide on a native document id")
-    bm25_index.set_doc_order(chunk_ids)
+    # The sparse index over these rows is a pure function of them, and
+    # Wirk has already told us, in `index_key`, exactly which rows these
+    # are: it digests the coordinate and the verified ranking-text digest
+    # of every row, in view order, under the producer configuration these
+    # very functions were read from. So an index built for that key ranks
+    # the same documents with the same tokens, and `semble`'s own
+    # `BM25.save`/`BM25.load` are what move it — no rank function, tokeniser
+    # or posting list is re-implemented here to make that possible.
+    bm25_index = load_cached_bm25(header, chunk_ids)
+    if bm25_index is None:
+        bm25_index = BM25()
+        for chunk_id, chunk in zip(chunk_ids, chunks):
+            bm25_index.add_document(chunk_id, tokenize(enrich_for_bm25(chunk)))
+        bm25_index.set_doc_order(chunk_ids)
+        save_cached_bm25(header, bm25_index, chunk_ids)
+    else:
+        bm25_index.set_doc_order(chunk_ids)
     semantic_index = SelectableBasicBackend(vectors, BasicArgs())
 
     from model2vec import StaticModel  # noqa: PLC0415
