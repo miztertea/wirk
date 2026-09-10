@@ -74,7 +74,15 @@ pub const EMBED_PROTOCOL_V2: &str = "wirk-embed/v2";
 /// which rows, in which order, with which vectors — and the backend ranks
 /// it with the installed native implementation. No index is persisted and
 /// nothing but the query itself is ever embedded.
-pub const QUERY_PROTOCOL: &str = "wirk-query/v1";
+///
+/// `v2` carries one field `v1` did not: every row's membership scope,
+/// beside a ranking path that is now the source-relative path alone
+/// (`RANKING_PATH_CONVENTION`). The version moves because a `v1` backend
+/// handed a `v2` row would rank the right text under the wrong identity —
+/// it would collapse two memberships' copies of one relative path into a
+/// single document — and because a `v2` backend handed a `v1` row would
+/// tokenise an alias. Neither is a thing to discover from the scores.
+pub const QUERY_PROTOCOL: &str = "wirk-query/v2";
 
 /// How a row's ranking text relates to the committed bytes it addresses.
 /// `identity` means the two are the same bytes; the other value names the
@@ -87,25 +95,63 @@ pub const TEXT_NORMALIZED: &str = "universal-newline+utf8-replace/v1";
 /// The frozen path string convention fed to the native ranker, disclosed
 /// in every edition that uses it.
 ///
-/// It is not cosmetic and it is not recoverable afterwards: the path is
-/// concatenated into the BM25 document text (`enrich_for_bm25` appends the
-/// file stem twice and the last three directory components), it is the
-/// BM25 document key (`make_chunk_id`), it is what `boost_multi_chunk_files`
-/// groups by, and `_boost_stem_matches` reads its parent directory name.
-/// Two memberships publishing the same source-relative path must therefore
-/// be distinct *here*, one layer below any adapter
-/// (`W4-CONTROL-ADJUDICATION.md`), and the convention must be frozen and
-/// disclosed before any reserved label rather than chosen from scores.
-pub const RANKING_PATH_CONVENTION: &str = "membership-alias/source-relative-path/v1";
+/// It is not cosmetic and it is not recoverable afterwards, because the
+/// native ranker reads one string for two different jobs. As *text* the
+/// path is ranking evidence: `enrich_for_bm25` appends the file stem twice
+/// and the last three directory components to every BM25 document,
+/// `_boost_stem_matches` reads the stem and the parent directory name, and
+/// `rerank_topk`'s `_file_path_penalty` matches test, compat/legacy and
+/// example directory and file patterns anywhere in it. As *identity* the
+/// same string is the BM25 document key (`make_chunk_id`) and the key
+/// `boost_multi_chunk_files` and the file-saturation decay group by, so
+/// two memberships publishing the same source-relative path must stay
+/// distinct here, one layer below any adapter
+/// (`W4-CONTROL-ADJUDICATION.md`).
+///
+/// `v1` served both jobs with `{alias}/{source-relative path}`, which put
+/// the operator's own name for the source in the first path component —
+/// exactly where those priors read. A membership called `tests` or
+/// `legacy` therefore had the test/compat penalty applied to every one of
+/// its rows, cancelling the prior's *discrimination* inside that source
+/// and losing about three quarters of its share of the head against a
+/// neighbour holding identical bytes (`native-ranking-gap-review/REVIEW.md`
+/// F2, measured through the real engine).
+///
+/// `v2` separates the two jobs rather than spelling the alias differently
+/// (0167: no denylist, no escape chosen to miss today's regexes). The
+/// ranking path is the source-relative path verbatim — what the ranker's
+/// own contract expects, "already repo-relative … so machine-specific
+/// directory components are never indexed" — and the membership travels
+/// beside it as an opaque scope (`RankingScope`) that is a document key
+/// and a grouping key and is never tokenised, never enriched into a
+/// document, and never matched by a path prior. Neither an operator's
+/// alias nor any estate or host path can become relevance text under it.
+///
+/// The convention is disclosed in `RetrievalIdentity`, so it is bound into
+/// every edition id and every continuation: a `v1` edition is refused
+/// rather than reinterpreted (`retrieval.rs`), and its recorded bytes are
+/// left exactly as they were built.
+pub const RANKING_PATH_CONVENTION: &str = "source-relative-path+membership-scope/v2";
 
 /// The retrieval identity scheme this product writes.
 pub const RETRIEVAL_SCHEME: &str = "wirk-retrieval/v1";
 
 /// How many ranked candidates one admitted view yields, frozen so that
 /// paging is a pure slice of one deterministic list rather than a second
-/// ranking at a different depth: the native ranker over-fetches
-/// `top_k * 5` and fuses, so asking for a different `top_k` is not
-/// guaranteed to return a prefix of the larger answer. Bound into the
+/// ranking at a different depth.
+///
+/// The mechanism, measured rather than assumed
+/// (`native-ranking-gap-review/REVIEW.md` F1): the native ranker truncates
+/// *each* modality's list to `top_k * 5` before fusing them. A row's own
+/// semantic score and its rank within each modality do not move with the
+/// depth; what moves is whether its **second** modality's rank fell inside
+/// that cut, and so whether its fused score carries that modality's
+/// reciprocal-rank term at all. `boost_multi_chunk_files` then normalises
+/// by the largest file sum in the candidate pool, so a larger pool also
+/// changes the boost every file's top chunk receives, and
+/// `apply_query_boost` inherits the changed maximum. Asking for a
+/// different `top_k` is therefore not guaranteed to return a prefix of
+/// the larger answer even though nothing was re-ranked. Bound into the
 /// retrieval identity and into every continuation.
 pub const CANDIDATE_LIMIT: u64 = 200;
 
@@ -737,9 +783,11 @@ impl RetrievalIdentity {
                     embedded text is the row's ranking text verbatim"
                 .into(),
             sparse: "semble.index.sparse.enrich_for_bm25: \
-                     `<text> <stem> <stem> <last three directory components>`, tokenised by \
-                     semble.tokens.tokenize, indexed by semble.index.bm25.BM25 under the document \
-                     key semble.index.types.make_chunk_id(<ranking path>, <slot>)"
+                     `<text> <stem> <stem> <last three directory components>` of the \
+                     source-relative ranking path, tokenised by semble.tokens.tokenize, indexed \
+                     by semble.index.bm25.BM25 under the document key \
+                     semble.index.types.make_chunk_id(<membership scope> NUL <ranking path>, \
+                     <slot>), which is an identity and is never tokenised"
                 .into(),
             path_convention: RANKING_PATH_CONVENTION.into(),
             fusion: "semble.search.search: reciprocal rank fusion k=60 with alpha from \
@@ -2200,17 +2248,30 @@ pub(crate) fn normalize_ranking_text(bytes: &[u8]) -> String {
     out
 }
 
-/// The frozen ranking path for one resource of one membership.
+/// The frozen ranking path for one resource: the source-relative path
+/// itself, under `RANKING_PATH_CONVENTION` v2.
 ///
-/// Deliberately the membership *alias* and not the source id: the string
-/// is indexed text (the stem and the last three directory components are
-/// appended to every BM25 document), so it has to be the name a human
-/// actually searches by, and it has to be stable across generations. It
-/// is also what makes two memberships publishing the same relative path
-/// two distinct files through the whole native ranker rather than one
-/// colliding document key.
-pub(crate) fn ranking_path(alias: &str, path: &[u8]) -> String {
-    format!("{alias}/{}", String::from_utf8_lossy(path))
+/// Everything the native ranker reads out of this string is ranking
+/// evidence — the stem and the last three directory components go into
+/// every BM25 document, and the whole string is matched against the
+/// test/compat/example path priors. So it holds what a repository
+/// actually contains and nothing an operator or a host contributed: the
+/// membership travels separately, as `ranking_scope`.
+pub(crate) fn ranking_path(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+/// The identity of the membership a ranked row belongs to, as the native
+/// ranker receives it.
+///
+/// The membership id, which is a digest over the estate, the alias and
+/// the source id — opaque, stable across generations and renames of
+/// nothing the operator typed. It separates two memberships that publish
+/// the same source-relative path into two documents, two BM25 keys and
+/// two groups, and it is never tokenised into any document: identity, not
+/// text (0167).
+pub(crate) fn ranking_scope(membership: &crate::MembershipId) -> String {
+    membership.0.clone()
 }
 
 // ---- the v2 (chunking) backend boundary ----------------------------------
@@ -3167,7 +3228,7 @@ impl crate::AtlasStore {
                 continue;
             };
             inputs.push(BuildInput {
-                ranking_path: ranking_path(&membership.alias, &resource.path),
+                ranking_path: ranking_path(&resource.path),
                 path: resource.path.clone(),
                 object_id,
                 family,

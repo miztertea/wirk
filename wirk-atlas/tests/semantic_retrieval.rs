@@ -3,7 +3,7 @@
 //!
 //! Every check runs real child processes across the two real argv/stdin
 //! boundaries the product uses in production — `wirk-embed/v2` for the
-//! build, `wirk-query/v1` for the query. The backends here are small
+//! build, `wirk-query/v2` for the query. The backends here are small
 //! scripts on disk: the chunk boundaries they return are deliberately
 //! simple, and the ranking one returns a fixed order, because what these
 //! pin is the *product's* half — the exact original-byte mapping and its
@@ -270,7 +270,7 @@ print(json.dumps(reply))
     script
 }
 
-/// A real `wirk-query/v1` backend. It writes the exact view it was handed
+/// A real `wirk-query/v2` backend. It writes the exact view it was handed
 /// to `<script>.view.ndjson` — that file is the evidence for what did and
 /// did not reach the ranker — and returns the rows in a fixed order.
 fn query_backend(directory: &Path, name: &str, flavour: &str) -> PathBuf {
@@ -310,8 +310,13 @@ with open(os.path.abspath(__file__) + ".view.ndjson", "w") as handle:
         handle.write(json.dumps(row, sort_keys=True) + "\n")
 vectors = open(header["vectors"], "rb").read()
 assert len(vectors) == header["rows"] * header["dimensions"] * 4, "view vectors are the wrong size"
+if FLAVOUR == "topk":
+    # The one thing a real ranker does that the honest stub does not: it
+    # answers with at most the depth it was asked for, so a view larger
+    # than the frozen candidate pool is cut to the pool.
+    rows = rows[: int(header["top_k"])]
 reply = {{
-    "protocol": "wirk-query/v1",
+    "protocol": "wirk-query/v2",
     "backend": "test-query/" + FLAVOUR,
     "native": "test-native/1.0",
     "model_path": header["model_path"],
@@ -407,11 +412,19 @@ fn large_fixture_repo() -> TempDir {
 }
 
 fn estate_with(repo: TempDir) -> Estate {
+    estate_with_alias(repo, "fixture")
+}
+
+/// The same estate, under an alias the caller chooses. The alias is the
+/// operator's name for a source; nothing about a ranking may depend on
+/// which one they picked (0167), so every check of that has to be able to
+/// pick one.
+fn estate_with_alias(repo: TempDir, alias: &str) -> Estate {
     let temporary = TempDir::new().unwrap();
     let mut store =
         AtlasStore::open(temporary.path(), temporary.path().display().to_string()).unwrap();
     let membership = store
-        .register_git("fixture", repo.path().display().to_string(), "HEAD")
+        .register_git(alias, repo.path().display().to_string(), "HEAD")
         .unwrap();
     let staged = store
         .acquire(&membership, "HEAD", ExtractorPolicy::default())
@@ -1199,7 +1212,12 @@ fn q_colliding_relative_paths_are_distinct_ranking_documents() {
         .iter()
         .filter_map(|row| {
             let row: serde_json::Value = serde_json::from_str(row).ok()?;
-            Some(format!("{}:{}", row["ranking_path"].as_str()?, row["slot"]))
+            Some(format!(
+                "{}\u{1f}{}:{}",
+                row["ranking_scope"].as_str()?,
+                row["ranking_path"].as_str()?,
+                row["slot"]
+            ))
         })
         .collect();
     let before = keys.len();
@@ -1210,10 +1228,41 @@ fn q_colliding_relative_paths_are_distinct_ranking_documents() {
         keys.len(),
         "the ranking view collides on a native document key"
     );
+    // Under the frozen convention the ranking path is the source-relative
+    // path and nothing else, so both memberships publish `code.rs` — and
+    // the document key that separates them is the membership scope beside
+    // it, which is never ranking text (0167).
     assert!(
-        paths.iter().any(|path| path.starts_with("fixture/"))
-            && paths.iter().any(|path| path.starts_with("second/")),
-        "both memberships must appear under the frozen path convention: {paths:?}"
+        paths
+            .iter()
+            .filter(|path| path.as_str() == "code.rs")
+            .count()
+            >= 2,
+        "both memberships must reach the ranker at their own relative path: {paths:?}"
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.contains("fixture/") || path.contains("second/")),
+        "no membership alias may appear in a ranking path: {paths:?}"
+    );
+    let scopes: std::collections::BTreeSet<String> = view
+        .iter()
+        .filter_map(|row| {
+            let row: serde_json::Value = serde_json::from_str(row).ok()?;
+            Some(row["ranking_scope"].as_str()?.to_owned())
+        })
+        .collect();
+    assert_eq!(
+        scopes.len(),
+        2,
+        "the two memberships must be two scopes: {scopes:?}"
+    );
+    assert!(
+        !scopes
+            .iter()
+            .any(|scope| scope.contains("fixture") || scope.contains("second")),
+        "the scope must be the opaque membership identity, not the alias: {scopes:?}"
     );
     // Both memberships' own bytes are recoverable at the colliding path.
     let hits: Vec<_> = answer
@@ -1316,7 +1365,7 @@ fn normalise(bytes: &[u8]) -> String {
 // `applied` and the same version string. What the token pinned was the
 // backend's spelling; what changed was its bytes.
 
-/// A `wirk-query/v1` backend whose *ranking order* and whose *reported
+/// A `wirk-query/v2` backend whose *ranking order* and whose *reported
 /// environment* are both parameters, so a test can change one and hold
 /// the other still. `order` is `forward` or `reverse`; `module`, when
 /// given, is a file this backend claims as a loaded module — the
@@ -1365,7 +1414,7 @@ rows = [json.loads(line) for line in sys.stdin if line.strip()]
 vectors = open(header["vectors"], "rb").read()
 assert len(vectors) == header["rows"] * header["dimensions"] * 4, "view vectors are the wrong size"
 reply = {{
-    "protocol": "wirk-query/v1",
+    "protocol": "wirk-query/v2",
     "backend": "test-query/identity",
     # Deliberately constant: a version string is not an identity, and this
     # backend keeps saying the same one however it is changed.
@@ -2138,7 +2187,7 @@ fn q13_the_measured_basis_statement_is_bounded_by_the_reported_scope() {
     assert!(wirk_atlas::QUERY_PRODUCER_SCOPE.contains("execution attestation"));
 }
 
-/// A `wirk-query/v1` backend that reports an environment whose module
+/// A `wirk-query/v2` backend that reports an environment whose module
 /// list measures nothing: either empty (`empty`) or present-but-every-
 /// entry-unreadable (`unreadable`). Both are real child processes.
 fn zero_module_query_backend(directory: &Path, name: &str, shape: &str) -> PathBuf {
@@ -2186,7 +2235,7 @@ if SHAPE == "unreadable":
         {{"name": "ranker.fusion", "reason": "loaded from a source this backend cannot read"}},
     ]
 print(json.dumps({{
-    "protocol": "wirk-query/v1",
+    "protocol": "wirk-query/v2",
     "backend": "test-query/zero-modules-" + SHAPE,
     "native": "test-native/1.0",
     "model_path": header["model_path"],
@@ -2204,7 +2253,7 @@ for rank, row in enumerate(rows, 1):
     script
 }
 
-/// A `wirk-query/v1` backend that reports an environment carrying no
+/// A `wirk-query/v2` backend that reports an environment carrying no
 /// module list at all: the `unmeasured` coverage state, as a real child
 /// process rather than a constructed record.
 fn nomodules_query_backend(directory: &Path, name: &str) -> PathBuf {
@@ -2237,7 +2286,7 @@ def model_digest(directory):
 header = json.loads(sys.stdin.readline())
 rows = [json.loads(line) for line in sys.stdin if line.strip()]
 print(json.dumps({
-    "protocol": "wirk-query/v1",
+    "protocol": "wirk-query/v2",
     "backend": "test-query/nomodules",
     "native": "test-native/1.0",
     "model_path": header["model_path"],
@@ -2608,4 +2657,562 @@ fn s2_a_hash_ordered_candidate_cut_keeps_the_same_rows_in_every_process() {
     let mut canonical = walked.clone();
     canonical.sort();
     assert_eq!(walked, canonical, "the walk did not page one ranked list");
+}
+
+// ---- source identity against ranking features (0167) ---------------------
+//
+// The demonstrated defect: the ranking path was `{alias}/{source-relative
+// path}`, so the operator's own name for a source occupied the first path
+// component of every `Chunk.file_path` the installed ranker sees — where
+// its path priors, its stem/parent boosting and its BM25 path enrichment
+// all read. A source called `tests` or `legacy` therefore reranked its own
+// identical bytes (`native-ranking-gap-review/REVIEW.md` F2).
+//
+// The corrected convention hands the ranker the source-relative path and
+// nothing else, and carries the membership beside it as an opaque scope
+// that is a document key and a grouping key but never a token. These
+// checks pin both halves: what the ranker may see, and what must still
+// keep two memberships apart.
+
+/// A repository holding the three path shapes a ranking path has to carry
+/// through unchanged — shallow, deeply nested, and directories the
+/// installed ranker's own priors read (`tests/`, `legacy/`).
+fn ranking_fixture_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    fs::write(
+        repo.path().join("README.md"),
+        "# admitted\nranking evidence for the estate\n",
+    )
+    .unwrap();
+    for (relative, body) in [
+        (
+            "src/route_planner.rs",
+            "fn plan() { let admitted = 1; }\nfn refuse() { let ranking = 2; }\n",
+        ),
+        (
+            "tests/route_planner_test.rs",
+            "fn test_plan() { let admitted = 3; }\nfn test_refuse() { let ranking = 4; }\n",
+        ),
+        (
+            "legacy/route_planner.rs",
+            "fn old_plan() { let admitted = 5; }\nfn old_refuse() { let ranking = 6; }\n",
+        ),
+        (
+            "a/b/c/d/deep_planner.rs",
+            "fn deep_plan() { let admitted = 7; }\nfn deep_refuse() { let ranking = 8; }\n",
+        ),
+    ] {
+        let path = repo.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "ranking fixture"]);
+    repo
+}
+
+/// T1. The ranking path a build records is the source-relative path
+/// verbatim — shallow, nested, and inside directories the ranker's priors
+/// read — whatever the membership is called.
+#[test]
+fn t1_the_ranking_path_is_the_source_relative_path_alone() {
+    let mut estate = estate_with_alias(ranking_fixture_repo(), "tests");
+    let edition = staged(build(&mut estate, "honest"));
+    let rows = read_rows(&estate, &edition);
+    assert!(rows.len() > 4);
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in &rows {
+        let path = String::from_utf8(row.path.clone()).unwrap();
+        let ranking = row.ranking_path.clone().expect("a row carries its path");
+        assert_eq!(
+            ranking, path,
+            "the ranking path must be the source-relative path itself"
+        );
+        seen.insert(ranking);
+    }
+    for expected in [
+        "README.md",
+        "src/route_planner.rs",
+        "tests/route_planner_test.rs",
+        "legacy/route_planner.rs",
+        "a/b/c/d/deep_planner.rs",
+    ] {
+        assert!(seen.contains(expected), "{expected} missing from {seen:?}");
+    }
+}
+
+/// T2. The decisive one. Two estates over byte-identical repositories,
+/// differing only in what the operator called the source, hand the ranker
+/// the same ranking features: the same paths, in the same order, with the
+/// same text. The alias appears nowhere in what is ranked; the scope that
+/// does appear is the opaque membership identity, and it is not the
+/// alias.
+///
+/// Red before the correction: alias `alpha` sent `alpha/src/...` and alias
+/// `tests` sent `tests/src/...`, and the second spelling matches the
+/// installed ranker's own test-directory prior at position 0.
+#[test]
+fn t2_only_the_alias_differs_and_the_ranking_features_do_not() {
+    let features = |alias: &str| -> (Vec<serde_json::Value>, String) {
+        let mut estate = estate_with_alias(ranking_fixture_repo(), alias);
+        let edition = staged(build(&mut estate, "honest"));
+        estate
+            .store
+            .select_semantic(&estate.membership.clone(), &edition.id)
+            .unwrap()
+            .unwrap();
+        let backend = query_backend(&estate.directory, &format!("query-{alias}.py"), "honest");
+        let answer =
+            wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+        assert!(
+            matches!(answer.semantic, SemanticStatus::Applied),
+            "{alias}: {:?}",
+            answer.semantic
+        );
+        let rows: Vec<serde_json::Value> = view_rows(&backend)
+            .iter()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect();
+        assert!(!rows.is_empty());
+        (rows, estate.membership.id.0.clone())
+    };
+    let (plain, plain_scope) = features("alpha");
+    let (reserved, reserved_scope) = features("tests");
+    let ranked = |rows: &[serde_json::Value]| -> Vec<(String, u64, String)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row["ranking_path"].as_str().unwrap().to_owned(),
+                    row["slot"].as_u64().unwrap(),
+                    row["text"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        ranked(&plain),
+        ranked(&reserved),
+        "the alias changed what the ranker sees"
+    );
+    // The paths are the repository's own, exactly — including the
+    // `tests/` directory the repository really has, which must keep its
+    // prior. An alias-shaped component nowhere else.
+    let expected: std::collections::BTreeSet<String> = [
+        "README.md",
+        "src/route_planner.rs",
+        "tests/route_planner_test.rs",
+        "legacy/route_planner.rs",
+        "a/b/c/d/deep_planner.rs",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    for (rows, alias) in [(&plain, "alpha"), (&reserved, "tests")] {
+        let seen: std::collections::BTreeSet<String> = rows
+            .iter()
+            .map(|row| row["ranking_path"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(seen, expected, "{alias}: the ranker saw other paths");
+        for row in rows {
+            let scope = row["ranking_scope"].as_str().unwrap();
+            assert!(!scope.is_empty(), "a row must carry its membership scope");
+            assert_ne!(scope, alias, "the scope must not be the alias itself");
+            assert!(
+                !scope.contains(alias),
+                "the scope must not spell the alias: {scope}"
+            );
+        }
+    }
+    assert_ne!(
+        plain_scope, reserved_scope,
+        "two memberships are two scopes"
+    );
+    for (rows, scope) in [(&plain, &plain_scope), (&reserved, &reserved_scope)] {
+        for row in rows {
+            assert_eq!(
+                row["ranking_scope"].as_str().unwrap(),
+                scope,
+                "the scope is the membership identity"
+            );
+        }
+    }
+}
+
+/// T3. Every alias the store accepts today it still accepts — including
+/// the ones whose spelling the installed ranker's priors would have
+/// matched. The correction is a separation of identity from ranking
+/// features, not a denylist (0167).
+#[test]
+fn t3_reserved_looking_aliases_are_still_accepted() {
+    let temporary = TempDir::new().unwrap();
+    let repo = ranking_fixture_repo();
+    let mut store =
+        AtlasStore::open(temporary.path(), temporary.path().display().to_string()).unwrap();
+    for alias in [
+        "ordinary",
+        "tests",
+        "test",
+        "spec",
+        "testing",
+        "__tests__",
+        "legacy",
+        "compat",
+        "_compat",
+        "examples",
+        "docs_src",
+    ] {
+        let membership = store
+            .register_git(alias, repo.path().display().to_string(), "HEAD")
+            .unwrap_or_else(|error| panic!("alias {alias} was refused: {error}"));
+        assert_eq!(membership.alias, alias);
+    }
+    // And the invalid ones stay invalid, for the reasons they always were.
+    assert!(
+        store
+            .register_git("", repo.path().display().to_string(), "HEAD")
+            .is_err()
+    );
+    assert!(
+        store
+            .register_git("a/b", repo.path().display().to_string(), "HEAD")
+            .is_err()
+    );
+}
+
+/// A repository with more resources than the frozen candidate pool holds,
+/// so a walk over it pages a cut list rather than everything admitted.
+fn deep_pool_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    for i in 0..260 {
+        let path = repo.path().join(format!("src/unit{i:03}.rs"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            format!("fn f{i}() {{ let admitted = {i}; }}\nfn g{i}() {{ let ranking = {i}; }}\n"),
+        )
+        .unwrap();
+    }
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "deep pool"]);
+    repo
+}
+
+/// T4. A view larger than the frozen candidate pool still pages as one
+/// deterministic list: every page is its own process, the pool does not
+/// move, and a serial walk returns each coordinate exactly once in the
+/// one canonical order.
+#[test]
+fn t4_a_view_past_the_candidate_pool_pages_without_duplicate_or_omission() {
+    let mut estate = estate_with_alias(deep_pool_repo(), "tests");
+    let edition = staged(build(&mut estate, "honest"));
+    estate
+        .store
+        .select_semantic(&estate.membership.clone(), &edition.id)
+        .unwrap()
+        .unwrap();
+    let rows = read_rows(&estate, &edition).len();
+    assert!(
+        rows > 200,
+        "this check needs a view larger than the pool: {rows}"
+    );
+    let backend = query_backend(&estate.directory, "query-deep.py", "topk");
+    let first =
+        wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+    let total = first.budget.total_candidates;
+    assert_eq!(total, 200, "the frozen candidate pool moved: {total}");
+    let mut walked: Vec<(String, Vec<u8>, u64)> = Vec::new();
+    let page_size = 25usize;
+    let mut offset = 0usize;
+    while offset < total as usize {
+        let mut request = search_request(&estate, Some(&backend));
+        request.limit = page_size;
+        request.offset = offset;
+        let answer = wirk_atlas::search(&estate.store, &request).unwrap();
+        assert_eq!(
+            answer.budget.total_candidates, total,
+            "the pool moved at offset {offset}"
+        );
+        walked.extend(answer.hits.iter().map(coordinate_key));
+        offset += page_size;
+    }
+    let mut unique = walked.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), walked.len(), "a coordinate came back twice");
+    assert_eq!(unique.len(), total as usize, "the walk missed the pool");
+    let mut canonical = walked.clone();
+    canonical.sort();
+    assert_eq!(walked, canonical, "the walk did not page one ranked list");
+}
+
+// T5 exercises the tie-boundary residue `ranking-identity-review/
+// VERIFIED.md` found and `ranking-identity-review/ROOT-ADJUDICATION.md`
+// rejected as pre-existing rather than acceptable: `_ScopedPath.__hash__`
+// mixes membership scope into `hash((path, scope))`, and `search.py`
+// unions candidates into a `set` before a stable sort on `start_line`
+// alone, so rows that tie beyond `start_line` keep the hash-derived set
+// order. At an exact score tie past the frozen 200-row candidate pool,
+// only the alias a source was registered under can move which rows
+// survive. Unlike T1-T4, this drives the *actual installed* `semble`
+// through the product's own backend script (`wirk-atlas/backends/
+// semble_backend.py`), not a stub: a hash-order artifact cannot be
+// reproduced by a backend that does not compute one.
+
+/// A fixed query the fixture's content is chosen to score highly against
+/// under the real ranker.
+const TIE_QUERY: &str = "admitted ranking plan";
+
+/// Rust source repeated byte-for-byte at every row so the real BM25 and
+/// semantic scores tie exactly (mirrors `ranking-identity-review/
+/// VERIFIED.md`'s adversarial-probe fixture).
+const TIE_TEXT: &str = "fn plan() { let admitted = 1; let ranking = 2; }\n";
+
+/// More than the frozen 200-row candidate pool (`CANDIDATE_LIMIT`), so the
+/// tie forces a real down-select rather than returning everything.
+const TIE_ROWS: usize = 300;
+
+/// `TIE_ROWS` files of identical content, at paths that differ only in a
+/// zero-padded index ahead of an identical `x/y/z` tail — so the BM25
+/// path-enrichment and length priors are identical too, and nothing but
+/// the index distinguishes one row's ranking path from another's.
+fn tied_fixture_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    for i in 0..TIE_ROWS {
+        let path = repo.path().join(format!("d{i:04}/x/y/z/mod.rs"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, TIE_TEXT).unwrap();
+    }
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "tied fixture"]);
+    repo
+}
+
+/// The pinned development `semble` interpreter (`DEVELOPMENT.md`), read
+/// from the required environment input — never a host-specific default
+/// baked into the product (R2/R4: same `#[ignore]`d-native-test shape as
+/// `WIRK_DOCKER_LIVE`/`WIRK_PLUGIN_INSTALL_LIVE`, adapted because this
+/// test needs a real interpreter path, not a boolean). Only reached once
+/// `t5` itself runs, i.e. under an explicit `--ignored`; panics with a
+/// clear reason rather than skipping, so an opt-in run with a missing or
+/// wrong prerequisite fails loudly instead of quietly recording a pass.
+fn pinned_semble_python() -> PathBuf {
+    let path = PathBuf::from(
+        std::env::var("WIRK_TEST_SEMBLE_PYTHON").unwrap_or_else(|_| {
+            panic!(
+                "t5 is opted in (--ignored) but WIRK_TEST_SEMBLE_PYTHON is unset: point it at the \
+             pinned semble python3 interpreter (see DEVELOPMENT.md for the working pin); this \
+             test never falls back to a host-specific default"
+            )
+        }),
+    );
+    assert!(
+        path.is_file(),
+        "WIRK_TEST_SEMBLE_PYTHON={} is not a file: point it at the pinned semble python3 \
+         interpreter (see DEVELOPMENT.md)",
+        path.display()
+    );
+    path
+}
+
+/// The pinned offline `minishlab/potion-code-16M-v2` snapshot
+/// (`DEVELOPMENT.md`), read from the required environment input the same
+/// way as `pinned_semble_python`.
+fn pinned_semble_model() -> PathBuf {
+    let path = PathBuf::from(std::env::var("WIRK_TEST_SEMBLE_MODEL").unwrap_or_else(|_| {
+        panic!(
+            "t5 is opted in (--ignored) but WIRK_TEST_SEMBLE_MODEL is unset: point it at the \
+             pinned offline potion-code-16M-v2 snapshot directory (see DEVELOPMENT.md for the \
+             working pin); this test never falls back to a host-specific default"
+        )
+    }));
+    assert!(
+        path.is_dir(),
+        "WIRK_TEST_SEMBLE_MODEL={} is not a directory: point it at the pinned offline \
+         potion-code-16M-v2 snapshot (see DEVELOPMENT.md)",
+        path.display()
+    );
+    path
+}
+
+/// The product's own `wirk-embed/v2` + `wirk-query/v2` backend, unmodified
+/// — not a copy, not a stub.
+fn real_semble_backend_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/semble_backend.py")
+}
+
+struct TiedEstate {
+    _temporary: TempDir,
+    store: AtlasStore,
+    membership: Membership,
+    generation: wirk_atlas::GenerationId,
+}
+
+/// One membership over `repo_path`, registered under `alias`, with its
+/// source acquired and published — the identity half only; no semantic
+/// build yet, since that is where the real backend gets chosen per call.
+fn tied_estate_with_alias(repo_path: &Path, alias: &str) -> TiedEstate {
+    let temporary = TempDir::new().unwrap();
+    let mut store =
+        AtlasStore::open(temporary.path(), temporary.path().display().to_string()).unwrap();
+    let membership = store
+        .register_git(alias, repo_path.display().to_string(), "HEAD")
+        .unwrap();
+    let staged = store
+        .acquire(&membership, "HEAD", ExtractorPolicy::default())
+        .unwrap()
+        .staged()
+        .unwrap();
+    store.publish(&membership, &staged.id).unwrap();
+    TiedEstate {
+        _temporary: temporary,
+        store,
+        membership,
+        generation: staged.id,
+    }
+}
+
+fn tied_build(
+    estate: &mut TiedEstate,
+    python: &Path,
+    script: &Path,
+    model: &Path,
+) -> SemanticEdition {
+    let outcome = estate
+        .store
+        .build_semantic(
+            &estate.membership.clone(),
+            &estate.generation.clone(),
+            &SemanticBuildConfig {
+                backend: python.to_path_buf(),
+                backend_args: vec![script.display().to_string()],
+                model: model.to_path_buf(),
+                producer: "test/ranking-tie".into(),
+                chunking: SemanticChunking::Native,
+            },
+        )
+        .unwrap();
+    match outcome {
+        SemanticBuildOutcome::Staged(edition) => *edition,
+        SemanticBuildOutcome::Refused(reason) => panic!("tied build refused: {reason}"),
+    }
+}
+
+/// The source-relative paths of the rows the real ranker selected into
+/// the frozen candidate pool for `TIE_QUERY`, over one membership. Two
+/// runs are comparable by this set alone: it carries no membership
+/// identity, only which of the `TIE_ROWS` byte-identical files survived.
+fn tied_selected_paths(
+    estate: &TiedEstate,
+    python: &Path,
+    script: &Path,
+    model: &Path,
+) -> std::collections::BTreeSet<String> {
+    let request = SearchRequest {
+        scope: QueryScope::EstateOrientation,
+        requested_source: None,
+        query: TIE_QUERY.into(),
+        families: vec![],
+        semantic: SemanticRequest::Requested,
+        limit: 200,
+        pinned: None,
+        offset: 0,
+        semantic_query: Some(SemanticQueryConfig {
+            backend: python.to_path_buf(),
+            backend_args: vec![script.display().to_string()],
+            model: model.to_path_buf(),
+        }),
+        pinned_editions: None,
+        pinned_mode: None,
+        pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+    };
+    let answer = wirk_atlas::search(&estate.store, &request).unwrap();
+    assert!(
+        matches!(answer.semantic, SemanticStatus::Applied),
+        "{:?}",
+        answer.semantic
+    );
+    assert_eq!(
+        answer.budget.total_candidates, 200,
+        "the frozen candidate pool moved"
+    );
+    answer
+        .hits
+        .iter()
+        .map(|hit| String::from_utf8(hit.coordinate.path.clone()).unwrap())
+        .collect()
+}
+
+/// T5. `TIE_ROWS` rows tie exactly under the real ranker for `TIE_QUERY`,
+/// past the frozen 200-row pool, so which 200 survive is a down-select
+/// with nothing but hash order to decide it. Registering the same
+/// repository under five different aliases must select the same 200
+/// source-relative paths every time (0167): the alias, and the
+/// membership scope it produces, must never be part of that decision.
+///
+/// Red on 68ff0c8: `_ScopedPath.__hash__` folds the membership scope into
+/// `hash((path, scope))`, so a different scope reorders the tied
+/// candidate set `search.py` builds and moves the cut
+/// (`ranking-identity-review/VERIFIED.md`, "Adversarial probe").
+///
+/// `#[ignore]`d (R2: same shape as `wirk/tests/docker_executor.rs`'s
+/// `WIRK_DOCKER_LIVE`/`wirk-herdr/tests/plugin_github_install.rs`'s
+/// `WIRK_PLUGIN_INSTALL_LIVE`): an ordinary `cargo test`/`cargo test
+/// --list` never runs or executes this test and reports it under
+/// `ignored`, so a native prerequisite this box happens not to have never
+/// reads as a silent pass. Run explicitly with `--ignored` plus
+/// `WIRK_TEST_SEMBLE_PYTHON`/`WIRK_TEST_SEMBLE_MODEL` set (see
+/// `DEVELOPMENT.md` for the working pin); unlike the boolean-flag
+/// convention those two tests use, a missing or invalid path here is a
+/// clear panic from `pinned_semble_python`/`pinned_semble_model`, not a
+/// quiet skip, since opting in means the prerequisite was promised.
+#[test]
+#[ignore]
+fn t5_alias_alone_does_not_move_an_equal_score_tied_selection() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+    assert!(
+        script.is_file(),
+        "the actual backend script is missing at {}",
+        script.display()
+    );
+
+    let repo = tied_fixture_repo();
+    let aliases = ["m-alpha", "m-tests", "m-legacy", "m-notes", "m-zulu"];
+    let mut by_alias = Vec::new();
+    for alias in aliases {
+        let mut estate = tied_estate_with_alias(repo.path(), alias);
+        let edition = tied_build(&mut estate, &python, &script, &model);
+        estate
+            .store
+            .select_semantic(&estate.membership.clone(), &edition.id)
+            .unwrap()
+            .unwrap();
+        let paths = tied_selected_paths(&estate, &python, &script, &model);
+        assert_eq!(
+            paths.len(),
+            200,
+            "alias {alias}: the frozen pool did not return 200 distinct paths"
+        );
+        by_alias.push((alias, paths));
+    }
+    let (base_alias, base) = &by_alias[0];
+    for (alias, paths) in &by_alias[1..] {
+        let symmetric: Vec<&String> = base.symmetric_difference(paths).collect();
+        assert!(
+            symmetric.is_empty(),
+            "0167 requires alias-invariant selection at an equal-score tie: {base_alias} vs \
+             {alias} differ on {} of {TIE_ROWS} rows: {symmetric:?}",
+            symmetric.len()
+        );
+    }
 }

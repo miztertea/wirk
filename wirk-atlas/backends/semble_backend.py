@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference `wirk-embed/v2` and `wirk-query/v1` backend over an installed
+"""Reference `wirk-embed/v2` and `wirk-query/v2` backend over an installed
 `semble` (P3 W4 B, `W4-PUBLIC-RETRIEVAL-BUILD.md`).
 
 Two protocols, one file, because they must agree about one thing: the
@@ -53,16 +53,27 @@ with its reason and contributes no row. Wirk re-derives the same text from
 the same committed bytes on its own side and refuses the build if the two
 digests disagree.
 
-`wirk-query/v1` (query). Wirk sends exactly the admitted rows and their
+`wirk-query/v2` (query). Wirk sends exactly the admitted rows and their
 already-built vectors; this backend composes a native in-memory index over
 those rows only and ranks with `semble.search.search`. It embeds one thing
 — the query — and writes nothing.
 
+Each row arrives as a *source-relative* ranking path plus the opaque scope
+of the membership it belongs to. `semble` reads one field, `Chunk.file_path`,
+for two different jobs: as text it is ranking evidence (BM25 enrichment,
+stem and parent-directory boosting, and the test/compat/example path
+priors), and as a string it is the identity everything groups and keys by.
+`_ScopedPath` below is the whole of this backend's adaptation: a value
+whose *text* is exactly the repo-relative path the ranker's own contract
+expects, and whose *identity* is the pair (scope, path). No rank function,
+regex, tokenizer or threshold is copied, patched or disabled to do it
+(0167).
+
     stdin (NDJSON)
-      {"protocol":"wirk-query/v1","model_path","vectors","rows","dimensions",
+      {"protocol":"wirk-query/v2","model_path","vectors","rows","dimensions",
        "query","top_k"}
-      {"row":i,"ranking_path":str,"slot":j,"text":str,"start_line","end_line",
-       "language"}                                                   x rows
+      {"row":i,"ranking_path":str,"ranking_scope":str,"slot":j,"text":str,
+       "start_line","end_line","language"}                           x rows
     stdout   {"protocol","backend","native","model_path","model_digest",
               "returned","environment"?} then one line per result
               {"row":i,"score":f,"rank":n}
@@ -87,7 +98,7 @@ import tempfile
 from pathlib import Path
 
 EMBED_PROTOCOL = "wirk-embed/v2"
-QUERY_PROTOCOL = "wirk-query/v1"
+QUERY_PROTOCOL = "wirk-query/v2"
 VECTOR_FORMAT = "f32le-row-major/v1"
 
 TEXT_IDENTITY = "identity"
@@ -774,7 +785,7 @@ def run_embed(header: dict) -> None:
     sys.stdout.flush()
 
 
-# ---- wirk-query/v1 -------------------------------------------------------
+# ---- wirk-query/v2 -------------------------------------------------------
 
 
 
@@ -888,6 +899,71 @@ def save_cached_bm25(header: dict, index: "BM25", chunk_ids: "list[str]") -> Non
         shutil.rmtree(staging, ignore_errors=True)
 
 
+class _ScopedPath(str):
+    """A repo-relative ranking path that carries its membership as identity.
+
+    `semble` reads `Chunk.file_path` twice over. As *text* it is ranking
+    evidence: `enrich_for_bm25` appends its stem twice and its last three
+    directory components to the BM25 document, `_boost_stem_matches` reads
+    its stem and parent directory name, and `_file_path_penalty` matches
+    the test, compat/legacy and example patterns anywhere in it. As a
+    *string* it is identity: the penalty cache, the path-parts cache,
+    `boost_multi_chunk_files`'s per-file sums and `rerank_topk`'s
+    file-saturation counter all key on it.
+
+    Wirk needs those two jobs to have two different answers -- the text
+    must be the repository's own path and nothing else, while the identity
+    must keep two memberships that publish the same relative path apart --
+    and `semble` offers one field for both. This is the smallest thing
+    that satisfies both without touching the ranker: the value *is* the
+    repo-relative path (every regex, `Path(...)`, tokenizer and f-string
+    sees exactly that), and equality additionally carries the scope, so it
+    is a distinct dict key per membership.
+
+    Equality is deliberately closed over this class: a plain `str` with the
+    same characters is a different key and is not equal. The hash is
+    path-only (`str.__hash__`), not the pair: unequal objects may legally
+    share a hash, and a hash that also carried the scope entered the
+    hash-ordered candidate `set` `search.py` builds before its stable
+    `start_line` sort, so an alias with nothing else different could move
+    which of several equal-scored rows survived a candidate-pool cut
+    (`ranking-identity-review/VERIFIED.md`, "Adversarial probe"). Nothing
+    in `semble` mixes text and identity -- every dict it keys on paths is
+    keyed on values that came out of `Chunk.file_path`.
+    """
+
+    # No `__slots__`: `str` is variable-length, so a subclass keeps an
+    # instance dict, and that is where the scope lives.
+
+    def __new__(cls, path: str, scope: str) -> "_ScopedPath":
+        value = super().__new__(cls, path)
+        value.scope = scope
+        return value
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _ScopedPath):
+            return self.scope == other.scope and str.__eq__(self, other) is True
+        return NotImplemented if not isinstance(other, str) else False
+
+    def __ne__(self, other: object) -> bool:
+        equal = self.__eq__(other)
+        return equal if equal is NotImplemented else not equal
+
+    def __hash__(self) -> int:
+        # Path-only, deliberately: two memberships publishing the same
+        # relative path now share a hash bucket, which `dict`/`set` handle
+        # correctly via `__eq__` (unequal objects may share a hash). The
+        # candidate cut `search.py` draws from a hash-ordered `set` (see
+        # `run_query` below) stops depending on which alias registered a
+        # source, which was the residue `ranking-identity-review/
+        # VERIFIED.md`'s adversarial probe demonstrated at an exact score
+        # tie past the frozen 200-row pool.
+        return str.__hash__(self)
+
+    def __reduce__(self):
+        return (_ScopedPath, (str.__str__(self), self.scope))
+
+
 def run_query(header: dict) -> None:
     import numpy as np  # noqa: PLC0415
     from vicinity.backends.basic import BasicArgs  # noqa: PLC0415
@@ -927,10 +1003,15 @@ def run_query(header: dict) -> None:
         )
     vectors = np.frombuffer(raw, dtype="<f4").reshape(expected_rows, dimensions).astype(np.float32)
 
+    for index, row in enumerate(rows):
+        scope = row.get("ranking_scope")
+        if not isinstance(scope, str) or not scope or "\0" in scope:
+            fail(f"row {index} carries no membership scope; this backend speaks {QUERY_PROTOCOL}")
+
     chunks = [
         Chunk(
             content=row["text"],
-            file_path=row["ranking_path"],
+            file_path=_ScopedPath(row["ranking_path"], row["ranking_scope"]),
             start_line=int(row["start_line"]),
             end_line=int(row["end_line"]),
             language=row["language"],
@@ -941,8 +1022,8 @@ def run_query(header: dict) -> None:
     # dataclass compared by value: two rows that are equal in every field
     # would silently merge and one coordinate would be lost. The admitted
     # view is refused rather than ranked in that case; it has never
-    # occurred, because the ranking path is source-qualified and two chunks
-    # of one file differ in their line span.
+    # occurred, because the ranking path carries its membership scope as
+    # identity and two chunks of one file differ in their line span.
     seen: dict[tuple, int] = {}
     for index, chunk in enumerate(chunks):
         key = (chunk.content, chunk.file_path, chunk.start_line, chunk.end_line, chunk.language)
@@ -954,7 +1035,15 @@ def run_query(header: dict) -> None:
         seen[key] = index
     back: dict[int, int] = {id(chunk): index for index, chunk in enumerate(chunks)}
 
-    chunk_ids = [make_chunk_id(row["ranking_path"], int(row["slot"])) for row in rows]
+    # The document key is the native one, over a *scoped* indexed path: it
+    # is an identity, never a token, so two memberships publishing the same
+    # relative path index two documents instead of colliding on one. NUL
+    # cannot occur in either half (the store refuses it in an alias, and a
+    # committed path cannot contain it), so the pair is unambiguous.
+    chunk_ids = [
+        make_chunk_id(f"{row['ranking_scope']}\0{row['ranking_path']}", int(row["slot"]))
+        for row in rows
+    ]
     if len(set(chunk_ids)) != len(chunk_ids):
         fail("admitted rows collide on a native document id")
     # The sparse index over these rows is a pure function of them, and

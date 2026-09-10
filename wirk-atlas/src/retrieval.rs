@@ -32,9 +32,10 @@ use crate::domain::{EstateScope, GenerationId, MembershipId};
 use crate::semantic::{
     BackendArgument, BackendEnvironment, BackendIdentity, CANDIDATE_LIMIT, EditionId, MappingRow,
     QUERY_HASH_SEED, QUERY_ORDERING_POLICY, QUERY_PRODUCER_BASIS_MISSING, QUERY_PROTOCOL,
-    QueryProducerBasis, QueryProducerPin, ReportedEnvironment, SemanticEdition, configured_file,
-    digest_bytes, measure_environment, normalize_ranking_text, producer_basis,
-    query_producer_configuration_digest, query_producer_identity_digest,
+    QueryProducerBasis, QueryProducerPin, RANKING_PATH_CONVENTION, ReportedEnvironment,
+    SemanticEdition, configured_file, digest_bytes, measure_environment, normalize_ranking_text,
+    producer_basis, query_producer_configuration_digest, query_producer_identity_digest,
+    ranking_scope,
 };
 use crate::{AtlasError, AtlasStore, ContentFamily, Membership, SemanticAvailability};
 use serde::{Deserialize, Serialize};
@@ -190,6 +191,21 @@ pub(crate) fn plan_semantic(
             ));
             continue;
         };
+        // A ranking representation is not a detail an answer may absorb
+        // silently. An edition built under an older ranking path
+        // convention holds paths that mean something else to the ranker —
+        // v1 put the membership alias in the first path component, where
+        // the native path priors read it (0167) — so it is refused, named,
+        // and left exactly as it was built. The recovery is the ordinary
+        // one: rebuild its semantic edition and select the rebuilt one.
+        if retrieval.path_convention != RANKING_PATH_CONVENTION {
+            excluded.push(format!(
+                "{}: edition {} ranks paths under {} and this product ranks under {}; rebuild its \
+                 semantic edition and select the rebuilt one before it can be ranked through",
+                membership.alias, edition.id.0, retrieval.path_convention, RANKING_PATH_CONVENTION
+            ));
+            continue;
+        }
         if let Some(first) = ready.first() {
             let reference = first
                 .edition
@@ -272,6 +288,10 @@ pub(crate) struct ViewRow {
     pub line_end: u64,
     pub bytes: Vec<u8>,
     pub ranking_path: String,
+    /// The membership this row belongs to, as the native ranker receives
+    /// it: an identity beside the path, never part of it
+    /// (`RANKING_PATH_CONVENTION`).
+    pub ranking_scope: String,
     pub slot: u64,
     pub text: String,
     pub language: Option<String>,
@@ -315,6 +335,7 @@ struct QueryHeader<'a> {
 struct QueryRow<'a> {
     row: u64,
     ranking_path: &'a str,
+    ranking_scope: &'a str,
     slot: u64,
     text: &'a str,
     start_line: u64,
@@ -376,7 +397,12 @@ pub struct SemanticApplication {
 /// The scheme the reusable-index identity below is digested under. Its own
 /// label, so a digest computed for this purpose can never be mistaken for
 /// an edition id, a producer identity or a retrieval digest.
-const QUERY_INDEX_IDENTITY: &str = "wirk-query-index/v1";
+///
+/// `v2` absorbs one field more than `v1`: the membership scope each row
+/// is ranked under. It moved with the ranking path convention — under v1
+/// the scope was inside the path this already digested, and an index
+/// built for a v1 key indexes different documents under different keys.
+const QUERY_INDEX_IDENTITY: &str = "wirk-query-index/v2";
 
 /// How many built query indexes are kept. The product owns this
 /// directory's growth, not the backend: a backend that is handed a path
@@ -388,11 +414,15 @@ const QUERY_INDEX_CACHE_ENTRIES: usize = 8;
 /// function of.
 ///
 /// Everything the ranking representation of these rows depends on, and
-/// nothing else: the producer configuration (which is the tokenizer and
-/// enrichment implementation, digested from the bytes at the configured
-/// path), the retrieval identity every planned edition agrees on, and,
-/// per row in view order, the coordinate the native ranker keys on plus
-/// the digest of the ranking text — the same digest this query has just
+/// nothing else: the producer configuration (the scheme, the protocol,
+/// the ordering policy, and the backend executable and argv digested from
+/// the bytes at the configured path — *not* the installed `semble` whose
+/// tokenizer and enrichment those bytes call, which is outside that
+/// digest and is guarded instead by the backend refusing a stored index
+/// that does not carry the running `semble` version, `QUERY_PRODUCER_SCOPE`),
+/// the retrieval identity every planned edition agrees on, and, per row in
+/// view order, the coordinate the native ranker keys on plus the digest of
+/// the ranking text — the same digest this query has just
 /// re-derived from the committed bytes and checked. Two views with this
 /// digest cannot differ in a way any index over them could see; a view
 /// that differs anywhere gets a different digest and therefore a
@@ -410,6 +440,8 @@ fn view_index_identity(configuration: &str, retrieval_digest: &str, view: &[View
     }
     for row in view {
         identity.extend_from_slice(row.ranking_path.as_bytes());
+        identity.push(0);
+        identity.extend_from_slice(row.ranking_scope.as_bytes());
         identity.push(0);
         identity.extend_from_slice(row.slot.to_string().as_bytes());
         identity.push(0);
@@ -687,6 +719,7 @@ pub(crate) fn rank(
                 line_end: row.line_end,
                 bytes: slice.to_vec(),
                 ranking_path,
+                ranking_scope: ranking_scope(&admitted.membership),
                 slot: row.slot.unwrap_or(0),
                 text,
                 language: row.language.clone(),
@@ -892,6 +925,7 @@ fn run_query_backend(
             stdin.write_all(&serde_json::to_vec(&QueryRow {
                 row: index as u64,
                 ranking_path: &row.ranking_path,
+                ranking_scope: &row.ranking_scope,
                 slot: row.slot,
                 text: &row.text,
                 start_line: row.line_start,
@@ -978,6 +1012,7 @@ mod query_index_identity_tests {
             line_end: 2,
             bytes: text.as_bytes().to_vec(),
             ranking_path: path.to_owned(),
+            ranking_scope: "m-x".to_owned(),
             slot,
             text: text.to_owned(),
             language: Some("rust".into()),
@@ -991,6 +1026,21 @@ mod query_index_identity_tests {
     /// implementation that would tokenise it, and the key moves — which
     /// is the whole invalidation rule: a moved key names a directory that
     /// holds nothing.
+    /// Two memberships publishing the same relative path are two
+    /// different views, and an index built over one cannot be reused for
+    /// the other: under this convention the scope, not the path, is what
+    /// separates their documents.
+    #[test]
+    fn the_membership_scope_is_part_of_the_index_identity() {
+        let base = vec![row("a/one.rs", 0, "alpha")];
+        let mut moved = vec![row("a/one.rs", 0, "alpha")];
+        moved[0].ranking_scope = "m-y".into();
+        assert_ne!(
+            view_index_identity("configuration-1", "retrieval-1", &base),
+            view_index_identity("configuration-1", "retrieval-1", &moved),
+        );
+    }
+
     #[test]
     fn a_view_that_differs_anywhere_gets_a_different_index_identity() {
         let base = vec![row("a/one.rs", 0, "alpha"), row("a/two.rs", 0, "beta")];
