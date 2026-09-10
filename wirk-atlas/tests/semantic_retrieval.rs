@@ -489,6 +489,7 @@ fn search_request(estate: &Estate, backend: Option<&Path>) -> SearchRequest {
         families: vec![],
         semantic: SemanticRequest::Requested,
         limit: 50,
+        capacity: None,
         pinned: None,
         offset: 0,
         semantic_query: backend.map(|backend| SemanticQueryConfig {
@@ -2882,7 +2883,7 @@ fn t3_reserved_looking_aliases_are_still_accepted() {
     );
 }
 
-/// A repository with more resources than the frozen candidate pool holds,
+/// A repository with more resources than the result capacity T4 asks for,
 /// so a walk over it pages a cut list rather than everything admitted.
 fn deep_pool_repo() -> TempDir {
     let repo = TempDir::new().unwrap();
@@ -2903,10 +2904,15 @@ fn deep_pool_repo() -> TempDir {
     repo
 }
 
-/// T4. A view larger than the frozen candidate pool still pages as one
-/// deterministic list: every page is its own process, the pool does not
-/// move, and a serial walk returns each coordinate exactly once in the
+/// T4. A view larger than this query's result capacity still pages as one
+/// deterministic list: every page is its own process, the result set does
+/// not move, and a serial walk returns each coordinate exactly once in the
 /// one canonical order.
+///
+/// The capacity is named explicitly (ruling 0171): 200 results walked 25
+/// at a time is exactly the shape the policy separates — a result set
+/// deeper than the page that shows it — and under the previous policy
+/// this was the only shape there was.
 #[test]
 fn t4_a_view_past_the_candidate_pool_pages_without_duplicate_or_omission() {
     let mut estate = estate_with_alias(deep_pool_repo(), "tests");
@@ -2922,21 +2928,24 @@ fn t4_a_view_past_the_candidate_pool_pages_without_duplicate_or_omission() {
         "this check needs a view larger than the pool: {rows}"
     );
     let backend = query_backend(&estate.directory, "query-deep.py", "topk");
-    let first =
-        wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+    let mut opening = search_request(&estate, Some(&backend));
+    opening.capacity = Some(200);
+    let first = wirk_atlas::search(&estate.store, &opening).unwrap();
     let total = first.budget.total_candidates;
-    assert_eq!(total, 200, "the frozen candidate pool moved: {total}");
+    assert_eq!(total, 200, "the requested result capacity moved: {total}");
+    assert_eq!(first.budget.capacity, 200);
     let mut walked: Vec<(String, Vec<u8>, u64)> = Vec::new();
     let page_size = 25usize;
     let mut offset = 0usize;
     while offset < total as usize {
         let mut request = search_request(&estate, Some(&backend));
         request.limit = page_size;
+        request.capacity = Some(200);
         request.offset = offset;
         let answer = wirk_atlas::search(&estate.store, &request).unwrap();
         assert_eq!(
             answer.budget.total_candidates, total,
-            "the pool moved at offset {offset}"
+            "the result set moved at offset {offset}"
         );
         walked.extend(answer.hits.iter().map(coordinate_key));
         offset += page_size;
@@ -2957,7 +2966,7 @@ fn t4_a_view_past_the_candidate_pool_pages_without_duplicate_or_omission() {
 // mixes membership scope into `hash((path, scope))`, and `search.py`
 // unions candidates into a `set` before a stable sort on `start_line`
 // alone, so rows that tie beyond `start_line` keep the hash-derived set
-// order. At an exact score tie past the frozen 200-row candidate pool,
+// order. At an exact score tie past a 200-result capacity,
 // only the alias a source was registered under can move which rows
 // survive. Unlike T1-T4, this drives the *actual installed* `semble`
 // through the product's own backend script (`wirk-atlas/backends/
@@ -2973,8 +2982,9 @@ const TIE_QUERY: &str = "admitted ranking plan";
 /// VERIFIED.md`'s adversarial-probe fixture).
 const TIE_TEXT: &str = "fn plan() { let admitted = 1; let ranking = 2; }\n";
 
-/// More than the frozen 200-row candidate pool (`CANDIDATE_LIMIT`), so the
-/// tie forces a real down-select rather than returning everything.
+/// More than the result capacity this test requests (200, which is also
+/// `CAPACITY_MAX`), so the tie forces a real down-select rather than
+/// returning everything.
 const TIE_ROWS: usize = 300;
 
 /// `TIE_ROWS` files of identical content, at paths that differ only in a
@@ -3123,6 +3133,7 @@ fn tied_selected_paths(
         families: vec![],
         semantic: SemanticRequest::Requested,
         limit: 200,
+        capacity: None,
         pinned: None,
         offset: 0,
         semantic_query: Some(SemanticQueryConfig {
@@ -3152,7 +3163,7 @@ fn tied_selected_paths(
 }
 
 /// T5. `TIE_ROWS` rows tie exactly under the real ranker for `TIE_QUERY`,
-/// past the frozen 200-row pool, so which 200 survive is a down-select
+/// past a 200-result capacity, so which 200 survive is a down-select
 /// with nothing but hash order to decide it. Registering the same
 /// repository under five different aliases must select the same 200
 /// source-relative paths every time (0167): the alias, and the
@@ -3215,4 +3226,457 @@ fn t5_alias_alone_does_not_move_an_equal_score_tied_selection() {
             symmetric.len()
         );
     }
+}
+
+// ---- T6-T9: query-bound result capacity (ruling 0171) ----------------
+//
+// The previous policy handed one universal candidate depth of 200 to the
+// native ranker for every query, so a five-result request was a five-row
+// window onto a two-hundred-result ranking rather than the ranking the
+// caller asked for. Measured red, on a fresh synthetic corpus with the
+// frozen parent binary and the installed `semble` 0.5.6:
+// `query-capacity-build/BUILT.md` — the product's first five and the
+// native ranker's own requested-five differ in membership on 4 of 6
+// queries and in score on 6 of 6, over byte-identical admitted rows.
+//
+// T6 and T7 drive the *installed* ranker, because the mechanism they pin
+// is the installed ranker's: `candidate_count = top_k * 5` truncates each
+// modality before fusion, so the capacity decides which rows carry a
+// second modality's reciprocal-rank term at all, and the pool-wide
+// normalisers in `boost_multi_chunk_files`/`apply_query_boost` move with
+// it. A stub backend that returns a fixed order cannot reproduce any of
+// that and would pin nothing but a field's shape.
+
+/// A deterministic varied corpus: forty files of fourteen blocks, words
+/// drawn by a seeded LCG from one fixed vocabulary. Varied on purpose,
+/// unlike `tied_fixture_repo` — a capacity's effect on fusion is only
+/// visible when scores actually differ.
+const CAPACITY_VOCAB: [&str; 24] = [
+    "route",
+    "journal",
+    "claim",
+    "trail",
+    "world",
+    "source",
+    "edition",
+    "ranking",
+    "continuation",
+    "membership",
+    "evidence",
+    "estate",
+    "producer",
+    "backend",
+    "candidate",
+    "penalty",
+    "boost",
+    "pagination",
+    "selection",
+    "admitted",
+    "digest",
+    "capacity",
+    "window",
+    "budget",
+];
+
+const CAPACITY_DIRS: [&str; 8] = [
+    "src", "lib", "docs", "tests", "pkg", "compat", "tools", "internal",
+];
+
+/// More rows than `CAPACITY_MAX`, so a capacity-200 result set is a real
+/// down-select over the admitted view and a walk of it has somewhere to
+/// go.
+fn capacity_fixture_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    let mut seed: u64 = 20_260_910;
+    let mut next = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (seed >> 33) as usize
+    };
+    for directory in CAPACITY_DIRS {
+        for index in 0..5 {
+            let path = repo.path().join(format!("{directory}/module_{index}.py"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut text = String::new();
+            for slot in 0..14 {
+                text.push_str(&format!("def block_{slot}():\n    # "));
+                for _ in 0..40 {
+                    text.push_str(CAPACITY_VOCAB[next() % CAPACITY_VOCAB.len()]);
+                    text.push(' ');
+                }
+                text.push_str(&format!("\n    return {slot}\n\n"));
+            }
+            fs::write(path, text).unwrap();
+        }
+    }
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "capacity fixture"]);
+    repo
+}
+
+/// Queries whose terms the fixture's vocabulary really carries, so every
+/// one of them ranks something rather than exercising the empty path.
+const CAPACITY_QUERIES: [&str; 6] = [
+    "candidate pool penalty selection",
+    "route journal claim",
+    "how does a continuation get refused",
+    "membership evidence estate",
+    "boost",
+    "capacity window budget frozen",
+];
+
+fn capacity_request(
+    query: &str,
+    limit: usize,
+    capacity: Option<u64>,
+    offset: usize,
+    python: &Path,
+    script: &Path,
+    model: &Path,
+) -> SearchRequest {
+    SearchRequest {
+        scope: QueryScope::EstateOrientation,
+        requested_source: None,
+        query: query.into(),
+        families: vec![],
+        semantic: SemanticRequest::Requested,
+        limit,
+        capacity,
+        pinned: None,
+        offset,
+        semantic_query: Some(SemanticQueryConfig {
+            backend: python.to_path_buf(),
+            backend_args: vec![script.display().to_string()],
+            model: model.to_path_buf(),
+        }),
+        pinned_editions: None,
+        pinned_mode: None,
+        pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+    }
+}
+
+/// One estate over `capacity_fixture_repo`, built and selected with the
+/// real backend — the shape T6 to T8 all start from.
+fn capacity_estate(python: &Path, script: &Path, model: &Path, repo: &Path) -> TiedEstate {
+    let mut estate = tied_estate_with_alias(repo, "m-capacity");
+    let edition = tied_build(&mut estate, python, script, model);
+    estate
+        .store
+        .select_semantic(&estate.membership.clone(), &edition.id)
+        .unwrap()
+        .unwrap();
+    estate
+}
+
+fn hit_keys(answer: &wirk_atlas::SearchAnswer) -> Vec<(String, u64, u64)> {
+    answer
+        .hits
+        .iter()
+        .map(|hit| {
+            (
+                String::from_utf8(hit.coordinate.path.clone()).unwrap(),
+                hit.coordinate.line_start,
+                hit.coordinate.line_end,
+            )
+        })
+        .collect()
+}
+
+/// T6. An ordinary request for five results is one native search at
+/// `top_k = 5`, not a five-row window onto a two-hundred-row one.
+///
+/// The mechanism, not the field: the whole result set is five rows
+/// (`total_candidates`), the capacity the ranker was handed is five, and
+/// asking the *same query with the same page size* at capacity 200
+/// returns a different head — which can only happen because the capacity
+/// changed what the installed ranker fused, since nothing else about the
+/// request, the corpus or the configuration moved.
+///
+/// Red on `d5a5efc`: `total_candidates` was 200 for every request, the
+/// application reported a fixed `candidate_limit` of 200, and the two
+/// arms were identical by construction.
+///
+/// `#[ignore]`d and opted in exactly as T5 is, with the same loud failure
+/// on a missing prerequisite rather than a silent pass.
+#[test]
+#[ignore]
+fn t6_a_requested_limit_is_the_native_ranking_at_that_capacity() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+    let repo = capacity_fixture_repo();
+    let estate = capacity_estate(&python, &script, &model, repo.path());
+
+    let mut heads_moved = 0;
+    for query in CAPACITY_QUERIES {
+        let shallow = wirk_atlas::search(
+            &estate.store,
+            &capacity_request(query, 5, None, 0, &python, &script, &model),
+        )
+        .unwrap();
+        assert!(
+            matches!(shallow.semantic, SemanticStatus::Applied),
+            "{query}: {:?}",
+            shallow.semantic
+        );
+        let applied = shallow.application.as_ref().unwrap();
+        assert_eq!(applied.capacity, 5, "{query}: the ranker's own top_k");
+        assert_eq!(
+            applied.capacity_source,
+            wirk_atlas::CapacitySource::RequestedLimit,
+            "{query}: an omitted capacity is the requested limit"
+        );
+        assert_eq!(
+            applied.capacity_policy,
+            wirk_atlas::CAPACITY_POLICY,
+            "{query}: the policy the edition declares"
+        );
+        assert_eq!(
+            shallow.budget.total_candidates, 5,
+            "{query}: the whole result set is this query's capacity, not a universal depth"
+        );
+        assert!(
+            applied.capacity_reached && !applied.resultset_exhausted,
+            "{query}: a full result set says so, and does not claim exhaustion"
+        );
+        assert!(
+            shallow.coverage.partial,
+            "{query}: a result set that filled its capacity may have relevant rows beyond it"
+        );
+
+        let deep = wirk_atlas::search(
+            &estate.store,
+            &capacity_request(query, 5, Some(200), 0, &python, &script, &model),
+        )
+        .unwrap();
+        let deep_applied = deep.application.as_ref().unwrap();
+        assert_eq!(deep_applied.capacity, 200);
+        assert_eq!(
+            deep_applied.capacity_source,
+            wirk_atlas::CapacitySource::Explicit
+        );
+        assert_eq!(
+            deep.budget.total_candidates, 200,
+            "{query}: an explicit capacity is the size of the result set, not of the page"
+        );
+        assert_eq!(deep.hits.len(), 5, "{query}: the page size did not move");
+        if hit_keys(&shallow) != hit_keys(&deep) {
+            heads_moved += 1;
+        }
+    }
+    assert!(
+        heads_moved > 0,
+        "capacity must reach the installed ranker: no query's first five moved between \
+         capacity 5 and capacity 200, so nothing here would have caught the universal-depth \
+         policy this test exists to replace"
+    );
+}
+
+/// T7. A page is a slice of one frozen result set: at a fixed capacity,
+/// the display page size decides how the same rows are handed over and
+/// nothing about which rows they are or what order they come in.
+///
+/// Walked twice over the same query at capacity 200, once five rows at a
+/// time and once forty — 40 pages against 5 — and the two walks must
+/// produce the same 200 coordinates, in the same order, with no row
+/// served twice.
+#[test]
+#[ignore]
+fn t7_a_fixed_capacity_is_one_result_set_however_it_is_paged() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+    let repo = capacity_fixture_repo();
+    let estate = capacity_estate(&python, &script, &model, repo.path());
+    let query = CAPACITY_QUERIES[0];
+
+    let walk = |page: usize| {
+        let mut seen: Vec<(String, u64, u64)> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let answer = wirk_atlas::search(
+                &estate.store,
+                &capacity_request(query, page, Some(200), offset, &python, &script, &model),
+            )
+            .unwrap();
+            assert!(matches!(answer.semantic, SemanticStatus::Applied));
+            assert_eq!(
+                answer.budget.capacity, 200,
+                "the capacity is the query's, not the page's"
+            );
+            assert_eq!(answer.budget.total_candidates, 200);
+            if answer.hits.is_empty() {
+                assert!(
+                    answer.coverage.spent,
+                    "a window past the end of the result set is spent, not a no-match"
+                );
+                break;
+            }
+            seen.extend(hit_keys(&answer));
+            offset += answer.hits.len();
+        }
+        seen
+    };
+
+    let by_five = walk(5);
+    let by_forty = walk(40);
+    assert_eq!(by_five.len(), 200, "the frozen result set is the capacity");
+    let mut unique = by_five.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 200, "a walk served a row twice");
+    assert_eq!(
+        by_five, by_forty,
+        "the display page budget moved the ranking at a fixed capacity"
+    );
+}
+
+/// T8. An edition built under the previous universal-depth policy is
+/// refused by name and left exactly as it was built — its own bytes are
+/// read back, not reinterpreted under a policy it never declared — and
+/// the refusal names the ordinary recovery.
+///
+/// The edition record is rewritten here to the shape the previous policy
+/// wrote (`candidate_limit: 200`, no capacity policy) rather than
+/// simulated behind a stub: this is the exact declaration a real
+/// pre-0171 edition carries on disk, and the real refusal and the real
+/// fresh-build recovery were both executed against a genuinely
+/// parent-built edition (`query-capacity-build/BUILT.md`).
+#[test]
+#[ignore]
+fn t8_a_previous_policy_edition_is_refused_by_name_not_reinterpreted() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+    let repo = capacity_fixture_repo();
+    let estate = capacity_estate(&python, &script, &model, repo.path());
+
+    let edition_id = estate.store.selected_semantic(&estate.membership).unwrap();
+    let record = estate
+        ._temporary
+        .path()
+        .join("atlas/semantic")
+        .join(&edition_id.0)
+        .join(wirk_atlas::EDITION_RECORD);
+    assert!(
+        record.is_file(),
+        "the edition record this test rewrites is not where it was looked for: {}",
+        record.display()
+    );
+    let before = fs::read(&record).unwrap();
+    let mut document: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let retrieval = document["retrieval"].as_object_mut().unwrap();
+    retrieval.remove("capacity_policy");
+    retrieval.remove("capacity_max");
+    retrieval.insert(
+        "candidate_limit".into(),
+        serde_json::json!(wirk_atlas::LEGACY_CANDIDATE_LIMIT),
+    );
+    fs::write(&record, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    let answer = wirk_atlas::search(
+        &estate.store,
+        &capacity_request(CAPACITY_QUERIES[0], 5, None, 0, &python, &script, &model),
+    )
+    .unwrap();
+    let reason = match &answer.semantic {
+        SemanticStatus::Unavailable(reason) => reason.clone(),
+        other => panic!("a previous-policy edition was ranked through: {other:?}"),
+    };
+    assert!(
+        reason.contains("fixed universal candidate depth of 200"),
+        "the refusal must state what the edition itself declares: {reason}"
+    );
+    assert!(
+        reason.contains(wirk_atlas::CAPACITY_POLICY),
+        "the refusal must name the policy this product decides under: {reason}"
+    );
+    assert!(
+        reason.contains("rebuild its semantic edition"),
+        "the refusal must name the recovery: {reason}"
+    );
+    assert!(
+        answer.application.is_none(),
+        "nothing was ranked, so nothing may be reported as having been"
+    );
+
+    // The historical record is read, never rewritten: the declaration
+    // this product refused is still exactly the one on disk.
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert_eq!(
+        after["retrieval"]["candidate_limit"],
+        serde_json::json!(wirk_atlas::LEGACY_CANDIDATE_LIMIT)
+    );
+    assert!(after["retrieval"]["capacity_policy"].is_null());
+}
+
+/// T9. The capacity policy itself, which needs no backend, no model and
+/// no estate: an omitted capacity is the requested limit, a requested
+/// limit above the bound derives the bound and says so, an explicit
+/// capacity is honoured inside the bound and refused outside it, and a
+/// page size is never bounded by any of it.
+#[test]
+fn t9_result_capacity_resolves_by_policy_and_refuses_outside_its_bounds() {
+    let request = |limit: usize, capacity: Option<u64>| SearchRequest {
+        scope: QueryScope::EstateOrientation,
+        requested_source: None,
+        query: "anything".into(),
+        families: vec![],
+        semantic: SemanticRequest::Requested,
+        limit,
+        capacity,
+        pinned: None,
+        offset: 0,
+        semantic_query: None,
+        pinned_editions: None,
+        pinned_mode: None,
+        pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+    };
+    let resolved = wirk_atlas::resolve_capacity(&request(5, None)).unwrap();
+    assert_eq!(resolved.value, 5);
+    assert_eq!(resolved.source, wirk_atlas::CapacitySource::RequestedLimit);
+
+    let resolved = wirk_atlas::resolve_capacity(&request(10, None)).unwrap();
+    assert_eq!(resolved.value, 10, "the documented default is the limit");
+
+    let bounded = wirk_atlas::resolve_capacity(&request(500, None)).unwrap();
+    assert_eq!(bounded.value, wirk_atlas::CAPACITY_MAX);
+    assert_eq!(
+        bounded.source,
+        wirk_atlas::CapacitySource::RequestedLimitBounded,
+        "a derived capacity that hit the bound says so rather than narrowing in silence"
+    );
+    assert_eq!(bounded.requested_limit, 500);
+
+    let explicit = wirk_atlas::resolve_capacity(&request(5, Some(200))).unwrap();
+    assert_eq!(explicit.value, 200);
+    assert_eq!(explicit.source, wirk_atlas::CapacitySource::Explicit);
+    assert_eq!(
+        explicit.requested_limit, 5,
+        "a deep result set with a small page is the ordinary shape of an explicit capacity"
+    );
+
+    // A page size far larger than the bound is not a capacity error: the
+    // page budget belongs to the caller's surface and is not bounded here.
+    assert!(wirk_atlas::resolve_capacity(&request(10_000, None)).is_ok());
+
+    for refused in [0, wirk_atlas::CAPACITY_MAX + 1, 10_000] {
+        let error = wirk_atlas::resolve_capacity(&request(5, Some(refused)))
+            .expect_err("a capacity this product cannot run must be refused, never clamped");
+        assert!(
+            error.contains(&wirk_atlas::CAPACITY_MAX.to_string())
+                && error.contains(wirk_atlas::CAPACITY_POLICY),
+            "the refusal must name the bound and the policy: {error}"
+        );
+    }
+    // A zero page still ranks from somewhere rather than asking the
+    // native ranker for nothing.
+    assert_eq!(
+        wirk_atlas::resolve_capacity(&request(0, None))
+            .unwrap()
+            .value,
+        1
+    );
 }

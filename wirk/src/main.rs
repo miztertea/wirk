@@ -909,6 +909,34 @@ fn print_world_show(result: &serde_json::Value) {
                 serde_json::Value::Array(degraded.clone())
             );
         }
+        // The capacity this ranked query actually ran at (ruling 0171,
+        // ruling 0172), absent for a lexical or unavailable answer — so
+        // "candidates 8 shown 8" is never mistaken for "the estate holds
+        // 8 relevant rows and no more" when a smaller rendering budget,
+        // not an exhausted ranker, produced that count.
+        if let Some(capacity) = retrieval.get("capacity") {
+            println!(
+                "      capacity {} of {} ({}, policy {}) reached {} exhausted {}",
+                capacity
+                    .get("capacity")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                capacity
+                    .get("max")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                string(capacity, "source"),
+                string(capacity, "policy"),
+                capacity
+                    .get("reached")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                capacity
+                    .get("resultset_exhausted")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            );
+        }
     }
     // The recorded learning this stage was handed, and the state of the
     // index the published half was read from — printed together and in

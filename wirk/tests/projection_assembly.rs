@@ -1735,6 +1735,405 @@ fn a_route_configures_its_own_semantic_backend_and_the_reason_is_about_the_reque
     estate.stop();
 }
 
+// ---- P3 world-capacity-correction: budget must never choose the ranking
+// on the World's own semantic path (ruling 0172, query-capacity-review
+// B1/B2) ----
+
+/// The pinned development `semble` interpreter (`DEVELOPMENT.md`), read
+/// from the required environment input — never a host-specific default
+/// baked into the product (R2: same `#[ignore]`d-native-test shape
+/// `wirk-atlas/tests/semantic_retrieval.rs`'s T5–T8 already use). Only
+/// reached once this test itself runs, i.e. under an explicit
+/// `--ignored`; panics with a clear reason rather than skipping, so an
+/// opt-in run with a missing or wrong prerequisite fails loudly instead
+/// of quietly recording a pass.
+fn pinned_semble_python() -> PathBuf {
+    let path = PathBuf::from(
+        std::env::var("WIRK_TEST_SEMBLE_PYTHON").unwrap_or_else(|_| {
+            panic!(
+                "this test is opted in (--ignored) but WIRK_TEST_SEMBLE_PYTHON is unset: point it \
+             at the pinned semble python3 interpreter (see DEVELOPMENT.md); this test never \
+             falls back to a host-specific default"
+            )
+        }),
+    );
+    assert!(
+        path.is_file(),
+        "WIRK_TEST_SEMBLE_PYTHON={} is not a file: point it at the pinned semble python3 \
+         interpreter (see DEVELOPMENT.md)",
+        path.display()
+    );
+    path
+}
+
+/// The pinned offline `minishlab/potion-code-16M-v2` snapshot
+/// (`DEVELOPMENT.md`), read the same way as `pinned_semble_python`.
+fn pinned_semble_model() -> PathBuf {
+    let path = PathBuf::from(std::env::var("WIRK_TEST_SEMBLE_MODEL").unwrap_or_else(|_| {
+        panic!(
+            "this test is opted in (--ignored) but WIRK_TEST_SEMBLE_MODEL is unset: point it \
+             at the pinned offline potion-code-16M-v2 snapshot directory (see DEVELOPMENT.md); \
+             this test never falls back to a host-specific default"
+        )
+    }));
+    assert!(
+        path.is_dir(),
+        "WIRK_TEST_SEMBLE_MODEL={} is not a directory: point it at the pinned offline \
+         potion-code-16M-v2 snapshot (see DEVELOPMENT.md)",
+        path.display()
+    );
+    path
+}
+
+/// The product's own `wirk-embed/v2` + `wirk-query/v2` backend, unmodified
+/// — not a copy, not a stub.
+fn real_semble_backend_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../wirk-atlas/backends/semble_backend.py")
+}
+
+/// A repository with more chunked rows than any rendering budget this
+/// test authors, so a capacity that tracked the budget (the regression)
+/// and a capacity that does not (the fix) are distinguishable by more
+/// than a count.
+fn capacity_repo(root: &Path) -> PathBuf {
+    let repo = root.join("capacity-repo");
+    fs::create_dir_all(&repo).expect("capacity repo dir");
+    init_repo(&repo);
+    const VOCAB: [&str; 24] = [
+        "claim",
+        "route",
+        "journal",
+        "ledger",
+        "boundary",
+        "capacity",
+        "budget",
+        "window",
+        "continuation",
+        "estate",
+        "membership",
+        "evidence",
+        "candidate",
+        "pool",
+        "penalty",
+        "selection",
+        "rank",
+        "score",
+        "vector",
+        "chunk",
+        "generation",
+        "coordinate",
+        "referenced",
+        "reachable",
+    ];
+    let mut seed: u64 = 183_092_026;
+    let mut next = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (seed >> 33) as usize
+    };
+    for dir in ["engine", "shell", "vendor", "notes"] {
+        fs::create_dir_all(repo.join(dir)).expect("capacity repo subdir");
+        for index in 0..6 {
+            let mut text = String::new();
+            for block in 0..8 {
+                text.push_str(&format!("def block_{block}():\n    # "));
+                for _ in 0..30 {
+                    text.push_str(VOCAB[next() % VOCAB.len()]);
+                    text.push(' ');
+                }
+                text.push_str(&format!("\n    return {block}\n\n"));
+            }
+            write_file(&repo, &format!("{dir}/unit_{index}.py"), &text);
+        }
+    }
+    commit_all(&repo);
+    repo
+}
+
+/// B1/B2 (`query-capacity-review/VERIFIED.md`): `orient.budget` is
+/// documented as how much of a ranked result gets *rendered*, never a
+/// second control on what gets ranked. Before ruling 0172's correction,
+/// the World assembly passed `budget.referenced()` straight through as
+/// this query's own result capacity, so two reservations of the same
+/// question that differ only in `budget.referenced_max` ranked at two
+/// different `top_k` values and could deliver a different first result
+/// and a different `total_candidates` — the invariant the sibling
+/// lexical-path test
+/// `a_budget_of_one_cuts_only_the_rendering_and_reports_the_real_totals`
+/// already pins, but which nothing pinned on the semantic path, because
+/// that test's own assembly has no semantic edition and falls to the
+/// lexical path (B2).
+///
+/// Real corpus, real built-and-selected edition, real `wirk world show`
+/// — no stub stands in for the ranker. `#[ignore]`d and opted in exactly
+/// as `wirk-atlas/tests/semantic_retrieval.rs`'s T5–T8 are, with the same
+/// loud failure on a missing prerequisite rather than a silent pass.
+#[test]
+#[ignore]
+fn a_semantic_budget_of_one_and_forty_agree_on_the_ranking_and_the_real_total() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+
+    let mut estate = Estate::new();
+    let repo = capacity_repo(estate.root.parent().expect("estate parent"));
+    let acquired = publish_reporting(&estate.root, "capacity", &repo);
+    let generation = acquired["generation"]["generation"]
+        .as_str()
+        .expect("acquired generation id")
+        .to_string();
+
+    let (ok, built, err) = atlas(
+        &estate.root,
+        &[
+            "semantic",
+            "build",
+            "--source",
+            "capacity",
+            "--generation",
+            &generation,
+            "--backend",
+            python.to_str().unwrap(),
+            "--backend-arg",
+            script.to_str().unwrap(),
+            "--model",
+            model.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "semantic build: {err}");
+    let edition_id = built["edition"]["edition"]
+        .as_str()
+        .expect("staged edition id")
+        .to_string();
+    let (ok, _, err) = atlas(
+        &estate.root,
+        &[
+            "semantic",
+            "select",
+            "--source",
+            "capacity",
+            "--edition",
+            &edition_id,
+        ],
+    );
+    assert!(ok, "semantic select: {err}");
+
+    let question = "capacity window budget frozen boundary route candidate pool";
+    let semantic = format!(
+        r#","semantic":{{"backend":{backend},"backend_args":[{arg}],"model":{model}}}"#,
+        backend = serde_json::to_string(python.to_str().unwrap()).unwrap(),
+        arg = serde_json::to_string(script.to_str().unwrap()).unwrap(),
+        model = serde_json::to_string(model.to_str().unwrap()).unwrap(),
+    );
+
+    let assemble = |name: &str, referenced_max: usize| -> Value {
+        let route = one_stage_route_with(
+            &estate.root,
+            name,
+            question,
+            r#"["capacity"]"#,
+            &format!(r#","budget":{{"referenced_max":{referenced_max}}}{semantic}"#),
+        );
+        let submitted = submit_kind(
+            &estate.root,
+            route.to_str().unwrap(),
+            &repo,
+            &["capacity:write"],
+            None,
+            Some("actor"),
+        )
+        .unwrap_or_else(|err| panic!("submit {name}: {err}"));
+        world_show(&estate.root, &submitted.work_id, &submitted.run_id)["projection"].clone()
+    };
+
+    let tight = assemble("capacity-tight", 1);
+    let wide = assemble("capacity-wide", 40);
+
+    assert_eq!(tight["retrieval"]["mode"], "semantic", "{tight}");
+    assert_eq!(wide["retrieval"]["mode"], "semantic", "{wide}");
+    assert_eq!(
+        tight["retrieval"]["semantic"], "applied",
+        "the ranked query must actually run: {tight}"
+    );
+    assert_eq!(
+        wide["retrieval"]["semantic"], "applied",
+        "the ranked query must actually run: {wide}"
+    );
+
+    // B1, the mechanism: the World's own fixed capacity, not the
+    // rendering budget, decides what gets ranked, so the real total the
+    // query found is identical under both budgets.
+    assert_eq!(
+        tight["retrieval"]["total_candidates"], wide["retrieval"]["total_candidates"],
+        "a rendering budget must not change the ranked result set (ruling 0172, B1): {tight} / \
+         {wide}"
+    );
+    // B1, restated on the delivered bytes: the one item a budget of one
+    // renders is the same item that leads the budget-of-forty list — not
+    // a different top-1 that a different top_k produced.
+    assert_eq!(
+        items(&tight, "referenced")[0]["coordinate"],
+        items(&wide, "referenced")[0]["coordinate"],
+        "the top-ranked item must not move when only the rendering budget does: {tight} / {wide}"
+    );
+
+    // B3/B4: the delivered projection states the capacity it ranked at,
+    // and it is the same capacity under both budgets — never something a
+    // reader has to infer from a budget that no longer tracks it.
+    let tight_capacity = &tight["retrieval"]["capacity"];
+    let wide_capacity = &wide["retrieval"]["capacity"];
+    assert!(
+        tight_capacity.is_object(),
+        "a real semantic answer must publish its capacity note (ruling 0172, B4): {tight}"
+    );
+    assert_eq!(
+        tight_capacity, wide_capacity,
+        "the published capacity must not move with the rendering budget: {tight} / {wide}"
+    );
+    assert_eq!(tight_capacity["max"].as_u64(), Some(200));
+
+    // B3, restated: a projection under a tight rendering budget must
+    // still say more was found than was shown — never `truncated: false`
+    // beside a shorter delivered list, which is what B1 made happen.
+    if items(&tight, "referenced").len()
+        < tight["retrieval"]["total_candidates"].as_u64().unwrap_or(0) as usize
+    {
+        assert_eq!(tight["truncated"], true, "{tight}");
+        let cut = items(&tight, "omitted")
+            .iter()
+            .find(|item| item["kind"] == "over_budget" && item["of"] == "referenced")
+            .unwrap_or_else(|| panic!("the referenced list was cut and must say so: {tight}"));
+        assert_eq!(
+            cut["total"], tight["retrieval"]["total_candidates"],
+            "the omission's total is the real ranked total, not the rendering budget: {tight}"
+        );
+    }
+
+    estate.stop();
+}
+
+/// `world-capacity-review/VERIFIED.md` §2: a Route that authors no
+/// `orient.capacity` gets the World's documented default of
+/// `CAPACITY_MAX`, but before this correction the default and an
+/// explicitly authored `200` were indistinguishable on the published
+/// `retrieval.capacity.source` — both said `"explicit"`, the exact
+/// confusion `capacity_source` (ruling 0171) exists to prevent. Same
+/// question, same budget, same corpus; the only difference between the
+/// two Routes is whether `orient.capacity` is authored at all.
+#[test]
+#[ignore]
+fn a_route_that_authors_no_capacity_is_not_labelled_explicit() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+
+    let mut estate = Estate::new();
+    let repo = capacity_repo(estate.root.parent().expect("estate parent"));
+    let acquired = publish_reporting(&estate.root, "capacity", &repo);
+    let generation = acquired["generation"]["generation"]
+        .as_str()
+        .expect("acquired generation id")
+        .to_string();
+
+    let (ok, built, err) = atlas(
+        &estate.root,
+        &[
+            "semantic",
+            "build",
+            "--source",
+            "capacity",
+            "--generation",
+            &generation,
+            "--backend",
+            python.to_str().unwrap(),
+            "--backend-arg",
+            script.to_str().unwrap(),
+            "--model",
+            model.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "semantic build: {err}");
+    let edition_id = built["edition"]["edition"]
+        .as_str()
+        .expect("staged edition id")
+        .to_string();
+    let (ok, _, err) = atlas(
+        &estate.root,
+        &[
+            "semantic",
+            "select",
+            "--source",
+            "capacity",
+            "--edition",
+            &edition_id,
+        ],
+    );
+    assert!(ok, "semantic select: {err}");
+
+    let question = "capacity window budget frozen boundary route candidate pool";
+    let semantic = format!(
+        r#","semantic":{{"backend":{backend},"backend_args":[{arg}],"model":{model}}}"#,
+        backend = serde_json::to_string(python.to_str().unwrap()).unwrap(),
+        arg = serde_json::to_string(script.to_str().unwrap()).unwrap(),
+        model = serde_json::to_string(model.to_str().unwrap()).unwrap(),
+    );
+
+    let assemble = |name: &str, extra: &str| -> Value {
+        let route = one_stage_route_with(
+            &estate.root,
+            name,
+            question,
+            r#"["capacity"]"#,
+            &format!(r#","budget":{{"referenced_max":8}}{semantic}{extra}"#),
+        );
+        let submitted = submit_kind(
+            &estate.root,
+            route.to_str().unwrap(),
+            &repo,
+            &["capacity:write"],
+            None,
+            Some("actor"),
+        )
+        .unwrap_or_else(|err| panic!("submit {name}: {err}"));
+        world_show(&estate.root, &submitted.work_id, &submitted.run_id)["projection"].clone()
+    };
+
+    let unauthored = assemble("capacity-unauthored", "");
+    let authored = assemble("capacity-authored-200", r#","capacity":200"#);
+
+    assert_eq!(unauthored["retrieval"]["mode"], "semantic", "{unauthored}");
+    assert_eq!(authored["retrieval"]["mode"], "semantic", "{authored}");
+
+    let unauthored_capacity = &unauthored["retrieval"]["capacity"];
+    let authored_capacity = &authored["retrieval"]["capacity"];
+    assert!(
+        unauthored_capacity.is_object() && authored_capacity.is_object(),
+        "both must publish a capacity note: {unauthored} / {authored}"
+    );
+
+    // Same World default value in both — the fix is about the label, not
+    // the number.
+    assert_eq!(
+        unauthored_capacity["capacity"], authored_capacity["capacity"],
+        "an unauthored Route gets the same default 200 an authored one names explicitly: \
+         {unauthored} / {authored}"
+    );
+    assert_eq!(unauthored_capacity["capacity"].as_u64(), Some(200));
+
+    // The label must distinguish them: only the Route that actually named
+    // a capacity gets "explicit".
+    assert_eq!(
+        authored_capacity["source"], "explicit",
+        "a Route that authored capacity 200 named it: {authored}"
+    );
+    assert_ne!(
+        unauthored_capacity["source"], "explicit",
+        "a Route that authored no capacity must not be reported as having named one \
+         (world-capacity-review/VERIFIED.md §2): {unauthored}"
+    );
+
+    estate.stop();
+}
+
 // ---- M7: `reachable` counts the indexed resources and nothing else -------
 
 /// A `reachable` entry's `resources` is "how many indexed resources of

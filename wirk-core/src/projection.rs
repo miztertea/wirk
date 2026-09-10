@@ -170,6 +170,20 @@ pub struct OrientationRequest {
     /// it serialized to before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic: Option<SemanticQueryRequest>,
+    /// This stage's ranked-retrieval result capacity (ruling 0171), held
+    /// apart from `budget`, which is only how much of that result this
+    /// stage wants *rendered*. `None` is not "no capacity" — it is "this
+    /// Route did not author one", and the assembler derives the World's
+    /// documented default from it, the same way `wirk atlas search`
+    /// derives one from an unset `--capacity`.
+    ///
+    /// Additive and skip-serialized, the same shape `semantic` above and
+    /// `ProjectionContentV2::expansion` already take (R2): a Route that
+    /// authors no capacity serializes to exactly the bytes it serialized
+    /// to before this field existed, so `route_edition` never moves for
+    /// an existing Route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<u64>,
 }
 
 /// An explicitly configured semantic query backend, as a Route authors
@@ -555,6 +569,14 @@ pub enum EvidenceCoverage {
 /// `SemanticStatus::reason()` verbatim, `editions` are the semantic
 /// editions the answer says it ranked through, and `degraded` names the
 /// `AnswerCoverage` dimensions that were true.
+///
+/// `total_candidates` is the ranked query's own result-set size at its
+/// capacity, never the rendering budget's — a presentation cut is
+/// `Omission::OverBudget { of: "referenced" }` on the delivered list, not
+/// a smaller `total_candidates` (ruling 0172). `capacity`, when present,
+/// says what that result-set size was bounded *by*, so a reader is never
+/// left to infer the difference between "this ranker's bounded result set
+/// is exhausted at this capacity" and "a rendering budget cut the list".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetrievalNote {
@@ -568,6 +590,49 @@ pub struct RetrievalNote {
     /// `Omission::OverBudget { of: "referenced" }`.
     pub total_candidates: usize,
     pub returned: usize,
+    /// The result capacity this assembly's ranked query ran at (ruling
+    /// 0171, ruling 0172), or absent for an answer no capacity bounded —
+    /// a lexical one, a query that could not run, or one produced before
+    /// this field existed. A missing field is unspecified historical
+    /// data, never an invented current default.
+    ///
+    /// Additive and skip-serialized, the shape `expansion` and
+    /// `OrientationRequest::semantic` already use (R2): a document
+    /// without it serializes to exactly the bytes it did before this
+    /// field existed, so no recorded `ProjectionId` moves for a
+    /// projection that never carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<RetrievalCapacityNote>,
+}
+
+/// What a ranked query's own result capacity was, copied from the answer
+/// that ran it — the disclosure ruling 0171 requires on every real World
+/// consumer, not only on the public search answer and the CLI (ruling
+/// 0172).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalCapacityNote {
+    /// The `top_k` this query actually ranked at.
+    pub capacity: u64,
+    /// Where that capacity came from: `requested-limit`,
+    /// `requested-limit-bounded`, or `explicit` — `CapacitySource::label`
+    /// verbatim.
+    pub source: String,
+    /// The policy this capacity was decided under, restated from the
+    /// edition this answer ranked through.
+    pub policy: String,
+    /// That policy's operational bound.
+    pub max: u64,
+    /// The result set filled the capacity: relevant rows may exist beyond
+    /// this query's budget, and a deeper answer is a *new query* at a
+    /// larger capacity — never something a smaller rendering budget can
+    /// reach.
+    pub reached: bool,
+    /// The native ranker returned fewer rows than the capacity allowed,
+    /// so this query's bounded result set is exhausted. A fact about
+    /// *this ranker at this capacity over the admitted view*, never a
+    /// claim that the estate holds no other relevant information.
+    pub resultset_exhausted: bool,
 }
 
 /// One admitted place this stage may go looking that nothing in the

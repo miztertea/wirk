@@ -145,6 +145,13 @@ pub enum AtlasError {
     GitUnavailable(String),
     #[error("inconsistent or out-of-scope coordinate: {0}")]
     InvalidCoordinate(String),
+    /// The request names something this product cannot run as asked — a
+    /// result capacity outside the policy's bounds, say. Split out from
+    /// `InvalidCoordinate` because nothing is wrong with any coordinate,
+    /// and a caller reading the reason is deciding what to change about
+    /// their own request, not about their estate.
+    #[error("request cannot be run as asked: {0}")]
+    InvalidRequest(String),
     #[error("catalog is malformed or has an unsupported version: {0}")]
     Catalog(String),
     #[error("generation is incomplete or absent: {0}")]

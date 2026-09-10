@@ -136,11 +136,12 @@ pub const RANKING_PATH_CONVENTION: &str = "source-relative-path+membership-scope
 /// The retrieval identity scheme this product writes.
 pub const RETRIEVAL_SCHEME: &str = "wirk-retrieval/v1";
 
-/// How many ranked candidates one admitted view yields, frozen so that
-/// paging is a pure slice of one deterministic list rather than a second
-/// ranking at a different depth.
+/// How a query's result capacity is decided (ruling 0171). An edition
+/// records the *policy*, never one query's capacity: baking each `K` into
+/// immutable edition data would make every capacity its own edition
+/// identity, which is worse than the universal depth it replaces.
 ///
-/// The mechanism, measured rather than assumed
+/// The mechanism this policy exists for, measured rather than assumed
 /// (`native-ranking-gap-review/REVIEW.md` F1): the native ranker truncates
 /// *each* modality's list to `top_k * 5` before fusing them. A row's own
 /// semantic score and its rank within each modality do not move with the
@@ -150,10 +151,44 @@ pub const RETRIEVAL_SCHEME: &str = "wirk-retrieval/v1";
 /// by the largest file sum in the candidate pool, so a larger pool also
 /// changes the boost every file's top chunk receives, and
 /// `apply_query_boost` inherits the changed maximum. Asking for a
-/// different `top_k` is therefore not guaranteed to return a prefix of
-/// the larger answer even though nothing was re-ranked. Bound into the
-/// retrieval identity and into every continuation.
-pub const CANDIDATE_LIMIT: u64 = 200;
+/// different `top_k` is therefore not guaranteed to return a prefix of the
+/// larger answer even though nothing was re-ranked.
+///
+/// The previous policy answered that by fixing one universal depth of 200
+/// for every query, which made a five-result request a slice of a
+/// two-hundred-result ranking and not the ranking the caller asked for
+/// (measured: `query-capacity-build/BUILT.md` red). This policy separates
+/// the two quantities the old one fused
+/// (`native-ranking-contract-review/CORRECTIONS.md` C5):
+///
+/// * **result capacity `K`** — how many ranked rows this query's answer
+///   consists of, i.e. the `top_k` handed to `semble.search.search`. It is
+///   the caller's, it defaults to the initially requested result limit, it
+///   is frozen at the first page and bound into the continuation, and
+///   asking for a deeper one is a *new query*, never a continuation of an
+///   old walk.
+/// * **display page size** — how many of those rows one page shows. It
+///   moves nothing about the ranking: every page of a walk re-runs the
+///   same `search(top_k = K)` and slices its output.
+///
+/// `K` is a budget, not a promise: fewer than `K` rows means this ranker's
+/// bounded result set was exhausted, never that the admitted view holds no
+/// other relevant information.
+pub const CAPACITY_POLICY: &str = "query-bound-capacity/v1";
+
+/// The largest result capacity this increment will run, retained at the
+/// previous universal depth (ruling 0171: "Keep existing operational upper
+/// bound 200 for this bounded increment … not as a guaranteed count").
+/// Larger estate budgets are separate work. An explicitly requested
+/// capacity above it is refused rather than quietly clamped; a capacity
+/// *derived* from a larger requested limit is bounded here and the answer
+/// says so.
+pub const CAPACITY_MAX: u64 = 200;
+
+/// The capacity every edition built under the previous policy recorded, so
+/// such an edition can be named in the sentence that refuses it rather
+/// than merely failing a digest comparison.
+pub const LEGACY_CANDIDATE_LIMIT: u64 = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EditionId(pub String);
@@ -765,8 +800,21 @@ pub struct RetrievalIdentity {
     pub path_convention: String,
     /// Fusion and re-ranking, named as the installed implementation does.
     pub fusion: String,
-    /// The frozen candidate depth one admitted view yields.
-    pub candidate_limit: u64,
+    /// How this edition's rows have their result capacity decided
+    /// (`CAPACITY_POLICY`), and the operational bound that policy runs
+    /// under. The *policy* is edition data; one query's `K` is not, and
+    /// travels on the answer and the continuation instead.
+    #[serde(default)]
+    pub capacity_policy: String,
+    #[serde(default)]
+    pub capacity_max: u64,
+    /// Historical only, never written now: an edition built under the
+    /// previous universal-depth policy recorded its one frozen candidate
+    /// depth here. Read so that such an edition's own bytes stay readable
+    /// and its declaration can be stated back to a caller when it is
+    /// refused — never to reinterpret it under this policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_limit: Option<u64>,
     /// One digest over every field above, length-prefixed. It is this
     /// value that an edition id absorbs and a continuation pins.
     pub digest: String,
@@ -794,7 +842,9 @@ impl RetrievalIdentity {
                      semble.ranking.resolve_alpha, then boost_multi_chunk_files, \
                      apply_query_boost and rerank_topk path penalties"
                 .into(),
-            candidate_limit: CANDIDATE_LIMIT,
+            capacity_policy: CAPACITY_POLICY.into(),
+            capacity_max: CAPACITY_MAX,
+            candidate_limit: None,
             digest: String::new(),
         };
         let mut hasher = Sha256::new();
@@ -807,10 +857,11 @@ impl RetrievalIdentity {
             identity.sparse.as_bytes(),
             identity.path_convention.as_bytes(),
             identity.fusion.as_bytes(),
+            identity.capacity_policy.as_bytes(),
         ] {
             absorb(&mut hasher, part);
         }
-        absorb(&mut hasher, &identity.candidate_limit.to_be_bytes());
+        absorb(&mut hasher, &identity.capacity_max.to_be_bytes());
         identity.digest = hex(&hasher.finalize());
         identity
     }

@@ -194,6 +194,7 @@ fn retrieval_note() -> wirk_core::RetrievalNote {
         degraded: Vec::new(),
         total_candidates: 0,
         returned: 0,
+        capacity: None,
     }
 }
 
@@ -665,6 +666,7 @@ fn an_authored_orientation_request_round_trips() {
             // serializes back to exactly the bytes it arrived as, so no
             // C1-era Route's `route_edition` moves (ruling 0128 F3).
             semantic: None,
+            capacity: None,
         })
     );
 }

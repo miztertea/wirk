@@ -100,6 +100,7 @@ fn request(scope: wirk_atlas::QueryScope, query: &str) -> SearchRequest {
         families: vec![],
         semantic: SemanticRequest::Disabled,
         limit: 10,
+        capacity: None,
         pinned: None,
         offset: 0,
         semantic_query: None,

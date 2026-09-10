@@ -50,9 +50,9 @@ pub use projection::{
     Lifetime, ObservationId, ObservationReceipt, Omission, OrientationRequest, PROJECTION_FORMAT,
     PROJECTION_FORMAT_V1, PROJECTION_FORMAT_V2, PresentationBudget, ProjectionContent,
     ProjectionContentV1, ProjectionContentV2, ProjectionFile, ProjectionId, ProjectionUnavailable,
-    ProjectionWriteError, REACHABLE_DEFAULT, REFERENCED_DEFAULT, ReachableEntry, RetrievalNote,
-    SemanticQueryRequest, ShownEvidence, Statement, StatementOrigin, UnavailableReason,
-    projection_path, projections_dir,
+    ProjectionWriteError, REACHABLE_DEFAULT, REFERENCED_DEFAULT, ReachableEntry,
+    RetrievalCapacityNote, RetrievalNote, SemanticQueryRequest, ShownEvidence, Statement,
+    StatementOrigin, UnavailableReason, projection_path, projections_dir,
 };
 
 // ---- Identity ----------------------------------------------------------

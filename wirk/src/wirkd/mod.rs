@@ -790,6 +790,12 @@ pub struct AtlasSearchPayload {
     pub families: Vec<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// This query's result capacity (ruling 0171): how many ranked results
+    /// the answer consists of, as against `limit`, which is how many of
+    /// them one page shows. Absent is the documented default — the
+    /// capacity is then the initially requested `limit`.
+    #[serde(default)]
+    pub capacity: Option<u64>,
     #[serde(default)]
     pub continuation: Option<String>,
     /// The semantic query backend, exactly as `semantic build`'s is:

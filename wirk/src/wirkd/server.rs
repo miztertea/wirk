@@ -1842,6 +1842,9 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
         match load_route(&resolve_route_path(&state.estate_root, spec)) {
             Ok(route) => {
                 let defs = route.waypoints.clone();
+                if let Err(message) = validate_route_capacities(&defs) {
+                    return err_reply("BadRequest", &message);
+                }
                 (Some(route), defs)
             }
             Err(err) => return err_reply("RouteError", &err.to_string()),
@@ -7037,6 +7040,11 @@ fn edition_json(edition: &wirk_atlas::SemanticEdition) -> Value {
             "sparse": retrieval.sparse,
             "path_convention": retrieval.path_convention,
             "fusion": retrieval.fusion,
+            "capacity_policy": retrieval.capacity_policy,
+            "capacity_max": retrieval.capacity_max,
+            // Present only on an edition built under the previous
+            // universal-depth policy, whose own bytes are left exactly as
+            // they were written and are read back verbatim here.
             "candidate_limit": retrieval.candidate_limit,
             "digest": retrieval.digest,
         })),
@@ -7844,6 +7852,13 @@ fn budget_json(budget: &wirk_atlas::AnswerBudget) -> Value {
         "offset": budget.offset,
         "total_candidates": budget.total_candidates,
         "returned": budget.returned,
+        // Ruling 0171: the result capacity this query ran at, held apart
+        // from `limit`, which is only how many of its rows this page
+        // shows. `total_candidates` is the size of the result set the
+        // capacity bounded, never a count of what the estate holds.
+        "capacity": budget.capacity,
+        "capacity_source": budget.capacity_source.label(),
+        "capacity_applies": budget.capacity_applies,
     })
 }
 
@@ -7869,8 +7884,21 @@ fn application_json(application: &wirk_atlas::SemanticApplication) -> Value {
         "model_digest": application.model_digest,
         "retrieval": application.retrieval_digest,
         "rows_ranked": application.rows_ranked,
-        "candidate_limit": application.candidate_limit,
-        "candidates_saturated": application.saturated,
+        // What this ranking's own budget was and what it did with it
+        // (ruling 0171). `capacity` is the `top_k` the native ranker was
+        // actually asked for and the whole continuation is frozen under;
+        // `result_rows` is how many rows it returned. `capacity_reached`
+        // says relevant rows may exist beyond this query's budget;
+        // `resultset_exhausted` says this ranker's bounded result set ran
+        // out at this capacity — which is never a statement that the
+        // admitted view holds nothing further.
+        "capacity": application.capacity,
+        "capacity_source": application.capacity_source.label(),
+        "capacity_policy": application.capacity_policy,
+        "capacity_max": application.capacity_max,
+        "result_rows": application.result_rows,
+        "capacity_reached": application.capacity_reached,
+        "resultset_exhausted": application.resultset_exhausted,
         // The implementation that actually ranked this answer, measured by
         // the product. Rendered through the same helpers the edition's own
         // backend block uses, because it is the same kind of claim about
@@ -7971,6 +7999,18 @@ struct ContinuationToken {
     families: Vec<String>,
     semantic: Option<String>,
     limit: usize,
+    /// The result capacity this continuation's first page was ranked at
+    /// and every later page must be ranked at (ruling 0171), or `None` on
+    /// a lexical answer, which has no native result set to bound.
+    ///
+    /// Separate from `limit` above on purpose: `limit` is how many rows a
+    /// page shows and moves nothing about the ranking, while a different
+    /// capacity is a different ranking function and so a different query.
+    /// A semantic token carrying no capacity at all was issued under the
+    /// previous universal-depth policy and is refused rather than resumed
+    /// under this one.
+    #[serde(default)]
+    capacity: Option<u64>,
     offset: usize,
     generations: Vec<(String, String)>,
     /// P3 W4 B: the semantic editions the issuing answer actually ranked
@@ -8201,6 +8241,29 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
         });
     }
     let limit = payload.limit.unwrap_or(10);
+    // Ruling 0171. Resolved here rather than only inside `wirk_atlas`
+    // because this is the surface that mints and checks continuation
+    // tokens: the capacity a page is frozen under has to be computable
+    // from the request alone, before anything is ranked, or a restated
+    // request could not be compared with the token that answered it.
+    let capacity = match wirk_atlas::resolve_capacity(&wirk_atlas::SearchRequest {
+        scope: scope.clone(),
+        requested_source: payload.source.clone(),
+        query: payload.query.clone(),
+        families: Vec::new(),
+        semantic,
+        limit,
+        capacity: payload.capacity,
+        pinned: None,
+        offset: 0,
+        semantic_query: None,
+        pinned_editions: None,
+        pinned_mode: None,
+        pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+    }) {
+        Ok(capacity) => capacity,
+        Err(detail) => return err_reply("BadRequest", &detail),
+    };
     // The query-time half of the portability boundary: an explicitly
     // configured executable and an explicitly configured offline model
     // directory, or nothing. Both are refused unless absolute, by the
@@ -8239,6 +8302,12 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                 families: payload.families.clone(),
                 semantic: payload.semantic.clone(),
                 limit,
+                // A lexical answer's token carries no capacity, so what is
+                // restated for comparison is whatever the token holds:
+                // this check is "did the caller change the request", and
+                // the separate policy check below is "was this token
+                // issued under this policy at all".
+                capacity: decoded.capacity.map(|_| capacity.value),
                 offset: decoded.offset,
                 generations: decoded.generations.clone(),
                 editions: decoded.editions.clone(),
@@ -8250,10 +8319,27 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                 producer_identity: decoded.producer_identity.clone(),
                 producer_basis: decoded.producer_basis.clone(),
             };
+            // Ruling 0171. A semantic continuation issued before result
+            // capacity was bound to the query was ranked under one
+            // universal candidate depth for every request. Resuming it
+            // now would serve a page from a different ranking function
+            // under the first page's receipt, and restarting it would
+            // hide that entirely — so it is refused, by name, with the
+            // ordinary recovery.
+            if decoded.capacity.is_none() && decoded.mode == "semantic" {
+                return err_reply(
+                    "ContinuationPolicyMismatch",
+                    "this continuation was issued under the previous policy, which ranked every \
+                     query at one fixed candidate depth; this product binds a result capacity to \
+                     the query itself, so there is no capacity on the token to reproduce this \
+                     page at and nothing was restarted. Re-run the query — naming --capacity if \
+                     you want a result set deeper than the page you ask for",
+                );
+            }
             if decoded != restated {
                 return err_reply(
                     "ContinuationMismatch",
-                    "the continuation token names a different work/query/source/family/semantic/limit/backend than this request",
+                    "the continuation token names a different work/query/source/family/semantic/limit/capacity/backend than this request",
                 );
             }
             let pinned: BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId> = decoded
@@ -8314,6 +8400,7 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
         families,
         semantic,
         limit,
+        capacity: payload.capacity,
         pinned,
         offset,
         semantic_query,
@@ -8330,6 +8417,13 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                 families: payload.families.clone(),
                 semantic: payload.semantic.clone(),
                 limit,
+                // Frozen on the answer that actually ranked: a semantic
+                // walk is bound to the capacity its first page ran at,
+                // and a lexical one binds none because none applied.
+                capacity: answer
+                    .budget
+                    .capacity_applies
+                    .then_some(answer.budget.capacity),
                 offset: offset + answer.hits.len(),
                 generations: answer
                     .generations
@@ -15755,6 +15849,7 @@ mod projection_tests {
                 sources: Vec::new(),
                 budget: wirk_core::PresentationBudget::default(),
                 semantic: None,
+                capacity: None,
             }),
         }
     }
@@ -18138,6 +18233,7 @@ fn degraded_projection(
             degraded: vec!["no_snapshot".to_string()],
             total_candidates: 0,
             returned: 0,
+            capacity: None,
         },
         bound: Vec::new(),
         // Nothing was observed, so nothing is claimed about what the
@@ -18713,9 +18809,10 @@ fn prepare_projection(
         &pinned,
         &orient.question,
         budget.referenced(),
+        orient.capacity,
         orient.semantic.as_ref(),
     );
-    let retrieval = retrieval_note(answer.as_ref());
+    let retrieval = retrieval_note(answer.as_ref(), orient.capacity);
     let referenced: Vec<wirk_core::EvidenceItem> = answer
         .as_ref()
         .map(|answer| {
@@ -19465,6 +19562,42 @@ fn worktree_of_reserved_world(
 /// the previous one described a product that ships no backend and was
 /// false about both the product and any estate holding editions.
 ///
+/// Refuse a Route whose authored `orient.capacity` cannot be run, at
+/// submit time — before any World is assembled — rather than letting it
+/// surface later as a silently unavailable ranked answer (ruling 0172).
+/// `ranked_answer` and `prepare_expansion` hand the same number to
+/// `wirk_atlas::search`, whose `resolve_capacity` refuses it identically,
+/// but that refusal turns an assembly's answer into `None` rather than
+/// failing the submit — the same silent-clamp shape ruling 0171 already
+/// refuses on the public CLI. Checked against every Actor leaf in the
+/// tree, nested or not.
+fn validate_route_capacities(defs: &[WaypointDefinition]) -> Result<(), String> {
+    for id in flatten_leaves(defs) {
+        let Some(def) = find_definition(defs, &id) else {
+            continue;
+        };
+        let Some(orient) = def.orient.as_ref() else {
+            continue;
+        };
+        let Some(capacity) = orient.capacity else {
+            continue;
+        };
+        if capacity == 0 || capacity > wirk_atlas::CAPACITY_MAX {
+            return Err(format!(
+                "waypoint {} authors a result capacity of {capacity}, which cannot be run: this \
+                 product decides result capacity under {} and ranks at most {} results for one \
+                 query in this increment, so name a capacity between 1 and {} — the number of \
+                 results a page shows is a separate limit and is not bounded by it",
+                id.0,
+                wirk_atlas::CAPACITY_POLICY,
+                wirk_atlas::CAPACITY_MAX,
+                wirk_atlas::CAPACITY_MAX,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Every check that makes a semantic answer trustworthy — the absolute
 /// path rule, the digest of the executable actually opened, the query
 /// producer identity and basis, edition selection and currency — lives
@@ -19476,6 +19609,7 @@ fn ranked_answer(
     pinned: &BTreeMap<wirk_atlas::MembershipId, wirk_atlas::GenerationId>,
     question: &str,
     limit: usize,
+    capacity: Option<u64>,
     configured: Option<&wirk_core::SemanticQueryRequest>,
 ) -> Option<wirk_atlas::SearchAnswer> {
     wirk_atlas::search(
@@ -19487,6 +19621,14 @@ fn ranked_answer(
             families: Vec::new(),
             semantic: wirk_atlas::SemanticRequest::Requested,
             limit,
+            // The World's own result capacity, independent of how much of
+            // it `limit` renders (ruling 0171, ruling 0172): a Route that
+            // authors none gets the World's documented default of 200,
+            // the same operational bound this assembly ran at before an
+            // explicit capacity existed — never the rendering budget, so
+            // a smaller `limit` alone can never choose a different
+            // ranking.
+            capacity: capacity.or(Some(wirk_atlas::CAPACITY_MAX)),
             pinned: Some(pinned.clone()),
             offset: 0,
             semantic_query: configured.map(|configured| wirk_atlas::SemanticQueryConfig {
@@ -19505,7 +19647,19 @@ fn ranked_answer(
 /// The retrieval note, copied out of the answer and nowhere else. An
 /// answer that could not be produced at all says so, rather than
 /// presenting a lexical default that never ran.
-fn retrieval_note(answer: Option<&wirk_atlas::SearchAnswer>) -> wirk_core::RetrievalNote {
+///
+/// `authored_capacity` is the Route's own `orient.capacity` — `None` when
+/// it named none — kept apart from the collapsed value handed to
+/// `wirk_atlas::search`, which folds "authored none" into the World's
+/// documented default before `resolve_capacity` ever sees the two apart
+/// (ruling 0172). Without it, a Route that authored no capacity and one
+/// that authored the default explicitly are indistinguishable on the
+/// published `source`, the exact confusion ruling 0171 added the field to
+/// prevent.
+fn retrieval_note(
+    answer: Option<&wirk_atlas::SearchAnswer>,
+    authored_capacity: Option<u64>,
+) -> wirk_core::RetrievalNote {
     let Some(answer) = answer else {
         return wirk_core::RetrievalNote {
             mode: "none".to_string(),
@@ -19519,6 +19673,7 @@ fn retrieval_note(answer: Option<&wirk_atlas::SearchAnswer>) -> wirk_core::Retri
             degraded: vec!["query_unavailable".to_string()],
             total_candidates: 0,
             returned: 0,
+            capacity: None,
         };
     };
     let coverage = answer.coverage;
@@ -19557,6 +19712,33 @@ fn retrieval_note(answer: Option<&wirk_atlas::SearchAnswer>) -> wirk_core::Retri
         degraded,
         total_candidates: answer.budget.total_candidates,
         returned: answer.budget.returned,
+        // The capacity this query actually ranked at (ruling 0171, ruling
+        // 0172), copied from what a real native ranking reports about
+        // itself. Absent for a lexical answer, which has no capacity to
+        // report — `capacity_applies` says so, and the lexical path's own
+        // `total_candidates` already names its whole admitted list.
+        capacity: answer
+            .application
+            .as_ref()
+            .map(|application| wirk_core::RetrievalCapacityNote {
+                capacity: application.capacity,
+                // The World's own default is not the caller naming a
+                // capacity: only an authored `orient.capacity` earns the
+                // `explicit` label `wirk_atlas::CapacitySource::Explicit`
+                // otherwise reports, since the collapse above already
+                // resolved a Route that named none to the same value.
+                source: if authored_capacity.is_none()
+                    && application.capacity_source == wirk_atlas::CapacitySource::Explicit
+                {
+                    "world-default".to_string()
+                } else {
+                    application.capacity_source.label().to_string()
+                },
+                policy: application.capacity_policy.clone(),
+                max: application.capacity_max,
+                reached: application.capacity_reached,
+                resultset_exhausted: application.resultset_exhausted,
+            }),
     }
 }
 
@@ -20100,6 +20282,10 @@ fn identifier_candidates(
             families: Vec::new(),
             semantic: wirk_atlas::SemanticRequest::Disabled,
             limit,
+            // Lexical: capacity bounds a native result set and this path
+            // has none. Defaulted rather than named, and reported as not
+            // applying.
+            capacity: None,
             // The captured vector, pinned: a page of this search reads
             // the generations this projection names and no others.
             pinned: Some(pinned.clone()),
@@ -21440,6 +21626,12 @@ fn prepare_expansion(
             families: handle.map(|handle| vec![handle.family]).unwrap_or_default(),
             semantic: wirk_atlas::SemanticRequest::Requested,
             limit: orient.budget.referenced(),
+            // The stage's own authored capacity, carried into its
+            // expansion the same way its rendering budget already is —
+            // an expansion keeps the ranking function the initial
+            // assembly ran, never a fresh one implied by the display
+            // page it happens to ask for (ruling 0171, ruling 0172).
+            capacity: orient.capacity.or(Some(wirk_atlas::CAPACITY_MAX)),
             pinned: Some(pinned.clone()),
             offset: 0,
             semantic_query: orient.semantic.as_ref().map(|configured| {
@@ -21455,7 +21647,7 @@ fn prepare_expansion(
         },
     )
     .ok();
-    let retrieval = retrieval_note(answer.as_ref());
+    let retrieval = retrieval_note(answer.as_ref(), orient.capacity);
     let ranked: Vec<wirk_core::EvidenceItem> = answer
         .as_ref()
         .map(|answer| {

@@ -30,7 +30,7 @@
 
 use crate::domain::{EstateScope, GenerationId, MembershipId};
 use crate::semantic::{
-    BackendArgument, BackendEnvironment, BackendIdentity, CANDIDATE_LIMIT, EditionId, MappingRow,
+    BackendArgument, BackendEnvironment, BackendIdentity, CAPACITY_POLICY, EditionId, MappingRow,
     QUERY_HASH_SEED, QUERY_ORDERING_POLICY, QUERY_PRODUCER_BASIS_MISSING, QUERY_PROTOCOL,
     QueryProducerBasis, QueryProducerPin, RANKING_PATH_CONVENTION, ReportedEnvironment,
     SemanticEdition, configured_file, digest_bytes, measure_environment, normalize_ranking_text,
@@ -206,6 +206,37 @@ pub(crate) fn plan_semantic(
             ));
             continue;
         }
+        // The same rule, for the other half of the ranking contract. An
+        // edition built under the previous universal-depth policy declares
+        // one frozen candidate depth for every query ever asked of it
+        // (ruling 0171). Its rows are perfectly good bytes and are left
+        // exactly as they were built; what cannot happen is ranking them
+        // under a policy they never declared, because a `K` this product
+        // now takes from the caller would be silently reinterpreting that
+        // edition's own statement about itself. The recovery is the
+        // ordinary one, the same as the `v1` path convention's: rebuild
+        // the semantic edition and select the rebuilt one.
+        if retrieval.capacity_policy != CAPACITY_POLICY {
+            let declared = match retrieval.candidate_limit {
+                Some(limit) if retrieval.capacity_policy.is_empty() => format!(
+                    "declares no result-capacity policy and a fixed universal candidate depth \
+                     of {limit}"
+                ),
+                _ if retrieval.capacity_policy.is_empty() => {
+                    "declares no result-capacity policy".to_owned()
+                }
+                _ => format!(
+                    "decides result capacity under {}",
+                    retrieval.capacity_policy
+                ),
+            };
+            excluded.push(format!(
+                "{}: edition {} {declared} and this product decides it under {}; rebuild its \
+                 semantic edition and select the rebuilt one before it can be ranked through",
+                membership.alias, edition.id.0, CAPACITY_POLICY
+            ));
+            continue;
+        }
         if let Some(first) = ready.first() {
             let reference = first
                 .edition
@@ -368,6 +399,52 @@ struct QueryResultRow {
     score: f64,
 }
 
+/// Where a query's result capacity came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CapacitySource {
+    /// No capacity was named, so this query's capacity is the result limit
+    /// it initially requested — the documented default (ruling 0171:
+    /// "Existing callers omitting it get documented initial-limit-derived
+    /// capacity").
+    #[default]
+    RequestedLimit,
+    /// No capacity was named and the initially requested limit is above
+    /// `CAPACITY_MAX`, so the derived capacity is the bound. The answer
+    /// publishes both numbers rather than narrowing in silence.
+    RequestedLimitBounded,
+    /// The caller named this capacity. A normal bounded search request,
+    /// not a tuning surface: it is the ordinary semantics of asking a
+    /// search engine for `k` results, held apart from how many of them one
+    /// page shows.
+    Explicit,
+}
+
+impl CapacitySource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::RequestedLimit => "requested-limit",
+            Self::RequestedLimitBounded => "requested-limit-bounded",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+/// One query's frozen result capacity: the `top_k` the native ranker is
+/// asked for, and where that number came from.
+///
+/// Resolved once, before anything is ranked, from the request alone — so
+/// the surface that issues a continuation can compute exactly the same
+/// value it will later have to compare a restated request against, without
+/// running a search to learn it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCapacity {
+    pub value: u64,
+    pub source: CapacitySource,
+    /// The limit the capacity was derived from, when it was derived. Kept
+    /// so a bounded derivation can say what it bounded.
+    pub requested_limit: u64,
+}
+
 /// What a completed native ranking says about itself, recorded on the
 /// answer so a caller never has to take "semantic" on the product's word.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,8 +453,30 @@ pub struct SemanticApplication {
     pub model_digest: String,
     pub retrieval_digest: String,
     pub rows_ranked: u64,
-    pub candidate_limit: u64,
-    pub saturated: bool,
+    /// The result capacity this query ran at: the `top_k` actually handed
+    /// to the native ranker, frozen for the whole continuation.
+    pub capacity: u64,
+    /// Where that capacity came from — the caller's explicit request, or
+    /// the initially requested result limit — so a reader never has to
+    /// guess whether a number was asked for or derived.
+    pub capacity_source: CapacitySource,
+    /// The policy the capacity was decided under, and its operational
+    /// bound, restated from the editions this answer ranked through.
+    pub capacity_policy: String,
+    pub capacity_max: u64,
+    /// How many rows the native ranker actually returned for this query.
+    /// The size of this query's whole result set, not of one page.
+    pub result_rows: u64,
+    /// The result set filled the capacity: relevant rows may exist beyond
+    /// this query's budget, and a deeper answer is a *new query* at a
+    /// larger capacity.
+    pub capacity_reached: bool,
+    /// The native ranker returned fewer rows than the capacity allowed, so
+    /// this query's bounded result set is exhausted. That is a fact about
+    /// *this ranker at this capacity over the admitted view* and never a
+    /// claim that the estate holds no other relevant information
+    /// (`native-ranking-contract-review/ROOT-ADJUDICATION.md`).
+    pub resultset_exhausted: bool,
     /// The implementation that actually ranked this answer, in exactly
     /// the terms the build side records its own producer: the executable
     /// the product opened and digested, every argv token in its executed
@@ -534,6 +633,7 @@ pub(crate) fn rank(
     editions: &[AdmittedEdition],
     store: &AtlasStore,
     query: &str,
+    capacity: ResolvedCapacity,
     pinned_producer: Option<&QueryProducerPin>,
 ) -> Result<Result<RankedView, String>, AtlasError> {
     // The producer's *configuration* is measured before anything else
@@ -759,6 +859,7 @@ pub(crate) fn rank(
             dimensions,
             query,
             &view,
+            capacity.value,
             index_cache.as_deref(),
             &index_key,
         ))
@@ -848,8 +949,13 @@ pub(crate) fn rank(
         model_digest: model.digest.clone(),
         retrieval_digest: retrieval.digest.clone(),
         rows_ranked: view.len() as u64,
-        candidate_limit: CANDIDATE_LIMIT,
-        saturated: ranked.len() as u64 >= CANDIDATE_LIMIT,
+        capacity: capacity.value,
+        capacity_source: capacity.source,
+        capacity_policy: retrieval.capacity_policy.clone(),
+        capacity_max: retrieval.capacity_max,
+        result_rows: ranked.len() as u64,
+        capacity_reached: ranked.len() as u64 >= capacity.value,
+        resultset_exhausted: (ranked.len() as u64) < capacity.value,
         producer,
         producer_pin,
     };
@@ -865,6 +971,7 @@ fn run_query_backend(
     dimensions: u64,
     query: &str,
     view: &[ViewRow],
+    capacity: u64,
     index_cache: Option<&Path>,
     index_key: &str,
 ) -> Result<(Vec<RankedRow>, QueryReply), String> {
@@ -913,7 +1020,7 @@ fn run_query_backend(
         rows,
         dimensions,
         query,
-        top_k: CANDIDATE_LIMIT,
+        top_k: capacity,
         index_cache: index_cache.map(|path| path.to_str()).unwrap_or(None),
         index_key: index_cache.and(Some(index_key)),
     })

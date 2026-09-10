@@ -1,7 +1,11 @@
 use crate::admission::{AdmissionSummary, QueryScope, admit};
 use crate::domain::actual_line_bounds;
-use crate::retrieval::{RankingMode, SemanticApplication, SemanticPlan, SemanticQueryConfig};
+use crate::retrieval::{
+    CapacitySource, RankingMode, ResolvedCapacity, SemanticApplication, SemanticPlan,
+    SemanticQueryConfig,
+};
 use crate::semantic::QueryProducerPin;
+use crate::semantic::{CAPACITY_MAX, CAPACITY_POLICY};
 use crate::{
     AtlasError, AtlasStore, ContentFamily, CoverageDisposition, EditionId, ExactCoordinate,
     GenerationId, MembershipId,
@@ -192,6 +196,15 @@ pub struct AnswerBudget {
     pub offset: usize,
     pub total_candidates: usize,
     pub returned: usize,
+    /// The result capacity this query ran at, and where it came from
+    /// (ruling 0171). Reported on every answer, including a lexical one,
+    /// so the number a continuation is frozen under is never something a
+    /// caller has to infer. It bounds a *semantic* result set; the lexical
+    /// path ranks the whole admitted candidate list and is unchanged by
+    /// it, which is what `capacity_applies` says.
+    pub capacity: u64,
+    pub capacity_source: CapacitySource,
+    pub capacity_applies: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,6 +238,21 @@ pub struct SearchRequest {
     pub families: Vec<ContentFamily>,
     pub semantic: SemanticRequest,
     pub limit: usize,
+    /// This query's result capacity `K`: how many ranked rows the answer
+    /// consists of, which is *not* how many one page shows (ruling 0171).
+    ///
+    /// `None` is the documented default and what every caller that does
+    /// not care writes: the capacity is then the initially requested
+    /// `limit`, so an ordinary request for five results is the native
+    /// ranking at five and not a five-row window onto a two-hundred-row
+    /// one. `Some(k)` is a caller asking for a deeper finite result set —
+    /// typically with a smaller `limit`, to walk it a page at a time.
+    ///
+    /// Frozen for a whole continuation: a page restating a different
+    /// capacity is refused, because a different capacity is a different
+    /// ranking function and therefore a new query, never the next page of
+    /// this one.
+    pub capacity: Option<u64>,
     /// Continuation (ruling 0093, W3-CORRECTION.md item 1): when `Some`,
     /// pins the exact generation an admitted membership is read from —
     /// the vector a prior answer already captured — instead of that
@@ -291,6 +319,62 @@ struct Candidate {
     generation_identity: HitGenerationIdentity,
 }
 
+/// Resolve this request's result capacity, or say exactly why it cannot be
+/// run as asked (ruling 0171).
+///
+/// Pure, and deliberately reachable without a store: the surface that
+/// issues and checks continuation tokens must be able to compute the very
+/// number a page will be frozen under *before* the page is ranked, so that
+/// a restated request can be compared against the token without running a
+/// second search to learn what it would have run at.
+///
+/// The policy, in full:
+///
+/// * an explicit capacity is honoured within `1..=CAPACITY_MAX`, and
+///   refused outside it — a caller who named a number this increment
+///   cannot run is told so, never quietly given a different one;
+/// * no explicit capacity means the capacity is the initially requested
+///   limit, which is what makes an ordinary `--limit 5` the native ranking
+///   at five;
+/// * a requested limit above `CAPACITY_MAX` derives the bound, and the
+///   answer publishes both the bound and the limit it came from, so the
+///   only caller whose behaviour is unchanged by this policy — one asking
+///   for more results than this increment ranks — is also the only one who
+///   has to be told that a bound applied;
+/// * a zero limit still needs somewhere to rank from, and derives a
+///   capacity of one rather than asking the native ranker for nothing.
+pub fn resolve_capacity(request: &SearchRequest) -> Result<ResolvedCapacity, String> {
+    let requested_limit = request.limit as u64;
+    match request.capacity {
+        Some(explicit) => {
+            if explicit == 0 || explicit > CAPACITY_MAX {
+                return Err(format!(
+                    "a result capacity of {explicit} cannot be run: this product decides result \
+                     capacity under {CAPACITY_POLICY} and ranks at most {CAPACITY_MAX} results \
+                     for one query in this increment, so name a capacity between 1 and \
+                     {CAPACITY_MAX} — the number of results a page shows is a separate limit and \
+                     is not bounded by it"
+                ));
+            }
+            Ok(ResolvedCapacity {
+                value: explicit,
+                source: CapacitySource::Explicit,
+                requested_limit,
+            })
+        }
+        None if requested_limit > CAPACITY_MAX => Ok(ResolvedCapacity {
+            value: CAPACITY_MAX,
+            source: CapacitySource::RequestedLimitBounded,
+            requested_limit,
+        }),
+        None => Ok(ResolvedCapacity {
+            value: requested_limit.max(1),
+            source: CapacitySource::RequestedLimit,
+            requested_limit,
+        }),
+    }
+}
+
 /// The sentence a caller gets when semantic ranking did not happen, or
 /// did not happen everywhere.
 ///
@@ -329,6 +413,10 @@ fn unrecoverable_reason(detail: &str) -> String {
 /// snapshot, so the vector this function captures is coherent for its
 /// whole duration regardless of what other handles do concurrently.
 pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswer, AtlasError> {
+    // Resolved before anything is read: a capacity this product cannot run
+    // is a request that cannot be answered as asked, and saying so costs
+    // no store read and asserts nothing about the estate (ruling 0171).
+    let capacity = resolve_capacity(request).map_err(AtlasError::InvalidRequest)?;
     // W3-CORRECTION.md item 3: a fresh estate (or a specifically
     // requested-but-unregistered source) has never had anything to admit
     // or deny — reported distinctly from both `denied` and `no_match`.
@@ -343,6 +431,7 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
         return Ok(empty_answer(
             store,
             request,
+            capacity,
             AdmissionSummary::default(),
             AnswerCoverage {
                 no_sources: true,
@@ -376,6 +465,7 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
         return Ok(empty_answer(
             store,
             request,
+            capacity,
             admission,
             AnswerCoverage {
                 denied: true,
@@ -483,8 +573,14 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
             .iter()
             .map(|(source, _)| source.membership.clone())
             .collect();
-        let outcome =
-            semantic_attempt(store, request, &memberships, &generation_of, &mut coverage)?;
+        let outcome = semantic_attempt(
+            store,
+            request,
+            capacity,
+            &memberships,
+            &generation_of,
+            &mut coverage,
+        )?;
         match outcome {
             Ok((ranked, applied, status)) => {
                 hits = ranked;
@@ -522,6 +618,9 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
                         budget: AnswerBudget {
                             limit: request.limit,
                             offset: request.offset,
+                            capacity: capacity.value,
+                            capacity_source: capacity.source,
+                            capacity_applies: true,
                             ..AnswerBudget::default()
                         },
                     });
@@ -557,6 +656,14 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
         offset: request.offset,
         total_candidates,
         returned: page.len(),
+        capacity: capacity.value,
+        capacity_source: capacity.source,
+        // The lexical path ranks the whole admitted, family-filtered
+        // candidate list; nothing about it is bounded by a native result
+        // capacity, and saying otherwise would be a false statement about
+        // a number this answer did publish (ruling 0171: no lexical
+        // contract change made in passing).
+        capacity_applies: !ranked_lexically,
     };
     let hits = page;
     // A continuation window that starts at or past the end of its own
@@ -605,6 +712,7 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
 fn empty_answer(
     store: &AtlasStore,
     request: &SearchRequest,
+    capacity: ResolvedCapacity,
     admission: AdmissionSummary,
     coverage: AnswerCoverage,
     semantic: SemanticStatus,
@@ -623,6 +731,13 @@ fn empty_answer(
         budget: AnswerBudget {
             limit: request.limit,
             offset: request.offset,
+            // The capacity this request resolved to, reported even though
+            // nothing was ranked: it is a property of the request, and
+            // publishing a zero here would state a capacity the policy
+            // never resolves. `capacity_applies` stays false — no native
+            // result set was bounded, because none was produced.
+            capacity: capacity.value,
+            capacity_source: capacity.source,
             ..AnswerBudget::default()
         },
     }
@@ -653,6 +768,7 @@ type SemanticOutcome = Result<
 fn semantic_attempt(
     store: &AtlasStore,
     request: &SearchRequest,
+    capacity: ResolvedCapacity,
     memberships: &[crate::Membership],
     generations: &BTreeMap<MembershipId, GenerationId>,
     coverage: &mut AnswerCoverage,
@@ -733,11 +849,17 @@ fn semantic_attempt(
         .iter()
         .map(|edition| (edition.membership.clone(), edition.edition.id.clone()))
         .collect();
-    let (view, ranked, applied) =
-        match crate::retrieval::rank(config, &editions, store, &request.query, pinned_producer)? {
-            Ok(result) => result,
-            Err(detail) => return Ok(Err(detail)),
-        };
+    let (view, ranked, applied) = match crate::retrieval::rank(
+        config,
+        &editions,
+        store,
+        &request.query,
+        capacity,
+        pinned_producer,
+    )? {
+        Ok(result) => result,
+        Err(detail) => return Ok(Err(detail)),
+    };
     let identities: BTreeMap<MembershipId, HitGenerationIdentity> = editions
         .iter()
         .map(|edition| {
@@ -793,10 +915,15 @@ fn semantic_attempt(
     // returned pool, before the `offset`/`limit` slice below and before
     // any hit is dropped, so what is paged is one list.
     order_ranked(&mut hits);
-    // The candidate pool is frozen so paging is a slice of one list. When
-    // the native ranker fills it, more candidates may exist beyond it and
-    // the answer says so rather than implying completeness.
-    if applied.saturated {
+    // The result set is frozen at this query's capacity so paging is a
+    // slice of one list. When the native ranker fills that capacity, rows
+    // relevant to this query may exist beyond this query's budget, and the
+    // answer says so rather than implying completeness. The converse is
+    // *not* asserted: a result set that did not fill its capacity is this
+    // ranker's bounded set exhausted, which is never a claim that the
+    // admitted view holds nothing further
+    // (`native-ranking-contract-review/ROOT-ADJUDICATION.md`).
+    if applied.capacity_reached {
         coverage.partial = true;
     }
     let status = match &partial {

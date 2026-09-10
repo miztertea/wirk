@@ -264,6 +264,7 @@ fn a_v2_generation_still_validates_and_resolves_under_the_v3_default() {
             families: vec![],
             semantic: wirk_atlas::SemanticRequest::Disabled,
             limit: 10,
+            capacity: None,
             pinned: Some(pinned),
             offset: 0,
             semantic_query: None,

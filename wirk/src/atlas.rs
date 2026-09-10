@@ -43,7 +43,7 @@ fn atlas_usage() -> ExitCode {
          | wirk atlas publish --estate <root> --source <name> --generation <id> [--json] \
          | wirk atlas status --estate <root> [--source <name>] [--work <id>] [--json] \
          | wirk atlas resolve [--estate <root>] [--work <id>] --coordinate <encoded> [--json] \
-         | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--semantic-backend <path>] [--semantic-backend-arg <arg>...] [--semantic-model <dir>] [--family code|knowledge|config]... [--limit <n>] [--continue <token>] [--json] \
+         | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--semantic-backend <path>] [--semantic-backend-arg <arg>...] [--semantic-model <dir>] [--family code|knowledge|config]... [--limit <n>] [--capacity <n>] [--continue <token>] [--json] \
          | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--chunker units|native] [--json] \
          | wirk atlas semantic select --estate <root> --source <name> --edition <id> [--json] \
          | wirk atlas relate --estate <root> --work <id> --kind governed_by --from <coordinate> --to <coordinate> --evidence <coordinate> [--evidence <coordinate>...] [--run <id>] [--world <hash>] [--json] \
@@ -402,6 +402,7 @@ fn search_command(rest: &[String]) -> ExitCode {
             ("--semantic-model", true),
             ("--family", true),
             ("--limit", true),
+            ("--capacity", true),
             ("--continue", true),
         ],
     ) {
@@ -443,6 +444,29 @@ fn search_command(rest: &[String]) -> ExitCode {
     let semantic = flag_value(rest, "--semantic");
     let families = flag_values(rest, "--family");
     let limit = flag_value(rest, "--limit").and_then(|value| value.parse::<usize>().ok());
+    // Ruling 0171: how many ranked results this query's answer *consists
+    // of*, as against `--limit`, which is how many of them one page
+    // shows. Omitted, the capacity is the requested `--limit`, so an
+    // ordinary search is the native ranking at the number of results it
+    // asked for. A value that is not a number is refused here rather than
+    // silently dropped: a caller who names a capacity is asking for a
+    // specific result set, and quietly running a different one would be
+    // exactly the substitution this policy exists to end.
+    let capacity = match flag_value(rest, "--capacity") {
+        None => None,
+        Some(value) => match value.parse::<u64>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                eprintln!(
+                    "wirk atlas search: --capacity takes a whole number of results (1 to {}); \
+                     it is this query's result capacity, not the number of results one page \
+                     shows, which is --limit",
+                    wirk_atlas::CAPACITY_MAX
+                );
+                return ExitCode::from(1);
+            }
+        },
+    };
     let continuation = flag_value(rest, "--continue");
     wirkd_client_call(
         &estate,
@@ -453,6 +477,7 @@ fn search_command(rest: &[String]) -> ExitCode {
             semantic,
             families,
             limit,
+            capacity,
             continuation,
             semantic_backend: flag_value(rest, "--semantic-backend"),
             semantic_backend_args: flag_values(rest, "--semantic-backend-arg"),
@@ -486,17 +511,19 @@ fn search_command(rest: &[String]) -> ExitCode {
                 }
                 // A ranking that actually happened names what did it.
                 if let Some(application) = result["ranking"]["application"].as_object() {
+                    let number = |key: &str| {
+                        application
+                            .get(key)
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0)
+                    };
                     println!(
-                        "  ranked by {} over {} admitted rows, {} of {} editions, candidate \
-                         limit {}{}",
+                        "  ranked by {} over {} admitted rows, {} of {} editions",
                         application
                             .get("native")
                             .and_then(|value| value.as_str())
                             .unwrap_or("?"),
-                        application
-                            .get("rows_ranked")
-                            .and_then(|value| value.as_u64())
-                            .unwrap_or(0),
+                        number("rows_ranked"),
                         result["ranking"]["editions"]
                             .as_array()
                             .map(|editions| editions.len())
@@ -505,18 +532,38 @@ fn search_command(rest: &[String]) -> ExitCode {
                             .as_array()
                             .map(|editions| editions.len())
                             .unwrap_or(0),
+                    );
+                    // Ruling 0171, on the surface a human actually reads:
+                    // what this query's result capacity was, where the
+                    // number came from, and — in words, not a token —
+                    // whether the result set filled that capacity or ran
+                    // out inside it. Neither sentence claims anything
+                    // about what the estate holds beyond this query.
+                    println!(
+                        "  result capacity {} ({}, at most {} per query under {}), returned {} \
+                         ranked result(s); {}",
+                        number("capacity"),
                         application
-                            .get("candidate_limit")
-                            .and_then(|value| value.as_u64())
-                            .unwrap_or(0),
+                            .get("capacity_source")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("?"),
+                        number("capacity_max"),
+                        application
+                            .get("capacity_policy")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("?"),
+                        number("result_rows"),
                         if application
-                            .get("candidates_saturated")
+                            .get("capacity_reached")
                             .and_then(|value| value.as_bool())
                             .unwrap_or(false)
                         {
-                            " (saturated: more candidates exist beyond it)"
+                            "the result set filled this query's capacity, so relevant results may \
+                             exist beyond it — asking for a deeper result set is a new query at a \
+                             larger --capacity, not a continuation of this one"
                         } else {
-                            ""
+                            "this query's result set is exhausted at this capacity, which says \
+                             nothing about what else the admitted sources hold"
                         }
                     );
                     // The measured half of "ranked by …". `native` above
