@@ -30,14 +30,14 @@
 
 use crate::domain::{EstateScope, GenerationId, MembershipId};
 use crate::semantic::{
-    BackendArgument, BackendEnvironment, BackendIdentity, CAPACITY_POLICY, EMBEDDING_BATCH_POLICY,
-    EditionId, MappingRow, QUERY_HASH_SEED, QUERY_ORDERING_POLICY, QUERY_PRODUCER_BASIS_MISSING,
-    QUERY_PROTOCOL, QueryProducerBasis, QueryProducerPin, RANKING_PATH_CONVENTION,
-    ReportedEnvironment, SemanticEdition, configured_file, digest_bytes, measure_environment,
-    normalize_ranking_text, producer_basis, query_producer_configuration_digest,
-    query_producer_identity_digest, ranking_scope,
+    AvailabilityVerified, BackendArgument, BackendEnvironment, BackendIdentity, CAPACITY_POLICY,
+    EMBEDDING_BATCH_POLICY, EditionId, MappingRow, QUERY_HASH_SEED, QUERY_ORDERING_POLICY,
+    QUERY_PRODUCER_BASIS_MISSING, QUERY_PROTOCOL, QueryProducerBasis, QueryProducerPin,
+    RANKING_PATH_CONVENTION, ReportedEnvironment, SemanticEdition, VerifiedEdition,
+    configured_file, digest_bytes, measure_environment, normalize_ranking_text, producer_basis,
+    query_producer_configuration_digest, query_producer_identity_digest, ranking_scope,
 };
-use crate::{AtlasError, AtlasStore, ContentFamily, Membership, SemanticAvailability};
+use crate::{AtlasError, AtlasStore, ContentFamily, Membership};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -79,12 +79,16 @@ pub struct SemanticQueryConfig {
     pub model: PathBuf,
 }
 
-/// One admitted source's contribution to the ranking view.
+/// One admitted source's contribution to the ranking view: the exact
+/// mapping rows and vector bytes `plan_semantic` already read and
+/// verified once for this query, carried through to `rank` instead of
+/// being reopened (ruling 0181).
 pub(crate) struct AdmittedEdition {
     pub membership: MembershipId,
     pub locator: String,
     pub edition: SemanticEdition,
     pub rows: Vec<MappingRow>,
+    pub vectors: Vec<u8>,
 }
 
 /// What a semantic request resolved to before a single row was read.
@@ -125,25 +129,55 @@ pub(crate) fn plan_semantic(
             // it is already reported through `generation_unavailable`.
             continue;
         };
-        let chosen = match pinned {
-            Some(pinned) => match pinned.get(&membership.id) {
-                Some(id) => Some(id.clone()),
-                None => {
+        // Exactly one verified read of this edition's mapping and vector
+        // bytes per membership, whichever branch below is taken (ruling
+        // 0181). The pinned branch verifies fresh, because a continuation
+        // must not rank through bytes that have rotted since the first
+        // page; the current-selection branch reuses the read
+        // `semantic_availability_verified` already did to decide whether
+        // this edition is usable at all, instead of verifying it twice.
+        let (edition, rows, vectors) = match pinned {
+            Some(pinned) => {
+                let Some(id) = pinned.get(&membership.id) else {
                     excluded.push(format!(
                         "{}: this continuation captured no semantic edition for it",
                         membership.alias
                     ));
                     continue;
+                };
+                let edition = match store.read_edition(id) {
+                    Ok(edition) => edition,
+                    Err(error) => {
+                        excluded.push(format!("{}: {error}", membership.alias));
+                        continue;
+                    }
+                };
+                match store.verify_edition_bytes(&edition) {
+                    VerifiedEdition::Verified(verified) => {
+                        (edition, verified.rows, verified.vectors)
+                    }
+                    _ => {
+                        excluded.push(format!(
+                            "{}: edition {} no longer verifies",
+                            membership.alias, edition.id.0
+                        ));
+                        continue;
+                    }
                 }
-            },
-            None => match store.semantic_availability(membership)? {
-                SemanticAvailability::Available => store.selected_semantic(membership),
+            }
+            None => match store.semantic_availability_verified(membership)? {
+                AvailabilityVerified::Available {
+                    edition,
+                    rows,
+                    vectors,
+                } => (*edition, rows, vectors),
                 other => {
+                    let status = other.status();
                     excluded.push(format!(
                         "{}: its selected edition is {}{}",
                         membership.alias,
-                        other.label(),
-                        other
+                        status.label(),
+                        status
                             .detail()
                             .map(|detail| format!(" — {detail}"))
                             .unwrap_or_default()
@@ -152,30 +186,6 @@ pub(crate) fn plan_semantic(
                 }
             },
         };
-        let Some(id) = chosen else {
-            excluded.push(format!("{}: no edition is selected", membership.alias));
-            continue;
-        };
-        let edition = match store.read_edition(&id) {
-            Ok(edition) => edition,
-            Err(error) => {
-                excluded.push(format!("{}: {error}", membership.alias));
-                continue;
-            }
-        };
-        // A pinned edition is verified here rather than inherited: a
-        // continuation must not rank through bytes that have rotted since
-        // the first page.
-        if !matches!(
-            store.verify_edition(&edition),
-            crate::SemanticVerification::Verified
-        ) {
-            excluded.push(format!(
-                "{}: edition {} no longer verifies",
-                membership.alias, edition.id.0
-            ));
-            continue;
-        }
         if &edition.generation != generation {
             excluded.push(format!(
                 "{}: edition {} describes generation {}, and this answer reads {}",
@@ -289,13 +299,6 @@ pub(crate) fn plan_semantic(
                 continue;
             }
         }
-        let rows = match store.read_mapping(&edition) {
-            Ok(rows) => rows,
-            Err(error) => {
-                excluded.push(format!("{}: {error}", membership.alias));
-                continue;
-            }
-        };
         let rows: Vec<MappingRow> = rows
             .into_iter()
             .filter(|row| {
@@ -314,6 +317,7 @@ pub(crate) fn plan_semantic(
             locator: membership.locator.clone(),
             edition,
             rows,
+            vectors,
         });
     }
     if ready.is_empty() {
@@ -654,10 +658,17 @@ fn prune_query_index_cache(root: &Path, keep: &str, own: u32) {
 /// Every row's ranking text is re-derived here from the committed bytes
 /// and checked against the digest its edition recorded, so a query ranks
 /// the text the build actually embedded or it ranks nothing.
+///
+/// `editions` is `&mut` so each edition's already-verified vector bytes
+/// (`AdmittedEdition::vectors`) can be moved out and dropped as this
+/// function's loop reaches it, releasing one edition's buffer at a time.
+/// That is not the same footprint as the prior disk re-read: planning
+/// already retains every admitted edition's verified buffer at once before
+/// rank runs, and this loop also accumulates its own combined admitted-view
+/// vector buffer across every edition as it goes.
 pub(crate) fn rank(
     config: &SemanticQueryConfig,
-    editions: &[AdmittedEdition],
-    store: &AtlasStore,
+    editions: &mut [AdmittedEdition],
     query: &str,
     capacity: ResolvedCapacity,
     pinned_producer: Option<&QueryProducerPin>,
@@ -734,7 +745,7 @@ pub(crate) fn rank(
         Ok(model) => model,
         Err(reason) => return Ok(Err(reason)),
     };
-    for admitted in editions {
+    for admitted in editions.iter_mut() {
         if admitted.edition.model.consumed.digest != model.digest {
             return Ok(Err(format!(
                 "the configured query model digests to {} but edition {} was embedded by {}; a \
@@ -742,15 +753,9 @@ pub(crate) fn rank(
                 model.digest, admitted.edition.id.0, admitted.edition.model.consumed.digest
             )));
         }
-        let raw = match store.edition_file(&admitted.edition.id, &admitted.edition.vectors.file) {
-            Ok(raw) => raw,
-            Err(error) => {
-                return Ok(Err(format!(
-                    "edition {} vectors are unreadable: {error}",
-                    admitted.edition.id.0
-                )));
-            }
-        };
+        // Already verified and read once by `plan_semantic`; consumed
+        // exactly as it was carried, never reopened (ruling 0181).
+        let raw = std::mem::take(&mut admitted.vectors);
         let width = admitted.edition.vectors.dimensions;
         if dimensions == 0 {
             dimensions = width;

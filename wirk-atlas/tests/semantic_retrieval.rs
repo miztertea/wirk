@@ -3681,6 +3681,313 @@ fn t9_result_capacity_resolves_by_policy_and_refuses_outside_its_bounds() {
     );
 }
 
+// ---- U1-U4: verified bytes are read once per query and never carried
+// across queries (ruling 0181) --------------------------------------------
+//
+// `plan_semantic`/`rank` now read and verify each admitted membership's
+// mapping and vector bytes exactly once per query — proved externally
+// with `strace` on the real CLI against a real daemon and a real
+// multi-repo fixture (`VERIFIED-READ-BUILT.md`), since these library-level
+// tests cannot themselves count file opens. What these four pin instead
+// is the correctness that refactor must never trade away: every call
+// still re-reads and re-verifies from disk, nothing survives from one
+// `search()` call to the next, per-membership verification stays
+// independent under a multi-source scope, and a continuation's pinned
+// edition still ranks even after its membership selects a different one.
+
+fn u_estate_with_edition() -> (Estate, SemanticEdition) {
+    let mut estate = estate();
+    let edition = staged(build(&mut estate, "honest"));
+    let membership = estate.membership.clone();
+    estate
+        .store
+        .select_semantic(&membership, &edition.id)
+        .unwrap()
+        .unwrap();
+    (estate, edition)
+}
+
+fn u_edition_file(estate: &Estate, edition: &SemanticEdition, file: &str) -> PathBuf {
+    estate
+        ._temporary
+        .path()
+        .join("atlas/semantic")
+        .join(&edition.id.0)
+        .join(file)
+}
+
+/// U1. A query re-verifies an edition's bytes from disk every time it
+/// runs, in both directions: corrupting the selected edition's vectors
+/// between two `search()` calls in the same process must be caught by the
+/// second one, and repairing them must let a third call rank normally
+/// again. Either direction failing would mean some earlier call's
+/// verification survived past its own query — a process-lifetime cache
+/// ruling 0181 explicitly forbids.
+#[test]
+fn u1_a_query_revalidates_disk_bytes_fresh_on_every_call() {
+    let (estate, edition) = u_estate_with_edition();
+    let backend = query_backend(&estate.directory, "query-u1.py", "topk");
+    let request = search_request(&estate, Some(&backend));
+
+    let first = wirk_atlas::search(&estate.store, &request).unwrap();
+    assert!(
+        matches!(first.semantic, SemanticStatus::Applied),
+        "{:?}",
+        first.semantic
+    );
+    let baseline_rows = first.application.as_ref().unwrap().rows_ranked;
+    assert!(baseline_rows > 0);
+
+    let vectors_path = u_edition_file(&estate, &edition, &edition.vectors.file);
+    let original = fs::read(&vectors_path).unwrap();
+    let tampered: Vec<u8> = original.iter().map(|byte| byte ^ 0x01).collect();
+    fs::write(&vectors_path, &tampered).unwrap();
+
+    let corrupted = wirk_atlas::search(&estate.store, &request).unwrap();
+    let SemanticStatus::Unavailable(reason) = corrupted.semantic else {
+        panic!(
+            "a corrupted selected edition must never be silently ranked: {:?}",
+            corrupted.semantic
+        );
+    };
+    assert!(
+        reason.contains("no longer verify"),
+        "unexpected reason: {reason}"
+    );
+
+    fs::write(&vectors_path, &original).unwrap();
+    let repaired = wirk_atlas::search(&estate.store, &request).unwrap();
+    assert!(
+        matches!(repaired.semantic, SemanticStatus::Applied),
+        "a repair on disk must be picked up fresh, not stuck on the corrupt call: {:?}",
+        repaired.semantic
+    );
+    assert_eq!(
+        repaired.application.unwrap().rows_ranked,
+        baseline_rows,
+        "the repaired query must rank the same rows the first, uncorrupted query did"
+    );
+}
+
+/// U2. The same freshness, over the mapping side, plus the shape checks a
+/// doctored mapping has to survive on the query path itself, not only when
+/// `verify_edition` is called directly: a row count that no longer
+/// matches the edition's own manifest, and a file removed outright.
+#[test]
+fn u2_a_mapping_row_count_mismatch_or_missing_file_refuses_the_query() {
+    let (estate, edition) = u_estate_with_edition();
+    let backend = query_backend(&estate.directory, "query-u2.py", "topk");
+    let request = search_request(&estate, Some(&backend));
+
+    let mapping_path = u_edition_file(&estate, &edition, &edition.mapping.file);
+    let original = fs::read_to_string(&mapping_path).unwrap();
+    let mut lines: Vec<&str> = original
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(lines.len() > 1, "fixture must have more than one row");
+    lines.pop();
+    fs::write(&mapping_path, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let answer = wirk_atlas::search(&estate.store, &request).unwrap();
+    let SemanticStatus::Unavailable(reason) = answer.semantic else {
+        panic!(
+            "a mapping row count that no longer matches its manifest must refuse, not rank: {:?}",
+            answer.semantic
+        );
+    };
+    assert!(
+        reason.contains("no longer verify"),
+        "unexpected reason: {reason}"
+    );
+
+    fs::write(&mapping_path, &original).unwrap();
+    let repaired = wirk_atlas::search(&estate.store, &request).unwrap();
+    assert!(matches!(repaired.semantic, SemanticStatus::Applied));
+
+    fs::remove_file(&mapping_path).unwrap();
+    let missing = wirk_atlas::search(&estate.store, &request).unwrap();
+    let SemanticStatus::Unavailable(reason) = missing.semantic else {
+        panic!(
+            "a query over a missing mapping file must refuse, not rank: {:?}",
+            missing.semantic
+        );
+    };
+    assert!(
+        reason.contains("incomplete") && reason.contains("absent"),
+        "unexpected reason: {reason}"
+    );
+}
+
+/// U3. A continuation's own captured edition — not whatever is selected by
+/// the time the next page runs — decides what that page ranks through.
+/// `plan_semantic`'s pinned branch reads and verifies exactly that
+/// edition, once, regardless of what `select_semantic` has done to the
+/// membership since. Red before ruling 0181's own selection-vs-pin
+/// distinction would be conflating "verified once" with "verified for the
+/// currently selected edition": this proves the pinned branch is its own
+/// independent verified read, not a reuse of whatever the current
+/// selection last checked.
+#[test]
+fn u3_a_continuation_follows_its_pinned_edition_past_a_later_selection() {
+    let mut estate = estate();
+    let edition_a = staged(build(&mut estate, "honest"));
+    let generation_a = estate.generation.clone();
+    let membership = estate.membership.clone();
+    estate
+        .store
+        .select_semantic(&membership, &edition_a.id)
+        .unwrap()
+        .unwrap();
+
+    let backend = query_backend(&estate.directory, "query-u3.py", "topk");
+    let first =
+        wirk_atlas::search(&estate.store, &search_request(&estate, Some(&backend))).unwrap();
+    assert!(
+        matches!(first.semantic, SemanticStatus::Applied),
+        "{:?}",
+        first.semantic
+    );
+    assert_eq!(
+        first.editions,
+        vec![(membership.id.clone(), edition_a.id.clone())]
+    );
+    let first_hits: Vec<_> = first.hits.iter().map(coordinate_key).collect();
+
+    // New content, a new generation, and a new edition selected over it:
+    // the membership now publishes and selects something other than A.
+    // A's own bytes are never touched.
+    fs::write(
+        estate._repo.path().join("extra.rs"),
+        "fn omega() { let extra = 99; }\n",
+    )
+    .unwrap();
+    git(estate._repo.path(), &["add", "."]);
+    git(estate._repo.path(), &["commit", "-qm", "extra content"]);
+    let staged_generation = estate
+        .store
+        .acquire(&membership, "HEAD", ExtractorPolicy::default())
+        .unwrap()
+        .staged()
+        .unwrap();
+    estate
+        .store
+        .publish(&membership, &staged_generation.id)
+        .unwrap();
+    estate.generation = staged_generation.id.clone();
+    let edition_b = staged(build(&mut estate, "honest"));
+    assert_ne!(
+        edition_b.id, edition_a.id,
+        "new content must build a new edition"
+    );
+    estate
+        .store
+        .select_semantic(&membership, &edition_b.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        estate.store.selected_semantic(&membership),
+        Some(edition_b.id.clone())
+    );
+
+    // A continuation pinned to A's own generation and edition, run after B
+    // became the membership's current selection.
+    let mut pinned = search_request(&estate, Some(&backend));
+    pinned.pinned = Some(std::collections::BTreeMap::from([(
+        membership.id.clone(),
+        generation_a,
+    )]));
+    pinned.pinned_editions = Some(std::collections::BTreeMap::from([(
+        membership.id.clone(),
+        edition_a.id.clone(),
+    )]));
+    // `pinned_mode`/`pinned_producer` stay at their defaults (`None`,
+    // `Unrecorded`): that pair guards a *different* correctness property
+    // (the implementation that ranked page 1 is the one ranking page 2,
+    // `QueryProducerPin`) which this stub backend reports no environment
+    // for and is not what U3 is about. `plan_semantic`'s pinned branch —
+    // the one this test pins — reads `pinned_editions` on its own,
+    // independent of that check.
+    let second = wirk_atlas::search(&estate.store, &pinned).unwrap();
+    assert!(
+        matches!(second.semantic, SemanticStatus::Applied),
+        "{:?}",
+        second.semantic
+    );
+    assert_eq!(
+        second.editions,
+        vec![(membership.id.clone(), edition_a.id.clone())],
+        "a continuation must rank through its own pinned edition, not the one now selected"
+    );
+    let second_hits: Vec<_> = second.hits.iter().map(coordinate_key).collect();
+    assert_eq!(
+        first_hits, second_hits,
+        "the pinned page must reproduce exactly what A alone ranked, unaffected by B"
+    );
+}
+
+/// U4. Multi-source scope: each membership's bytes are verified
+/// independently and fresh on every call. Corrupting one of two selected
+/// editions must not affect the other — the answer still ranks the
+/// healthy membership and names the corrupt one — and repairing it must
+/// restore full coverage on the very next call, proving the corrupt
+/// membership's earlier failure was not remembered either.
+#[test]
+fn u4_multi_source_verification_is_independent_and_revalidated_per_call() {
+    let mut estate = tie_estate();
+    add_colliding_source(&mut estate);
+    let backend = query_backend(&estate.directory, "query-u4.py", "topk");
+    let request = search_request(&estate, Some(&backend));
+
+    let first = wirk_atlas::search(&estate.store, &request).unwrap();
+    assert!(
+        matches!(first.semantic, SemanticStatus::Applied),
+        "{:?}",
+        first.semantic
+    );
+    assert_eq!(first.editions.len(), 2, "both sources must contribute");
+
+    let corrupted_membership = estate.membership.clone();
+    let corrupted_edition_id = first
+        .editions
+        .iter()
+        .find(|(membership, _)| *membership == corrupted_membership.id)
+        .unwrap()
+        .1
+        .clone();
+    let corrupted_edition = estate.store.read_edition(&corrupted_edition_id).unwrap();
+    let vectors_path = u_edition_file(&estate, &corrupted_edition, &corrupted_edition.vectors.file);
+    let original = fs::read(&vectors_path).unwrap();
+    let tampered: Vec<u8> = original.iter().map(|byte| byte ^ 0x01).collect();
+    fs::write(&vectors_path, &tampered).unwrap();
+
+    let partial = wirk_atlas::search(&estate.store, &request).unwrap();
+    let SemanticStatus::Partial(reason) = partial.semantic else {
+        panic!(
+            "one corrupted membership among two must be partial, not applied or unavailable: {:?}",
+            partial.semantic
+        );
+    };
+    assert!(
+        reason.contains(&corrupted_membership.alias),
+        "unexpected reason: {reason}"
+    );
+    assert_eq!(
+        partial.editions.len(),
+        1,
+        "the healthy membership alone must still rank"
+    );
+
+    fs::write(&vectors_path, &original).unwrap();
+    let repaired = wirk_atlas::search(&estate.store, &request).unwrap();
+    assert!(
+        matches!(repaired.semantic, SemanticStatus::Applied),
+        "a repair on disk must restore full coverage on the very next call: {:?}",
+        repaired.semantic
+    );
+    assert_eq!(repaired.editions.len(), 2);
+}
+
 // ---- T10-T12: native embedding batch composition (ruling 0175, D4) ------
 //
 // Native chunk-embed vectors are a function of how chunks are batched into

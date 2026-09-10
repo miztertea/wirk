@@ -823,7 +823,7 @@ fn semantic_attempt(
         request.pinned_editions.as_ref(),
         &request.families,
     )?;
-    let (editions, partial) = match plan {
+    let (mut editions, partial) = match plan {
         SemanticPlan::Unavailable(detail) => return Ok(Err(detail)),
         SemanticPlan::Ready { editions, partial } => (editions, partial),
     };
@@ -851,8 +851,7 @@ fn semantic_attempt(
         .collect();
     let (view, ranked, applied) = match crate::retrieval::rank(
         config,
-        &editions,
-        store,
+        &mut editions,
         &request.query,
         capacity,
         pinned_producer,

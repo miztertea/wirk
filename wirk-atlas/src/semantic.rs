@@ -1020,6 +1020,35 @@ pub enum SemanticVerification {
     Unavailable(String),
 }
 
+/// The exact mapping rows and vector bytes `verify_edition_bytes` read and
+/// confirmed against an edition's record, carried out instead of being
+/// read again by whatever needs them next.
+pub(crate) struct VerifiedEditionBytes {
+    pub rows: Vec<MappingRow>,
+    pub vectors: Vec<u8>,
+}
+
+/// `SemanticVerification`, plus the verified bytes on the one outcome that
+/// has any: `verify_edition` below reduces this to the bare verdict for
+/// every caller that only needs it.
+pub(crate) enum VerifiedEdition {
+    Verified(VerifiedEditionBytes),
+    Missing(String),
+    Corrupt(String),
+    Unavailable(String),
+}
+
+impl VerifiedEdition {
+    pub(crate) fn status(&self) -> SemanticVerification {
+        match self {
+            Self::Verified(_) => SemanticVerification::Verified,
+            Self::Missing(detail) => SemanticVerification::Missing(detail.clone()),
+            Self::Corrupt(detail) => SemanticVerification::Corrupt(detail.clone()),
+            Self::Unavailable(detail) => SemanticVerification::Unavailable(detail.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditionState {
     pub edition: SemanticEdition,
@@ -3316,62 +3345,6 @@ impl crate::AtlasStore {
         Ok(Ok((inputs, unitizer)))
     }
 
-    /// The bytes of one file of an edition's immutable directory.
-    pub(crate) fn edition_file(&self, id: &EditionId, file: &str) -> std::io::Result<Vec<u8>> {
-        let directory = self
-            .edition_dir(id)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        std::fs::read(directory.join(file))
-    }
-
-    /// One edition's mapping rows, in the order they were written, which
-    /// is the vector row order.
-    pub(crate) fn read_mapping(
-        &self,
-        edition: &SemanticEdition,
-    ) -> Result<Vec<MappingRow>, String> {
-        let bytes = self
-            .edition_file(&edition.id, &edition.mapping.file)
-            .map_err(|error| format!("edition {} mapping is unreadable: {error}", edition.id.0))?;
-        if digest_bytes(&bytes) != edition.mapping.digest {
-            return Err(format!(
-                "edition {} mapping bytes are not the bytes its record commits to",
-                edition.id.0
-            ));
-        }
-        let text = String::from_utf8(bytes)
-            .map_err(|_| format!("edition {} mapping is not UTF-8", edition.id.0))?;
-        let mut rows = Vec::new();
-        for (number, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let row: MappingRow = serde_json::from_str(line).map_err(|error| {
-                format!(
-                    "edition {} mapping line {} is malformed: {error}",
-                    edition.id.0,
-                    number + 1
-                )
-            })?;
-            if row.row != rows.len() as u64 {
-                return Err(format!(
-                    "edition {} mapping rows are out of order at {}",
-                    edition.id.0, row.row
-                ));
-            }
-            rows.push(row);
-        }
-        if rows.len() as u64 != edition.mapping.rows {
-            return Err(format!(
-                "edition {} record commits to {} mapping rows and holds {}",
-                edition.id.0,
-                edition.mapping.rows,
-                rows.len()
-            ));
-        }
-        Ok(rows)
-    }
-
     pub fn read_edition(&self, id: &EditionId) -> Result<SemanticEdition, AtlasError> {
         let path = self.edition_dir(id)?.join(EDITION_RECORD);
         if !path.exists() {
@@ -3391,18 +3364,26 @@ impl crate::AtlasStore {
         Ok(edition)
     }
 
-    /// Recompute, from the bytes on disk, everything the record claims.
-    /// Nothing here is cached and nothing is repaired.
-    pub fn verify_edition(&self, edition: &SemanticEdition) -> SemanticVerification {
+    /// Recompute, from the bytes on disk, everything the record claims,
+    /// and hand back the exact verified mapping rows and vector bytes
+    /// rather than discarding them.
+    ///
+    /// This is the one place an edition's mapping and vector bytes are
+    /// read, digested and parsed; `verify_edition` below, and every other
+    /// caller that only needs the verdict, are thin wrappers over it. A
+    /// query's plan and rank stages carry this call's output through
+    /// instead of repeating it (ruling 0181) — nothing here is cached
+    /// across calls, so a later call always re-reads and re-verifies.
+    pub(crate) fn verify_edition_bytes(&self, edition: &SemanticEdition) -> VerifiedEdition {
         let directory = match self.edition_dir(&edition.id) {
             Ok(directory) => directory,
-            Err(error) => return SemanticVerification::Corrupt(error.to_string()),
+            Err(error) => return VerifiedEdition::Corrupt(error.to_string()),
         };
         let mapping_path = directory.join(&edition.mapping.file);
         let vectors_path = directory.join(&edition.vectors.file);
         for path in [&mapping_path, &vectors_path] {
             if !path.exists() {
-                return SemanticVerification::Missing(format!(
+                return VerifiedEdition::Missing(format!(
                     "{} is absent",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 ));
@@ -3410,16 +3391,16 @@ impl crate::AtlasStore {
         }
         let mapping_bytes = match std::fs::read(&mapping_path) {
             Ok(bytes) => bytes,
-            Err(error) => return SemanticVerification::Unavailable(error.to_string()),
+            Err(error) => return VerifiedEdition::Unavailable(error.to_string()),
         };
         let vector_bytes = match std::fs::read(&vectors_path) {
             Ok(bytes) => bytes,
-            Err(error) => return SemanticVerification::Unavailable(error.to_string()),
+            Err(error) => return VerifiedEdition::Unavailable(error.to_string()),
         };
         if mapping_bytes.len() as u64 != edition.mapping.byte_len
             || digest_bytes(&mapping_bytes) != edition.mapping.digest
         {
-            return SemanticVerification::Corrupt(format!(
+            return VerifiedEdition::Corrupt(format!(
                 "{} does not match the digest this edition commits to",
                 edition.mapping.file
             ));
@@ -3429,7 +3410,7 @@ impl crate::AtlasStore {
         if vector_bytes.len() as u64 != edition.vectors.byte_len
             || digest_bytes(&vector_bytes) != edition.vectors.digest
         {
-            return SemanticVerification::Corrupt(format!(
+            return VerifiedEdition::Corrupt(format!(
                 "{} does not match the digest this edition commits to",
                 edition.vectors.file
             ));
@@ -3437,7 +3418,7 @@ impl crate::AtlasStore {
         if edition.vectors.byte_len != edition.vectors.rows * edition.vectors.dimensions * 4
             || edition.vectors.rows != edition.mapping.rows
         {
-            return SemanticVerification::Corrupt(
+            return VerifiedEdition::Corrupt(
                 "vector rows, dimensions and mapping rows are not mutually consistent".into(),
             );
         }
@@ -3449,11 +3430,11 @@ impl crate::AtlasStore {
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) => {
-                return SemanticVerification::Corrupt(format!("mapping is malformed: {error}"));
+                return VerifiedEdition::Corrupt(format!("mapping is malformed: {error}"));
             }
         };
         if rows.len() as u64 != edition.mapping.rows {
-            return SemanticVerification::Corrupt(
+            return VerifiedEdition::Corrupt(
                 "mapping row count does not match the manifest".into(),
             );
         }
@@ -3464,12 +3445,21 @@ impl crate::AtlasStore {
                 || row.source != edition.source
                 || row.generation != edition.generation
             {
-                return SemanticVerification::Corrupt(format!(
+                return VerifiedEdition::Corrupt(format!(
                     "mapping row {index} does not belong to this edition"
                 ));
             }
         }
-        SemanticVerification::Verified
+        VerifiedEdition::Verified(VerifiedEditionBytes {
+            rows,
+            vectors: vector_bytes,
+        })
+    }
+
+    /// Recompute, from the bytes on disk, everything the record claims.
+    /// Nothing here is cached and nothing is repaired.
+    pub fn verify_edition(&self, edition: &SemanticEdition) -> SemanticVerification {
+        self.verify_edition_bytes(edition).status()
     }
 
     /// Re-read every mapping row's committed bytes from Git and confirm
@@ -3655,23 +3645,37 @@ impl crate::AtlasStore {
         &self,
         membership: &Membership,
     ) -> Result<SemanticAvailability, AtlasError> {
+        Ok(self.semantic_availability_verified(membership)?.status())
+    }
+
+    /// The same question `semantic_availability` answers, plus — only on
+    /// `Available` — the exact edition and the verified mapping rows and
+    /// vector bytes `verify_edition_bytes` already read while answering
+    /// it. A caller about to plan a query over this edition uses this
+    /// instead of `semantic_availability`, so a currently-selected edition
+    /// is verified once per query, not once here and again to get the
+    /// bytes (ruling 0181).
+    pub(crate) fn semantic_availability_verified(
+        &self,
+        membership: &Membership,
+    ) -> Result<AvailabilityVerified, AtlasError> {
         self.check_membership_public(membership)?;
         let Some(id) = self.selected_semantic(membership) else {
-            return Ok(SemanticAvailability::None);
+            return Ok(AvailabilityVerified::None);
         };
         let edition = match self.read_edition(&id) {
             Ok(edition) => edition,
-            Err(error) => return Ok(SemanticAvailability::Unreadable(error.to_string())),
+            Err(error) => return Ok(AvailabilityVerified::Unreadable(error.to_string())),
         };
         if edition.membership != membership.id || edition.estate != membership.estate {
-            return Ok(SemanticAvailability::Unreadable(
+            return Ok(AvailabilityVerified::Unreadable(
                 "the selected edition does not belong to this membership".into(),
             ));
         }
-        match self.verify_edition(&edition) {
-            SemanticVerification::Verified => {}
+        let verified = match self.verify_edition_bytes(&edition) {
+            VerifiedEdition::Verified(bytes) => bytes,
             other => {
-                return Ok(SemanticAvailability::Unusable(match other {
+                return Ok(AvailabilityVerified::Unusable(match other.status() {
                     SemanticVerification::Missing(detail) => {
                         format!("the selected edition is incomplete: {detail}")
                     }
@@ -3684,26 +3688,56 @@ impl crate::AtlasStore {
                     SemanticVerification::Verified => unreachable!(),
                 }));
             }
-        }
+        };
         // Retained, intact, and no longer a description of what this
         // source publishes. Explicitly not a reason to clear the
         // selection: the edition remains historical evidence and a future
         // continuation pin, and erasing it would only hide the staleness.
         match self.current(membership)? {
             Some(current) if current.id == edition.generation => {
-                Ok(SemanticAvailability::Available)
+                Ok(AvailabilityVerified::Available {
+                    edition: Box::new(edition),
+                    rows: verified.rows,
+                    vectors: verified.vectors,
+                })
             }
-            Some(current) => Ok(SemanticAvailability::Superseded(format!(
+            Some(current) => Ok(AvailabilityVerified::Superseded(format!(
                 "the selected edition is built over generation {}, which this source no longer \
                  publishes; it now publishes {}. The edition is retained unchanged; build and \
                  select one over the published generation, or publish that generation again.",
                 edition.generation.0, current.id.0
             ))),
-            None => Ok(SemanticAvailability::Superseded(format!(
+            None => Ok(AvailabilityVerified::Superseded(format!(
                 "the selected edition is built over generation {}, and this source publishes no \
                  generation at all right now. The edition is retained unchanged.",
                 edition.generation.0
             ))),
+        }
+    }
+}
+
+/// `SemanticAvailability`, plus the verified edition and its bytes on the
+/// one outcome that has any.
+pub(crate) enum AvailabilityVerified {
+    None,
+    Unreadable(String),
+    Unusable(String),
+    Superseded(String),
+    Available {
+        edition: Box<SemanticEdition>,
+        rows: Vec<MappingRow>,
+        vectors: Vec<u8>,
+    },
+}
+
+impl AvailabilityVerified {
+    pub(crate) fn status(&self) -> SemanticAvailability {
+        match self {
+            Self::None => SemanticAvailability::None,
+            Self::Unreadable(detail) => SemanticAvailability::Unreadable(detail.clone()),
+            Self::Unusable(detail) => SemanticAvailability::Unusable(detail.clone()),
+            Self::Superseded(detail) => SemanticAvailability::Superseded(detail.clone()),
+            Self::Available { .. } => SemanticAvailability::Available,
         }
     }
 }
