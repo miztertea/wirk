@@ -7042,6 +7042,11 @@ fn edition_json(edition: &wirk_atlas::SemanticEdition) -> Value {
             "fusion": retrieval.fusion,
             "capacity_policy": retrieval.capacity_policy,
             "capacity_max": retrieval.capacity_max,
+            // How this edition's native rows were batched into the
+            // embedding model's calls. Empty for a units edition and for
+            // every native edition built before this policy existed —
+            // read back exactly as declared, never inferred as today's.
+            "batch_policy": retrieval.batch_policy,
             // Present only on an edition built under the previous
             // universal-depth policy, whose own bytes are left exactly as
             // they were written and are read back verbatim here.

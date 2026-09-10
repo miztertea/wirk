@@ -176,6 +176,18 @@ pub const RETRIEVAL_SCHEME: &str = "wirk-retrieval/v1";
 /// other relevant information.
 pub const CAPACITY_POLICY: &str = "query-bound-capacity/v1";
 
+/// How a native edition's rows were batched into the embedding model's
+/// `encode` calls, disclosed the same way `CAPACITY_POLICY` is (ruling
+/// 0175, D4). The installed tokenizer pads every text in one call to that
+/// call's own longest member, so a chunk's stored vector depends on which
+/// other texts shared its `encode` call; this product now batches by
+/// resource, matching `semble.index.create.create_index_from_path`'s
+/// `embed_chunks(model, file_chunks)` -- one call per file, never one call
+/// over the whole build. Units editions never declare this: their rows are
+/// boundaries Wirk already owns, embedded one request at a time exactly as
+/// before, and out of this correction's scope.
+pub const EMBEDDING_BATCH_POLICY: &str = "resource-batched-embedding/v1";
+
 /// The largest result capacity this increment will run, retained at the
 /// previous universal depth (ruling 0171: "Keep existing operational upper
 /// bound 200 for this bounded increment … not as a guaranteed count").
@@ -808,6 +820,13 @@ pub struct RetrievalIdentity {
     pub capacity_policy: String,
     #[serde(default)]
     pub capacity_max: u64,
+    /// How this edition's native rows were batched into the embedding
+    /// model's `encode` calls (`EMBEDDING_BATCH_POLICY`). Empty for a
+    /// units edition, which never batches by resource, and for every
+    /// native edition built before this correction -- both read back
+    /// honestly rather than being assumed to match today's policy.
+    #[serde(default)]
+    pub batch_policy: String,
     /// Historical only, never written now: an edition built under the
     /// previous universal-depth policy recorded its one frozen candidate
     /// depth here. Read so that such an edition's own bytes stay readable
@@ -845,6 +864,10 @@ impl RetrievalIdentity {
             capacity_policy: CAPACITY_POLICY.into(),
             capacity_max: CAPACITY_MAX,
             candidate_limit: None,
+            batch_policy: match chunking {
+                SemanticChunking::Native => EMBEDDING_BATCH_POLICY.into(),
+                SemanticChunking::Units => String::new(),
+            },
             digest: String::new(),
         };
         let mut hasher = Sha256::new();
@@ -858,6 +881,7 @@ impl RetrievalIdentity {
             identity.path_convention.as_bytes(),
             identity.fusion.as_bytes(),
             identity.capacity_policy.as_bytes(),
+            identity.batch_policy.as_bytes(),
         ] {
             absorb(&mut hasher, part);
         }

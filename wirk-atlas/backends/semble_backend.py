@@ -638,12 +638,25 @@ def run_embed(header: dict) -> None:
 
     rows: list[dict] = []
     texts: list[str] = []
+    # Native mode only (ruling 0175, D4): each resource's chunk texts, kept
+    # separate so every resource is handed to `encode` in its own call --
+    # exactly what `embed_chunks(model, file_chunks)` does in
+    # `semble.index.create.create_index_from_path`, and never the whole
+    # request at once. The installed tokenizer pads every text in one
+    # `encode` call to that call's own longest member
+    # (`tokenizers.Tokenizer.encode_batch_fast`), so a chunk's stored vector
+    # must not depend on which other resources happen to share this
+    # request.
+    per_resource_texts: list[list[str]] = []
     unmapped: list[dict] = []
     identity = None
 
     if mode == "embed":
-        # Wirk already fixed every boundary (one generation unit per row)
-        # and already owns the text; this side only embeds it.
+        # Units mode: Wirk already fixed every boundary (one generation unit
+        # per row) and already owns the text; this side only embeds it, in
+        # one call over the whole request exactly as before. Out of this
+        # correction's scope (ruling 0175 binds native chunk-embed batching
+        # only).
         texts = [entry["text"] for entry in inputs]
         rows = texts
     else:
@@ -737,17 +750,29 @@ def run_embed(header: dict) -> None:
                 continue
             rows.extend(projected)
             texts.extend(projected_texts)
+            per_resource_texts.append(projected_texts)
 
     from model2vec import StaticModel  # noqa: PLC0415
     import model2vec  # noqa: PLC0415
 
     model = StaticModel.from_pretrained(model_path, force_download=False)
-    if texts:
-        vectors = model.encode(texts, use_multiprocessing=False)
-        dimensions = int(vectors.shape[1])
+    if mode == "embed":
+        if texts:
+            vectors = list(model.encode(texts, use_multiprocessing=False))
+            dimensions = int(len(vectors[0]))
+        else:
+            vectors = []
+            dimensions = 0
     else:
+        # One `encode` call per resource (see `per_resource_texts` above),
+        # concatenated in the same resource order as `rows`/`texts` were
+        # built, so row order and mapping are unaffected -- only which
+        # texts are padded against which inside the model's tokenizer.
         vectors = []
-        dimensions = 0
+        for file_texts in per_resource_texts:
+            if file_texts:
+                vectors.extend(model.encode(file_texts, use_multiprocessing=False))
+        dimensions = int(len(vectors[0])) if texts else 0
     with open(header["output"], "wb") as handle:
         for index in range(len(texts)):
             handle.write(struct.pack(f"<{dimensions}f", *(float(v) for v in vectors[index])))

@@ -3680,3 +3680,436 @@ fn t9_result_capacity_resolves_by_policy_and_refuses_outside_its_bounds() {
         1
     );
 }
+
+// ---- T10-T12: native embedding batch composition (ruling 0175, D4) ------
+//
+// Native chunk-embed vectors are a function of how chunks are batched into
+// the model's `encode` calls: the installed tokenizer pads every text in
+// one call to that call's own longest member, so a chunk's stored vector
+// used to depend on every other chunk in the *whole build request*
+// (`wirk-atlas/backends/semble_backend.py::run_embed`,
+// `model.encode(texts, ...)` once over every resource). The installed
+// reference does not do this: `create_index_from_path` calls
+// `embed_chunks(model, file_chunks)` once per file. These three tests are
+// `#[ignore]`d and opted in exactly as T5-T9 are, against the pinned real
+// `semble` interpreter and offline model — no stub, because a stub's
+// vectors do not depend on batching and could not observe this defect.
+
+/// The directory one edition's files live under, by the same path
+/// convention T7's pinned-edition-rot check uses.
+fn edition_directory(estate: &TiedEstate, id: &wirk_atlas::EditionId) -> PathBuf {
+    estate._temporary.path().join("atlas/semantic").join(&id.0)
+}
+
+/// The edition's stored vectors, decoded from the raw `f32le` row-major
+/// file the record's own `VectorManifest` names — never re-derived, never
+/// assumed to be at a fixed path.
+fn read_vectors(estate: &TiedEstate, edition: &SemanticEdition) -> Vec<Vec<f32>> {
+    let bytes =
+        fs::read(edition_directory(estate, &edition.id).join(&edition.vectors.file)).unwrap();
+    let dimensions = edition.vectors.dimensions as usize;
+    assert_eq!(
+        bytes.len(),
+        edition.vectors.rows as usize * dimensions * 4,
+        "the vectors file is not the size its own manifest declares"
+    );
+    bytes
+        .chunks_exact(dimensions * 4)
+        .map(|row| {
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|four| f32::from_le_bytes(*four))
+                .collect()
+        })
+        .collect()
+}
+
+/// The edition's mapping rows, parsed from the NDJSON file its own
+/// `MappingManifest` names, in vector row order.
+fn read_mapping(estate: &TiedEstate, edition: &SemanticEdition) -> Vec<wirk_atlas::MappingRow> {
+    let bytes =
+        fs::read(edition_directory(estate, &edition.id).join(&edition.mapping.file)).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The rows and vectors belonging to one source-relative path, in row
+/// order, as `(row, vector)` pairs.
+fn rows_for_path<'a>(
+    mapping: &'a [wirk_atlas::MappingRow],
+    vectors: &'a [Vec<f32>],
+    path: &str,
+) -> Vec<(&'a wirk_atlas::MappingRow, &'a Vec<f32>)> {
+    mapping
+        .iter()
+        .zip(vectors.iter())
+        .filter(|(row, _)| row.path == path.as_bytes())
+        .collect()
+}
+
+/// Vectors for exactly these texts, computed by the installed `semble`'s
+/// own per-file embedding call — `embed_chunks(model, file_chunks)`,
+/// i.e. one `model.encode` call over exactly this list, never mixed with
+/// any other file's chunks. Used as the independent oracle T10 compares
+/// the product's stored vectors against; it shells out to the pinned
+/// interpreter rather than re-implementing `model2vec` encoding.
+fn embed_chunks_oracle(python: &Path, model: &Path, texts: &[String]) -> Vec<Vec<f32>> {
+    let script = r#"
+import json, struct, sys
+from model2vec import StaticModel
+request = json.loads(sys.stdin.read())
+model = StaticModel.from_pretrained(request["model_path"], force_download=False)
+texts = request["texts"]
+if texts:
+    vectors = model.encode(texts, use_multiprocessing=False)
+else:
+    vectors = []
+sys.stdout.buffer.write(struct.pack("<Q", len(texts)))
+sys.stdout.buffer.write(struct.pack("<Q", model.dim))
+for row in vectors:
+    sys.stdout.buffer.write(struct.pack(f"<{model.dim}f", *(float(v) for v in row)))
+"#;
+    let mut child = Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            &serde_json::to_vec(&serde_json::json!({
+                "model_path": model.display().to_string(),
+                "texts": texts,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "embedding oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows = u64::from_le_bytes(output.stdout[0..8].try_into().unwrap()) as usize;
+    let dimensions = u64::from_le_bytes(output.stdout[8..16].try_into().unwrap()) as usize;
+    assert_eq!(rows, texts.len());
+    output.stdout[16..]
+        .chunks_exact(dimensions * 4)
+        .map(|row| {
+            row.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|four| f32::from_le_bytes(*four))
+                .collect()
+        })
+        .collect()
+}
+
+/// The exact ranking text of one mapping row, read from the committed
+/// bytes at `[byte_start, byte_end)` -- valid only for the plain-LF ASCII
+/// fixtures these tests use, where the ranking text is byte-identical to
+/// the committed slice (`text_normalization` is always `identity` here).
+fn row_text(repo: &Path, relative: &str, row: &wirk_atlas::MappingRow) -> String {
+    let bytes = fs::read(repo.join(relative)).unwrap();
+    assert_eq!(
+        row.text_normalization.as_deref(),
+        Some(wirk_atlas::TEXT_IDENTITY),
+        "this helper only recovers text for identity-normalized rows"
+    );
+    String::from_utf8(bytes[row.byte_start as usize..row.byte_end as usize].to_vec()).unwrap()
+}
+
+fn batch_module_text(seed: u64, blocks: usize) -> String {
+    let mut text = String::new();
+    let mut state = seed;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 33) as usize
+    };
+    for slot in 0..blocks {
+        text.push_str(&format!("def block_{slot}():\n    # "));
+        for _ in 0..40 {
+            text.push_str(CAPACITY_VOCAB[next() % CAPACITY_VOCAB.len()]);
+            text.push(' ');
+        }
+        text.push_str(&format!("\n    return {slot}\n\n"));
+    }
+    text
+}
+
+/// T10. Every one of a resource's chunks is embedded in the *same*
+/// `encode` call as every other chunk of that resource, and in no other
+/// call: the product's stored vectors for `pkg_a/util.py` and
+/// `pkg_b/util.py` (same basename, different directories, so row
+/// alignment cannot be papering over a path collision) match the
+/// installed `semble`'s own `embed_chunks` run over exactly that file's
+/// chunk texts, bit-identical, while `short.py`'s vectors independently
+/// verify the same way.
+///
+/// Red before the correction: the product embedded every resource's
+/// chunks in one call over the whole build, so a multi-chunk file's
+/// vectors depended on which other files were in the same build and
+/// disagreed with `embed_chunks` run alone (`DIAGNOSIS.md` D4, measured
+/// min cosine 0.9998-0.99999, max abs delta up to 0.0055 on the
+/// diagnosis fixture).
+#[test]
+#[ignore]
+fn t10_native_vectors_match_installed_semble_per_file_embed_chunks() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    for (relative, text) in [
+        ("short.py", batch_module_text(1, 2)),
+        ("pkg_a/util.py", batch_module_text(2, 3)),
+        ("pkg_b/util.py", batch_module_text(3, 5)),
+    ] {
+        let path = repo.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "batch fixture"]);
+
+    let mut estate = tied_estate_with_alias(repo.path(), "m-batch");
+    let edition = tied_build(&mut estate, &python, &script, &model);
+    let mapping = read_mapping(&estate, &edition);
+    let vectors = read_vectors(&estate, &edition);
+
+    for relative in ["short.py", "pkg_a/util.py", "pkg_b/util.py"] {
+        let pairs = rows_for_path(&mapping, &vectors, relative);
+        assert!(!pairs.is_empty(), "{relative} produced no row");
+        // Row alignment: this file's rows are its own chunks' slots, in
+        // order, with no gap and no row belonging to another path.
+        for (slot, (row, _)) in pairs.iter().enumerate() {
+            assert_eq!(row.path, relative.as_bytes());
+            let _ = slot;
+        }
+        let texts: Vec<String> = pairs
+            .iter()
+            .map(|(row, _)| row_text(repo.path(), relative, row))
+            .collect();
+        let oracle = embed_chunks_oracle(&python, &model, &texts);
+        assert_eq!(
+            oracle.len(),
+            pairs.len(),
+            "{relative}: oracle returned a different row count"
+        );
+        for (index, ((_, stored), expected)) in pairs.iter().zip(oracle.iter()).enumerate() {
+            assert_eq!(
+                stored.as_slice(),
+                expected.as_slice(),
+                "{relative} row {index}: stored vector does not match embed_chunks run over \
+                 exactly this file's chunks"
+            );
+        }
+    }
+}
+
+/// T11. Adding an unrelated, much longer file to the same membership must
+/// not change the stored vectors of a file already there: `short.py`'s
+/// vectors are bit-identical across a build without `long.py` and a
+/// rebuild with it. A whitespace-only resource, present in both builds,
+/// still produces no row in either (D-class coverage from
+/// `fixture_repo`, pinned here against the real backend rather than a
+/// synthetic one).
+///
+/// Red before the correction: `long.py`'s many long chunks entered the
+/// same `encode` call as `short.py`'s few short ones, so the tokenizer
+/// padded `short.py`'s chunks up to `long.py`'s longest token length and
+/// moved their vectors (`DIAGNOSIS.md` D4).
+#[test]
+#[ignore]
+fn t11_an_unrelated_longer_file_leaves_other_files_vectors_unchanged() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    fs::write(repo.path().join("short.py"), batch_module_text(11, 1)).unwrap();
+    fs::write(repo.path().join("blank.py"), "   \n\t\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "before"]);
+
+    let mut estate = tied_estate_with_alias(repo.path(), "m-unrelated");
+    let before = tied_build(&mut estate, &python, &script, &model);
+    assert_eq!(before.coverage.resources_indexed, 2);
+    assert_eq!(before.coverage.resources_with_rows, 1);
+    assert_eq!(before.coverage.resources_without_rows.len(), 1);
+    let mapping_before = read_mapping(&estate, &before);
+    let vectors_before = read_vectors(&estate, &before);
+    let short_before = rows_for_path(&mapping_before, &vectors_before, "short.py");
+    assert!(!short_before.is_empty());
+
+    fs::write(repo.path().join("long.py"), batch_module_text(12, 60)).unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "after"]);
+    estate.generation = estate
+        .store
+        .acquire(
+            &estate.membership.clone(),
+            "HEAD",
+            ExtractorPolicy::default(),
+        )
+        .unwrap()
+        .staged()
+        .unwrap()
+        .id;
+    estate
+        .store
+        .publish(&estate.membership.clone(), &estate.generation.clone())
+        .unwrap();
+    let after = tied_build(&mut estate, &python, &script, &model);
+    assert_eq!(after.coverage.resources_indexed, 3);
+    assert_eq!(after.coverage.resources_with_rows, 2);
+    assert_eq!(
+        after.coverage.resources_without_rows.len(),
+        1,
+        "the whitespace-only resource still yields no row with a longer sibling present"
+    );
+    let mapping_after = read_mapping(&estate, &after);
+    let vectors_after = read_vectors(&estate, &after);
+    let short_after = rows_for_path(&mapping_after, &vectors_after, "short.py");
+
+    assert_eq!(
+        short_before.len(),
+        short_after.len(),
+        "short.py's own row count moved when an unrelated file was added"
+    );
+    for (index, ((_, before_vector), (_, after_vector))) in
+        short_before.iter().zip(short_after.iter()).enumerate()
+    {
+        assert_eq!(
+            before_vector.as_slice(),
+            after_vector.as_slice(),
+            "short.py row {index}: vector changed after an unrelated longer file was added"
+        );
+    }
+}
+
+/// T12. An edition built under the previous whole-request batching policy
+/// is refused by name, never silently ranked as though it matched
+/// today's per-resource policy — the same shape T8 proves for
+/// `CAPACITY_POLICY`. The historical record is read, never rewritten.
+#[test]
+#[ignore]
+fn t12_a_previous_batch_policy_edition_is_refused_by_name_not_reinterpreted() {
+    let python = pinned_semble_python();
+    let model = pinned_semble_model();
+    let script = real_semble_backend_script();
+    let repo = capacity_fixture_repo();
+    let estate = capacity_estate(&python, &script, &model, repo.path());
+
+    let edition_id = estate.store.selected_semantic(&estate.membership).unwrap();
+    let record = edition_directory(&estate, &edition_id).join(wirk_atlas::EDITION_RECORD);
+    let before = fs::read(&record).unwrap();
+    let mut document: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let retrieval = document["retrieval"].as_object_mut().unwrap();
+    retrieval.insert("batch_policy".into(), serde_json::json!(""));
+    fs::write(&record, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+    let answer = wirk_atlas::search(
+        &estate.store,
+        &capacity_request(CAPACITY_QUERIES[0], 5, None, 0, &python, &script, &model),
+    )
+    .unwrap();
+    let reason = match &answer.semantic {
+        SemanticStatus::Unavailable(reason) => reason.clone(),
+        other => panic!("a previous-batch-policy edition was ranked through: {other:?}"),
+    };
+    assert!(
+        reason.contains("declares no embedding-batch policy"),
+        "the refusal must state what the edition itself declares: {reason}"
+    );
+    assert!(
+        reason.contains(wirk_atlas::EMBEDDING_BATCH_POLICY),
+        "the refusal must name the policy this product embeds under: {reason}"
+    );
+    assert!(
+        reason.contains("rebuild its semantic edition"),
+        "the refusal must name the recovery: {reason}"
+    );
+    assert!(
+        answer.application.is_none(),
+        "nothing was ranked, so nothing may be reported as having been"
+    );
+
+    // Fresh-build recovery: the ordinary recovery this product names is
+    // building against the estate's current admitted content and
+    // selecting the result. A rebuild against byte-identical content
+    // would reproduce the very same content-addressed id and find this
+    // corrupted record already on disk (0089's deliberate content
+    // addressing: identical bytes are one edition, never two) -- so the
+    // realistic recovery, and what this proves, is building against a
+    // freshly admitted generation, exactly what an operator does next.
+    let mut estate = estate;
+    fs::write(repo.path().join("recovery.py"), batch_module_text(99, 2)).unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "recovery content"]);
+    estate.generation = estate
+        .store
+        .acquire(
+            &estate.membership.clone(),
+            "HEAD",
+            ExtractorPolicy::default(),
+        )
+        .unwrap()
+        .staged()
+        .unwrap()
+        .id;
+    estate
+        .store
+        .publish(&estate.membership.clone(), &estate.generation.clone())
+        .unwrap();
+    let rebuilt = tied_build(&mut estate, &python, &script, &model);
+    assert_ne!(
+        rebuilt.id, edition_id,
+        "a rebuild against freshly admitted content must not collide with the stale edition's id"
+    );
+    assert_eq!(
+        rebuilt
+            .retrieval
+            .as_ref()
+            .expect("a native edition binds a retrieval identity")
+            .batch_policy,
+        wirk_atlas::EMBEDDING_BATCH_POLICY,
+        "a fresh build must declare today's policy, not inherit the stale one"
+    );
+    estate
+        .store
+        .select_semantic(&estate.membership.clone(), &rebuilt.id)
+        .unwrap()
+        .unwrap();
+    let recovered = wirk_atlas::search(
+        &estate.store,
+        &capacity_request(CAPACITY_QUERIES[0], 5, None, 0, &python, &script, &model),
+    )
+    .unwrap();
+    assert!(
+        matches!(recovered.semantic, SemanticStatus::Applied),
+        "{:?}",
+        recovered.semantic
+    );
+
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert_eq!(after["retrieval"]["batch_policy"], serde_json::json!(""));
+}

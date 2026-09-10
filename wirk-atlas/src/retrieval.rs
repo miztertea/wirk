@@ -30,12 +30,12 @@
 
 use crate::domain::{EstateScope, GenerationId, MembershipId};
 use crate::semantic::{
-    BackendArgument, BackendEnvironment, BackendIdentity, CAPACITY_POLICY, EditionId, MappingRow,
-    QUERY_HASH_SEED, QUERY_ORDERING_POLICY, QUERY_PRODUCER_BASIS_MISSING, QUERY_PROTOCOL,
-    QueryProducerBasis, QueryProducerPin, RANKING_PATH_CONVENTION, ReportedEnvironment,
-    SemanticEdition, configured_file, digest_bytes, measure_environment, normalize_ranking_text,
-    producer_basis, query_producer_configuration_digest, query_producer_identity_digest,
-    ranking_scope,
+    BackendArgument, BackendEnvironment, BackendIdentity, CAPACITY_POLICY, EMBEDDING_BATCH_POLICY,
+    EditionId, MappingRow, QUERY_HASH_SEED, QUERY_ORDERING_POLICY, QUERY_PRODUCER_BASIS_MISSING,
+    QUERY_PROTOCOL, QueryProducerBasis, QueryProducerPin, RANKING_PATH_CONVENTION,
+    ReportedEnvironment, SemanticEdition, configured_file, digest_bytes, measure_environment,
+    normalize_ranking_text, producer_basis, query_producer_configuration_digest,
+    query_producer_identity_digest, ranking_scope,
 };
 use crate::{AtlasError, AtlasStore, ContentFamily, Membership, SemanticAvailability};
 use serde::{Deserialize, Serialize};
@@ -234,6 +234,32 @@ pub(crate) fn plan_semantic(
                 "{}: edition {} {declared} and this product decides it under {}; rebuild its \
                  semantic edition and select the rebuilt one before it can be ranked through",
                 membership.alias, edition.id.0, CAPACITY_POLICY
+            ));
+            continue;
+        }
+        // A native edition's stored vectors are a function of how its
+        // chunks were batched into the embedding model's `encode` calls
+        // (ruling 0175, D4): the installed tokenizer pads every text in
+        // one call to that call's own longest member. An edition built
+        // before this correction batched the whole request together and
+        // its vectors are perfectly good bytes, left exactly as built;
+        // what cannot happen is ranking them as though they were embedded
+        // under today's per-resource policy. The recovery is the same as
+        // the other two: rebuild the semantic edition and select the
+        // rebuilt one.
+        if retrieval.chunking == crate::semantic::SemanticChunking::Native
+            && retrieval.batch_policy != EMBEDDING_BATCH_POLICY
+        {
+            let declared = if retrieval.batch_policy.is_empty() {
+                "declares no embedding-batch policy".to_owned()
+            } else {
+                format!("embeds native chunks under {}", retrieval.batch_policy)
+            };
+            excluded.push(format!(
+                "{}: edition {} {declared} and this product embeds native chunks under {}; \
+                 rebuild its semantic edition and select the rebuilt one before it can be ranked \
+                 through",
+                membership.alias, edition.id.0, EMBEDDING_BATCH_POLICY
             ));
             continue;
         }
