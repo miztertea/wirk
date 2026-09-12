@@ -73,6 +73,8 @@ fn open_run(run_id: &str) -> Run {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     }
 }
 
@@ -143,30 +145,38 @@ fn fixture_estate_root() -> &'static std::path::Path {
 }
 
 /// The selection flags in a claude `agent.start` argv, with the Claim
-/// hook's own `--settings <path>` pair (appended last by
+/// hook's own `--plugin-dir <dir>` pair (appended last by
 /// `start_actor_agent`) checked and removed. P3 execution-recovery
 /// correction item 1: these fixtures' estate root is now real and
 /// writable, so the hook is genuinely delivered where the former
 /// `/estate` placeholder made the write fail and the argv look bare —
-/// the settings pair is asserted here by name and Run rather than
-/// dropped from what these tests check.
+/// the pair is asserted here by name and Run rather than dropped from
+/// what these tests check. Ruling 0208 moved the envelope from
+/// `--settings` (one exclusive, last-wins slot) to `--plugin-dir`
+/// (repeatable and additive); the hook inside it is unchanged.
 fn selection_args_without_claim_hook(args: &[String], run_id: &str) -> Vec<String> {
     let split = args
         .iter()
-        .position(|arg| arg == "--settings")
-        .unwrap_or_else(|| panic!("claude argv must carry the Claim hook's --settings: {args:?}"));
+        .position(|arg| arg == "--plugin-dir")
+        .unwrap_or_else(|| {
+            panic!("claude argv must carry the Claim hook's --plugin-dir: {args:?}")
+        });
     let path = args
         .get(split + 1)
-        .unwrap_or_else(|| panic!("--settings must be followed by a path: {args:?}"));
-    let expected_tail = format!(".wirk/claude/{run_id}/settings.json");
+        .unwrap_or_else(|| panic!("--plugin-dir must be followed by a path: {args:?}"));
+    let expected_tail = format!(".wirk/claude/{run_id}/wirk-claim-plugin");
     assert!(
         path.ends_with(&expected_tail),
-        "--settings must name this Run's own claude settings ({expected_tail}): {path}"
+        "--plugin-dir must name this Run's own claude Claim plugin ({expected_tail}): {path}"
+    );
+    assert!(
+        !args.iter().any(|arg| arg == "--settings"),
+        "wirk never adds a --settings element: it is a last-wins slot (0208): {args:?}"
     );
     assert_eq!(
         split + 2,
         args.len(),
-        "the --settings pair is appended last: {args:?}"
+        "the --plugin-dir pair is appended last: {args:?}"
     );
     args[..split].to_vec()
 }
@@ -190,6 +200,7 @@ fn actor_world(run: &Run) -> wirk_core::World {
         boundary: wirk_core::Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
+        contract: None,
     })
 }
 

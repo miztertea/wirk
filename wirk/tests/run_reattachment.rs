@@ -728,3 +728,64 @@ fn after_a_retry_nothing_is_ever_recorded_against_the_superseded_run() {
     assert_eq!(actor.base_sha, m.base_sha);
     stop_wirkd(&m.estate);
 }
+
+/// P4.1 (ruling 0202), end to end through the real daemon: a real
+/// `work submit` reserves an Actor World that **binds the shared worker
+/// contract**, and the bytes that digest names are durably on disk,
+/// estate-owned, before the World referencing them exists.
+///
+/// This is the half no fake can stand for: the reservation is wirkd's
+/// own, on a real journal, and the file is read back off a real
+/// filesystem and re-hashed.
+#[test]
+fn a_real_reservation_binds_the_worker_contract_and_writes_its_bytes_durably() {
+    let m = materialize();
+    let actor = reserved_actor(&m.estate, &m.work_id);
+
+    let contract = actor
+        .contract
+        .as_ref()
+        .expect("a reserved Actor World carries the shared worker contract");
+    assert_eq!(contract.version, "wirk.worker-contract/v1");
+
+    let path = m
+        .estate
+        .join(".wirk")
+        .join("contracts")
+        .join(format!("{}.md", contract.digest));
+    let bytes = fs::read(&path).unwrap_or_else(|error| {
+        panic!(
+            "the reserved contract's bytes must be durable before the reservation references \
+             them ({}): {error}",
+            path.display()
+        )
+    });
+
+    // The name is the content: re-hashing the file reproduces the
+    // reserved digest exactly.
+    let found = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    assert_eq!(found, contract.digest);
+
+    // And it is this build's own contract, not some other estate's.
+    assert_eq!(
+        String::from_utf8(bytes).expect("utf-8"),
+        wirk_herdr::worker_contract::WORKER_CONTRACT
+    );
+
+    // Estate-owned: never inside the actor's boundary-checked worktree,
+    // never under `~/`.
+    assert!(!path.starts_with(&m.worktree));
+    assert!(!path.starts_with(&m.repo));
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        assert!(!path.starts_with(&home));
+    }
+
+    stop_wirkd(&m.estate);
+}

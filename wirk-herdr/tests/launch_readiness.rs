@@ -39,6 +39,8 @@ fn run_id() -> Run {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     }
 }
 
@@ -73,6 +75,7 @@ fn actor_world(run: &Run, estate_root: &std::path::Path) -> World {
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
+        contract: None,
     })
 }
 
@@ -281,9 +284,26 @@ fn actor_pane_env_path_begins_with_the_running_executable_directory() {
         .launch_actor(&run, &world)
         .expect("launch_actor succeeds with no busy refusal configured");
 
+    // Ruling 0205: an opencode Run splits a short-lived probe pane
+    // first, to read the configuration that placement actually
+    // inherits, and the actor's own pane second. Ruling 0208: the probe
+    // pane carries the actor's *own* base launch environment, so the two
+    // panes are the same context in both halves — pinned here, since
+    // this file is where the actor pane's own map is pinned. Every
+    // assertion below is about the actor's pane.
     let calls = client.split_pane_calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    let env = &calls[0].env;
+    assert_eq!(calls.len(), 2, "the probe pane, then the actor's pane");
+    let mut actor_base = calls[1].env.clone();
+    for key in ["OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"] {
+        actor_base.remove(key);
+    }
+    assert_eq!(
+        calls[0].env, actor_base,
+        "the probe reads the configuration of the launch it is about to place, so it must \
+         be placed with that launch's own environment, differing only in the opencode key \
+         its own answer then chooses"
+    );
+    let env = &calls[1].env;
     assert!(
         env.contains_key("PATH"),
         "actor pane env must carry PATH: {env:?}"
@@ -328,7 +348,7 @@ fn actor_pane_env_path_begins_with_the_running_executable_directory() {
     // The triple stays alongside it (P2.6 W3: `actor_pane` passes
     // `CARGO_TARGET_DIR` through exactly when set, same mechanism as
     // `PATH` above).
-    // The triple (3) + PATH + `OPENCODE_CONFIG` (this fixture's Run is
+    // The triple (3) + PATH + `OPENCODE_CONFIG_CONTENT` (this fixture's Run is
     // an opencode kind, and the estate root is now real and writable,
     // so the Claim hook is genuinely delivered where the former
     // `/estate` placeholder silently failed to write it) + and

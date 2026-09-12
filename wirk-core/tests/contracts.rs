@@ -12,7 +12,7 @@ use wirk_core::{
     Access, ActorWorld, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimVerdict,
     DeterministicWorld, Event, EventId, EventKind, ExecutionTriple, FailureCause, OutputContract,
     RepositoryBinding, ReviewTarget, RouteId, Run, RunId, RunState, SourceBasis, Timestamp,
-    WaypointId, WorkId, WorkState, World, WorldHash,
+    WaypointId, WorkId, WorkState, WorkerContractRef, World, WorldHash,
 };
 
 fn triple(run_id: &str) -> ExecutionTriple {
@@ -37,6 +37,8 @@ fn open_run(run_id: &str) -> Run {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     }
 }
 
@@ -68,6 +70,7 @@ fn actor_world(repository: &str, branch: &str, base_sha: &str, worktree: &str) -
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
+        contract: None,
     })
 }
 
@@ -138,6 +141,8 @@ fn d9_1_journal_replay_rebuilds_work_state() {
                 actor_kind: Default::default(),
                 selection: Default::default(),
                 launch_argv: Vec::new(),
+                contract: None,
+                claim_hook: None,
             },
         ),
         event(
@@ -811,6 +816,8 @@ fn run_launched_with_opencode_kind_updates_run() {
             actor_kind: wirk_core::ActorKind::opencode(),
             selection: Default::default(),
             launch_argv: Vec::new(),
+            contract: None,
+            claim_hook: None,
         },
     );
     run.apply(&event);
@@ -834,6 +841,8 @@ fn run_launched_with_an_unlisted_kind_updates_run_and_round_trips() {
             actor_kind: wirk_core::ActorKind("codex".to_string()),
             selection: Default::default(),
             launch_argv: Vec::new(),
+            contract: None,
+            claim_hook: None,
         },
     );
     run.apply(&event);
@@ -1009,6 +1018,8 @@ fn run_launch_requested_binds_the_request_without_claiming_a_launch() {
                 args: vec!["--raw".to_string()],
             },
             launch_argv: vec!["opencode".to_string(), "--model".to_string()],
+            contract: None,
+            claim_hook: None,
         },
     ));
     assert!(run.launched);
@@ -1140,6 +1151,7 @@ fn an_unknown_basis_world_carrying_review_targets_hashes_its_targets() {
             boundary: Boundary(vec!["**".to_string()]),
             review_targets: targets,
             evidence: None,
+            contract: None,
         })
     };
 
@@ -1198,5 +1210,171 @@ fn an_unknown_basis_world_carrying_review_targets_hashes_its_targets() {
     assert_eq!(
         WorldHash::of(&deterministic),
         WorldHash::legacy_for_tests(&deterministic)
+    );
+}
+
+/// P4.1 (ruling 0202): the reserved worker contract is part of the
+/// World's own content — it is what the stage was actually given to
+/// operate under — so it binds into the resume key, exactly as the
+/// frozen review targets and the delivered projection already do.
+///
+/// Two properties, and the second is the one that protects every
+/// journal already on disk:
+///
+/// 1. Changing which contract a stage was reserved with changes its
+///    World hash. Without this, a product upgrade could silently hand an
+///    already-reserved stage a different contract under the same key.
+/// 2. A World that carries **no** contract hashes exactly as it always
+///    did. No World written before this wave carries one, so every
+///    historical hash — including the `Unknown`-basis worlds that take
+///    the pre-v2 `legacy` encoding — is untouched.
+#[test]
+fn a_reserved_worker_contract_binds_into_the_world_hash_and_no_historical_hash_moves() {
+    let world = |contract: Option<WorkerContractRef>| {
+        World::Actor(ActorWorld {
+            repository: "/repo".to_string(),
+            worktree_path: PathBuf::from("/estate"),
+            branch: "wirk/work-1".to_string(),
+            base_sha: "HEAD".to_string(),
+            // The bare public Actor submit's own basis: the one that
+            // takes the pre-v2 fallback, so the "no historical hash
+            // moves" half is asserted where it is hardest.
+            source_basis: SourceBasis::Unknown,
+            triple: ExecutionTriple {
+                estate_root: "/estate".to_string(),
+                work_id: WorkId("work-1".to_string()),
+                run_id: RunId("run-1".to_string()),
+            },
+            intent: "do the thing".to_string(),
+            output_contract: OutputContract(vec![ArtifactSpec {
+                name: "report.md".to_string(),
+                required: true,
+            }]),
+            boundary: Boundary(vec!["**".to_string()]),
+            review_targets: Vec::new(),
+            evidence: None,
+            contract,
+        })
+    };
+    let reference = |version: &str, digest: &str| WorkerContractRef {
+        version: version.to_string(),
+        digest: digest.to_string(),
+    };
+
+    let v1 = world(Some(reference("wirk.worker-contract/v1", "aa")));
+    assert!(v1.carries_contract());
+    assert_eq!(v1.contract().map(|c| c.digest.as_str()), Some("aa"));
+
+    // Each half of the identity moves the hash on its own.
+    assert_ne!(
+        WorldHash::of(&v1),
+        WorldHash::of(&world(Some(reference("wirk.worker-contract/v1", "bb")))),
+        "different rendered bytes must be a different World"
+    );
+    assert_ne!(
+        WorldHash::of(&v1),
+        WorldHash::of(&world(Some(reference("wirk.worker-contract/v2", "aa")))),
+        "a different contract version must be a different World"
+    );
+
+    // A World carrying a contract is no longer a pre-v2 World.
+    assert_ne!(
+        WorldHash::of(&v1),
+        WorldHash::legacy_for_tests(&v1),
+        "a World carrying a contract takes the v2 encoding, which covers it"
+    );
+
+    // And the case every journal on disk is in: unchanged, byte for
+    // byte, through the fallback it always took.
+    let historical = world(None);
+    assert!(!historical.carries_contract());
+    assert_eq!(
+        WorldHash::of(&historical),
+        WorldHash::legacy_for_tests(&historical),
+        "a World with no contract is still a pre-v2 World and keeps its historical hash"
+    );
+    assert_ne!(
+        WorldHash::of(&historical),
+        WorldHash::of(&v1),
+        "and it is distinguishable from the same World once a contract is reserved"
+    );
+}
+
+/// P4.1: the delivery mode folds onto the Run from its own
+/// `RunLaunched`, which is what keeps a reattach or a second `wirk run`
+/// truthful — the prompt composition reads the mode that was actually
+/// recorded rather than re-deciding one.
+///
+/// And the reading of an absent value is fixed here, once: a journal
+/// written before this field existed folds to `None`, which means *this
+/// record carries no delivery fact*, never "this Run launched without a
+/// contract".
+#[test]
+fn the_contract_delivery_folds_from_run_launched_and_absent_means_unrecorded() {
+    let mut run = Run {
+        id: RunId("run-1".to_string()),
+        waypoint: WaypointId("route-1/wp-1".to_string()),
+        attempt: 1,
+        world_hash: WorldHash("deadbeef".to_string()),
+        state: RunState::Open,
+        kind: Default::default(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
+        expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
+    };
+
+    let delivery = wirk_core::ContractDelivery {
+        version: "wirk.worker-contract/v1".to_string(),
+        digest: "abc".to_string(),
+        mode: wirk_core::ContractDeliveryMode::Prompt,
+        fallback_reason: Some("no native mechanism for `gemini`".to_string()),
+    };
+    run.apply(&Event {
+        id: EventId("ev-1".to_string()),
+        at: Timestamp(1),
+        work: WorkId("work-1".to_string()),
+        run: Some(RunId("run-1".to_string())),
+        kind: EventKind::RunLaunched {
+            run: RunId("run-1".to_string()),
+            actor_kind: Default::default(),
+            selection: Default::default(),
+            launch_argv: vec!["--model".to_string(), "sonnet".to_string()],
+            contract: Some(delivery.clone()),
+            claim_hook: None,
+        },
+    });
+    assert_eq!(run.contract_delivery.as_ref(), Some(&delivery));
+    assert!(run.launched);
+
+    // A journal line written before the field existed carries no
+    // `contract` key at all, and still folds.
+    let historical = serde_json::json!({
+        "kind": "RunLaunched",
+        "run": "run-2",
+        "actor_kind": "claude",
+        "launch_argv": ["--model", "sonnet"]
+    });
+    let kind: EventKind = serde_json::from_value(historical).expect("an old RunLaunched folds");
+    let mut old = Run {
+        id: RunId("run-2".to_string()),
+        contract_delivery: Some(delivery),
+        claim_hook: None,
+        ..run.clone()
+    };
+    old.apply(&Event {
+        id: EventId("ev-2".to_string()),
+        at: Timestamp(2),
+        work: WorkId("work-1".to_string()),
+        run: Some(RunId("run-2".to_string())),
+        kind,
+    });
+    assert_eq!(
+        old.contract_delivery, None,
+        "a record carrying no delivery fact states exactly that, and does not inherit one"
     );
 }

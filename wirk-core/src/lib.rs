@@ -148,6 +148,7 @@ impl WorldHash {
         if world.source_basis() == &SourceBasis::Unknown
             && !world.carries_review_targets()
             && !world.carries_evidence()
+            && !world.carries_contract()
         {
             return Self::legacy(world);
         }
@@ -204,6 +205,28 @@ impl WorldHash {
                     hash_string(&mut hasher, &evidence.projection.0);
                     hasher.update(evidence.revision.to_be_bytes());
                     hash_string(&mut hasher, &evidence.format);
+                }
+                // P4.1 (ruling 0202): the shared worker contract this
+                // stage was reserved with is likewise this World's own
+                // content — it is the operating guidance the stage was
+                // actually given, in the same sense the projection is
+                // the context it was given. Binding it here is what
+                // makes "one reservation, several attempts" mean the
+                // same contract every time: a retry or a reattach
+                // resolves the identical digest, and a product upgrade
+                // that changes the contract cannot silently change what
+                // an already-reserved stage operates under.
+                //
+                // Same precedent, third application: appended under the
+                // existing `v2` tag, behind its own marker byte and
+                // presence-gated, so no World reserved without a
+                // contract moves. Version and digest both, because a
+                // re-versioned contract with coincidentally equal bytes
+                // is still a different contract.
+                if let Some(contract) = &actor.contract {
+                    hasher.update([0x04]);
+                    hash_string(&mut hasher, &contract.version);
+                    hash_string(&mut hasher, &contract.digest);
                 }
             }
             World::Deterministic(det) => {
@@ -1529,6 +1552,139 @@ pub struct ActorWorld {
     /// sees it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Box<EvidenceProjectionRef>>,
+    /// P4.1: the shared worker operating contract this stage was
+    /// reserved with — the reference, never the content. The bytes live
+    /// at `<estate_root>/.wirk/contracts/<digest>.md`, written and
+    /// fsynced *before* this World is built, exactly as `evidence`'s
+    /// projection file is, so a reference always names a file that was
+    /// durable first.
+    ///
+    /// It lives on the World, not on `ActorSelection`, for the two
+    /// reasons `selection`'s own doc gives: `selection` is documented as
+    /// mechanism rather than content and never reaches `WorldHash::of`,
+    /// and an authored selection is deliberately *dropped* when the
+    /// launching harness differs from the one it was scoped to
+    /// (`resolve_launch_selection`). The contract is content, and it is
+    /// harness-independent, so either property would silently lose it.
+    ///
+    /// Being in the World is also what makes it stable: one reservation
+    /// backs several attempts (`RunOpened`), so a retry or a reattach of
+    /// a reserved Run operates under the identical contract, and a
+    /// product upgrade cannot change what an already-reserved stage was
+    /// given.
+    ///
+    /// `None` for every World written before this wave.
+    /// `#[serde(default)]` with `skip_serializing_if`, and
+    /// `WorldHash::of` hashes it **only when present**, so neither the
+    /// journal bytes nor the hash of any historical World moves because
+    /// this field exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<WorkerContractRef>,
+}
+
+/// P4.1: which shared worker contract a stage was reserved with. The
+/// shape and the exact bytes, never the bytes themselves — `version`
+/// says which contract this is, `digest` says which rendering of it,
+/// and the two together name exactly one file under
+/// `<estate_root>/.wirk/contracts/`.
+///
+/// The rendered contract is static per product build (no per-Run
+/// substitution: everything per-Run already lives in the first prompt),
+/// so `digest` identifies the source version and the delivered content
+/// at once, and "the same bytes across a retry or a reattach" needs no
+/// further machinery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerContractRef {
+    /// e.g. `wirk.worker-contract/v1`.
+    pub version: String,
+    /// Lowercase hex SHA-256 of the exact rendered bytes.
+    pub digest: String,
+}
+
+/// P4.1: how a launch **actually** delivered the reserved contract to
+/// the actor. Distinct from `WorkerContractRef`, which says what was
+/// reserved: this says what the launch did with it, and is journaled on
+/// `RunLaunched` rather than hashed into the World, because it is
+/// mechanism decided at launch time, not content decided at
+/// reservation.
+///
+/// It earns a field of its own even though `RunLaunched.launch_argv`
+/// already records Herdr's own argv, because two of the delivery modes
+/// leave no argv trace at all: opencode's is an environment variable
+/// naming a config file, and the fallback is prompt text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractDelivery {
+    pub version: String,
+    pub digest: String,
+    pub mode: ContractDeliveryMode,
+    /// Why the native mechanism was not used, for a `Prompt` delivery —
+    /// the honest half of a disclosed fallback. `None` for every native
+    /// mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+/// The delivery mechanisms wirk has actually verified, plus the
+/// disclosed fallback. Not a harness allowlist (0056 D164 stands): a
+/// kind with no native mechanism here is delivered `Prompt`, never
+/// refused and never silently skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractDeliveryMode {
+    /// claude: `--append-system-prompt-file <path>` — appends, never
+    /// replaces, and keeps the bytes out of argv.
+    AppendSystemPromptFile,
+    /// opencode: one more entry in an `instructions` array opencode
+    /// concatenates with the user's own — global, and whatever the
+    /// launch already carries. Which of opencode's two per-launch
+    /// slots wirk's entries arrive through (`OPENCODE_CONFIG_CONTENT`,
+    /// `OPENCODE_CONFIG`, or appended into an inherited inline
+    /// document) is decided per launch from what is free, and no slot
+    /// a launch already filled is overwritten.
+    OpencodeInstructions,
+    /// codex: one `-c developer_instructions=<toml string>` element,
+    /// used only when the harness's own dry render **of this launch's
+    /// own argument list** shows it composes additively with everything
+    /// that launch already configures.
+    CodexDeveloperInstructions,
+    /// Ordinary prompt text, under an explicit disclosure sentence: the
+    /// kind has no native mechanism wirk has verified, or this
+    /// configuration could not compose natively without replacing
+    /// something the user owns.
+    Prompt,
+}
+
+/// P4.1 (ruling 0208): whether this launch **actually delivered** wirk's
+/// own Claim-filing hook into the actor's pane.
+///
+/// Distinct from "this kind is one wirk installs a hook for", which is a
+/// fact about the harness and was all the standing prompt used to have.
+/// Every native delivery mechanism can fail for reasons only the launch
+/// knows — an opencode launch whose two configuration slots are both
+/// taken, a claude launch whose plugin directory could not be written —
+/// and a prompt that promises automatic claiming on a launch where none
+/// was installed tells the actor something untrue about its own turn
+/// end.
+///
+/// Journaled on `RunLaunched` beside `ContractDelivery`, for the same
+/// reason and with the same durability: a reattach or a second `wirk
+/// run` composes its prompt from the delivery that was actually
+/// recorded, never from one re-decided by a later invocation.
+///
+/// Supplying an instruction is not the same as enforcing one: this
+/// records only that the mechanism was handed to the harness, which is
+/// what the prompt is allowed to say.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ClaimHookDelivery {
+    /// The hook reached the launch: opencode's overlay went into a
+    /// configuration slot the launch had left free, or claude's plugin
+    /// directory is on the launch's own argv.
+    Installed,
+    /// It did not, and this is why — carried into the standing prompt so
+    /// the actor is told, in the same breath, to file its Claim by hand.
+    NotInstalled { reason: String },
 }
 
 /// World handed to a deterministic (child/docker) Waypoint. Same
@@ -1592,6 +1748,26 @@ impl World {
     pub fn evidence(&self) -> Option<&EvidenceProjectionRef> {
         match self {
             World::Actor(actor) => actor.evidence.as_deref(),
+            World::Deterministic(_) => None,
+        }
+    }
+
+    /// Whether this World carries a shared worker contract — the third
+    /// fact that disqualifies it from the pre-v2 `WorldHash::legacy`
+    /// encoding. Only an `ActorWorld` can carry one: a contract is
+    /// operating guidance for an actor, and a deterministic command has
+    /// no one to read it.
+    pub fn carries_contract(&self) -> bool {
+        match self {
+            World::Actor(actor) => actor.contract.is_some(),
+            World::Deterministic(_) => false,
+        }
+    }
+
+    /// The shared worker contract this World was reserved with, if any.
+    pub fn contract(&self) -> Option<&WorkerContractRef> {
+        match self {
+            World::Actor(actor) => actor.contract.as_ref(),
             World::Deterministic(_) => None,
         }
     }
@@ -1747,6 +1923,27 @@ pub struct Run {
     /// literal truth for every one of them.
     #[serde(default)]
     pub expansions: Vec<EvidenceProjectionRef>,
+    /// P4.1: how this Run's launch actually delivered the reserved
+    /// worker contract, folded from its own `RunLaunched`. `None` until
+    /// that event folds, and for every journal written before this field
+    /// existed — absent means *this record carries no delivery fact*,
+    /// never "this Run launched without a contract", the same reading
+    /// `selection`'s own doc fixes for its default.
+    ///
+    /// This is what keeps the delivery choice truthful across a reattach
+    /// or a second `wirk run`: the mode the prompt composition reads is
+    /// the one the journal already recorded, not one re-decided by a
+    /// later invocation.
+    #[serde(default)]
+    pub contract_delivery: Option<ContractDelivery>,
+    /// P4.1 (ruling 0208): whether this Run's launch actually installed
+    /// wirk's own Claim-filing hook, folded from its own `RunLaunched`.
+    /// `None` until that event folds, and for every journal written
+    /// before this field existed — absent means *this record carries no
+    /// hook-delivery fact*, never "no hook was installed", the same
+    /// reading `contract_delivery`'s own doc fixes for its default.
+    #[serde(default)]
+    pub claim_hook: Option<ClaimHookDelivery>,
 }
 
 /// Reshaped hard from sergeant's `StageStatus` (domain/workflow.rs:561-578,
@@ -1849,12 +2046,23 @@ impl Run {
                 actor_kind,
                 selection,
                 launch_argv,
+                contract,
+                claim_hook,
                 ..
             } => {
                 self.kind = actor_kind.clone();
                 self.selection = selection.clone();
                 self.launch_argv = launch_argv.clone();
                 self.launched = true;
+                // P4.1: the delivery fact folds beside the argv it is
+                // evidence alongside. `clone()`, not "set only when
+                // `Some`": a launch that delivered nothing (a World with
+                // no contract) must read as exactly that.
+                self.contract_delivery = contract.clone();
+                // 0208: same fold, same reading — a launch that
+                // installed no hook must read as exactly that, never as
+                // "unrecorded".
+                self.claim_hook = claim_hook.clone();
             }
             // The pre-launch half of the same move: the request is bound
             // here, before Herdr is called at all, so a launch that
@@ -3019,6 +3227,26 @@ pub enum EventKind {
         /// point 3). `#[serde(default)]`, same reason as `selection`.
         #[serde(default)]
         launch_argv: Vec<String>,
+        /// P4.1: how the reserved worker contract was actually
+        /// delivered by this launch. `None` for a `RunLaunched` written
+        /// before this field existed, and for a Run whose World carries
+        /// no contract at all.
+        ///
+        /// On `RunLaunched` rather than `RunLaunchRequested`: the mode
+        /// is decided inside the launch itself (it depends on what the
+        /// harness's own configuration turns out to allow), and this is
+        /// the record of the launch actually returning.
+        #[serde(default)]
+        contract: Option<ContractDelivery>,
+        /// P4.1 (ruling 0208): whether this launch actually installed
+        /// wirk's own Claim-filing hook in the actor's pane. `None` for
+        /// a `RunLaunched` written before this field existed.
+        ///
+        /// On `RunLaunched` for the same reason `contract` is: the
+        /// answer depends on what the harness's own configuration turned
+        /// out to allow, and is only known once the launch returns.
+        #[serde(default)]
+        claim_hook: Option<ClaimHookDelivery>,
     },
     /// Terminal Work failure is never inferred from `RunFailed`
     /// (incident file); an explicit event keeps `fold` retry-policy-

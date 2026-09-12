@@ -56,6 +56,8 @@ fn open_run(run_id: &str) -> Run {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     }
 }
 
@@ -228,6 +230,8 @@ fn d5_1_true_completes_by_claim() {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     };
     // P2.4 W1: `cwd` must be the *journaled* World's own `cwd`
     // (`estate`, `handle_submit`'s ad hoc deterministic arm — real
@@ -476,6 +480,8 @@ fn d5_6b_a_claim_wirkd_refuses_surfaces_as_claim_filing_error() {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     };
     let world = deterministic_world(vec!["true"], cwd.path(), OutputContract(Vec::new()));
     executor.launch(&run, &world).expect("launch true");

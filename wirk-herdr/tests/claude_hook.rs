@@ -1,8 +1,11 @@
-//! P2.7 Wave 3 (`build-brief.md` §6 item 1, `reorient.md` §C): a
-//! claude Run's `agent.start` argv carries `--settings <path>` naming a
-//! wirk-owned settings file under the estate root — never the
-//! worktree, never `~/` — declaring a `Stop` hook that runs bare
-//! `wirk claim` and nothing else. No live opencode/claude process runs
+//! P2.7 Wave 3 (`build-brief.md` §6 item 1, `reorient.md` §C), as
+//! corrected by ruling 0208: a claude Run's `agent.start` argv carries
+//! `--plugin-dir <dir>` naming a wirk-owned plugin directory under the
+//! estate root — never the worktree, never `~/` — whose `Stop` hook
+//! runs this Run's own pinned `wirk claim` and nothing else, and
+//! carries **no** `--settings` element, because that flag is a single
+//! last-wins slot and appending wirk's own to a launch's own silently
+//! destroyed it. No live opencode/claude process runs
 //! here: this file pins the *delivery* mechanism (does
 //! `start_actor_agent` build the right argv and does the file it names
 //! exist and say the right thing) deterministically, against
@@ -37,6 +40,8 @@ fn run_with_kind(kind: ActorKind) -> Run {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     }
 }
 
@@ -62,6 +67,7 @@ fn actor_world(run: &Run, estate_root: &std::path::Path, worktree_path: &std::pa
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
+        contract: None,
     })
 }
 
@@ -89,11 +95,15 @@ fn pane_info(pane_id: &str) -> PaneInfo {
     }
 }
 
-/// Red on `main` (`BUILD.md`'s pasted output): `start_actor_agent`'s
-/// claude arm is `["--model", "sonnet"]` and nothing else — no
-/// `--settings` element, no file written anywhere.
+/// Red on the 5195eaa candidate (ruling 0208's own measured defect):
+/// `start_actor_agent`'s claude arm pushed `--settings <wirk's file>`,
+/// which claude resolves last-wins — so a launch carrying its own
+/// `--settings` lost it, hooks and `env` block together, with nothing
+/// journaled and nothing disclosed. Green: the same `Stop` hook arrives
+/// through `--plugin-dir`, claude's own repeatable session-scoped
+/// mechanism, and `--settings` is never written at all.
 #[test]
-fn claude_run_gets_a_settings_flag_naming_a_wirk_owned_stop_hook_under_the_estate_root() {
+fn claude_run_gets_a_plugin_dir_naming_a_wirk_owned_stop_hook_under_the_estate_root() {
     let run = run_with_kind(ActorKind::claude());
     let estate = tempdir().expect("estate tempdir");
     let worktree = tempdir().expect("worktree tempdir");
@@ -108,45 +118,67 @@ fn claude_run_gets_a_settings_flag_naming_a_wirk_owned_stop_hook_under_the_estat
     assert_eq!(calls.len(), 1, "exactly one agent.start call");
     let args = &calls[0].args;
 
+    assert!(
+        !args.iter().any(|a| a == "--settings"),
+        "wirk must never append a --settings element: claude resolves that flag last-wins, \
+         so appending one discards whatever the launch itself declared: {args:?}"
+    );
+
     let flag_index = args
         .iter()
-        .position(|a| a == "--settings")
-        .unwrap_or_else(|| panic!("no --settings element in claude's argv: {args:?}"));
-    let settings_path = args
+        .position(|a| a == "--plugin-dir")
+        .unwrap_or_else(|| panic!("no --plugin-dir element in claude's argv: {args:?}"));
+    let plugin_dir = args
         .get(flag_index + 1)
-        .unwrap_or_else(|| panic!("--settings has no following value: {args:?}"));
-    let settings_path = std::path::Path::new(settings_path);
+        .unwrap_or_else(|| panic!("--plugin-dir has no following value: {args:?}"));
+    let plugin_dir = std::path::Path::new(plugin_dir);
 
-    // Neither the worktree nor `~/` was touched: the settings file
-    // lives under the estate root, outside the worktree entirely.
+    // Neither the worktree nor `~/` was touched: the plugin lives under
+    // the estate root, outside the worktree entirely.
     assert!(
-        settings_path.starts_with(estate.path()),
-        "{settings_path:?} is not under the estate root {:?}",
+        plugin_dir.starts_with(estate.path()),
+        "{plugin_dir:?} is not under the estate root {:?}",
         estate.path()
     );
     assert!(
-        !settings_path.starts_with(worktree.path()),
-        "{settings_path:?} must not be written into the worktree"
+        !plugin_dir.starts_with(worktree.path()),
+        "{plugin_dir:?} must not be written into the worktree"
     );
     let home = std::env::var("HOME").unwrap_or_default();
     if !home.is_empty() {
         assert!(
-            !settings_path.starts_with(&home),
-            "{settings_path:?} must not be written under $HOME"
+            !plugin_dir.starts_with(&home),
+            "{plugin_dir:?} must not be written under $HOME"
         );
     }
 
-    let contents = std::fs::read_to_string(settings_path).expect("settings file exists");
+    // The shape `claude plugin validate --strict` accepts, measured on
+    // 2.1.270: a manifest at `.claude-plugin/plugin.json` naming its
+    // hook file by plugin-relative path.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(plugin_dir.join(".claude-plugin").join("plugin.json"))
+            .expect("plugin manifest exists"),
+    )
+    .expect("plugin manifest is valid JSON");
+    assert_eq!(manifest["name"], "wirk-claim");
+    assert_eq!(manifest["hooks"], "./hooks/hooks.json");
+    assert!(
+        manifest.get("permissions").is_none() && manifest.get("mcpServers").is_none(),
+        "the plugin declares no permissions and no servers (0054 D163a): {manifest}"
+    );
+
+    let contents = std::fs::read_to_string(plugin_dir.join("hooks").join("hooks.json"))
+        .expect("plugin hooks file exists");
     let settings: serde_json::Value =
-        serde_json::from_str(&contents).expect("settings file is valid JSON");
+        serde_json::from_str(&contents).expect("plugin hooks file is valid JSON");
 
     // Declares nothing but a Stop hook: no permissions, no other hook
     // event, no model (0054 D163a; `build-brief.md` §6 item 1).
-    let obj = settings.as_object().expect("settings is a JSON object");
+    let obj = settings.as_object().expect("hooks file is a JSON object");
     assert_eq!(
         obj.keys().collect::<Vec<_>>(),
         vec!["hooks"],
-        "settings must declare nothing but hooks: {settings}"
+        "the hooks file must declare nothing but hooks: {settings}"
     );
     let hooks = settings["hooks"].as_object().expect("hooks is an object");
     assert_eq!(
@@ -208,10 +240,53 @@ fn claude_run_gets_a_settings_flag_naming_a_wirk_owned_stop_hook_under_the_estat
     );
 }
 
-/// An opencode Run gets no `--settings` element at all — this wave adds
-/// nothing for opencode's own hook (delivered by env var, Wave 2).
+/// Ruling 0208's decisive product check, the deterministic twin of the
+/// live control: a launch that carries **its own** `--settings` keeps it
+/// exactly as authored, wirk adds no second one, and wirk's own hook
+/// still reaches the pane through the repeatable flag. Red on 5195eaa:
+/// the argv ended `--settings <route> … --settings <wirk>`, and claude's
+/// last-wins resolution meant the route's file never applied.
 #[test]
-fn opencode_run_gets_no_settings_flag() {
+fn a_launch_carrying_its_own_settings_keeps_it_and_wirk_adds_no_second_one() {
+    let mut run = run_with_kind(ActorKind::claude());
+    run.selection.args = vec![
+        "--settings".to_string(),
+        "/route/owned/settings.json".to_string(),
+    ];
+    let estate = tempdir().expect("estate tempdir");
+    let worktree = tempdir().expect("worktree tempdir");
+    let world = actor_world(&run, estate.path(), worktree.path());
+
+    let client =
+        Arc::new(FakeHerdrClient::default().with_split_pane_response(pane_info(&run.id.0)));
+    let executor = HerdrExecutor::new(client.clone());
+    executor.launch(&run, &world).expect("launch succeeds");
+
+    let calls = client.start_agent_calls.lock().unwrap();
+    let args = &calls[0].args;
+    let settings: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .filter(|(index, arg)| {
+            *arg == "--settings" || (*index > 0 && args[index - 1] == "--settings")
+        })
+        .map(|(_, arg)| arg)
+        .collect();
+    assert_eq!(
+        settings,
+        vec!["--settings", "/route/owned/settings.json"],
+        "the launch's own settings must be the only --settings in the argv: {args:?}"
+    );
+    assert!(
+        args.iter().any(|arg| arg == "--plugin-dir"),
+        "wirk's own Claim hook still reaches the pane, through the repeatable flag: {args:?}"
+    );
+}
+
+/// An opencode Run gets no `--plugin-dir` element at all — this wave
+/// adds nothing for opencode's own hook (delivered by env var, Wave 2).
+#[test]
+fn opencode_run_gets_no_claude_plugin_dir_flag() {
     let run = run_with_kind(ActorKind::opencode());
     let estate = tempdir().expect("estate tempdir");
     let worktree = tempdir().expect("worktree tempdir");
@@ -225,8 +300,11 @@ fn opencode_run_gets_no_settings_flag() {
     let calls = client.start_agent_calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert!(
-        !calls[0].args.iter().any(|a| a == "--settings"),
-        "opencode must not get the claude --settings flag: {:?}",
+        !calls[0]
+            .args
+            .iter()
+            .any(|a| a == "--plugin-dir" || a == "--settings"),
+        "opencode must not get claude's own flags: {:?}",
         calls[0].args
     );
 }

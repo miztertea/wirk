@@ -2053,6 +2053,13 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // outside any journal guard — this Work has no journal
                 // yet, and no other Work's is touched.
                 evidence: None,
+                // P4.1: the contract is reserved here, with the World,
+                // so every attempt this reservation backs operates under
+                // the identical bytes.
+                contract: match reserve_worker_contract(state) {
+                    Ok(contract) => contract,
+                    Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                },
             })
         }
         WaypointKind::Actor => {
@@ -2110,6 +2117,14 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // orienting Waypoint outright, above, rather than
                 // reserving one whose evidence could never be trusted.
                 evidence: None,
+                // P4.1: an actor is an actor whatever its source basis,
+                // and it gets the same contract. Presence-gated hashing
+                // means this arm's own historical hashes are unmoved by
+                // the field existing; a World reserved *now* binds it.
+                contract: match reserve_worker_contract(state) {
+                    Ok(contract) => contract,
+                    Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                },
             })
         }
         // `waypoint_id` is `all_waypoints[0]`, drawn from `flatten_leaves`
@@ -2881,6 +2896,8 @@ fn handle_record(
             actor_kind,
             selection,
             launch_argv,
+            contract,
+            claim_hook,
         } => {
             // P3 native launch selection: this duplicate check is
             // already the server-side half of "a repeated invocation
@@ -2941,11 +2958,17 @@ fn handle_record(
                 }
                 Some(_) => {}
             }
+            // P4.1: the delivery fact is passed through verbatim. It
+            // is not part of the admitted-request match above — the
+            // request binds kind and selection, and the delivery mode is
+            // decided inside the launch itself.
             EventKind::RunLaunched {
                 run: inner,
                 actor_kind,
                 selection,
                 launch_argv,
+                contract,
+                claim_hook,
             }
         }
         EventKind::LifecycleObserved { status, detail } => {
@@ -4121,6 +4144,11 @@ fn reserve_next_leaf(
                         journaled_defs,
                         prepared,
                     )?,
+                    // P4.1: every Actor reservation, not only a Work's
+                    // first — a later stage is as much an actor as the
+                    // first one.
+                    contract: reserve_worker_contract(state)
+                        .map_err(|detail| ("ValidationUnavailable", detail))?,
                 }))
             }
             // `waypoints` (`route_waypoints`) names only executable
@@ -4210,6 +4238,34 @@ fn reserve_next_leaf(
 /// degraded projection, minted here without taking any lock. An
 /// orienting reservation therefore always carries a projection, and it
 /// is never one prepared for something else.
+/// P4.1 (ruling 0202): the shared worker contract every Actor
+/// reservation binds.
+///
+/// Written durably **before** the World that references it is built —
+/// the same "durable first, then referenced" ordering the delivered
+/// projection already has — so a reserved digest always names a file
+/// that was on disk first. Content-addressed, so two Works reserved
+/// against the same product build legitimately share one file.
+///
+/// A write failure refuses the reservation rather than reserving a World
+/// whose contract could never be honoured: the same posture
+/// `resolve_git_sha` takes for a base ref that cannot be resolved
+/// (issue 285). The alternative — reserving without one — would produce
+/// exactly the instruction-less actor 0202 forbids, and would do it
+/// silently.
+fn reserve_worker_contract(
+    state: &Arc<WirkdState>,
+) -> Result<Option<wirk_core::WorkerContractRef>, String> {
+    wirk_herdr::worker_contract::reserve(&state.estate_root)
+        .map(Some)
+        .map_err(|error| {
+            format!(
+                "the shared worker contract could not be written under {}: {error}",
+                state.estate_root.display()
+            )
+        })
+}
+
 fn reservation_evidence(
     state: &Arc<WirkdState>,
     work_id: &WorkId,
@@ -5053,6 +5109,16 @@ fn handle_retry_inner(
                     }
                     None => None,
                 },
+                // P4.1: a retry re-reserves rather than inheriting, for
+                // the same reason its projection does. The prior Run's
+                // World keeps the digest it was reserved with, on disk
+                // and readable; this Run binds the contract this build
+                // actually ships, and the bytes are re-asserted durable
+                // before the reference is written.
+                contract: match reserve_worker_contract(state) {
+                    Ok(contract) => contract,
+                    Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                },
                 ..actor.clone()
             })
         }
@@ -5833,6 +5899,8 @@ fn find_run(events: &[Event], run_id: &RunId) -> Option<Run> {
                 launch_attempt: None,
                 launch_argv: Vec::new(),
                 expansions: Vec::new(),
+                contract_delivery: None,
+                claim_hook: None,
             });
         }
         if let Some(run) = run.as_mut() {
@@ -8715,6 +8783,8 @@ fn current_producing_action(events: &[Event]) -> Result<ProducingAction, Reply> 
             launch_argv: Vec::new(),
             launch_attempt: None,
             expansions: Vec::new(),
+            contract_delivery: None,
+            claim_hook: None,
         };
         for later in events {
             folded.apply(later);

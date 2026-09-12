@@ -6,7 +6,8 @@
 //! `HerdrExecutor::launch` builds an opencode Run's pane env
 //! (`actor_pane`), it writes a wirk-owned plugin file and a config
 //! naming it under the estate root — never the worktree, never `~/` —
-//! and sets `OPENCODE_CONFIG` on the pane to that config's path; a
+//! and sets `OPENCODE_CONFIG_CONTENT` on the pane to that config's own
+//! bytes; a
 //! claude Run gets neither. The plugin's own runtime *logic* (does it
 //! actually call `wirk claim` on `session.idle` and ignore child
 //! sessions) is pinned separately in `opencode_hook_plugin.rs`, since
@@ -23,7 +24,9 @@ use wirk_core::{
     ActorKind, ActorWorld, ArtifactSpec, Boundary, ExecutionTriple, Executor, OutputContract, Run,
     RunId, RunState, WaypointId, WorkId, World, WorldHash,
 };
-use wirk_herdr::claim_hook::{OPENCODE_CONFIG_ENV, wirk_claim_plugin_js};
+use wirk_herdr::claim_hook::{
+    OPENCODE_CONFIG_CONTENT_ENV, OPENCODE_CONFIG_ENV, wirk_claim_plugin_js,
+};
 use wirk_herdr::fake::FakeHerdrClient;
 use wirk_herdr::{AgentStatus, HerdrExecutor, PaneInfo};
 
@@ -41,6 +44,8 @@ fn run_with_kind(kind: ActorKind) -> Run {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     }
 }
 
@@ -66,6 +71,7 @@ fn actor_world(run: &Run, estate_root: &std::path::Path, worktree_path: &std::pa
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
+        contract: None,
     })
 }
 
@@ -93,10 +99,16 @@ fn pane_info(pane_id: &str) -> PaneInfo {
     }
 }
 
-/// Red on `main` (`BUILD.md`'s pasted output): no key named
-/// `OPENCODE_CONFIG` is ever inserted into `SplitPane.env` — this test
-/// did not exist before this wave and `actor_pane` wrote only the
+/// Red on `main` (`BUILD.md`'s pasted output): no key naming wirk's own
+/// opencode configuration was ever inserted into `SplitPane.env` — this
+/// test did not exist before that wave and `actor_pane` wrote only the
 /// triple, `PATH`, and (when set) `CARGO_TARGET_DIR`.
+///
+/// The layer is delivered inline, through `OPENCODE_CONFIG_CONTENT`, and
+/// `OPENCODE_CONFIG` is deliberately never set: it names a single file,
+/// so a launch already carrying one would lose it (P4.1 correction,
+/// OpenCode config scope). The file on disk stays the readable record,
+/// and is where the plugin the layer names lives.
 #[test]
 fn opencode_run_gets_a_wirk_owned_claim_plugin_with_no_worktree_or_home_write() {
     let run = run_with_kind(ActorKind::opencode());
@@ -114,17 +126,37 @@ fn opencode_run_gets_a_wirk_owned_claim_plugin_with_no_worktree_or_home_write() 
     // the fresh-workspace `create_workspace` + `split_pane` branch,
     // `lib.rs:918-937`) — either branch writes the same `env` map,
     // asserted here on the one `split_pane` call this launch makes.
+    // Ruling 0205: an opencode launch splits a short-lived probe pane
+    // first — it reads the two opencode configuration values as the
+    // pane will actually have them, since a pane's environment comes
+    // from the Herdr server and not from this process — and the
+    // actor's own pane second. `opencode_pane_env.rs` pins that
+    // separation; here the assertions are about the actor's pane.
     let calls = client.split_pane_calls.lock().unwrap();
-    assert_eq!(calls.len(), 1, "exactly one split_pane call");
-    let env = &calls[0].env;
+    assert_eq!(calls.len(), 2, "the probe pane, then the actor's pane");
+    let env = &calls[1].env;
 
-    let config_path = env
-        .get(OPENCODE_CONFIG_ENV)
-        .unwrap_or_else(|| panic!("{OPENCODE_CONFIG_ENV} missing from pane env: {env:?}"));
+    assert!(
+        !env.contains_key(OPENCODE_CONFIG_ENV),
+        "{OPENCODE_CONFIG_ENV} names one file and must be left to the launch: {env:?}"
+    );
+    let inline = env
+        .get(OPENCODE_CONFIG_CONTENT_ENV)
+        .unwrap_or_else(|| panic!("{OPENCODE_CONFIG_CONTENT_ENV} missing from pane env: {env:?}"));
+    assert!(
+        !inline.chars().any(char::is_control),
+        "the inline layer crosses the pane environment as one line: {inline:?}"
+    );
 
-    // Neither the worktree nor `~/` was touched: the config path lives
+    // Neither the worktree nor `~/` was touched: the config file lives
     // under the estate root, outside the worktree entirely.
-    let config_path = std::path::Path::new(config_path);
+    let config_path = estate
+        .path()
+        .join(".wirk")
+        .join("opencode")
+        .join(&run.id.0)
+        .join("wirk-opencode-config.json");
+    let config_path = config_path.as_path();
     assert!(
         config_path.starts_with(estate.path()),
         "{config_path:?} is not under the estate root {:?}",
@@ -145,6 +177,11 @@ fn opencode_run_gets_a_wirk_owned_claim_plugin_with_no_worktree_or_home_write() 
     let config_contents = std::fs::read_to_string(config_path).expect("config file exists");
     let config: serde_json::Value =
         serde_json::from_str(&config_contents).expect("config file is valid JSON");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(inline).expect("the inline layer is JSON"),
+        config,
+        "the delivered layer and the file on disk must not drift"
+    );
     let plugin_array = config["plugin"]
         .as_array()
         .expect("config declares a \"plugin\" array");
@@ -219,8 +256,143 @@ fn claude_run_gets_no_opencode_config_key() {
 
     let calls = client.split_pane_calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
+    for key in [OPENCODE_CONFIG_ENV, OPENCODE_CONFIG_CONTENT_ENV] {
+        assert!(
+            !calls[0].env.contains_key(key),
+            "claude must not get the opencode plugin env key {key}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// P4.1 (ruling 0204): which native slot this Run's overlay takes, given
+// what the launch already carries. `opencode_delivery` is a pure
+// decision over two inherited values, so it is pinned here directly
+// rather than through a pane: setting process environment variables
+// from a threaded test is exactly the kind of global mutation these
+// suites avoid.
+//
+// The four cases and the counterexample that forced them are measured
+// against installed opencode 1.18.30 with `opencode debug config`
+// (2026-09-12, `REPAIR.md`): setting `OPENCODE_CONFIG_CONTENT`
+// unconditionally, as the candidate did, drops a launch's own inline
+// `instructions`, `plugin`, `permission` and scalar entries wholesale.
+
+fn overlay_fixture() -> wirk_herdr::claim_hook::OpencodeOverlay {
+    wirk_herdr::claim_hook::OpencodeOverlay {
+        config_path: std::path::PathBuf::from("/estate/.wirk/opencode/run-1/wirk-opencode-config.json"),
+        config_content:
+            r#"{"$schema":"https://opencode.ai/config.json","plugin":["/estate/wirk-claim.js"],"instructions":["/estate/contract.md"]}"#
+                .to_string(),
+    }
+}
+
+/// Nothing inherited: wirk's own bytes take the free inline slot, and
+/// `OPENCODE_CONFIG` stays untouched — the candidate's behaviour, kept.
+#[test]
+fn a_launch_carrying_neither_variable_gets_the_inline_layer() {
+    let overlay = overlay_fixture();
+    match wirk_herdr::claim_hook::opencode_delivery(&overlay, None, None) {
+        wirk_herdr::claim_hook::OpencodeDelivery::Content(bytes) => {
+            assert_eq!(bytes, overlay.config_content);
+        }
+        other => panic!("expected the inline slot, got {other:?}"),
+    }
+}
+
+/// A launch carrying its own inline layer must keep it. The free
+/// `OPENCODE_CONFIG` slot is opencode's own second layer, measured to
+/// compose with the inherited inline one — no parsing, no merge.
+#[test]
+fn an_inherited_inline_layer_is_never_replaced() {
+    let overlay = overlay_fixture();
+    let inherited = r#"{"instructions":["/tmp/launch.md"],"permission":{"bash":"ask"}}"#;
+    match wirk_herdr::claim_hook::opencode_delivery(&overlay, Some(inherited), None) {
+        wirk_herdr::claim_hook::OpencodeDelivery::ConfigFile(path) => {
+            assert_eq!(path, overlay.config_path);
+        }
+        other => panic!("expected wirk's own file in the free OPENCODE_CONFIG slot, got {other:?}"),
+    }
+}
+
+/// Both native slots taken: wirk appends its own two entries to the
+/// inherited inline document and changes nothing else.
+#[test]
+fn with_both_slots_taken_the_inherited_document_is_appended_to_not_replaced() {
+    let overlay = overlay_fixture();
+    let inherited = r#"{"instructions":["/tmp/launch.md"],"plugin":["file:///tmp/p.js"],"permission":{"bash":"ask"},"small_model":"launch/chose-this"}"#;
+    let composed = match wirk_herdr::claim_hook::opencode_delivery(
+        &overlay,
+        Some(inherited),
+        Some("/tmp/launch.json"),
+    ) {
+        wirk_herdr::claim_hook::OpencodeDelivery::ComposedContent(bytes) => bytes,
+        other => panic!("expected a composed inline layer, got {other:?}"),
+    };
     assert!(
-        !calls[0].env.contains_key(OPENCODE_CONFIG_ENV),
-        "claude must not get the opencode plugin env key"
+        !composed.chars().any(char::is_control),
+        "the composed layer crosses the pane environment as one line: {composed:?}"
     );
+    let value: serde_json::Value = serde_json::from_str(&composed).expect("composed layer is JSON");
+    assert_eq!(
+        value["instructions"],
+        serde_json::json!(["/tmp/launch.md", "/estate/contract.md"]),
+        "the launch's own instructions entry survives, with the contract appended"
+    );
+    assert_eq!(
+        value["plugin"],
+        serde_json::json!(["file:///tmp/p.js", "/estate/wirk-claim.js"]),
+        "the launch's own plugin survives, with the Claim plugin appended"
+    );
+    assert_eq!(
+        value["permission"],
+        serde_json::json!({"bash": "ask"}),
+        "a field wirk owns no entry in is carried through untouched"
+    );
+    assert_eq!(value["small_model"], serde_json::json!("launch/chose-this"));
+}
+
+/// Outside the declared input scope — both slots taken and the
+/// inherited inline value is not an object of the shape wirk can append
+/// to — nothing is overwritten and the loss is disclosed by name.
+#[test]
+fn unsupported_inherited_content_is_disclosed_rather_than_overwritten() {
+    let overlay = overlay_fixture();
+    for inherited in [
+        r#"["not","an","object"]"#,
+        r#"{"instructions":"one-string"}"#,
+        "{ not json",
+    ] {
+        match wirk_herdr::claim_hook::opencode_delivery(
+            &overlay,
+            Some(inherited),
+            Some("/tmp/launch.json"),
+        ) {
+            wirk_herdr::claim_hook::OpencodeDelivery::Unsupported(reason) => {
+                assert!(
+                    reason.contains(OPENCODE_CONFIG_CONTENT_ENV),
+                    "the reason names the variable wirk left alone: {reason}"
+                );
+                assert!(
+                    reason.contains("Claim"),
+                    "the reason says the Claim plugin is not delivered either: {reason}"
+                );
+            }
+            other => panic!("expected a disclosed fallback for {inherited:?}, got {other:?}"),
+        }
+    }
+}
+
+/// An empty or blank inherited value is not a layer: the slot is free.
+#[test]
+fn a_blank_inherited_inline_value_leaves_the_slot_free() {
+    let overlay = overlay_fixture();
+    for inherited in ["", "   "] {
+        match wirk_herdr::claim_hook::opencode_delivery(&overlay, Some(inherited), None) {
+            wirk_herdr::claim_hook::OpencodeDelivery::Content(bytes) => {
+                assert_eq!(bytes, overlay.config_content)
+            }
+            other => panic!("expected the inline slot for {inherited:?}, got {other:?}"),
+        }
+    }
 }

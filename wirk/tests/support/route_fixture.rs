@@ -47,6 +47,12 @@ fn fixture_text(name: &str) -> &'static str {
         // declared report, and the container that requires it as a
         // child role — the shape the observed blocker was found in.
         "outputs_read_reviewer" => include_str!("../fixtures/routes/outputs_read_reviewer.json"),
+        "outputs_read_reviewer_two" => {
+            include_str!("../fixtures/routes/outputs_read_reviewer_two.json")
+        }
+        "outputs_read_reviewer_optional" => {
+            include_str!("../fixtures/routes/outputs_read_reviewer_optional.json")
+        }
         "outputs_container_reviewer_role" => {
             include_str!("../fixtures/routes/outputs_container_reviewer_role.json")
         }

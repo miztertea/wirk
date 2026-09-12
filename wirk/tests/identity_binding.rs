@@ -650,6 +650,8 @@ fn record_refuses_unknown_mismatched_duplicate_and_terminal_run_transitions() {
             actor_kind: Default::default(),
             selection: Default::default(),
             launch_argv: Vec::new(),
+            contract: None,
+            claim_hook: None,
         },
     );
     assert!(matches!(unknown, Reply::Err { .. }));
@@ -897,6 +899,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
         boundary: Boundary(vec!["**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
+        contract: None,
     });
     let hash = WorldHash::of(&initial);
     let mut updated = initial.clone();

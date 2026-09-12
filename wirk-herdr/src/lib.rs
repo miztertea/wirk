@@ -27,6 +27,7 @@ pub mod fake;
 pub mod git;
 pub mod run_loop;
 pub mod socket;
+pub mod worker_contract;
 
 pub use run_loop::{RunLoop, WirkdApi};
 pub use socket::SocketClient;
@@ -571,6 +572,20 @@ pub trait HerdrClient: Send + Sync {
     fn destination(&self) -> String;
 }
 
+/// How long `probe_opencode_pane_config` will wait, in total, for a
+/// probe pane to answer. Generous against a measured answer of ~50ms on
+/// a live 0.9.0 server (2026-09-12), and bounded because a launch that
+/// cannot learn its own configuration must disclose that rather than
+/// hang: the deadline is the only thing standing between a wedged pane
+/// shell and a launch that never starts.
+const OPENCODE_ENV_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long one sent command is given before it is sent again — a
+/// freshly split pane may still be starting its shell and drop the
+/// first line.
+const OPENCODE_ENV_PROBE_RESEND: std::time::Duration = std::time::Duration::from_millis(750);
+/// How often the completion marker is checked while waiting.
+const OPENCODE_ENV_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// So a test can hold an `Arc<FakeHerdrClient>` (mutating its recorded
 /// responses concurrently with a `RunLoop` driving on another thread)
 /// and still satisfy `RunLoop`'s `C: HerdrClient` bound directly — the
@@ -708,6 +723,13 @@ impl PromptGate {
 /// through this trait).
 pub struct HerdrExecutor<C: HerdrClient> {
     client: C,
+    /// P4.1: how a codex launch asks codex itself whether adding the
+    /// worker contract to `developer_instructions` would displace a
+    /// value already configured (`worker_contract::codex_composition`).
+    /// A field, defaulted to the real CLI probe, so a test can pin the
+    /// launch path's behaviour for each answer without an installed
+    /// codex and without the launch path ever guessing.
+    codex_probe: std::sync::Arc<dyn worker_contract::CodexProbe>,
 }
 
 /// What `HerdrExecutor::launch_actor` hands back: the actor's pane, and
@@ -728,6 +750,25 @@ pub struct LaunchedRun {
     /// here so `RunLoop::launch` can journal it distinctly from
     /// `run.selection` (what was requested).
     pub argv: Vec<String>,
+    /// P4.1: how this launch actually delivered the reserved worker
+    /// contract, carried out so `RunLoop::launch` can journal it on
+    /// `RunLaunched` beside Herdr's own argv — the one delivery fact
+    /// argv alone cannot reconstruct, since opencode's mechanism is an
+    /// environment variable and the fallback is prompt text.
+    ///
+    /// `None` when this Run's World carries no contract at all (every
+    /// World reserved before this wave).
+    pub contract: Option<wirk_core::ContractDelivery>,
+    /// P4.1 (ruling 0208): whether this launch actually installed wirk's
+    /// own Claim-filing hook in the actor's pane, carried out for the
+    /// same reason `contract` is — the standing prompt must tell the
+    /// actor the truth about its own turn end, and neither argv nor the
+    /// pane's environment says whether the hook reached it.
+    ///
+    /// `None` only for a launch path that records nothing (the
+    /// `Executor::launch` trait row); every `launch_actor` returns an
+    /// answer.
+    pub claim_hook: Option<wirk_core::ClaimHookDelivery>,
 }
 
 impl std::fmt::Debug for LaunchedRun {
@@ -1072,9 +1113,51 @@ pub fn ensure_pinned_wirk_bin(
     Ok(dir)
 }
 
+/// P4.1: one launch's working state for the reserved worker contract —
+/// the proven bytes, where they are, and which mechanism ended up
+/// delivering them.
+///
+/// It exists because the decision is taken in two places: opencode's
+/// delivery is part of the pane's environment (`actor_pane`), and
+/// claude's and codex's are argv elements (`start_actor_agent`). Both
+/// write into the same plan, and the prompt fallback is whatever is left
+/// when neither claimed it — so a kind can never be served twice, and
+/// can never be served not at all.
+struct ContractPlan {
+    reference: wirk_core::WorkerContractRef,
+    path: std::path::PathBuf,
+    text: String,
+    delivery: Option<wirk_core::ContractDelivery>,
+    /// Why a native mechanism that was tried did not work, carried
+    /// forward so the prompt fallback discloses the real reason rather
+    /// than a generic one.
+    pending_fallback: Option<String>,
+}
+
+impl ContractPlan {
+    fn deliver(&mut self, mode: wirk_core::ContractDeliveryMode, reason: Option<String>) {
+        self.delivery = Some(worker_contract::delivery(&self.reference, mode, reason));
+    }
+}
+
 impl<C: HerdrClient> HerdrExecutor<C> {
     pub fn new(client: C) -> Self {
-        Self { client }
+        Self {
+            client,
+            codex_probe: std::sync::Arc::new(worker_contract::CodexCliProbe),
+        }
+    }
+
+    /// Replaces the codex composition probe (P4.1). The default is the
+    /// real `codex debug prompt-input` renderer; tests substitute a
+    /// fixed answer so each branch of the composition decision is
+    /// exercised deterministically.
+    pub fn with_codex_probe(
+        mut self,
+        probe: std::sync::Arc<dyn worker_contract::CodexProbe>,
+    ) -> Self {
+        self.codex_probe = probe;
+        self
     }
 
     pub fn client(&self) -> &C {
@@ -1103,7 +1186,13 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // — not after, as it was when the only check lived inside
         // `start_actor_agent`.
         validate_selection(run.kind.0.as_str(), &run.selection)?;
-        let pane = self.actor_pane(run, world)?;
+        // P4.1 (ruling 0202): prove the reserved contract before any
+        // pane side effect, for the same reason `validate_selection`
+        // runs here — "a verified contract must actually be delivered,
+        // or launch must refuse".
+        let mut contract = self.verified_contract(world)?;
+        let mut claim_hook: Option<wirk_core::ClaimHookDelivery> = None;
+        let pane = self.actor_pane(run, world, contract.as_mut(), &mut claim_hook)?;
 
         // Subscribe to this pane's status changes and revision bumps
         // before starting the agent, so no early transition is missed
@@ -1125,9 +1214,22 @@ impl<C: HerdrClient> HerdrExecutor<C> {
             },
         ])?;
 
-        let argv = self.start_actor_agent_when_ready(run, &pane.pane_id, world, &mut events)?;
+        let argv = self.start_actor_agent_when_ready(
+            run,
+            &pane.pane_id,
+            world,
+            &mut events,
+            contract.as_mut(),
+            &mut claim_hook,
+        )?;
 
-        Ok(LaunchedRun { pane, events, argv })
+        Ok(LaunchedRun {
+            pane,
+            events,
+            argv,
+            contract: contract.and_then(|plan| plan.delivery),
+            claim_hook,
+        })
     }
 
     /// Retries `start_actor_agent` on Herdr's pane-busy refusal (P2.5
@@ -1150,9 +1252,15 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         pane_id: &str,
         world: &wirk_core::World,
         events: &mut Box<dyn Iterator<Item = Result<HerdrEvent, HerdrError>> + Send>,
+        contract: Option<&mut ContractPlan>,
+        claim_hook: &mut Option<wirk_core::ClaimHookDelivery>,
     ) -> Result<Vec<String>, HerdrExecutorError> {
+        // P4.1: the plan is re-borrowed on every retry, never re-decided
+        // — a pane-busy retry must not be able to change which
+        // mechanism this Run is recorded as having used.
+        let mut contract = contract;
         loop {
-            match self.start_actor_agent(run, pane_id, world) {
+            match self.start_actor_agent(run, pane_id, world, contract.as_deref_mut(), claim_hook) {
                 Ok(argv) => return Ok(argv),
                 Err(err) if is_agent_pane_busy(&err) => {
                     println!(
@@ -1175,6 +1283,39 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         }
     }
 
+    /// P4.1 (ruling 0202): reads and **proves** the shared worker
+    /// contract this Run's World was reserved with, before anything
+    /// irreversible happens.
+    ///
+    /// Called first by both launch paths, ahead of `actor_pane`, so a
+    /// contract that cannot be honoured costs no workspace, no pane and
+    /// no agent — the same ordering `validate_selection` and the runtime
+    /// pin already have. `Ok(None)` is the honest answer for every World
+    /// reserved before this wave: it carries no contract, and its launch
+    /// is exactly the launch it always was.
+    fn verified_contract(
+        &self,
+        world: &wirk_core::World,
+    ) -> Result<Option<ContractPlan>, HerdrExecutorError> {
+        let wirk_core::World::Actor(actor) = world else {
+            return Ok(None);
+        };
+        let Some(reference) = actor.contract.clone() else {
+            return Ok(None);
+        };
+        let (path, text) = worker_contract::read_verified(
+            std::path::Path::new(&actor.triple.estate_root),
+            &reference,
+        )?;
+        Ok(Some(ContractPlan {
+            reference,
+            path,
+            text,
+            delivery: None,
+            pending_fallback: None,
+        }))
+    }
+
     /// The actor's pane: reuse-and-split when one exists for this Run,
     /// create a workspace and split otherwise. No subscription, no
     /// agent — shared by `launch_actor` and the `Executor::launch`
@@ -1183,6 +1324,8 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         &self,
         run: &wirk_core::Run,
         world: &wirk_core::World,
+        contract: Option<&mut ContractPlan>,
+        claim_hook: &mut Option<wirk_core::ClaimHookDelivery>,
     ) -> Result<PaneInfo, HerdrExecutorError> {
         let actor = match world {
             wirk_core::World::Actor(actor) => actor,
@@ -1306,19 +1449,19 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // as a `PATH`-prepend write above would have nothing to add —
         // this arm is unreachable in that case anyway, since `exe` above
         // is unwrapped before `pinned_dir`/`pinned_wirk` exist.
-        if run.kind == wirk_core::ActorKind::opencode()
-            && let Ok(config_path) = claim_hook::write_wirk_claim_hook(
-                &actor.triple.estate_root,
-                &run.id.0,
-                &pinned_wirk,
-            )
-        {
-            env.insert(
-                claim_hook::OPENCODE_CONFIG_ENV.to_string(),
-                config_path.to_string_lossy().into_owned(),
-            );
-        }
-
+        //
+        // P4.1 (ruling 0202): the same overlay carries the shared
+        // worker contract, as one more entry in opencode's own
+        // `instructions` array — measured additive across an
+        // `OPENCODE_CONFIG_CONTENT` layer (the owner's global
+        // `instructions` and `plugin`, and those of any
+        // `OPENCODE_CONFIG` file this launch already carries, all
+        // survive and concatenate), so no new mechanism is introduced
+        // and nothing the user configured is replaced. The *contract's* delivery is not best-effort the
+        // way the hook's is: if the overlay cannot be written, this Run
+        // has no native contract delivery, and the prompt fallback in
+        // `start_actor_agent` below picks it up rather than an actor
+        // launching with no contract at all.
         // Workspace-vs-pane branching (item 4, W2; loop.md §2, build
         // brief §2.2 row 4: "CreateWorkspace{cwd,env} (no open
         // workspace) or SplitPane{...} (one exists)"). `ActorWorld`
@@ -1340,43 +1483,323 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // creates a workspace as a side effect of that call today (this
         // file's prior behavior; 0017 spike: "Connecting the CLI with
         // `--cwd` creates a workspace before any explicit call").
+        //
+        // Ruling 0205 splits this into *deciding where the pane goes*
+        // and *creating it*, because an opencode Run has to read the
+        // environment that placement will actually give the pane before
+        // it can know which configuration slot is free. Nothing about
+        // the placement itself changed.
         let existing = self.client.get_pane(&run.id.0).ok();
-        let pane = match existing {
-            Some(pane) => self.client.split_pane(SplitPane {
-                workspace_id: Some(pane.workspace_id),
-                target_pane_id: Some(pane.pane_id),
-                // `Down`: the actor's pane appears below the existing
-                // one, matching the old hardcoded `Vertical`'s intent
-                // (a vertical stack) now expressed in the schema's own
-                // `right`/`down` vocabulary — which of the two is a
-                // design call the tried step's RESULT.md parked, not
-                // resolved elsewhere; kept as one hardcoded value here,
-                // same as before (J1, local/reversible).
-                direction: SplitDirection::Down,
-                cwd: actor.worktree_path.clone(),
-                env: env.clone(),
-            })?,
-            None => {
-                let workspace_id = self
-                    .client
+        let (workspace_id, target_pane_id) = match existing {
+            Some(pane) => (Some(pane.workspace_id), Some(pane.pane_id)),
+            None => (
+                self.client
                     .create_workspace(CreateWorkspace {
                         cwd: actor.worktree_path.clone(),
                         env: env.clone(),
                         label: None,
                     })
                     .ok()
-                    .map(|w| w.workspace_id);
-                self.client.split_pane(SplitPane {
-                    workspace_id,
-                    target_pane_id: None,
-                    // Same `Down` as the branch above.
-                    direction: SplitDirection::Down,
-                    cwd: actor.worktree_path.clone(),
-                    env,
-                })?
-            }
+                    .map(|w| w.workspace_id),
+                None,
+            ),
         };
+
+        // P2.7 Wave 2 (`orient/reorient.md` §6 item 1): an opencode
+        // Run gets wirk's own claim-filing plugin delivered with no
+        // write into the worktree and no write under `~/` —
+        // `w2-probe.md`'s Mechanism 2, measured live. The directory is
+        // wirk-owned, under the estate root (`claim_hook::run_dir`,
+        // the same `.wirk` convention `wirkd::client::locate` already
+        // uses), never `actor.worktree_path`. A write failure here
+        // does not fail the launch: the actor still starts, just
+        // without the hook, the same "degrade, don't block" posture
+        // `CARGO_TARGET_DIR` above already has. Gated on `run.kind`
+        // directly (not `claim_hook::hook_installed_for`, which W3
+        // widened to include claude too): opencode's own delivery
+        // mechanism is an env var, claude's is an argv element built in
+        // `start_actor_agent` below. **The plugin invokes this Run's own
+        // pinned `wirk` (`pinned_wirk`, installed above), not the
+        // driver's mutable `exe`.**
+        //
+        // P4.1 (ruling 0202): the same overlay carries the shared
+        // worker contract, as one more entry in opencode's own
+        // `instructions` array. The *contract's* delivery is not
+        // best-effort the way the hook's is: if the overlay cannot be
+        // written, this Run has no native contract delivery, and the
+        // prompt fallback in `start_actor_agent` below picks it up
+        // rather than an actor launching with no contract at all.
+        if run.kind == wirk_core::ActorKind::opencode() {
+            let contract_path = contract.as_ref().map(|plan| plan.path.clone());
+            match claim_hook::write_wirk_claim_hook(
+                &actor.triple.estate_root,
+                &run.id.0,
+                &pinned_wirk,
+                contract_path.as_deref(),
+            ) {
+                Ok(overlay) => {
+                    // opencode has **two** per-launch layers that
+                    // compose with the owner's global config and with
+                    // each other — `OPENCODE_CONFIG` (one file) and
+                    // `OPENCODE_CONFIG_CONTENT` (one inline document) —
+                    // and each names exactly one thing. Writing either
+                    // over a value the launch already carries replaces
+                    // that layer wholesale: measured with `opencode
+                    // debug config`, 1.18.30, an inherited inline
+                    // layer's `instructions`, `plugin`, `permission`
+                    // and scalar entries all disappear (0204). So which
+                    // slot wirk takes is decided from what is free, and
+                    // only the both-taken case reads the inherited
+                    // bytes at all.
+                    //
+                    // Ruling 0205: "what is free" is a fact about **the
+                    // pane this launch will create**, not about this
+                    // process. A pane's environment is the Herdr
+                    // *server's* environment overlaid per key by the
+                    // `env` map passed at creation; the driver's own
+                    // environment is on neither path. So the two values
+                    // are read by `probe_opencode_pane_config` from a
+                    // short-lived pane placed exactly where the actor's
+                    // pane is about to be placed, and `std::env::var`
+                    // is not consulted for either key — it answered a
+                    // different question, wrongly in both directions.
+                    // When the probe cannot be read, wirk sets neither
+                    // variable and discloses why: an unknown
+                    // configuration is never overwritten on a guess.
+                    match self.probe_opencode_pane_config(
+                        &actor.triple.estate_root,
+                        &run.id.0,
+                        workspace_id.clone(),
+                        target_pane_id.clone(),
+                        &actor.worktree_path,
+                        env.clone(),
+                    ) {
+                        Ok((inherited_content, inherited_config)) => {
+                            let (key, value, fallback) = match claim_hook::opencode_delivery(
+                                &overlay,
+                                Some(inherited_content.as_str()),
+                                Some(inherited_config.as_str()),
+                            ) {
+                                claim_hook::OpencodeDelivery::Content(bytes)
+                                | claim_hook::OpencodeDelivery::ComposedContent(bytes) => (
+                                    Some(claim_hook::OPENCODE_CONFIG_CONTENT_ENV.to_string()),
+                                    Some(bytes),
+                                    None,
+                                ),
+                                claim_hook::OpencodeDelivery::ConfigFile(path) => (
+                                    Some(claim_hook::OPENCODE_CONFIG_ENV.to_string()),
+                                    Some(path.to_string_lossy().into_owned()),
+                                    None,
+                                ),
+                                claim_hook::OpencodeDelivery::Unsupported(reason) => {
+                                    (None, None, Some(reason))
+                                }
+                            };
+                            if let (Some(key), Some(value)) = (key, value) {
+                                env.insert(key, value);
+                            }
+                            // 0208: the overlay carries wirk's Claim
+                            // plugin and the contract together, so a
+                            // slot taken is both delivered and a slot
+                            // refused is neither. Recorded either way:
+                            // the standing prompt promises an automatic
+                            // claim only where one was actually handed
+                            // to this pane.
+                            *claim_hook = Some(match &fallback {
+                                None => wirk_core::ClaimHookDelivery::Installed,
+                                Some(reason) => wirk_core::ClaimHookDelivery::NotInstalled {
+                                    reason: reason.clone(),
+                                },
+                            });
+                            if let Some(plan) = contract {
+                                match fallback {
+                                    None => plan.deliver(
+                                        wirk_core::ContractDeliveryMode::OpencodeInstructions,
+                                        None,
+                                    ),
+                                    Some(reason) => plan.pending_fallback = Some(reason),
+                                }
+                            }
+                        }
+                        Err(reason) => {
+                            println!("wirk: {reason}");
+                            *claim_hook = Some(wirk_core::ClaimHookDelivery::NotInstalled {
+                                reason: reason.clone(),
+                            });
+                            if let Some(plan) = contract {
+                                plan.pending_fallback = Some(reason);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let reason = format!(
+                        "wirk's opencode configuration overlay could not be written ({error})"
+                    );
+                    *claim_hook = Some(wirk_core::ClaimHookDelivery::NotInstalled {
+                        reason: reason.clone(),
+                    });
+                    if let Some(plan) = contract {
+                        plan.pending_fallback = Some(reason);
+                    }
+                }
+            }
+        }
+
+        let pane = self.client.split_pane(SplitPane {
+            workspace_id,
+            target_pane_id,
+            // `Down`: the actor's pane appears below the existing one,
+            // matching the old hardcoded `Vertical`'s intent (a
+            // vertical stack) now expressed in the schema's own
+            // `right`/`down` vocabulary — kept as one hardcoded value
+            // here, same as before (J1, local/reversible).
+            direction: SplitDirection::Down,
+            cwd: actor.worktree_path.clone(),
+            env,
+        })?;
         Ok(pane)
+    }
+
+    /// Reads the two opencode per-launch configuration values **as the
+    /// actor's pane will actually have them** (ruling 0205), by running
+    /// `claim_hook::OPENCODE_ENV_PROBE_SH` in a short-lived pane placed
+    /// exactly where the actor's pane is about to be placed.
+    ///
+    /// The probe pane is created with **the actor's own base launch
+    /// environment** — the very `env` map `actor_pane` has built for
+    /// this launch, handed in by value at the one moment it holds
+    /// exactly what the actor will get minus the opencode key this
+    /// decision is about to choose (ruling 0208). A Herdr pane's
+    /// environment is the server's environment overlaid per key by the
+    /// caller's `env` map, so this makes the probe's pane and the
+    /// actor's pane the same context in both halves rather than only in
+    /// the inherited half: same cwd, same shell startup, same
+    /// `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`/`PATH`/
+    /// `CARGO_TARGET_DIR`. It closes the one residual the previous
+    /// `env: {}` left open — a shell rule that *derives* an opencode
+    /// variable from a launch variable would have been read wrongly by a
+    /// pane that did not carry those launch variables
+    /// (`affected-verify/VERIFY.md`, "Residual limit"), and is measured
+    /// green by an owned control on this box.
+    ///
+    /// R2: only `pane.split`, `pane.send_text` and `pane.close` are used
+    /// — verbs this client already speaks; R4 was checked first and
+    /// herdr 0.9.0 returns no pane environment from any read verb. The
+    /// script/marker/deadline protocol itself is **R7**, reached only
+    /// because R1–R5 fail: reusing native verbs does not make a new
+    /// invocation-local protocol pre-existing functionality (0208).
+    ///
+    /// The command is re-sent until the completion marker appears or
+    /// the deadline passes, because a freshly split pane's shell is
+    /// still starting and may not have consumed the first line — the
+    /// same settling `start_actor_agent_when_ready` waits out on
+    /// `agent_pane_busy`. Re-sending is safe: the script only rewrites
+    /// the same three files from the same environment. The marker is
+    /// checked before each wait, so a client that answers
+    /// synchronously (the fake) costs no sleep at all.
+    ///
+    /// `Err` carries the sentence a caller discloses as the contract's
+    /// `fallback_reason`: when this cannot be answered, wirk sets
+    /// neither variable rather than replace a layer it cannot see.
+    fn probe_opencode_pane_config(
+        &self,
+        estate_root: &str,
+        run_id: &str,
+        workspace_id: Option<String>,
+        target_pane_id: Option<String>,
+        cwd: &std::path::Path,
+        env: BTreeMap<String, String>,
+    ) -> Result<(String, String), String> {
+        let unknown = |what: &str| {
+            format!(
+                "wirk could not read this pane's own opencode configuration ({what}), so it set \
+                 neither {} nor {} rather than replace a layer this launch may already carry: \
+                 neither the worker contract nor wirk's own Claim plugin is delivered to this \
+                 pane natively",
+                claim_hook::OPENCODE_CONFIG_ENV,
+                claim_hook::OPENCODE_CONFIG_CONTENT_ENV,
+            )
+        };
+
+        let probe = claim_hook::write_opencode_env_probe(estate_root, run_id)
+            .map_err(|error| unknown(&format!("its probe could not be written: {error}")))?;
+
+        // Ruling 0208: the answer files hold *the launch's own*
+        // configuration — an inline document that can carry anything the
+        // owner or the Route put in it — copied into wirk-owned scratch
+        // so one decision can be taken from it. They are cleared before
+        // the probe runs, so a stale answer from an earlier attempt can
+        // never be read as this one's, and cleared again on **every**
+        // return below, not only the successful one: the failure paths
+        // are the ones that used to keep an inherited layer on disk for
+        // the life of the estate (`affected-verify/VERIFY.md` §4). Only
+        // the three files this Run's own probe writes are removed; the
+        // script beside them is wirk's own program and carries nothing
+        // from the launch, and no path wirk does not own is touched.
+        probe.clear();
+        let outcome =
+            self.read_opencode_pane_config(&probe, workspace_id, target_pane_id, cwd, env);
+        probe.clear();
+        outcome.map_err(|what| unknown(&what))
+    }
+
+    /// The probe itself: one pane, one command line, three files. Split
+    /// out from `probe_opencode_pane_config` so that function can clear
+    /// the answer files on every return through a single path, whatever
+    /// this one does (ruling 0208). `Err` carries only the clause the
+    /// caller's own disclosure sentence is built around.
+    fn read_opencode_pane_config(
+        &self,
+        probe: &claim_hook::OpencodeEnvProbe,
+        workspace_id: Option<String>,
+        target_pane_id: Option<String>,
+        cwd: &std::path::Path,
+        env: BTreeMap<String, String>,
+    ) -> Result<(String, String), String> {
+        let pane = self
+            .client
+            .split_pane(SplitPane {
+                workspace_id,
+                target_pane_id,
+                direction: SplitDirection::Down,
+                cwd: cwd.to_path_buf(),
+                env,
+            })
+            .map_err(|error| format!("its probe pane could not be created: {error}"))?;
+
+        let command = probe.command();
+        let deadline = std::time::Instant::now() + OPENCODE_ENV_PROBE_DEADLINE;
+        let mut sent = Err(String::new());
+        while std::time::Instant::now() < deadline {
+            if let Err(error) = self.client.send_input(&pane.pane_id, &command) {
+                sent = Err(format!("its probe could not be sent: {error}"));
+                break;
+            }
+            sent = Ok(());
+            let attempt = std::time::Instant::now() + OPENCODE_ENV_PROBE_RESEND;
+            while std::time::Instant::now() < attempt {
+                if probe.done.exists() {
+                    break;
+                }
+                std::thread::sleep(OPENCODE_ENV_PROBE_POLL);
+            }
+            if probe.done.exists() {
+                break;
+            }
+        }
+
+        // The probe pane has done its one job either way; a close that
+        // fails leaves an idle shell, never a wrong answer.
+        let _ = self.client.close_pane(&pane.pane_id);
+
+        sent?;
+        if !probe.done.exists() {
+            return Err("its probe did not report back in time".to_string());
+        }
+        probe
+            .read()
+            .map_err(|error| format!("its probe's answer was unreadable: {error}"))
     }
 
     /// `agent.start` on the actor's pane, named by `run.id` — the name
@@ -1389,6 +1812,8 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         run: &wirk_core::Run,
         pane_id: &str,
         world: &wirk_core::World,
+        contract: Option<&mut ContractPlan>,
+        claim_hook: &mut Option<wirk_core::ClaimHookDelivery>,
     ) -> Result<Vec<String>, HerdrExecutorError> {
         // P3 native launch selection (BUILD-BRIEF.md, superseding W1's
         // 0041 D129 hardcoded per-kind defaults): `run.selection`, not a
@@ -1415,13 +1840,24 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         let kind_str = run.kind.0.as_str();
         let mut args = build_selection_args(kind_str, &run.selection)?;
 
-        // P2.7 Wave 3 (`build-brief.md` §6 item 1, `reorient.md` §C): a
-        // claude Run gets wirk's own Claim-filing hook via one
-        // `--settings <path>` argv element pair naming a wirk-owned
-        // settings file under the estate root (never the worktree,
-        // never `~/`) — hooks merge across settings levels, so this
-        // coexists with whatever `~/.claude/settings.json` or the
-        // worktree's own `.claude/settings.json` already declare. Same
+        // P2.7 Wave 3 (`build-brief.md` §6 item 1, `reorient.md` §C),
+        // corrected by ruling 0208: a claude Run gets wirk's own
+        // Claim-filing hook via one `--plugin-dir <dir>` argv element
+        // pair naming a wirk-owned plugin directory under the estate
+        // root (never the worktree, never `~/`).
+        //
+        // It was `--settings <path>`, and that silently destroyed a
+        // launch's own `--settings`: claude resolves that flag
+        // last-wins, measured in owned panes on 2.1.270 — the route's
+        // `SessionStart` hook fires with its settings alone and does not
+        // fire once wirk appends its own, and the route's `env` block
+        // goes with it. `--plugin-dir` is claude's own repeatable,
+        // session-scoped mechanism (`claude --help`), measured additive
+        // in the same controls against a launch's own `--settings` *and*
+        // its own `--plugin-dir`, so wirk now takes a slot that is not
+        // exclusive and reads, parses and replaces nothing the launch
+        // configured. No settings file of the user's, the repository's
+        // or the launch's is written, widened or inspected. Same
         // "degrade, don't block" posture as opencode's env-var delivery
         // above: a write failure (including `current_exe` itself being
         // unreadable, or this Run's own pin having become unrestorable
@@ -1440,17 +1876,171 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         // command a real claude actor's own turn end actually fires).
         if run.kind == wirk_core::ActorKind::claude()
             && let wirk_core::World::Actor(actor) = world
-            && let Ok(exe) = std::env::current_exe()
-            && let Ok(pinned_dir) =
-                ensure_pinned_wirk_bin(&actor.triple.estate_root, &run.id.0, &exe)
-            && let Ok(settings_path) = claim_hook::write_claude_claim_hook(
-                &actor.triple.estate_root,
-                &run.id.0,
-                &pinned_dir.join("wirk"),
-            )
         {
-            args.push("--settings".to_string());
-            args.push(settings_path.to_string_lossy().into_owned());
+            let written = std::env::current_exe()
+                .map_err(|error| error.to_string())
+                .and_then(|exe| {
+                    ensure_pinned_wirk_bin(&actor.triple.estate_root, &run.id.0, &exe)
+                        .map_err(|error| error.to_string())
+                })
+                .and_then(|pinned_dir| {
+                    claim_hook::write_claude_claim_plugin(
+                        &actor.triple.estate_root,
+                        &run.id.0,
+                        &pinned_dir.join("wirk"),
+                    )
+                    .map_err(|error| error.to_string())
+                });
+            match written {
+                Ok(plugin_dir) => {
+                    args.push("--plugin-dir".to_string());
+                    args.push(plugin_dir.to_string_lossy().into_owned());
+                    *claim_hook = Some(wirk_core::ClaimHookDelivery::Installed);
+                }
+                // 0208: the same "degrade, don't block" posture as
+                // before — the launch still happens — but the degrade is
+                // now *recorded*, so the standing prompt can stop
+                // promising an automatic claim this pane will never get.
+                Err(error) => {
+                    *claim_hook = Some(wirk_core::ClaimHookDelivery::NotInstalled {
+                        reason: format!(
+                            "wirk's own Claim-hook plugin could not be written for this pane \
+                             ({error})"
+                        ),
+                    });
+                }
+            }
+        }
+
+        // 0208: every other kind. `hook_installed_for` names the kinds
+        // wirk has a mechanism *for*; this records what this launch
+        // actually did, and for a kind with no mechanism the honest
+        // record is "none was installed", not silence. Set only when
+        // nothing above already answered, so opencode's own answer
+        // (taken in `actor_pane`, where its delivery is decided) is
+        // never overwritten here.
+        if claim_hook.is_none() {
+            *claim_hook = Some(wirk_core::ClaimHookDelivery::NotInstalled {
+                reason: format!(
+                    "wirk has no automatic Claim-filing hook for the `{kind_str}` harness"
+                ),
+            });
+        }
+
+        // P4.1 (ruling 0202): the shared worker contract's own argv
+        // half. Additive in every arm — claude appends rather than
+        // replaces, codex only composes when codex itself says the
+        // composition adds without displacing — and whatever is not
+        // claimed here falls through to disclosed prompt delivery, so no
+        // actor ever starts without the contract its World reserved.
+        if let Some(plan) = contract {
+            match kind_str {
+                // `--append-system-prompt-file`, not
+                // `--append-system-prompt`: Herdr types the quoted argv
+                // line into the pane's shell and refuses any element
+                // containing a control character, so a multi-line
+                // contract cannot ride in argv at all. The file variant
+                // also keeps `--system-prompt`'s *replacing* semantics
+                // permanently out of the picture. The file must stay
+                // readable for the life of the Run: claude re-renders
+                // the appended prompt after a compaction, from the same
+                // path.
+                "claude" => {
+                    // Review F3, the concrete transport collision: this
+                    // launch may already carry an append control of its
+                    // own. Whether claude 2.1.269 concatenates two
+                    // append sources or keeps the last could not be
+                    // settled without a live actor, so wirk does not
+                    // guess: it adds nothing, leaves the launch's own
+                    // append exactly as authored, and delivers the
+                    // contract as disclosed prompt text instead.
+                    //
+                    // Narrow on purpose (0202: "do not blanket-refuse
+                    // … user base prompts or other unrelated
+                    // settings"). Only the two *append* controls
+                    // collide with the mechanism wirk uses; `--agent`,
+                    // `--system-prompt[-file]` and every other
+                    // base-prompt setting compose with an append and
+                    // are untouched here.
+                    match existing_claude_append_control(&args) {
+                        Some(flag) => {
+                            plan.pending_fallback = Some(format!(
+                                "this launch already carries `{flag}`, and wirk cannot show \
+                                 that adding a second append source composes rather than \
+                                 replacing it"
+                            ));
+                        }
+                        None => {
+                            args.push("--append-system-prompt-file".to_string());
+                            args.push(plan.path.to_string_lossy().into_owned());
+                            plan.deliver(
+                                wirk_core::ContractDeliveryMode::AppendSystemPromptFile,
+                                None,
+                            );
+                        }
+                    }
+                }
+                // codex has no file-valued instruction key and no
+                // additive one wirk may write (the `managed_`/
+                // `additional_` keys belong to enterprise-managed
+                // configuration). `-c developer_instructions=` is an
+                // override, so it is used **only** when codex's own dry
+                // render shows the override adds the contract and
+                // displaces nothing already configured; otherwise the
+                // user's value is left entirely alone and the contract
+                // is delivered by disclosed prompt.
+                "codex" => {
+                    let cwd = match world {
+                        wirk_core::World::Actor(actor) => actor.worktree_path.clone(),
+                        wirk_core::World::Deterministic(_) => std::path::PathBuf::from("."),
+                    };
+                    // Review F1: the decision is taken under the
+                    // arguments this launch will actually run with —
+                    // `build_selection_args`' mapped model/effort and
+                    // the Route's own `selection.args` — never under a
+                    // configuration no launch will ever have.
+                    match worker_contract::codex_composition(
+                        &cwd,
+                        &plan.text,
+                        self.codex_probe.as_ref(),
+                        &args,
+                    ) {
+                        worker_contract::CodexComposition::Additive => {
+                            args.push("-c".to_string());
+                            args.push(worker_contract::codex_override(&plan.text));
+                            plan.deliver(
+                                wirk_core::ContractDeliveryMode::CodexDeveloperInstructions,
+                                None,
+                            );
+                        }
+                        worker_contract::CodexComposition::Fallback(reason) => {
+                            plan.pending_fallback = Some(reason);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if plan.delivery.is_none() {
+                // 0056 D164 stands: a kind with no native mechanism is
+                // not refused and not silently skipped. It is served by
+                // ordinary prompt text under an explicit disclosure, and
+                // the mode is journaled, so "native" and "prompt" are a
+                // recorded difference rather than an assumption.
+                let reason = plan.pending_fallback.clone().unwrap_or_else(|| {
+                    format!(
+                        "wirk has no verified native instruction-delivery mechanism for the \
+                         `{kind_str}` harness"
+                    )
+                });
+                plan.deliver(wirk_core::ContractDeliveryMode::Prompt, Some(reason));
+            }
+            // The invariant Herdr enforces at `agent.start`, restated
+            // here so a future contract that cannot cross the shell
+            // fails in wirk's own tests instead of at launch.
+            debug_assert!(
+                !args.iter().any(|arg| arg.chars().any(char::is_control)),
+                "an argv element carrying a control character is refused by Herdr: {args:?}"
+            );
         }
 
         let argv = self.client.start_agent(StartAgent {
@@ -1517,6 +2107,16 @@ pub enum HerdrExecutorError {
          `wirk` from a mutable or ambiguous location instead of this Run's own pinned runtime"
     )]
     RuntimePin(#[from] RuntimePinError),
+    /// P4.1 (ruling 0202): this Run's World reserved a shared worker
+    /// contract whose bytes this launch cannot verify — missing,
+    /// unreadable, or not hashing to the reserved digest. Refused
+    /// **before any pane side effect**, the same fail-closed posture
+    /// `RuntimePin` above already takes, and for the reason 0202 gives:
+    /// "a verified contract must actually be delivered, or launch must
+    /// refuse; a swallowed overlay error followed by an
+    /// instruction-less actor is not success".
+    #[error(transparent)]
+    Contract(#[from] worker_contract::ContractError),
 }
 
 /// Every way `build_selection_args` refuses a requested model/effort
@@ -1625,6 +2225,25 @@ pub enum SelectionError {
 /// Nothing here parses the harness's whole command line: it recognizes
 /// only the handful of spellings of the flags wirk itself emits, which
 /// is exactly the overlap it has to be honest about.
+/// The claude *append* controls a launch may already carry, if any —
+/// the one concrete transport collision with wirk's own
+/// `--append-system-prompt-file` delivery (review F3).
+///
+/// Exactly two flags, in both value forms claude's own parser accepts
+/// (`--flag value` and `--flag=value`), because those are the two that
+/// occupy the same mechanism. Deliberately **not** a category ban:
+/// `--agent`, `--system-prompt`, `--system-prompt-file` and any profile
+/// or base-prompt setting set what an append is appended *to*, compose
+/// with it, and are neither inspected nor refused here (0202).
+fn existing_claude_append_control(args: &[String]) -> Option<&'static str> {
+    const APPEND_CONTROLS: [&str; 2] = ["--append-system-prompt", "--append-system-prompt-file"];
+    args.iter().find_map(|arg| {
+        APPEND_CONTROLS
+            .into_iter()
+            .find(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+    })
+}
+
 fn conflicting_raw_arg(kind: &str, field: SelectionField, args: &[String]) -> Option<String> {
     let (flags, config_keys): (&[&str], &[&str]) = match (kind, field) {
         ("claude", SelectionField::Model) => (&["--model"], &[]),
@@ -1794,8 +2413,16 @@ impl<C: HerdrClient> wirk_core::Executor for HerdrExecutor<C> {
     /// before `agent.start` per D51 and returns it.
     fn launch(&self, run: &wirk_core::Run, world: &wirk_core::World) -> Result<(), Self::Error> {
         validate_selection(run.kind.0.as_str(), &run.selection)?;
-        let pane = self.actor_pane(run, world)?;
-        self.start_actor_agent(run, &pane.pane_id, world)?;
+        let mut contract = self.verified_contract(world)?;
+        let mut claim_hook = None;
+        let pane = self.actor_pane(run, world, contract.as_mut(), &mut claim_hook)?;
+        self.start_actor_agent(
+            run,
+            &pane.pane_id,
+            world,
+            contract.as_mut(),
+            &mut claim_hook,
+        )?;
         Ok(())
     }
 

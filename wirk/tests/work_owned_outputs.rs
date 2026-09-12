@@ -127,6 +127,30 @@ fn read_bound_reviewer(estate: &Path, repo: &Path, socket: &Path) -> Reviewer {
     }
 }
 
+/// Same shape as `read_bound_reviewer`, on the two-output fixture
+/// (`report.md` and `summary.md`, both required) — ruling 0212's own
+/// decisive check: a bare Claim on a Read-bound Run must snapshot both
+/// validated managed artifacts, not just one.
+fn read_bound_reviewer_two(estate: &Path, repo: &Path, socket: &Path) -> Reviewer {
+    route_fixture::install_route_fixture(estate, "outputs_read_reviewer_two");
+    init_repo(repo);
+    let submitted = submit_kind(
+        estate,
+        "outputs_read_reviewer_two",
+        repo,
+        &["demo:read"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit the two-output read-bound reviewer");
+    let worktree = materialize_actor(socket, estate, &submitted.work_id, &submitted.run_id);
+    Reviewer {
+        work_id: submitted.work_id,
+        run_id: submitted.run_id,
+        worktree,
+    }
+}
+
 // ---- 1. the preserved refusal ----------------------------------------
 
 /// The observed blocker, reproduced and kept. Watched fail against the
@@ -239,6 +263,219 @@ fn read_bound_run_delivers_its_declared_output_through_the_managed_area() {
         path.starts_with("claims/") && path.ends_with("/report.md"),
         "a managed receipt records its own derived relative address, got {path}"
     );
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+/// Ruling 0212's own decisive check, watched red beforehand: on `main`
+/// at eb379aa a bare `wirk claim` (no `--artifact`/`--output` flags at
+/// all — the shape the automatic Claude/OpenCode Stop-hook always
+/// files, `wirk-herdr/src/claim_hook.rs`) mapped both declared names
+/// into checkout artifacts and was refused `Refused: MissingArtifact
+/// report.md` even though the actor had written both files under `wirk
+/// output dir`. After the correction the same bare Claim snapshots both
+/// validated managed artifacts and Validates — the actor never types
+/// `--output` at all.
+#[test]
+fn a_bare_claim_snapshots_both_declared_managed_outputs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+    let reviewer = read_bound_reviewer_two(&estate, &dir.path().join("repo"), &pointer.socket);
+
+    let staging = output_dir(&estate, &reviewer.work_id, &reviewer.run_id);
+    fs::write(staging.join("report.md"), b"# report\n").expect("actor writes report.md");
+    fs::write(staging.join("summary.md"), b"# summary\n").expect("actor writes summary.md");
+
+    let (code, stdout) = claim(&estate, &reviewer.work_id, &reviewer.run_id, &[]);
+    assert_eq!(code, Some(0), "bare claim refused: {stdout}");
+    assert_eq!(stdout, "Validated");
+    assert_eq!(state_of(&pointer.socket, &reviewer.work_id), "completed");
+
+    assert_eq!(
+        worktree_changes(&reviewer.worktree),
+        "",
+        "the Read-bound checkout must be exactly as materialized"
+    );
+
+    for name in ["report.md", "summary.md"] {
+        let evidence = evidence_for(&pointer.socket, &reviewer.work_id, name);
+        assert_eq!(evidence["store"].as_str(), Some("work_outputs"), "{name}");
+        assert_eq!(evidence["available"].as_bool(), Some(true), "{name}");
+    }
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+/// Same shape as `read_bound_reviewer_two`, on the three-output fixture
+/// (`report.md` and `summary.md` required, `draft.md` optional) — ruling
+/// 0213's own decisive check: a bare Claim must default to the *required*
+/// declared outputs only, never every declared name regardless of
+/// `required`.
+fn read_bound_reviewer_optional(estate: &Path, repo: &Path, socket: &Path) -> Reviewer {
+    route_fixture::install_route_fixture(estate, "outputs_read_reviewer_optional");
+    init_repo(repo);
+    let submitted = submit_kind(
+        estate,
+        "outputs_read_reviewer_optional",
+        repo,
+        &["demo:read"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit the optional-output read-bound reviewer");
+    let worktree = materialize_actor(socket, estate, &submitted.work_id, &submitted.run_id);
+    Reviewer {
+        work_id: submitted.work_id,
+        run_id: submitted.run_id,
+        worktree,
+    }
+}
+
+/// Ruling 0213's decisive check, watched red beforehand: on `main` at
+/// c268c55, `fetch_output_contract_names` mapped every declared name into
+/// the bare Claim's addressing regardless of `required`, so an actor that
+/// legitimately left an optional declared output unwritten was refused
+/// `Refused: MissingArtifact draft.md` even though both required outputs
+/// existed and validated. After the correction the same bare Claim
+/// snapshots only the required declared outputs and Validates; the
+/// optional one is never claimed and never refused for being absent.
+#[test]
+fn a_bare_claim_selects_required_managed_outputs_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+    let reviewer = read_bound_reviewer_optional(&estate, &dir.path().join("repo"), &pointer.socket);
+
+    let staging = output_dir(&estate, &reviewer.work_id, &reviewer.run_id);
+    fs::write(staging.join("report.md"), b"# report\n").expect("actor writes report.md");
+    fs::write(staging.join("summary.md"), b"# summary\n").expect("actor writes summary.md");
+    // draft.md is deliberately never written: it is optional, and this is
+    // the legitimate case the default must admit.
+
+    let (code, stdout) = claim(&estate, &reviewer.work_id, &reviewer.run_id, &[]);
+    assert_eq!(
+        code,
+        Some(0),
+        "a bare claim must validate on the required outputs alone, got: {stdout}"
+    );
+    assert_eq!(stdout, "Validated");
+    assert_eq!(state_of(&pointer.socket, &reviewer.work_id), "completed");
+
+    assert_eq!(
+        worktree_changes(&reviewer.worktree),
+        "",
+        "the Read-bound checkout must be exactly as materialized"
+    );
+
+    for name in ["report.md", "summary.md"] {
+        let evidence = evidence_for(&pointer.socket, &reviewer.work_id, name);
+        assert_eq!(evidence["store"].as_str(), Some("work_outputs"), "{name}");
+        assert_eq!(evidence["available"].as_bool(), Some(true), "{name}");
+    }
+
+    // The optional output was never named by the default, so it carries
+    // no evidence at all — not "missing", not "unavailable": absent from
+    // the Claim entirely.
+    let status = status(&pointer.socket, &reviewer.work_id);
+    let claimed_names: Vec<String> = status["evidence"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|entry| {
+            entry["artifacts"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|artifact| artifact["name"].as_str().map(str::to_string))
+        })
+        .collect();
+    assert!(
+        !claimed_names.iter().any(|name| name == "draft.md"),
+        "the optional output must not appear in the Claim's own evidence: {claimed_names:?}"
+    );
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+/// The explicit half of the same fixture: `--output` may still name a
+/// produced optional artifact by hand, all three at once, unaffected by
+/// the default's own filtering.
+#[test]
+fn claim_with_explicit_output_can_include_a_produced_optional_artifact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+    let reviewer = read_bound_reviewer_optional(&estate, &dir.path().join("repo"), &pointer.socket);
+
+    let staging = output_dir(&estate, &reviewer.work_id, &reviewer.run_id);
+    fs::write(staging.join("report.md"), b"# report\n").expect("write report.md");
+    fs::write(staging.join("summary.md"), b"# summary\n").expect("write summary.md");
+    fs::write(staging.join("draft.md"), b"# draft\n").expect("write draft.md");
+
+    let (code, stdout) = claim(
+        &estate,
+        &reviewer.work_id,
+        &reviewer.run_id,
+        &[
+            "--output",
+            "report.md",
+            "--output",
+            "summary.md",
+            "--output",
+            "draft.md",
+        ],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "explicit optional claiming refused: {stdout}"
+    );
+    assert_eq!(stdout, "Validated");
+
+    let evidence = evidence_for(&pointer.socket, &reviewer.work_id, "draft.md");
+    assert_eq!(evidence["store"].as_str(), Some("work_outputs"));
+    assert_eq!(evidence["available"].as_bool(), Some(true));
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+/// And the other explicit half: naming an absent optional artifact by
+/// hand is still refused `MissingArtifact` — `required: false` changes
+/// what the *default* selects, never what an explicit name must satisfy.
+#[test]
+fn claim_with_explicit_output_still_refuses_an_absent_optional_artifact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+    let reviewer = read_bound_reviewer_optional(&estate, &dir.path().join("repo"), &pointer.socket);
+
+    let staging = output_dir(&estate, &reviewer.work_id, &reviewer.run_id);
+    fs::write(staging.join("report.md"), b"# report\n").expect("write report.md");
+    fs::write(staging.join("summary.md"), b"# summary\n").expect("write summary.md");
+    // draft.md is never written, but is named explicitly anyway.
+
+    let (code, stdout) = claim(
+        &estate,
+        &reviewer.work_id,
+        &reviewer.run_id,
+        &[
+            "--output",
+            "report.md",
+            "--output",
+            "summary.md",
+            "--output",
+            "draft.md",
+        ],
+    );
+    assert_eq!(code, Some(3), "expected a refusal, got: {stdout}");
+    assert_eq!(stdout, "Refused: MissingArtifact draft.md");
 
     stop_wirkd(&estate, wirkd_child);
 }

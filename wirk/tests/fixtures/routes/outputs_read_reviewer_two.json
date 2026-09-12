@@ -1,0 +1,15 @@
+{
+  "id": "outputs-read-reviewer-two",
+  "waypoints": [
+    {
+      "id": "outputs-read-reviewer-two/review",
+      "kind": "Actor",
+      "intent": "review the source without changing it and return report.md and summary.md",
+      "declared_outputs": [
+        {"name": "report.md", "required": true},
+        {"name": "summary.md", "required": true}
+      ],
+      "boundary": []
+    }
+  ]
+}

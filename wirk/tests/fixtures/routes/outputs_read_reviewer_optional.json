@@ -1,0 +1,16 @@
+{
+  "id": "outputs-read-reviewer-optional",
+  "waypoints": [
+    {
+      "id": "outputs-read-reviewer-optional/review",
+      "kind": "Actor",
+      "intent": "review the source without changing it, return report.md and summary.md, and draft.md only when there is a draft worth keeping",
+      "declared_outputs": [
+        {"name": "report.md", "required": true},
+        {"name": "summary.md", "required": true},
+        {"name": "draft.md", "required": false}
+      ],
+      "boundary": []
+    }
+  ]
+}

@@ -209,25 +209,36 @@ fn claim(args: &[String]) -> ExitCode {
         }
     };
 
-    // P2.7 W1 (`orient/reorient.md` §D, R2 over R7): no explicit
-    // `--artifact` flags and no `--question` means the actor never
-    // named its outputs by hand — ask wirkd for the current Waypoint's
-    // declared output contract (the `status` verb it already returns,
-    // `handle_status`'s `result["world"]`, unchanged wire method) and
-    // claim each declared output at its own name as the worktree-
-    // relative path; wirkd's own validator still refuses whatever is
-    // actually missing. An explicit `--artifact` flag keeps its
-    // meaning exactly — this only fires when the caller supplied none.
-    //
-    // Unchanged by ruling 0145, deliberately: an explicit `--output`
-    // flag means the caller named its outputs by hand, so this fallback
-    // does not fire, and it still resolves a bare `wirk claim` to
-    // *checkout* artifacts exactly as it always has. A Read-bound Run
-    // asks for the managed route by name; nothing about the historical
-    // default changes underneath a Work that never heard of it.
+    // P2.7 W1 (`orient/reorient.md` §D, R2 over R7), corrected by ruling
+    // 0212 and 0213: no explicit `--artifact`/`--output` flags and no
+    // `--question` means the actor never named its outputs by hand —
+    // ask wirkd for the current Waypoint's declared output contract
+    // (the `status` verb it already returns, `handle_status`'s
+    // `result["world"]`, unchanged wire method) and claim each
+    // *required* declared output at its own name, addressed the same
+    // way its own World produces it: an `ActorWorld`'s outputs are
+    // written under `wirk output dir` (the delivered worker contract,
+    // `wirk-herdr/src/worker-contract.md` "Outputs"; the automatic
+    // Claude/OpenCode Stop-hook always files a bare Claim,
+    // `wirk-herdr/src/claim_hook.rs`), so those default to `--output`
+    // addressing; a `DeterministicWorld`'s `expected_artifacts` are
+    // written straight into the checkout by its own executor
+    // (`executors::child::ChildExecutor::file_claim`'s own doc: "it
+    // never reaches for the managed output area"), so those default to
+    // `--artifact` addressing exactly as before. An optional
+    // (`required: false`) declared output is never added by this
+    // fallback: the daemon refuses `MissingArtifact` for any name a
+    // Claim supplies whether or not it is required, so naming one by
+    // default would turn it into a requirement the actor never agreed
+    // to (0213) — it is claimed only when named explicitly. Either
+    // explicit flag keeps its meaning exactly — this fallback only
+    // fires when the caller supplied neither.
     if artifacts.is_empty() && outputs.is_empty() && question.is_none() {
         match fetch_output_contract_names(&pointer.socket, &work_id) {
-            Ok(names) => {
+            Ok(ContractNames::Managed(names)) => {
+                outputs.extend(names);
+            }
+            Ok(ContractNames::Checkout(names)) => {
                 for name in names {
                     artifacts.insert(name.clone(), name);
                 }
@@ -271,15 +282,40 @@ fn claim(args: &[String]) -> ExitCode {
     }
 }
 
+/// A bare Claim's declared output names, tagged by which addressing
+/// they resolve through — decided by which World kind declared them
+/// (ruling 0212), never guessed from which file happens to exist.
+enum ContractNames {
+    /// `ActorWorld.output_contract`: staged under `wirk output dir`,
+    /// so a bare Claim reaches for them the same way `--output NAME`
+    /// does.
+    Managed(Vec<String>),
+    /// `DeterministicWorld.expected_artifacts`: written straight into
+    /// the checkout by the executor, so a bare Claim reaches for them
+    /// the same way `--artifact NAME=PATH` does (at their own
+    /// worktree-relative name).
+    Checkout(Vec<String>),
+}
+
 /// Asks wirkd's existing `status` verb for the current Waypoint's
 /// reserved World (`handle_status`'s `result["world"]`, the same field
 /// `wirk run-deterministic`'s `reserved_deterministic` and
 /// `boundary_claim.rs`'s own `reserved_world` test helper already
-/// read) and returns its declared output names, in the order the Route
-/// authored them — `ActorWorld.output_contract` for an actor Waypoint,
-/// `DeterministicWorld.expected_artifacts` for a deterministic one, R2
-/// over adding a new wire method (`orient/reorient.md` §D).
-fn fetch_output_contract_names(socket: &Path, work_id: &WorkId) -> Result<Vec<String>, String> {
+/// read) and returns its *required* declared output names, in the order
+/// the Route authored them — `ActorWorld.output_contract` for an actor
+/// Waypoint, `DeterministicWorld.expected_artifacts` for a deterministic
+/// one, R2 over adding a new wire method (`orient/reorient.md` §D).
+///
+/// A `required: false` spec is filtered out here (ruling 0213): the
+/// daemon validates every name a Claim actually supplies and refuses
+/// `MissingArtifact` for any of them that is absent, `required` or not
+/// (`server.rs`'s own managed- and checkout-artifact validation) — so
+/// naming an optional output by default would turn it into a
+/// requirement the actor never agreed to. Explicit `--output`/
+/// `--artifact` are untouched by this filter: a caller that names an
+/// optional output by hand still has it validated, present or absent,
+/// exactly as before.
+fn fetch_output_contract_names(socket: &Path, work_id: &WorkId) -> Result<ContractNames, String> {
     let reply = wirkd::client::status(
         socket,
         // The claiming Work reading its own output contract: scoped to
@@ -301,11 +337,18 @@ fn fetch_output_contract_names(socket: &Path, work_id: &WorkId) -> Result<Vec<St
         .ok_or_else(|| "wirkd status carries no World for this Work".to_string())?;
     let world: World = serde_json::from_value(world_value.clone())
         .map_err(|err| format!("malformed World from wirkd status: {err}"))?;
-    let contract: OutputContract = match world {
-        World::Actor(actor) => actor.output_contract,
-        World::Deterministic(det) => det.expected_artifacts,
+    let names_of = |contract: OutputContract| -> Vec<String> {
+        contract
+            .0
+            .into_iter()
+            .filter(|spec| spec.required)
+            .map(|spec| spec.name)
+            .collect()
     };
-    Ok(contract.0.into_iter().map(|spec| spec.name).collect())
+    Ok(match world {
+        World::Actor(actor) => ContractNames::Managed(names_of(actor.output_contract)),
+        World::Deterministic(det) => ContractNames::Checkout(names_of(det.expected_artifacts)),
+    })
 }
 
 // ---- wirk output (ruling 0145) --------------------------------------
@@ -1072,7 +1115,10 @@ fn claim_usage() -> ExitCode {
         "usage: wirk claim [--artifact NAME=PATH]... [--output NAME]... [--question TEXT]\n  \
          --artifact  a file in this Run's own checkout, at the path you name\n  \
          --output    a declared output this Work owns, by name; run `wirk output` for where to \
-         write it"
+         write it\n  \
+         with neither flag: claims every *required* declared output at its own name, addressed \
+         the way its World writes it — managed for an actor Waypoint, checkout for a \
+         deterministic one; an optional declared output is claimed only by naming it explicitly"
     );
     ExitCode::from(1)
 }
@@ -2667,6 +2713,8 @@ fn reserved_deterministic(status: &serde_json::Value) -> Result<(Run, World), St
         launch_requested: false,
         launch_argv: Vec::new(),
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
         // Attempt admission is the Actor launch path's own
         // (`RunLaunchAttempted`); a Deterministic Run never takes one.
         launch_attempt: None,
@@ -3039,6 +3087,8 @@ fn demo_events() -> Vec<Event> {
                 actor_kind: wirk_core::ActorKind::default(),
                 selection: wirk_core::ActorSelection::default(),
                 launch_argv: Vec::new(),
+                contract: None,
+                claim_hook: None,
             },
         ),
         new_event(

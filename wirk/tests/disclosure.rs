@@ -2700,6 +2700,8 @@ fn record_launch_events(
             actor_kind: kind.clone(),
             selection: selection.clone(),
             launch_argv: launch_argv.iter().map(|arg| (*arg).to_string()).collect(),
+            contract: None,
+            claim_hook: None,
         },
     ] {
         let reply = wirkd::client::call(

@@ -44,6 +44,10 @@ hmac = "0.13.0"
 sha2 = "0.11.0"
 
 [dev-dependencies]
+# P4.1: wirk/tests/run_reattachment.rs re-hashes the reserved worker
+# contract's bytes off disk. Same pin the crate's own `[dependencies]`
+# already carry (R2); an integration test does not inherit them.
+sha2 = "0.11.0"
 # wirk/tests/journal_demo.rs's tempdirs (R5, cache-resolvable; same pin
 # already used by wirk-core/Cargo.toml's Journal round-trip fixtures,
 # ruling 0031 D97's latest-then-pin checked 2026-09-04).

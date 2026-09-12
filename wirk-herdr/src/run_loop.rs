@@ -502,6 +502,28 @@ pub struct RunLoop<C: HerdrClient, W: WirkdApi> {
     /// piped stdout (R2 over inventing a sink trait: this is the
     /// narrowest thing that makes the fake-backed case observable).
     captured_output: Option<Arc<Mutex<Vec<String>>>>,
+    /// P4.1 (ruling 0202): how this Run's worker contract was actually
+    /// delivered — the fact the prompt composition needs so that a kind
+    /// served natively is never served a second time in prompt text, and
+    /// a kind with no native mechanism always is.
+    ///
+    /// Seeded in `drive` from the Run's own journaled value, so a
+    /// reattach or a second `wirk run` composes from the delivery that
+    /// was actually recorded rather than re-deciding it, and overwritten
+    /// by `launch` when this invocation is the one that launches.
+    contract_delivery: Option<wirk_core::ContractDelivery>,
+    /// P4.1 (ruling 0208): whether this Run's launch actually installed
+    /// wirk's own Claim-filing hook — the fact the standing prompt needs
+    /// so it promises an automatic claim only where one was delivered,
+    /// and tells the actor to file by hand, with the reason, where it
+    /// was not.
+    ///
+    /// Seeded in `drive` from the Run's own journaled value and
+    /// overwritten by `launch` when this invocation is the one that
+    /// launches, exactly as `contract_delivery` above: a reattach or a
+    /// second `wirk run` composes from what was recorded, never from a
+    /// fact re-decided by a later invocation.
+    claim_hook: Option<wirk_core::ClaimHookDelivery>,
 }
 
 impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
@@ -517,6 +539,8 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             last_status: None,
             launched_pane: None,
             run_state: None,
+            contract_delivery: None,
+            claim_hook: None,
             watch_events: Vec::new(),
             run_opened_this_run: false,
             resumed_status: None,
@@ -681,6 +705,8 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         match self.executor.launch_actor(run, world) {
             Ok(launched) => {
                 self.launched_pane = Some(launched.pane.pane_id.clone());
+                self.contract_delivery = launched.contract.clone();
+                self.claim_hook = launched.claim_hook.clone();
                 self.record_required(
                     work_id,
                     &run.id,
@@ -689,6 +715,8 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                         actor_kind: run.kind.clone(),
                         selection: run.selection.clone(),
                         launch_argv: launched.argv.clone(),
+                        contract: launched.contract.clone(),
+                        claim_hook: launched.claim_hook.clone(),
                     },
                 )?;
                 Ok(launched.events)
@@ -1067,6 +1095,8 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         actor.triple.run_id = run.id.clone();
         let world = World::Actor(actor.clone());
         self.run_state = Some(run.clone());
+        self.contract_delivery = run.contract_delivery.clone();
+        self.claim_hook = run.claim_hook.clone();
         self.watch_events.clear();
         self.run_opened_this_run = false;
 
@@ -1656,7 +1686,34 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         if !self.prompt_gate.try_acquire() {
             return Ok(());
         }
-        let text = compose_first_prompt(actor, &run.kind);
+        // P4.1 (ruling 0202): a prompt-delivered contract is read and
+        // re-verified here, every time the prompt is composed. A file
+        // that has gone missing or changed since launch fails the prompt
+        // loudly rather than quietly sending an actor a prompt with no
+        // contract in it — the same "delivered, or refuse" rule the
+        // launch itself is held to.
+        let contract_text = match self.contract_delivery.as_ref() {
+            Some(delivery) if delivery.mode == wirk_core::ContractDeliveryMode::Prompt => {
+                let reference = wirk_core::WorkerContractRef {
+                    version: delivery.version.clone(),
+                    digest: delivery.digest.clone(),
+                };
+                let (_, text) = crate::worker_contract::read_verified(
+                    std::path::Path::new(&actor.triple.estate_root),
+                    &reference,
+                )
+                .map_err(|error| RunLoopError::Herdr(HerdrExecutorError::Contract(error)))?;
+                Some(text)
+            }
+            _ => None,
+        };
+        let text = compose_first_prompt(
+            actor,
+            &run.kind,
+            self.contract_delivery.as_ref(),
+            contract_text.as_deref(),
+            self.claim_hook.as_ref(),
+        );
         self.executor
             .client()
             .prompt_agent(PromptAgent {
@@ -1841,6 +1898,15 @@ fn spawn_watch_reader<E: std::error::Error + Send + 'static>(
 /// `actor_pane` already uses to decide whether to write the hook at
 /// all, never a second list of kinds):
 ///
+/// P4.1 (ruling 0208) narrows the first of those two from the kind to
+/// **this launch**: a claim is promised automatically only where the
+/// launch's own recorded `ClaimHookDelivery` says the hook was actually
+/// installed. Supplying a mechanism is not the same as the harness
+/// enforcing it, and a kind wirk has a mechanism *for* is not a pane
+/// that got one — an opencode launch with both configuration slots
+/// already taken, or a claude launch whose plugin directory could not be
+/// written, gets the by-hand instruction and the reason.
+///
 /// - a kind with the hook installed is told the required outputs by
 ///   name, and truthfully: a claim is *attempted* at every turn end and
 ///   *refused* until they exist (`native-progress-contract-use/
@@ -1885,7 +1951,13 @@ fn spawn_watch_reader<E: std::error::Error + Send + 'static>(
 /// installed and validated (correction item 1), the file this text
 /// names is guaranteed to exist and to hold the Run's own bytes by the
 /// time any prompt is sent.
-pub fn compose_first_prompt(actor: &ActorWorld, kind: &ActorKind) -> String {
+pub fn compose_first_prompt(
+    actor: &ActorWorld,
+    kind: &ActorKind,
+    contract: Option<&wirk_core::ContractDelivery>,
+    contract_text: Option<&str>,
+    claim_hook: Option<&wirk_core::ClaimHookDelivery>,
+) -> String {
     let required: Vec<&str> = actor
         .output_contract
         .0
@@ -1910,22 +1982,69 @@ pub fn compose_first_prompt(actor: &ActorWorld, kind: &ActorKind) -> String {
          different build), and do not go looking for one in a build tree or anywhere \
          else."
     );
-    let claim_line = if crate::claim_hook::hook_installed_for(kind) {
+    // 0208: bound to what this Run's launch **actually delivered**, not
+    // to the kind it is. `hook_installed_for` answers "is there a
+    // mechanism for this harness at all", which is the wrong question
+    // for a pane whose opencode slots were both taken or whose plugin
+    // directory could not be written: a launch like that installs
+    // nothing, and a prompt promising an automatic claim there tells the
+    // actor something untrue about its own turn end. The `None` arm is
+    // the one case with no recorded fact — a `RunLaunched` written
+    // before the field existed — where the kind predicate is still the
+    // best answer available and is exactly what this text always said.
+    let by_hand = |why: Option<&str>| {
+        let disclosure = why
+            .map(|reason| {
+                format!(
+                    "wirk did not install its automatic Claim hook in this pane, because \
+                     {reason}. "
+                )
+            })
+            .unwrap_or_default();
         format!(
-            "A claim is attempted automatically at the end of every turn and is refused \
-             until the required outputs above exist, so end your turn once they do — a \
-             refusal before then is a normal record, not a failure. If you need input \
-             before you can finish, run {wirk} claim --question \"...\" instead."
-        )
-    } else {
-        format!(
-            "When you are done, file the claim from this pane: run {wirk} claim. If you \
-             need input before you can finish, run {wirk} claim --question \"...\" \
-             instead."
+            "{disclosure}When you are done, file the claim from this pane: run {wirk} \
+             claim. If you need input before you can finish, run {wirk} claim --question \
+             \"...\" instead."
         )
     };
+    let automatic = format!(
+        "A claim is attempted automatically at the end of every turn and is refused \
+         until the required outputs above exist, so end your turn once they do — a \
+         refusal before then is a normal record, not a failure. If you need input \
+         before you can finish, run {wirk} claim --question \"...\" instead."
+    );
+    let claim_line = match claim_hook {
+        Some(wirk_core::ClaimHookDelivery::Installed) => automatic,
+        Some(wirk_core::ClaimHookDelivery::NotInstalled { reason }) => by_hand(Some(reason)),
+        None if crate::claim_hook::hook_installed_for(kind) => automatic,
+        None => by_hand(None),
+    };
+    // P4.1 (ruling 0202): the shared worker contract, and *only* when
+    // this Run's own recorded delivery says the prompt is how it was
+    // delivered. The predicate is the journaled mode itself, not a
+    // second list of kinds, so the delivery decision and the prompt can
+    // never drift onto different answers — the same "one predicate"
+    // discipline `claim_hook::hook_installed_for` already sets. It leads
+    // the text: the contract is how to operate, the assignment that
+    // follows is what to produce.
+    let contract_block = match (contract, contract_text) {
+        (Some(delivery), Some(text))
+            if delivery.mode == wirk_core::ContractDeliveryMode::Prompt =>
+        {
+            let reason = delivery
+                .fallback_reason
+                .as_deref()
+                .unwrap_or("no native mechanism was available");
+            format!(
+                "{}\n\n{}\n\n---\n\n",
+                crate::worker_contract::prompt_disclosure(&kind.0, reason),
+                text.trim()
+            )
+        }
+        _ => String::new(),
+    };
     format!(
-        "{intent}{artifacts_line}\n\n{runtime_line}\n\n{claim_line}",
+        "{contract_block}{intent}{artifacts_line}\n\n{runtime_line}\n\n{claim_line}",
         intent = actor.intent,
     )
 }
@@ -2094,6 +2213,8 @@ fn fake_run_states(events: &[Event]) -> Vec<RunStatusEntry> {
                 launch_attempt: None,
                 launch_argv: Vec::new(),
                 expansions: Vec::new(),
+                contract_delivery: None,
+                claim_hook: None,
             });
         }
         for run in runs.iter_mut() {

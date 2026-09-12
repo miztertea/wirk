@@ -294,6 +294,8 @@ fn replay_then_fold_equals_folding_the_original_events() {
                 actor_kind: Default::default(),
                 selection: Default::default(),
                 launch_argv: Vec::new(),
+                contract: None,
+                claim_hook: None,
             },
         },
         Event {
@@ -726,6 +728,8 @@ fn historical_opencode_actor_kind_replays_to_the_current_launch_spelling() {
             actor_kind: ActorKind::opencode(),
             selection: Default::default(),
             launch_argv: Vec::new(),
+            contract: None,
+            claim_hook: None,
         },
     };
     let mut value = serde_json::to_value(&event).expect("event serializes");
@@ -753,6 +757,8 @@ fn historical_opencode_actor_kind_replays_to_the_current_launch_spelling() {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     };
     for event in &replayed {
         run.apply(event);

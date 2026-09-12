@@ -2591,6 +2591,14 @@ fn a_bare_actor_review_binds_its_frozen_target_and_refuses_substitution() {
     );
     let mut without = reserved.clone();
     without.review_targets = Vec::new();
+    // P4.1: an Actor reservation now also binds the shared worker
+    // contract, which is a second, independent reason to leave the
+    // pre-v2 encoding. The property this assertion pins is "a World
+    // carrying none of the post-v2 content keeps its historical hash",
+    // so both are stripped; the contract's own half of that property is
+    // pinned directly in
+    // `wirk-core/tests/contracts.rs::a_reserved_worker_contract_binds_into_the_world_hash_and_no_historical_hash_moves`.
+    without.contract = None;
     assert_eq!(
         wirk_core::WorldHash::of(&wirk_core::World::Actor(without.clone())),
         wirk_core::WorldHash::legacy_for_tests(&wirk_core::World::Actor(without)),

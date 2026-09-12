@@ -112,3 +112,44 @@ fn claim_treats_blank_variable_as_missing() {
         "stderr should not name WIRK_RUN_ID, got {stderr}"
     );
 }
+
+/// Ruling 0145's own rule, still enforced after the ruling 0212
+/// correction: one name cannot be claimed from both places at once.
+/// This is a usage error caught before the triple is even read (the
+/// duplicate check runs on the parsed flags alone), so no wirkd needs
+/// to be running.
+#[test]
+fn claim_refuses_a_name_claimed_as_both_artifact_and_output() {
+    let output = Command::new(wirk_bin())
+        .args([
+            "claim",
+            "--artifact",
+            "report.md=report.md",
+            "--output",
+            "report.md",
+        ])
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID")
+        .output()
+        .expect("wirk claim should run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit 1 (usage), got {:?}",
+        output.status
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "stdout should be empty on a usage error, got {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("report.md")
+            && stderr.contains("--artifact")
+            && stderr.contains("--output"),
+        "expected the conflicting-name usage error naming both flags, got: {stderr}"
+    );
+}

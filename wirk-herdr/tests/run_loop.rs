@@ -52,6 +52,8 @@ fn open_run(run_id: &str) -> Run {
         launch_argv: Vec::new(),
         launch_attempt: None,
         expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
     }
 }
 
@@ -92,6 +94,7 @@ fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
+        contract: None,
     })
 }
 
@@ -186,6 +189,8 @@ fn run_launched(run: &Run) -> EventKind {
         actor_kind: run.kind.clone(),
         selection: run.selection.clone(),
         launch_argv: Vec::new(),
+        contract: None,
+        claim_hook: None,
     }
 }
 
@@ -1775,9 +1780,18 @@ fn launch_does_not_release_an_earlier_run_with_no_live_pane() {
         client.prompt_agent_calls.lock().unwrap().len() == 1
     });
 
+    // Ruling 0205: an opencode launch closes its own short-lived
+    // configuration probe pane, so "nothing should be closed" is about
+    // the earlier Run's pane by name, not about the call list being
+    // empty.
     assert!(
-        client.close_pane_calls.lock().unwrap().is_empty(),
-        "no live pane existed for the earlier Run, so nothing should be closed"
+        !client
+            .close_pane_calls
+            .lock()
+            .unwrap()
+            .contains(&old_run.id.0),
+        "no live pane existed for the earlier Run, so its pane must not be closed: {:?}",
+        client.close_pane_calls.lock().unwrap()
     );
 
     wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
@@ -1814,9 +1828,12 @@ fn actor_pane_env_carries_cargo_target_dir_from_the_driver_when_set() {
     HerdrExecutor::new(client_with.clone())
         .launch_actor(&run, &world)
         .expect("launch_actor succeeds");
+    // Ruling 0205: `[0]` is the opencode configuration probe pane,
+    // which carries no environment of its own; the actor's pane is
+    // `[1]`, and that is the one `CARGO_TARGET_DIR` must reach.
     let calls_with = client_with.split_pane_calls.lock().unwrap();
     assert_eq!(
-        calls_with[0]
+        calls_with[1]
             .env
             .get("CARGO_TARGET_DIR")
             .map(String::as_str),
@@ -1840,7 +1857,7 @@ fn actor_pane_env_carries_cargo_target_dir_from_the_driver_when_set() {
         .expect("launch_actor succeeds");
     let calls_without = client_without.split_pane_calls.lock().unwrap();
     assert!(
-        !calls_without[0].env.contains_key("CARGO_TARGET_DIR"),
+        !calls_without[1].env.contains_key("CARGO_TARGET_DIR"),
         "no CARGO_TARGET_DIR in the driver's own env must mean none in the pane's env either"
     );
     drop(calls_without);
@@ -2247,6 +2264,7 @@ fn actor_world_with_estate(
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
+        contract: None,
     })
 }
 
@@ -3357,4 +3375,189 @@ fn the_prompts_path_is_the_file_the_installer_actually_pins() {
 
     let text = first_prompt_text(run.clone(), wirk_core::ActorKind::claude(), estate.path());
     assert!(text.contains(&installed.to_string_lossy().into_owned()));
+}
+
+// ---- P4.1 (ruling 0202): prompt fallback, and no double delivery -------
+//
+// 0056 D164 stands: wirk is not a supported-harness allowlist. A kind
+// with no native instruction mechanism wirk has verified still launches,
+// and still gets the shared worker contract — as ordinary prompt text,
+// under an explicit disclosure naming what happened. The kinds that
+// *do* have a native mechanism must not then get it a second time in
+// the prompt, which is the same text re-sent on every continuation.
+//
+// Both cases go through the real `prompt_agent` seam, so a regression in
+// the `RunLoop` wiring (the wrong delivery reaching the composition)
+// fails them too.
+
+/// Writes a contract where a reservation would have, and returns the
+/// reference a reserved World carries for it.
+fn reserved_contract(text: &str) -> wirk_core::WorkerContractRef {
+    let digest = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(text.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let dir = fixture_estate_root().join(".wirk").join("contracts");
+    std::fs::create_dir_all(&dir).expect("contracts dir");
+    std::fs::write(dir.join(format!("{digest}.md")), text).expect("contract bytes");
+    wirk_core::WorkerContractRef {
+        version: "wirk.worker-contract/v1".to_string(),
+        digest,
+    }
+}
+
+fn world_with_contract(run: &Run, worktree: &std::path::Path, text: &str) -> World {
+    let World::Actor(mut actor) = actor_world(run, worktree) else {
+        unreachable!()
+    };
+    actor.contract = Some(reserved_contract(text));
+    World::Actor(actor)
+}
+
+const FALLBACK_CONTRACT: &str = "# Wirk worker contract\n\nOperate inside Wirk. \"Verify\" it.\n";
+
+fn first_prompt_for(kind: ActorKind) -> String {
+    let mut run = open_run("run-1");
+    run.kind = kind;
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = world_with_contract(&run, dir.path(), FALLBACK_CONTRACT);
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("first prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    handle.join().unwrap().expect("drive");
+    let calls = client.prompt_agent_calls.lock().unwrap();
+    calls[0].text.clone()
+}
+
+#[test]
+fn a_kind_with_no_native_mechanism_gets_the_contract_in_its_prompt_with_a_disclosure() {
+    let text = first_prompt_for(ActorKind("gemini".to_string()));
+    assert!(
+        text.contains(FALLBACK_CONTRACT.trim()),
+        "the contract itself must reach an actor whose harness has no native mechanism: {text:?}"
+    );
+    assert!(
+        text.contains("ordinary prompt text"),
+        "the fallback must disclose that it is not native delivery: {text:?}"
+    );
+    assert!(
+        text.contains("gemini"),
+        "the disclosure must name the harness it is about: {text:?}"
+    );
+    assert!(
+        text.contains("report.md"),
+        "the assignment is still delivered beside it: {text:?}"
+    );
+}
+
+#[test]
+fn a_natively_served_kind_never_gets_the_contract_in_its_prompt_as_well() {
+    for kind in [ActorKind::claude(), ActorKind::opencode()] {
+        let text = first_prompt_for(kind.clone());
+        assert!(
+            !text.contains(FALLBACK_CONTRACT.trim()),
+            "{kind} received the contract natively; repeating it in the prompt — which is \
+             re-sent on every continuation — is double delivery: {text:?}"
+        );
+        assert!(
+            !text.contains("ordinary prompt text"),
+            "{kind} must carry no fallback disclosure: {text:?}"
+        );
+        assert!(
+            text.contains("report.md"),
+            "the assignment is unaffected: {text:?}"
+        );
+    }
+}
+
+// ---- 0208: the standing prompt's claim line is bound to what the
+// launch actually delivered, not to the kind ----------------------------
+//
+// `compose_first_prompt` used to decide "is a claim filed automatically
+// here?" from `claim_hook::hook_installed_for(kind)` — a fact about the
+// harness. The independent affected-path report measured two live
+// launches where that answer was wrong in the actor's face: an opencode
+// pane with both configuration slots already taken, and a probe that
+// could not report back, each of which delivers no plugin at all while
+// the prompt still promised "A claim is attempted automatically at the
+// end of every turn". These render the function directly, since the
+// point is the mapping from one recorded fact to one sentence.
+
+fn prompt_with_hook(claim_hook: Option<wirk_core::ClaimHookDelivery>) -> String {
+    let run = open_run("run-1");
+    let dir = tempdir().expect("tempdir");
+    let World::Actor(actor) = actor_world(&run, dir.path()) else {
+        unreachable!("actor_world builds an Actor World")
+    };
+    wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, claim_hook.as_ref())
+}
+
+#[test]
+fn a_delivered_claim_hook_is_the_only_thing_that_promises_an_automatic_claim() {
+    let text = prompt_with_hook(Some(wirk_core::ClaimHookDelivery::Installed));
+    assert!(
+        text.contains("A claim is attempted automatically at the end of every turn"),
+        "a launch that installed the hook says so: {text:?}"
+    );
+    assert!(
+        !text.contains("did not install its automatic Claim hook"),
+        "…and discloses no failure that did not happen: {text:?}"
+    );
+}
+
+/// Red on 5195eaa: `hook_installed_for(opencode)` is `true`, so this
+/// prompt promised an automatic claim to a pane that got no plugin, and
+/// named no reason. Green: the by-hand instruction, the reason the
+/// launch already journaled, and the explicit Claim command — which
+/// stays available exactly where automatic claiming could not be
+/// delivered.
+#[test]
+fn a_launch_that_installed_no_hook_says_so_and_keeps_the_explicit_claim_command() {
+    let reason = "this launch already carries both OPENCODE_CONFIG and \
+                  OPENCODE_CONFIG_CONTENT, and the inline value is not JSON";
+    let text = prompt_with_hook(Some(wirk_core::ClaimHookDelivery::NotInstalled {
+        reason: reason.to_string(),
+    }));
+    assert!(
+        !text.contains("A claim is attempted automatically"),
+        "no automatic claim may be promised where none was installed: {text:?}"
+    );
+    assert!(
+        text.contains("did not install its automatic Claim hook") && text.contains(reason),
+        "the actor is told what happened, in the launch's own recorded words: {text:?}"
+    );
+    assert!(
+        text.contains(" claim. If you need input"),
+        "the native Claim command stays available and is the instruction: {text:?}"
+    );
+}
+
+/// The only case with no recorded fact — a `RunLaunched` written before
+/// the field existed. The kind predicate is then the best answer
+/// available, and is exactly what this text has always said; absent is
+/// unrecorded, never "no hook was installed".
+#[test]
+fn an_unrecorded_delivery_falls_back_to_the_kind_predicate_it_always_used() {
+    let text = prompt_with_hook(None);
+    assert!(
+        wirk_herdr::claim_hook::hook_installed_for(&open_run("run-1").kind),
+        "this test's premise: open_run's kind is one wirk has a mechanism for"
+    );
+    assert!(
+        text.contains("A claim is attempted automatically at the end of every turn"),
+        "{text:?}"
+    );
 }

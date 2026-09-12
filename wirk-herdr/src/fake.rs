@@ -72,6 +72,29 @@ pub struct FakeHerdrClient {
     /// before launching a retry's own, the way `split_pane_calls`
     /// already does for `split_pane`.
     pub close_pane_calls: Mutex<Vec<String>>,
+    /// Ruling 0205: the environment a pane created by this fake
+    /// carries — standing in for the Herdr *server's* environment,
+    /// which is what a real pane inherits when the caller passes no
+    /// `env` of its own. Empty by default, which is exactly this
+    /// estate's own development server today; a test sets it to pin
+    /// the counterexample a driver-side `std::env::var` could never
+    /// see.
+    pub pane_env: Mutex<BTreeMap<String, String>>,
+    /// Every `pane.send_text` this fake received, as
+    /// `(pane_id, text)` — the same recording `split_pane_calls`
+    /// already does for `split_pane`.
+    pub send_input_calls: Mutex<Vec<(String, String)>>,
+    /// One `split_pane` reply per call, popped in order, falling back
+    /// to `split_pane_response` once empty — the same shape
+    /// `start_agent_responses` already has. Ruling 0205: an opencode
+    /// launch now splits a short-lived probe pane before the actor's
+    /// own, and a test that cares which pane was closed needs the two
+    /// to have different ids.
+    pub split_pane_responses: Mutex<VecDeque<PaneInfo>>,
+    /// When set, every `pane.send_text` fails with it — standing in for
+    /// a pane that cannot be reached at all, so the disclosed-fallback
+    /// path is reachable without waiting out a real deadline.
+    pub send_input_error: Mutex<Option<HerdrError>>,
 }
 
 impl FakeHerdrClient {
@@ -101,6 +124,24 @@ impl FakeHerdrClient {
             .lock()
             .unwrap()
             .insert(pane_id.to_string(), result);
+        self
+    }
+
+    /// Ruling 0205: replies for successive `split_pane` calls.
+    pub fn with_split_pane_responses(self, panes: Vec<PaneInfo>) -> Self {
+        *self.split_pane_responses.lock().unwrap() = panes.into();
+        self
+    }
+
+    /// Ruling 0205: makes every `pane.send_text` fail.
+    pub fn with_send_input_error(self, error: HerdrError) -> Self {
+        *self.send_input_error.lock().unwrap() = Some(error);
+        self
+    }
+
+    /// Ruling 0205: the environment panes created by this fake carry.
+    pub fn with_pane_env(self, env: BTreeMap<String, String>) -> Self {
+        *self.pane_env.lock().unwrap() = env;
         self
     }
 
@@ -155,6 +196,9 @@ impl HerdrClient for FakeHerdrClient {
 
     fn split_pane(&self, req: SplitPane) -> Result<PaneInfo, HerdrError> {
         self.split_pane_calls.lock().unwrap().push(req);
+        if let Some(pane) = self.split_pane_responses.lock().unwrap().pop_front() {
+            return Ok(pane);
+        }
         self.split_pane_response
             .lock()
             .unwrap()
@@ -174,7 +218,32 @@ impl HerdrClient for FakeHerdrClient {
         Ok(())
     }
 
-    fn send_input(&self, _pane_id: &str, _text: &str) -> Result<(), HerdrError> {
+    /// A pane is a shell with an environment, so this fake is one
+    /// (0040 D127 — "behaves like the service", not a canned reply a
+    /// real `pane.send_text` never shapes like): it records the text
+    /// and then actually runs it, with `pane_env` above applied over
+    /// this process's own environment and the two opencode
+    /// configuration variables **removed first**. That removal is the
+    /// point: whatever the test process itself carries, a pane created
+    /// by this fake carries only what `pane_env` says — the same way a
+    /// real pane's environment comes from the Herdr server and never
+    /// from the wirk driver (ruling 0205). Any failure to spawn is
+    /// swallowed: the caller's own timeout is what a silent pane means.
+    fn send_input(&self, pane_id: &str, text: &str) -> Result<(), HerdrError> {
+        self.send_input_calls
+            .lock()
+            .unwrap()
+            .push((pane_id.to_string(), text.to_string()));
+        if let Some(error) = self.send_input_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(text)
+            .env_remove(crate::claim_hook::OPENCODE_CONFIG_ENV)
+            .env_remove(crate::claim_hook::OPENCODE_CONFIG_CONTENT_ENV)
+            .envs(self.pane_env.lock().unwrap().iter())
+            .status();
         Ok(())
     }
 

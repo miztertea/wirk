@@ -275,6 +275,8 @@ fn blocked(socket: &Path, estate: &Path, work_id: &str, run_id: &str, detail: &s
                 actor_kind: Default::default(),
                 selection: Default::default(),
                 launch_argv: Vec::new(),
+                contract: None,
+                claim_hook: None,
             },
         }),
     )

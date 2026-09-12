@@ -1,5 +1,6 @@
-//! P2.7 Wave 3 (`build-brief.md` §6 item 1): the claude settings
-//! file's `Stop` hook *command* actually runs the driver's own binary
+//! P2.7 Wave 3 (`build-brief.md` §6 item 1), carried to the plugin
+//! envelope by ruling 0208: the claude Claim-hook plugin's `Stop` hook
+//! *command* actually runs the driver's own binary
 //! by absolute path with the env it is given, the way Claude Code
 //! itself would run it — `sh -c <command>` (`type: "command"`'s own
 //! documented shape, `reorient.md` §C), fed the Stop hook's stdin JSON
@@ -78,11 +79,11 @@ fn the_stop_hooks_command_runs_the_drivers_own_binary_with_the_panes_env() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake_wirk = fake_driver(dir.path());
 
-    // The settings file's own JSON, as `claim_hook::write_claude_claim_hook`
-    // writes it — pull the command string out of it the way Claude
-    // Code's own hook runner would, rather than hardcoding it a second
-    // time in this test.
-    let settings = claim_hook::claude_settings_json(&fake_wirk);
+    // The plugin's own hooks JSON, as
+    // `claim_hook::write_claude_claim_plugin` writes it — pull the
+    // command string out of it the way Claude Code's own hook runner
+    // would, rather than hardcoding it a second time in this test.
+    let settings = claim_hook::claude_plugin_hooks_json(&fake_wirk);
     let command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .expect("Stop hook command is a string")
@@ -126,27 +127,29 @@ fn the_stop_hooks_command_runs_the_drivers_own_binary_with_the_panes_env() {
     assert!(recorded.contains("WIRK_RUN_ID=run-sentinel\n"));
 }
 
-/// The settings file `write_claude_claim_hook` writes on disk names the
+/// The hooks file `write_claude_claim_plugin` writes on disk names the
 /// same driver-binary command, end to end through the real writer (not
-/// just `claude_settings_json`'s in-memory value above) — and, run the
-/// same way through `sh -c`, it still resolves and runs the renamed,
+/// just `claude_plugin_hooks_json`'s in-memory value above) — and, run
+/// the same way through `sh -c`, it still resolves and runs the renamed,
 /// off-`PATH` fake driver.
 #[test]
-fn the_written_settings_file_names_the_same_absolute_driver_command() {
+fn the_written_plugin_hooks_file_names_the_same_absolute_driver_command() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake_wirk = fake_driver(dir.path());
     let estate = dir.path().join("estate");
 
-    let path = claim_hook::write_claude_claim_hook(&estate.to_string_lossy(), "run-1", &fake_wirk)
-        .expect("write claude settings");
-    let contents = std::fs::read_to_string(&path).expect("read written settings");
+    let plugin_dir =
+        claim_hook::write_claude_claim_plugin(&estate.to_string_lossy(), "run-1", &fake_wirk)
+            .expect("write claude claim plugin");
+    let contents = std::fs::read_to_string(plugin_dir.join("hooks").join("hooks.json"))
+        .expect("read written hooks");
     let settings: serde_json::Value =
-        serde_json::from_str(&contents).expect("written settings is valid JSON");
+        serde_json::from_str(&contents).expect("written hooks file is valid JSON");
     let command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .expect("command is a string")
         .to_string();
-    let in_memory = claim_hook::claude_settings_json(&fake_wirk);
+    let in_memory = claim_hook::claude_plugin_hooks_json(&fake_wirk);
     let in_memory_command = in_memory["hooks"]["Stop"][0]["hooks"][0]["command"]
         .as_str()
         .expect("command is a string");

@@ -213,6 +213,27 @@ fn submit_actor_with_repo(
     (work_id, run_id)
 }
 
+/// `wirk output dir`, run exactly as an actor runs it: the injected
+/// triple in the environment, no argument naming a Work or a path — an
+/// `ActorWorld`'s declared outputs are staged here (ruling 0212), never
+/// written straight into the checkout.
+fn output_dir(estate: &Path, work_id: &str, run_id: &str) -> PathBuf {
+    let out = Command::new(wirk_bin())
+        .args(["output", "dir"])
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", work_id)
+        .env("WIRK_RUN_ID", run_id)
+        .output()
+        .expect("wirk output dir runs");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "wirk output dir: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// `wirk work status --estate <root> --work <id>`, the CLI verb (not
 /// the raw socket call `reserved_world` uses) — P2.4 W2's own decisive
 /// check names `wirk work status` showing `needs_input` with the
@@ -1102,16 +1123,18 @@ fn retry_after_out_of_boundary_refusal_keeps_the_world_otherwise_unchanged() {
     stop_wirkd(estate, wirkd_child);
 }
 
-/// P2.7 Wave 1 (`orient/build-brief.md` §6.2, `orient/reorient.md` §D):
-/// `wirk claim` with no `--artifact` flags asks wirkd for the current
-/// Waypoint's declared output contract (the existing `status` verb,
-/// `handle_status`'s `result["world"]`, R2 — no new wire method) and
-/// files a Done Claim naming each declared output at its own name as
-/// the worktree-relative path, before this change refused
-/// `MissingArtifact` naming the one required output (`smoke.json`'s
-/// `report.md`) since `claim.artifacts` was empty. This is the red
-/// check: on `main` the assertion below is `Refused: MissingArtifact
-/// report.md`; after the change it is `Validated`.
+/// P2.7 Wave 1 (`orient/build-brief.md` §6.2, `orient/reorient.md` §D),
+/// corrected by ruling 0212: `wirk claim` with no `--artifact`/`--output`
+/// flags asks wirkd for the current Waypoint's declared output contract
+/// (the existing `status` verb, `handle_status`'s `result["world"]`, R2
+/// — no new wire method) and files a Done Claim naming each declared
+/// output at its own name, addressed the way an `ActorWorld` actually
+/// produces it: staged under `wirk output dir`, never the checkout — the
+/// mismatch ruling 0212 observed (a bare Claim mapped every declared
+/// name into the checkout, so a real actor's staged `report.md` was
+/// refused `MissingArtifact` even though the file existed). This is the
+/// decisive check: before the correction the assertion below was
+/// `Refused: MissingArtifact report.md`; after it is `Validated`.
 #[test]
 fn claim_with_no_artifact_flags_uses_the_waypoint_output_contract() {
     let (repo_dir, base_sha) = scratch_repo();
@@ -1127,12 +1150,13 @@ fn claim_with_no_artifact_flags_uses_the_waypoint_output_contract() {
     fs::write(&route, route_text).expect("write embedded fixture");
 
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
-    let worktree =
+    let _worktree =
         create_worktree_for_run(estate, &pointer.socket, &work_id, &run_id, "smoke/wp-1");
 
-    // The declared output exists in the worktree at its own name; the
-    // actor never types `wirk claim --artifact report.md=report.md`.
-    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+    // The declared output is staged at its own name under `wirk output
+    // dir`; the actor never types `wirk claim --output report.md`.
+    let staging = output_dir(estate, &work_id, &run_id);
+    fs::write(staging.join("report.md"), b"# report\n").expect("write report.md");
 
     let (code, stdout) = claim(estate, &work_id, &run_id, &[]);
     assert_eq!(
@@ -1146,7 +1170,8 @@ fn claim_with_no_artifact_flags_uses_the_waypoint_output_contract() {
 }
 
 /// (b) Two declared outputs, one absent: the Claim is refused, naming
-/// the absent one, when `wirk claim` is run with no `--artifact` flags.
+/// the absent one, when `wirk claim` is run with no `--artifact`/
+/// `--output` flags.
 #[test]
 fn claim_with_no_artifact_flags_names_the_missing_declared_output() {
     let (repo_dir, base_sha) = scratch_repo();
@@ -1157,7 +1182,7 @@ fn claim_with_no_artifact_flags_names_the_missing_declared_output() {
 
     let route = two_required_outputs_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
-    let worktree = create_worktree_for_run(
+    let _worktree = create_worktree_for_run(
         estate,
         &pointer.socket,
         &work_id,
@@ -1165,8 +1190,9 @@ fn claim_with_no_artifact_flags_names_the_missing_declared_output() {
         "two-required-outputs/wp-1",
     );
 
-    // report.md is written; summary.md never is.
-    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
+    // report.md is staged; summary.md never is.
+    let staging = output_dir(estate, &work_id, &run_id);
+    fs::write(staging.join("report.md"), b"# report\n").expect("write report.md");
 
     let (code, stdout) = claim(estate, &work_id, &run_id, &[]);
     assert_eq!(code, Some(3), "expected exit 3 (Refused), stdout: {stdout}");
@@ -1194,7 +1220,7 @@ fn claim_with_no_artifact_flags_validates_once_all_declared_outputs_exist() {
 
     let route = two_required_outputs_route(estate);
     let (work_id, run_id) = submit_actor(estate, &route, repo, &base_sha);
-    let worktree = create_worktree_for_run(
+    let _worktree = create_worktree_for_run(
         estate,
         &pointer.socket,
         &work_id,
@@ -1202,8 +1228,9 @@ fn claim_with_no_artifact_flags_validates_once_all_declared_outputs_exist() {
         "two-required-outputs/wp-1",
     );
 
-    fs::write(worktree.join("report.md"), b"# report\n").expect("write report.md");
-    fs::write(worktree.join("summary.md"), b"# summary\n").expect("write summary.md");
+    let staging = output_dir(estate, &work_id, &run_id);
+    fs::write(staging.join("report.md"), b"# report\n").expect("write report.md");
+    fs::write(staging.join("summary.md"), b"# summary\n").expect("write summary.md");
 
     let (code, stdout) = claim(estate, &work_id, &run_id, &[]);
     assert_eq!(

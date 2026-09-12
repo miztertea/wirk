@@ -97,6 +97,7 @@ fn actor_world(evidence: Option<EvidenceProjectionRef>) -> World {
         boundary: Boundary(vec!["**".to_string()]),
         review_targets: Vec::new(),
         evidence: evidence.map(Box::new),
+        contract: None,
     })
 }
 

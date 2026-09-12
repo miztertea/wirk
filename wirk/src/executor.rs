@@ -1212,6 +1212,8 @@ mod tests {
             launch_argv: Vec::new(),
             launch_attempt: None,
             expansions: Vec::new(),
+            contract_delivery: None,
+            claim_hook: None,
         }
     }
 
