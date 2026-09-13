@@ -200,6 +200,7 @@ fn claim(args: &[String]) -> ExitCode {
     }
     let estate_root = triple["WIRK_ESTATE_ROOT"].clone();
     let work_id = WorkId(triple["WIRK_WORK_ID"].clone());
+    let run_id = RunId(triple["WIRK_RUN_ID"].clone());
 
     let pointer = match wirkd::client::locate(Path::new(&estate_root)) {
         Ok(pointer) => pointer,
@@ -209,12 +210,21 @@ fn claim(args: &[String]) -> ExitCode {
         }
     };
 
+    let triple = ExecutionTriple {
+        estate_root,
+        work_id,
+        run_id,
+    };
+
     // P2.7 W1 (`orient/reorient.md` §D, R2 over R7), corrected by ruling
-    // 0212 and 0213: no explicit `--artifact`/`--output` flags and no
-    // `--question` means the actor never named its outputs by hand —
-    // ask wirkd for the current Waypoint's declared output contract
-    // (the `status` verb it already returns, `handle_status`'s
-    // `result["world"]`, unchanged wire method) and claim each
+    // 0212, 0213 and 0235: no explicit `--artifact`/`--output` flags and
+    // no `--question` means the actor never named its outputs by hand —
+    // ask wirkd for *this Run's own bound* Waypoint's declared output
+    // contract (`wirk output`'s own scoped `run_outputs` verb,
+    // `handle_run_outputs`'s reply, keyed off this Run's triple — not
+    // `status`'s current-Waypoint answer, which names whichever Waypoint
+    // the Work has since advanced to and, for a Run that is no longer
+    // current, is simply the wrong contract; ruling 0235) and claim each
     // *required* declared output at its own name, addressed the same
     // way its own World produces it: an `ActorWorld`'s outputs are
     // written under `wirk output dir` (the delivered worker contract,
@@ -234,7 +244,7 @@ fn claim(args: &[String]) -> ExitCode {
     // explicit flag keeps its meaning exactly — this fallback only
     // fires when the caller supplied neither.
     if artifacts.is_empty() && outputs.is_empty() && question.is_none() {
-        match fetch_output_contract_names(&pointer.socket, &work_id) {
+        match fetch_output_contract_names(&pointer.socket, &triple) {
             Ok(ContractNames::Managed(names)) => {
                 outputs.extend(names);
             }
@@ -255,11 +265,7 @@ fn claim(args: &[String]) -> ExitCode {
         None => ClaimKind::Done,
     };
     let payload = ClaimPayload {
-        triple: ExecutionTriple {
-            estate_root,
-            work_id: WorkId(triple["WIRK_WORK_ID"].clone()),
-            run_id: RunId(triple["WIRK_RUN_ID"].clone()),
-        },
+        triple,
         kind,
         artifacts,
         outputs,
@@ -297,14 +303,25 @@ enum ContractNames {
     Checkout(Vec<String>),
 }
 
-/// Asks wirkd's existing `status` verb for the current Waypoint's
-/// reserved World (`handle_status`'s `result["world"]`, the same field
-/// `wirk run-deterministic`'s `reserved_deterministic` and
-/// `boundary_claim.rs`'s own `reserved_world` test helper already
-/// read) and returns its *required* declared output names, in the order
-/// the Route authored them — `ActorWorld.output_contract` for an actor
-/// Waypoint, `DeterministicWorld.expected_artifacts` for a deterministic
-/// one, R2 over adding a new wire method (`orient/reorient.md` §D).
+/// Asks wirkd's existing `run_outputs` verb — the same scoped query
+/// `wirk output` itself calls (`output_command`, `RunOutputsPayload`) —
+/// for the declared output contract of *this Run's own bound Waypoint*,
+/// and returns its *required* names, in the order the Route authored
+/// them.
+///
+/// Ruling 0235: this used to ask `status` for "the current Waypoint's
+/// reserved World" — `handle_status`'s `result["world"]`, whichever
+/// Waypoint the *Work* is on right now. For the Run that is still
+/// current that is the same answer; for a Run a later Waypoint has
+/// already superseded (an old Run's automatic Stop-hook Claim firing
+/// after `wirk run` moved on) it silently names a *different*
+/// Waypoint's outputs — the exact producer defect that let a finished
+/// review Run's bare Claim address its Work's next `publish` Waypoint's
+/// output name. `run_outputs` resolves from the triple's own `run_id`
+/// (`handle_run_outputs`, `find_run` then that Run's own journaled
+/// Waypoint definition) precisely because there is no other caller of
+/// this verb it could mean: an actor's bare Claim is always about the
+/// Run it is running as, never about wherever its Work has since moved.
 ///
 /// A `required: false` spec is filtered out here (ruling 0213): the
 /// daemon validates every name a Claim actually supplies and refuses
@@ -315,40 +332,45 @@ enum ContractNames {
 /// `--artifact` are untouched by this filter: a caller that names an
 /// optional output by hand still has it validated, present or absent,
 /// exactly as before.
-fn fetch_output_contract_names(socket: &Path, work_id: &WorkId) -> Result<ContractNames, String> {
-    let reply = wirkd::client::status(
+fn fetch_output_contract_names(
+    socket: &Path,
+    triple: &ExecutionTriple,
+) -> Result<ContractNames, String> {
+    let reply = wirkd::client::call(
         socket,
-        // The claiming Work reading its own output contract: scoped to
-        // itself, never the administrative surface (F-C) — through the
-        // typed door, so a daemon that never applied that scope is
-        // refused rather than read (V-5).
-        StatusPayload::scoped(work_id.clone(), work_id.clone()),
+        &Request::run_outputs(wirkd::RunOutputsPayload {
+            triple: triple.clone(),
+        }),
     )
     .map_err(|err| err.to_string())?;
     let result = match reply {
         Reply::Ok { result, .. } => result,
         Reply::Err { error, .. } => {
-            return Err(format!("status refused: {} {}", error.code, error.message));
+            return Err(format!(
+                "run_outputs refused: {} {}",
+                error.code, error.message
+            ));
         }
     };
-    let world_value = result
-        .get("world")
-        .filter(|value| !value.is_null())
-        .ok_or_else(|| "wirkd status carries no World for this Work".to_string())?;
-    let world: World = serde_json::from_value(world_value.clone())
-        .map_err(|err| format!("malformed World from wirkd status: {err}"))?;
-    let names_of = |contract: OutputContract| -> Vec<String> {
-        contract
-            .0
-            .into_iter()
-            .filter(|spec| spec.required)
-            .map(|spec| spec.name)
-            .collect()
-    };
-    Ok(match world {
-        World::Actor(actor) => ContractNames::Managed(names_of(actor.output_contract)),
-        World::Deterministic(det) => ContractNames::Checkout(names_of(det.expected_artifacts)),
-    })
+    let kind = result
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "wirkd run_outputs carries no Waypoint kind for this Run".to_string())?;
+    let names: Vec<String> = result
+        .get("outputs")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|spec| spec["required"].as_bool().unwrap_or(false))
+        .filter_map(|spec| spec["name"].as_str().map(str::to_string))
+        .collect();
+    match kind {
+        "actor" => Ok(ContractNames::Managed(names)),
+        "deterministic" => Ok(ContractNames::Checkout(names)),
+        other => Err(format!(
+            "wirkd run_outputs named an unclaimable Waypoint kind `{other}` for this Run"
+        )),
+    }
 }
 
 // ---- wirk output (ruling 0145) --------------------------------------

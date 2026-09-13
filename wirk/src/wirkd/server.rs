@@ -21636,10 +21636,24 @@ fn handle_run_outputs(state: &Arc<WirkdState>, payload: super::RunOutputsPayload
             },
         )
         .collect();
+    // Ruling 0235: which addressing this Run's declared outputs resolve
+    // through (`ContractNames::Managed` for `Actor`, `::Checkout` for
+    // `Deterministic` — `main.rs`'s own doc on that split) is a fact of
+    // this Run's own bound Waypoint, never of whatever Waypoint the Work
+    // is *currently* on — the defect this ruling closes was exactly a
+    // caller reading the wrong (current, not bound) Waypoint's contract.
+    // A `Container` never opens a Run of its own (`find_definition`
+    // above always resolves a leaf), so this is Actor/Deterministic only.
+    let kind = match def.kind {
+        wirk_core::WaypointKind::Actor => "actor",
+        wirk_core::WaypointKind::Deterministic => "deterministic",
+        wirk_core::WaypointKind::Container => "container",
+    };
     ok_reply(json!({
         "work": work_id.0,
         "run": run_id.0,
         "waypoint": run.waypoint.0,
+        "kind": kind,
         "current": current,
         "staging": staging.display().to_string(),
         "outputs": outputs,

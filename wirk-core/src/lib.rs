@@ -3421,6 +3421,15 @@ pub fn fold(events: &[Event]) -> Work {
     let mut route_waypoints: Vec<WaypointId> = Vec::new();
     let mut waypoint_defs: Vec<WaypointDefinition> = Vec::new();
     let mut run_waypoints: BTreeMap<RunId, WaypointId> = BTreeMap::new();
+    // Ruling 0235: the most recently opened Run for each Waypoint, as of
+    // wherever the fold has walked to so far — updated on every
+    // `RunOpened`, so a same-Waypoint retry's own `RunOpened` overwrites
+    // the entry the superseded Run left behind. This is what lets a late
+    // `ClaimRecorded` tell "the Run a human is still waiting on" apart
+    // from "a Run a retry has already moved past", which `claimed_waypoint`
+    // (a bare Waypoint id) cannot: two Runs of the same Waypoint carry the
+    // identical id.
+    let mut latest_run_per_waypoint: BTreeMap<WaypointId, RunId> = BTreeMap::new();
 
     for event in events {
         let is_work_submitted = matches!(event.kind, EventKind::WorkSubmitted { .. });
@@ -3496,6 +3505,7 @@ pub fn fold(events: &[Event]) -> Work {
             }
             EventKind::RunOpened { run, waypoint, .. } => {
                 run_waypoints.insert(run.clone(), waypoint.clone());
+                latest_run_per_waypoint.insert(waypoint.clone(), run.clone());
                 // P2.3 W2 (decide.md §1, build-brief.md §7): a retry's
                 // own `RunOpened` clears `NeedsInput` back to `Active`
                 // on the same reserved World — the human's decision is
@@ -3642,8 +3652,37 @@ pub fn fold(events: &[Event]) -> Work {
                     // human decides what happens next. Same shape as
                     // `RunFailed`/`RunVanished` above, guarded the same
                     // way so an already-terminal Work is left alone.
+                    //
+                    // Ruling 0235: only the Run this Work is *actually
+                    // waiting on* may plant that decision. A Run is
+                    // applicable here exactly when it is still both the
+                    // Waypoint's own latest attempt (`latest_run_per_waypoint`
+                    // — refuses a same-Waypoint retry's superseded Run,
+                    // which shares its predecessor's Waypoint id and so
+                    // is not caught by a name-only comparison) and the
+                    // Work's own current Waypoint (`w.current_waypoint`
+                    // — refuses a Run whose Waypoint the Work has since
+                    // advanced past entirely, nested leaves included).
+                    // `current_waypoint` does not always name a leaf: a
+                    // `StageHeld` can set it to the held container's own
+                    // id while a nested leaf is reserved underneath, so
+                    // this check only ever asserts current/latest-run
+                    // applicability against whatever `current_waypoint`
+                    // presently names, container or leaf — it makes no
+                    // claim that a leaf is always the most recent thing
+                    // reserved. A stale/nonapplicable Run's
+                    // refusal is still its own Claim's fact — recorded on
+                    // the Claim exactly as filed — it just cannot also
+                    // reach in and flip a Work state a live, current Run
+                    // already owns.
                     (ClaimVerdict::Refused(ClaimRefusal::OutOfBoundary(what)), _) => {
-                        if !w.state.is_terminal() {
+                        let applicable = event.run.as_ref().is_some_and(|run_id| {
+                            claimed_waypoint.is_some_and(|wp| {
+                                latest_run_per_waypoint.get(wp) == Some(run_id)
+                                    && w.current_waypoint.as_ref() == Some(wp)
+                            })
+                        });
+                        if applicable && !w.state.is_terminal() {
                             w.state = WorkState::NeedsInput;
                             w.needs_input = Some(NeedsInputCause {
                                 run: event
