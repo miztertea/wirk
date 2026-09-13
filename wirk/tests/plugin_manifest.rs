@@ -25,6 +25,7 @@ fn repo_root() -> (tempfile::TempDir, PathBuf) {
     std::fs::write(root.join("herdr-plugin.toml"), MANIFEST_TEXT).unwrap();
     std::fs::create_dir_all(root.join("plugin")).unwrap();
     std::fs::write(root.join("plugin/startup.sh"), STARTUP_SH).unwrap();
+    std::fs::write(root.join("plugin/assistant.sh"), ASSISTANT_SH).unwrap();
     std::fs::write(root.join("plugin/README.md"), PLUGIN_README).unwrap();
     #[cfg(unix)]
     {
@@ -40,6 +41,7 @@ fn repo_root() -> (tempfile::TempDir, PathBuf) {
 
 const MANIFEST_TEXT: &str = include_str!("../../herdr-plugin.toml");
 const STARTUP_SH: &str = include_str!("../../plugin/startup.sh");
+const ASSISTANT_SH: &str = include_str!("../../plugin/assistant.sh");
 const PLUGIN_README: &str = include_str!("../../plugin/README.md");
 
 fn manifest() -> Value {
@@ -71,7 +73,7 @@ fn exactly_three_actions_with_unique_ids() {
         assert!(seen.insert(id), "duplicate action id: {id}");
     }
     let ids: std::collections::HashSet<&str> = seen;
-    for expected in ["submit", "claim", "wirkd-status"] {
+    for expected in ["assistant", "claim", "wirkd-status"] {
         assert!(ids.contains(expected), "missing action id: {expected}");
     }
 }
@@ -98,8 +100,8 @@ fn no_events_table() {
 /// exists in the repo relative to the plugin root, or be `-c` with an
 /// inline script that names the same binary-resolution variables
 /// `plugin/startup.sh` uses (`WIRK_BIN_PATH`, `CARGO_TARGET_DIR`) —
-/// the allow-listed shape for item 7 W1, which permits no second
-/// script file beyond `startup.sh` itself.
+/// the allow-listed shape for item 7 W1, which permits the two script
+/// files this manifest names, `startup.sh` and `assistant.sh`.
 #[test]
 fn every_command_resolves_to_a_repo_script_or_the_wirk_binary() {
     let doc = manifest();
