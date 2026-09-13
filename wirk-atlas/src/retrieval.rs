@@ -597,13 +597,35 @@ fn view_index_identity(configuration: &str, retrieval_digest: &str, view: &[View
 /// reached without following a symlink. Anything else and this returns
 /// `None`: no reuse is a slower query, a poisoned index would be a
 /// different answer.
+/// Where this uid's shared query-index cache lives, as a pure path.
+///
+/// Deliberately **outside** any estate: the cache is keyed by the view a
+/// query ranks, is reusable by every estate this user runs, and already
+/// bounds itself to [`QUERY_INDEX_CACHE_ENTRIES`] entries. An inventory
+/// names it for that reason — a reader looking for "what has wirk put on
+/// my disk" should not have to discover it by accident — and reports it
+/// as host-scoped and shared rather than charging it to one estate
+/// (P4.5 A, ruling 0256).
+pub fn query_index_cache_root() -> PathBuf {
+    // SAFETY: `getuid` takes no arguments, cannot fail, and touches no
+    // memory this process owns — the same call `query_index_cache`
+    // itself makes, one line down, for the same directory name.
+    let own = unsafe { libc::getuid() };
+    std::env::temp_dir().join(format!("wirk-atlas-query-index-{own}"))
+}
+
+/// How many entries that cache keeps before it prunes its own oldest.
+pub fn query_index_cache_capacity() -> usize {
+    QUERY_INDEX_CACHE_ENTRIES
+}
+
 fn query_index_cache(key: &str) -> Option<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     // SAFETY: `getuid` takes no arguments, cannot fail, and touches no
     // memory this process owns — the same call, made the same way, as
     // `wirk/src/executors/docker.rs`.
     let own = unsafe { libc::getuid() };
-    let root = std::env::temp_dir().join(format!("wirk-atlas-query-index-{own}"));
+    let root = query_index_cache_root();
     if !root.exists() {
         let _ = std::fs::DirBuilder::new().mode(0o700).create(&root);
     }

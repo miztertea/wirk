@@ -372,6 +372,7 @@ fn claimed_done() -> EventKind {
         claim: ClaimId("claim-1".to_string()),
         claim_kind: ClaimKind::Done,
         verdict: ClaimVerdict::Validated,
+        origin: None,
     }
 }
 

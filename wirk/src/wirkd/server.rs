@@ -1367,6 +1367,7 @@ fn reattach_docker_run(
                 // which is a real checkout it holds Write on: it has no
                 // reason to reach for the managed area (ruling 0145).
                 outputs: Default::default(),
+                origin: Some(wirk_core::ClaimOrigin::Deliberate),
             },
         );
         return;
@@ -1573,6 +1574,18 @@ fn dispatch(
             Ok(payload) => Outcome::Reply(handle_clean(state, payload)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
         },
+        Verb::EstateStorage => {
+            match serde_json::from_value::<super::EstateStoragePayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_estate_storage(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::EstateClean => {
+            match serde_json::from_value::<super::EstateCleanPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_estate_clean(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
         // `handle_connection` intercepts `watch` before ever calling
         // `dispatch` (its own long-lived, many-lines-out shape does not
@@ -3441,6 +3454,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 claim_kind: payload.kind,
                 verdict: ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
                 artifacts: Vec::new(),
+                origin: payload.origin,
             },
         );
     };
@@ -3478,6 +3492,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 claim_kind: payload.kind,
                 verdict: ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
                 artifacts: Vec::new(),
+                origin: payload.origin,
             },
         );
     }
@@ -3504,6 +3519,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 claim_kind: payload.kind,
                 verdict: ClaimVerdict::Refused(ClaimRefusal::TripleMismatch),
                 artifacts: Vec::new(),
+                origin: payload.origin,
             },
         );
     };
@@ -3959,6 +3975,76 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
         }
     }
 
+    // ---- Ruling 0257: an automatic attempt never closes over this
+    // ---- Run's own standing question -------------------------------
+    //
+    // The hole this closes, observed live against the real daemon
+    // (`knowledge/work/p4-recovery/question-completion-use/USE.md`):
+    // an actor stages its required declared output, decides it cannot
+    // finish without an answer, files `wirk claim --question`, and ends
+    // its turn. The turn-end hook then fires the ordinary bare Claim —
+    // which, with the output already staged, validated `Done` and
+    // completed the Work *over the top of* the unanswered question. The
+    // question was never withdrawn and never answered; it simply
+    // stopped being visible. Nothing in the path had any way to tell
+    // that Claim from one the actor typed itself, because on the wire
+    // they were the same bytes. `ClaimOrigin` is that missing word, and
+    // this is where it is read.
+    //
+    // Read **here**, inside the journal lock this handler already holds
+    // and after this same replay's own `fold`, and not in the hook: a
+    // client that checked for a standing question and then submitted
+    // unconditionally would have moved the race rather than closed it —
+    // the question can be filed, or answered, in the gap between the
+    // two calls. Serialized against every other writer to this Work is
+    // the only place the answer cannot go stale between deciding and
+    // acting on it.
+    //
+    // Scoped three ways, deliberately, so nothing that works today
+    // stops working:
+    //
+    //  * **Automatic only.** `Some(ClaimOrigin::Automatic)` is stated
+    //    by wirk's own hooks and by nothing else. The actor's own
+    //    `wirk claim` is the supported way to finish after a question
+    //    (`compose_first_prompt` says so, and says it in those words),
+    //    and it still completes this very same Run — with the answer,
+    //    or having decided it no longer needs one. A client too old to
+    //    state an origin stated no automatic intent and is unaffected.
+    //  * **This Run's own question only.** `needs_input.run == run_id`:
+    //    a question another Run of this Work asked is that Run's hold,
+    //    not this one's, and never blocks this one's completion.
+    //  * **`reason == "question"` only.** A Work sitting in
+    //    `NeedsInput` for any other reason — `no_observable_progress`
+    //    above all (ruling 0243: the Run stays `Open`, and a late
+    //    legitimate Claim afterwards is exactly the evidence that says
+    //    the actor was working all along) — is untouched. A live
+    //    background process is not an incomplete-work signal, and this
+    //    does not make it one.
+    //
+    // Last of all the checks, and gated on a still-`Validated` verdict,
+    // so every existing refusal keeps its own voice: a required output
+    // that is simply not staged yet is still `MissingArtifact` (the
+    // common case, which already preserved the question and always
+    // did), a boundary violation is still `OutOfBoundary`, a superseded
+    // Run is still `AlreadyClaimed`. This adds one refusal in the one
+    // state that previously completed, and takes none away. It is
+    // recorded like any other refusal — `ClaimRecorded{Refused}`, which
+    // `fold` leaves the `NeedsInput` question cause standing through —
+    // so the hook's failure is *visible evidence*, not something
+    // swallowed to make a turn look clean.
+    if matches!(verdict, ClaimVerdict::Validated)
+        && matches!(claim.kind, ClaimKind::Done)
+        && matches!(payload.origin, Some(wirk_core::ClaimOrigin::Automatic))
+        && let Some(cause) = &work.needs_input
+        && work.state == WorkState::NeedsInput
+        && cause.reason == "question"
+        && cause.run == run_id
+    {
+        verdict = ClaimVerdict::Refused(ClaimRefusal::QuestionOutstanding(cause.detail.clone()));
+        artifact_receipts.clear();
+        managed_bytes.clear();
+    }
+
     // Ruling 0145, durable before referenced: the bytes validated just
     // above are written, fsynced and renamed under
     // `works/<work>/outputs/claims/<claim>/` **before** the
@@ -4026,6 +4112,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             claim_kind: payload.kind,
             verdict: verdict.clone(),
             artifacts: artifact_receipts,
+            origin: payload.origin,
         },
     );
 
@@ -4547,6 +4634,10 @@ struct ClaimOutcome {
     claim_kind: ClaimKind,
     verdict: ClaimVerdict,
     artifacts: Vec<ArtifactReceipt>,
+    /// Ruling 0257: the origin the filing client stated, carried
+    /// straight onto `ClaimRecorded`. `None` is a client that stated
+    /// none — recorded as "not stated", never back-filled.
+    origin: Option<wirk_core::ClaimOrigin>,
 }
 
 /// Appends `ClaimFiled` then `ClaimRecorded { verdict }` (validate.md
@@ -4565,6 +4656,7 @@ fn record_and_reply(
         claim_kind,
         verdict,
         artifacts,
+        origin,
     } = outcome;
     let filed = new_event(
         work_id,
@@ -4584,6 +4676,7 @@ fn record_and_reply(
             claim_kind,
             verdict: verdict.clone(),
             artifacts,
+            origin,
         },
     );
     if let Err(err) = append_event(state, journal, work_id, &recorded) {
@@ -4794,10 +4887,12 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
                 worktree_removed,
                 runtime_pins_removed,
                 complete,
+                outputs_staging_removed,
             } => Some(json!({
                 "runs": runs.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
                 "worktree_removed": worktree_removed,
                 "runtime_pins_removed": runtime_pins_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+                "outputs_staging_removed": outputs_staging_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
                 "complete": complete,
                 "at": event.at,
             })),
@@ -6451,6 +6546,16 @@ fn refusal_reply(refusal: &ClaimRefusal) -> Reply {
         ClaimRefusal::AlreadyClaimed => {
             ("AlreadyClaimed", "the Run is already Claimed".to_string())
         }
+        // Ruling 0257: the message is written for the actor who will
+        // read it in its own pane, and says all three things it needs
+        // — what was held, why, and the one command that finishes this
+        // same Run when it is ready.
+        ClaimRefusal::QuestionOutstanding(question) => (
+            "QuestionOutstanding",
+            format!(
+                "this Run's own question is still standing, so the automatic turn-end claim did                  not complete it: {question:?}. The question is still open and still visible.                  When you are ready to finish, file your own `wirk claim` — that one completes                  this Run whether or not the question was answered."
+            ),
+        ),
     };
     err_reply(code, &message)
 }
@@ -7189,7 +7294,12 @@ fn cancel_work(
 // it returns an error and touches nothing.
 
 fn handle_clean(state: &Arc<WirkdState>, payload: CleanPayload) -> Reply {
-    match clean_work(state, &payload.work_id, payload.dry_run) {
+    match clean_work(
+        state,
+        &payload.work_id,
+        payload.dry_run,
+        payload.outputs_staging,
+    ) {
         Ok(result) => ok_reply(result),
         Err((code, message)) => err_reply(code, &message),
     }
@@ -7500,6 +7610,7 @@ fn clean_work(
     state: &Arc<WirkdState>,
     work_id: &WorkId,
     dry_run: bool,
+    outputs_staging: bool,
 ) -> Result<Value, (&'static str, String)> {
     let journal = journal_for(state, work_id)
         .map_err(|err| ("JournalError", err.to_string()))?
@@ -7538,6 +7649,14 @@ fn clean_work(
     // preserved once the checkout is gone — refuse rather than losing
     // it silently.
     let mut checkout_evidence: BTreeSet<String> = BTreeSet::new();
+    // P4.5 A (ruling 0256): the same pass, asking the same question of
+    // the other store. A validated `WorkOutputs` receipt normally reads
+    // `claims/<claim>/<name>` — an independent write-once snapshot taken
+    // at validation (`outputs::store_claimed_bytes`), which is precisely
+    // why staging is optional once the Work is terminal. A receipt
+    // shaped otherwise resolves into staging, and removing staging would
+    // take a validated Claim's own evidence with it.
+    let mut staging_evidence: BTreeSet<String> = BTreeSet::new();
     for event in &events {
         if let EventKind::ClaimRecorded {
             verdict: ClaimVerdict::Validated,
@@ -7546,8 +7665,15 @@ fn clean_work(
         } = &event.kind
         {
             for artifact in artifacts {
-                if artifact.store == wirk_core::ArtifactStore::Worktree {
-                    checkout_evidence.insert(artifact.name.clone());
+                match artifact.store {
+                    wirk_core::ArtifactStore::Worktree => {
+                        checkout_evidence.insert(artifact.name.clone());
+                    }
+                    wirk_core::ArtifactStore::WorkOutputs => {
+                        if !artifact.path.starts_with("claims/") {
+                            staging_evidence.insert(artifact.path.clone());
+                        }
+                    }
                 }
             }
         }
@@ -7559,6 +7685,16 @@ fn clean_work(
                 "validated Claim evidence lives only in the checkout, not this Work's managed \
                  outputs, and would become unavailable: {}",
                 checkout_evidence.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+
+    if outputs_staging && !staging_evidence.is_empty() {
+        return Err((
+            "ClaimEvidenceInStaging",
+            format!(
+                "validated Claim evidence resolves into this Work's output staging rather than                  into its claims/ snapshot, and removing staging would make it unavailable: {}.                  Nothing has been touched; the checkout half of this call was not performed                  either",
+                staging_evidence.into_iter().collect::<Vec<_>>().join(", ")
             ),
         ));
     }
@@ -7650,6 +7786,7 @@ fn clean_work(
     // early via `?`; it records the first failure and stops, so the
     // journal append below (reached for both outcomes, as long as this
     // call is not `dry_run`) always sees exactly what actually happened.
+    let mut outputs_staging_removed: Vec<RunId> = Vec::new();
     let mut pin_removal_error: Option<(&'static str, String)> = None;
     'runs: for run_id in &run_ids {
         let [runtime_dir, claude_dir, opencode_dir] = run_pin_dirs(&state.estate_root, run_id);
@@ -7668,6 +7805,24 @@ fn clean_work(
         if had_any {
             runtime_pins_removed.push(run_id.clone());
         }
+
+        // Opt-in, and inside the same loop so one failure stops one
+        // sequence rather than two: this Run's own output scratch, which
+        // a Claim's evidence is a separate copy of.
+        if outputs_staging
+            && let Some(staging) =
+                wirk_core::outputs::staging_dir(&state.estate_root, work_id, run_id)
+            && staging.exists()
+        {
+            if !dry_run && let Err(err) = std::fs::remove_dir_all(&staging) {
+                pin_removal_error = Some((
+                    "JournalError",
+                    format!("removing {}: {err}", staging.display()),
+                ));
+                break 'runs;
+            }
+            outputs_staging_removed.push(run_id.clone());
+        }
     }
 
     if dry_run {
@@ -7677,6 +7832,8 @@ fn clean_work(
             "runs": run_ids.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
             "worktree_removed": worktree_removed,
             "runtime_pins_removed": runtime_pins_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+            "outputs_staging_removed": outputs_staging_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+            "outputs_staging_requested": outputs_staging,
         }));
     }
 
@@ -7689,6 +7846,7 @@ fn clean_work(
             worktree_removed,
             runtime_pins_removed: runtime_pins_removed.clone(),
             complete,
+            outputs_staging_removed: outputs_staging_removed.clone(),
         },
     );
     let mut journal = lock_journal(&journal);
@@ -7722,6 +7880,8 @@ fn clean_work(
         "runs": run_ids.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
         "worktree_removed": worktree_removed,
         "runtime_pins_removed": runtime_pins_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        "outputs_staging_removed": outputs_staging_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        "outputs_staging_requested": outputs_staging,
         "complete": complete,
     }))
 }
@@ -7744,6 +7904,590 @@ fn run_pin_dirs(estate_root: &Path, run_id: &RunId) -> [PathBuf; 3] {
     let opencode_dir =
         wirk_herdr::claim_hook::run_dir(&estate_root.display().to_string(), &run_id.0);
     [runtime_dir, claude_dir, opencode_dir]
+}
+
+// ---- Estate storage: inventory and explicit guarded cleanup ---------
+//
+// P4.5 increment A (ruling 0256). B made expensive work bounded; this is
+// the half that tells an operator what the estate is keeping and lets
+// them get some of it back, deliberately.
+//
+// Neither verb takes an expensive or a materialization slot. An
+// inventory is not the resource contention that pool exists to protect,
+// and making "what is my estate keeping" queue behind a build would
+// repeat exactly the defect ruling 0251 fixed for `ping`. What
+// `estate clean` *does* take, for its whole span, is this daemon's own
+// atlas mutex — which is how it is serialized against every verb that
+// could publish a generation, select an edition or start a job while it
+// is deciding what nothing needs.
+
+/// One Work's facts, folded from its own journal and its own delivered
+/// projections.
+fn work_facts(
+    estate_root: &Path,
+    work_id: &WorkId,
+    events: &[Event],
+    unreadable: &mut Vec<wirk_core::storage::Unreadable>,
+) -> super::inventory::WorkFacts {
+    let work = fold(events);
+    let mut facts = super::inventory::WorkFacts {
+        id: work_id.0.clone(),
+        terminal: work.state.is_terminal(),
+        runs: Vec::new(),
+        projected_generations: BTreeSet::new(),
+        contract_digests: BTreeSet::new(),
+        validated_managed_paths: BTreeSet::new(),
+        claim_evidence_in_checkout: false,
+    };
+    for event in events {
+        match &event.kind {
+            EventKind::RunOpened { run, .. } => facts.runs.push(run.0.clone()),
+            EventKind::WaypointReserved { world, .. } => {
+                if let World::Actor(actor) = world
+                    && let Some(contract) = &actor.contract
+                {
+                    facts.contract_digests.insert(contract.digest.clone());
+                }
+            }
+            EventKind::ClaimRecorded {
+                verdict: ClaimVerdict::Validated,
+                artifacts,
+                ..
+            } => {
+                for artifact in artifacts {
+                    match artifact.store {
+                        wirk_core::ArtifactStore::WorkOutputs => {
+                            facts.validated_managed_paths.insert(artifact.path.clone());
+                        }
+                        wirk_core::ArtifactStore::Worktree => {
+                            facts.claim_evidence_in_checkout = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The delivered Worlds themselves, read from the files rather than
+    // from the journal's reference: the generation vector lives in the
+    // projection, and that is the record that says what a later read of
+    // this World would have to resolve.
+    let dir = wirk_core::projections_dir(estate_root, work_id);
+    match std::fs::read_dir(&dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    continue;
+                }
+                match std::fs::read(&path)
+                    .map_err(|err| err.to_string())
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<wirk_core::ProjectionFile>(&bytes)
+                            .map_err(|err| err.to_string())
+                    }) {
+                    Ok(file) => {
+                        for (_, generation) in file.content.generations() {
+                            facts.projected_generations.insert(generation.clone());
+                        }
+                    }
+                    // A projection that cannot be parsed is a hole: what
+                    // it referenced is unknown, so it is disclosed rather
+                    // than treated as referencing nothing.
+                    Err(err) => unreadable.push(wirk_core::storage::Unreadable::at(
+                        super::inventory::WORK_PROJECTIONS,
+                        &path,
+                        err,
+                    )),
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => unreadable.push(wirk_core::storage::Unreadable::at(
+            super::inventory::WORK_PROJECTIONS,
+            &dir,
+            err.to_string(),
+        )),
+    }
+    facts
+}
+
+/// Derive who still needs what, from records rather than from guesses.
+///
+/// Reads the catalog's publications and selections, every Work's journal
+/// and delivered projections, and the findings index. Anything that
+/// could not be read lands in `unreadable`, and `Retention::complete` is
+/// then false — which `handle_estate_clean` treats as a refusal, because
+/// a retention set with a hole in it cannot establish that anything is
+/// unreferenced.
+fn derive_retention(
+    state: &Arc<WirkdState>,
+    atlas: &wirk_atlas::AtlasStore,
+) -> super::inventory::Retention {
+    let mut retention = super::inventory::Retention::default();
+
+    // The published generation and the selected edition, read *without*
+    // resolving their bytes: a publication whose generation is already
+    // unreadable must still be protected, and `AtlasStore::current`
+    // would have forgotten it precisely then.
+    for membership in atlas.memberships() {
+        retention
+            .sources
+            .push((membership.alias.clone(), membership.locator.clone()));
+        if let Some(generation) = atlas.published_generation(membership) {
+            super::inventory::Retention::retain(
+                &mut retention.generations,
+                &generation.0,
+                format!("published generation of source {}", membership.alias),
+            );
+        }
+        if let Some(edition) = atlas.selected_semantic(membership) {
+            super::inventory::Retention::retain(
+                &mut retention.editions,
+                &edition.0,
+                format!("selected semantic edition of source {}", membership.alias),
+            );
+        }
+    }
+
+    // This build's own worker contract: the next reservation writes it
+    // back anyway, so removing it is churn with no byte saved.
+    super::inventory::Retention::retain(
+        &mut retention.contracts,
+        &wirk_herdr::worker_contract::digest(),
+        "this build's own worker contract".to_string(),
+    );
+
+    let works_dir = state.estate_root.join("works");
+    match std::fs::read_dir(&works_dir) {
+        Ok(entries) => {
+            let mut ids: Vec<String> = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) if entry.path().is_dir() => {
+                        ids.push(entry.file_name().to_string_lossy().to_string());
+                    }
+                    Ok(_) => {}
+                    Err(err) => retention
+                        .unreadable
+                        .push(wirk_core::storage::Unreadable::at(
+                            super::inventory::WORKS_DIRECTORY,
+                            &works_dir,
+                            err.to_string(),
+                        )),
+                }
+            }
+            ids.sort();
+            for id in ids {
+                let work_id = WorkId(id.clone());
+                let Some(events) = replay_events(state, &work_id) else {
+                    // A directory under `works/` whose journal cannot be
+                    // replayed is a hole in the retention set, never an
+                    // absence of references.
+                    retention
+                        .unreadable
+                        .push(wirk_core::storage::Unreadable::at(
+                            super::inventory::WORK_JOURNAL,
+                            works_dir.join(&id),
+                            "could not be replayed, so what it still references is unknown",
+                        ));
+                    continue;
+                };
+                if events.is_empty() {
+                    continue;
+                }
+                let facts = work_facts(
+                    &state.estate_root,
+                    &work_id,
+                    &events,
+                    &mut retention.unreadable,
+                );
+                retention.works.push(facts);
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => retention
+            .unreadable
+            .push(wirk_core::storage::Unreadable::at(
+                super::inventory::WORKS_DIRECTORY,
+                &works_dir,
+                err.to_string(),
+            )),
+    }
+
+    // A Work that can still run, expand its World or write an output
+    // requires everything its delivered Worlds name. A Work that is
+    // finished holds those same names in a journal that stays readable
+    // without them.
+    let open: Vec<super::inventory::WorkFacts> = retention
+        .works
+        .iter()
+        .filter(|work| !work.terminal)
+        .cloned()
+        .collect();
+    for work in &open {
+        for generation in &work.projected_generations {
+            super::inventory::Retention::retain(
+                &mut retention.generations,
+                generation,
+                format!("a delivered World of work {} (not terminal)", work.id),
+            );
+        }
+        for digest in &work.contract_digests {
+            super::inventory::Retention::retain(
+                &mut retention.contracts,
+                digest,
+                format!("work {} is not terminal and reserves it", work.id),
+            );
+        }
+    }
+
+    // An unsettled finding was recorded against a generation, and the
+    // estate should not drop the ground under a question nobody has
+    // answered yet. A *settled* one keeps its recorded identity in the
+    // index and needs no bytes for it.
+    match atlas.read_findings() {
+        Ok(read) => {
+            for row in read.rows {
+                if row.settlement.is_some() {
+                    continue;
+                }
+                for evidence in row
+                    .finding
+                    .evidence
+                    .iter()
+                    .chain(row.finding.contradicts.iter())
+                    .chain(row.finding.applies_to.iter())
+                {
+                    if let wirk_core::EvidenceOutcome::Admitted { generation, .. } =
+                        &evidence.outcome
+                    {
+                        super::inventory::Retention::retain(
+                            &mut retention.generations,
+                            generation,
+                            format!("unsettled finding {}", row.finding.id.0),
+                        );
+                    }
+                }
+            }
+        }
+        // No path of its own, and none needed: the findings index is one
+        // per estate, so naming it discloses nothing a caller of this
+        // verb does not already know.
+        Err(err) => retention
+            .unreadable
+            .push(wirk_core::storage::Unreadable::of(
+                super::inventory::FINDINGS_INDEX,
+                format!(
+                    "could not be read ({err}), so which generations an unsettled finding was \
+                     recorded against is unknown"
+                ),
+            )),
+    }
+
+    retention
+}
+
+/// `wirk estate storage` — read-only, creates nothing, removes nothing.
+fn handle_estate_storage(state: &Arc<WirkdState>, payload: super::EstateStoragePayload) -> Reply {
+    // Scope first, and before anything is read: a scoped call naming a
+    // Work that does not exist costs it nothing and tells it nothing —
+    // the same ordering `authorized_jobs` applies.
+    let itemized = match &payload.work {
+        Some(_) => {
+            if let Err(reply) = resolve_query_scope(state, &payload.work) {
+                return reply;
+            }
+            false
+        }
+        None => true,
+    };
+
+    // The atlas is read under `try_lock`, for the reason `ping`'s
+    // recovery field is: an inventory must answer *while a build is
+    // running*, because that is exactly when someone asks. Without the
+    // catalog the class measurements are still true; what is withheld is
+    // the retention derivation, and it is named as withheld rather than
+    // reported as "nothing is retained", which would invite a removal
+    // that was never justified.
+    let retention = match state.atlas.try_lock() {
+        Ok(atlas) => derive_retention(state, &atlas),
+        Err(std::sync::TryLockError::Poisoned(poison)) => {
+            derive_retention(state, &poison.into_inner())
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let mut retention = super::inventory::Retention::default();
+            retention
+                .unreadable
+                .push(wirk_core::storage::Unreadable::of(
+                    super::inventory::ATLAS,
+                    "is held by a running job, so publications, selections and findings were not \
+                     read. Every class below is still measured; what nothing retains is not \
+                     established here, and a cleanup would refuse on this same fact",
+                ));
+            retention
+        }
+    };
+
+    let survey = super::inventory::survey(&state.estate_root, &retention, &state.resource_policy);
+    ok_reply(survey.to_json(itemized))
+}
+
+/// `wirk estate clean` — explicit, guarded, `--dry-run`-able removal of
+/// optional derivations.
+fn handle_estate_clean(state: &Arc<WirkdState>, payload: super::EstateCleanPayload) -> Reply {
+    // These assets belong to the estate, not to any Work, so there is no
+    // Work whose authority could scope their removal. Refused with that
+    // reason rather than silently answered administratively.
+    if let Some(work) = &payload.work {
+        return err_reply(
+            "AdministrativeOnly",
+            &format!(
+                "estate clean removes assets the estate owns, not work {}'s own, so a Work-scoped \
+                 caller has no authority to select them; name --admin to ask administratively. A \
+                 Work's own checkout, Run residue and output staging are reached through \
+                 `wirk work clean --work <id>`, which is scoped by that Work's own terminality",
+                work.0
+            ),
+        );
+    }
+    if !wirk_core::storage::is_cleanable_class(&payload.class) {
+        return err_reply(
+            "UnknownClass",
+            &format!(
+                "{} is not a class an explicit cleanup can select; the selectable classes are {}",
+                payload.class,
+                wirk_core::storage::CLEANABLE_CLASSES.join(", ")
+            ),
+        );
+    }
+    if payload.class == "outputs-staging" {
+        return err_reply(
+            "WorkScopedClass",
+            "outputs-staging is a Work's own scratch and is selected per Work, through \
+             `wirk work clean --work <id> --outputs-staging`, which checks that Work's \
+             terminality, its live actor and its Claim evidence first. The estate-wide verb has \
+             no Work to check those against and will not remove it blind",
+        );
+    }
+    // Exactly one selector, and no default target — the discipline
+    // `atlas cancel` already applies, for the same reason: an operation
+    // that can remove things must never be reached by leaving an
+    // argument off.
+    match (payload.ids.is_empty(), payload.all_unreferenced) {
+        (true, false) => {
+            return err_reply(
+                "NoTarget",
+                "name what to remove: --id <id> (repeatable) for exact items, or \
+                 --all-unreferenced for every item in the class that nothing this estate records \
+                 still needs. There is no default",
+            );
+        }
+        (false, true) => {
+            return err_reply(
+                "AmbiguousTarget",
+                "--id and --all-unreferenced are two different selections; name one",
+            );
+        }
+        _ => {}
+    }
+
+    // **Registry first, mutex second.** The order is the substance, and
+    // the reverse was a real defect this work's own live-job check
+    // caught: an expensive verb holds the atlas mutex for the whole span
+    // of its build, so a cleanup that reached for the mutex before
+    // looking at the registry queued behind that build — invisibly,
+    // unboundedly — instead of refusing. That is precisely the wait
+    // increment B removed from cheap reads, reintroduced by a new verb.
+    // The registry lives *beside* the mutex for exactly this reason.
+    let running = state.job_registry.list();
+    if !running.is_empty() {
+        return err_reply_with_notes(
+            "ExpensiveJobBusy",
+            &format!(
+                "{} job(s) this estate started are still running ({}); a cleanup will not select \
+                 against a moving catalog. Wait for them, or stop them with `wirk atlas cancel`, \
+                 and ask again",
+                running.len(),
+                running
+                    .iter()
+                    .map(|job| format!("{} {}", job.job_id, job.verb))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            &["nothing was selected and nothing was removed".to_string()],
+        );
+    }
+
+    // Only now the atlas itself, and on a **bounded** wait rather than a
+    // blocking one: with no job registered, the holder is a cheap read
+    // that will be gone in a moment, or something this daemon does not
+    // know about — and the second case must be answered, not waited on.
+    // `lock_atlas_cheap` is the same primitive, and the same `AtlasBusy`
+    // vocabulary, B already gives every cheap read (R2).
+    let atlas = match lock_atlas_cheap(state) {
+        Ok(atlas) => atlas,
+        Err(reply) => return reply,
+    };
+
+    let retention = derive_retention(state, &atlas);
+    if !retention.complete() {
+        // `estate clean` is administrative-only (it refuses a
+        // Work-scoped caller above), so this refusal keeps every path:
+        // the operator who must repair the hole is exactly who is
+        // reading it (ruling 0260).
+        return err_reply_with_notes(
+            "RetentionIncomplete",
+            "part of what this estate records could not be read, so nothing here can be shown to \
+             be unreferenced. Nothing was removed",
+            &wirk_core::storage::tell_unreadable(
+                &retention.unreadable,
+                wirk_core::storage::Disclosure::Administrative,
+            ),
+        );
+    }
+    let survey = super::inventory::survey(&state.estate_root, &retention, &state.resource_policy);
+    let Some(class) = survey.class(&payload.class) else {
+        return err_reply(
+            "UnknownClass",
+            &format!("{} was not measured", payload.class),
+        );
+    };
+
+    // Selection. A named id that is retained is refused *by name* — an
+    // administrative caller asked about a specific thing and is owed the
+    // reason, not silence.
+    let mut selected: Vec<&super::inventory::Item> = Vec::new();
+    let mut refused: Vec<Value> = Vec::new();
+    if payload.all_unreferenced {
+        for item in &class.items {
+            if item.removable() {
+                selected.push(item);
+            } else {
+                refused.push(json!({
+                    "id": item.id,
+                    "reason": "retained",
+                    "retained_by": item.retained_by,
+                }));
+            }
+        }
+    } else {
+        for id in &payload.ids {
+            match class.items.iter().find(|item| &item.id == id) {
+                Some(item) if item.removable() => selected.push(item),
+                Some(item) => refused.push(json!({
+                    "id": id,
+                    "reason": "retained",
+                    "retained_by": item.retained_by,
+                })),
+                None => refused.push(json!({
+                    "id": id,
+                    "reason": "no such item in this class",
+                    "retained_by": Vec::<String>::new(),
+                })),
+            }
+        }
+    }
+
+    let selected_json: Vec<Value> = selected
+        .iter()
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "path": item.path.display().to_string(),
+                "apparent_bytes": item.measured.apparent_bytes,
+                "allocated_bytes": item.measured.allocated_bytes,
+                "unique_allocated_bytes": item.measured.unique_allocated_bytes,
+            })
+        })
+        .collect();
+    let estimate: u64 = selected
+        .iter()
+        .map(|item| item.measured.unique_allocated_bytes)
+        .fold(0u64, u64::saturating_add);
+    let measurement_limits: Vec<String> = selected
+        .iter()
+        .filter_map(|item| {
+            item.measured
+                .limit_note(wirk_core::storage::Disclosure::Administrative)
+                .map(|note| format!("{}: {note}", item.id))
+        })
+        .collect();
+
+    // Every check above ran with no mutation. A dry run stops here,
+    // having proven each refusal, and performs none of it — the same
+    // stop point `clean_work` uses.
+    if payload.dry_run {
+        return ok_reply(json!({
+            "class": payload.class,
+            "dry_run": true,
+            "selected": selected_json,
+            "refused": refused,
+            "estimated_unique_allocated_bytes": estimate,
+            "estimate_is_not_a_reclaim_promise":
+                "this is the sum of the selected items' allocated blocks counted once per inode. \
+                 It is not a promise of bytes a removal would return: a reflink, a shared extent, \
+                 a snapshot or an open descriptor can all make the filesystem return less, and \
+                 compression can make it return more than these blocks suggest. What a real call \
+                 reports instead is the free space observed before and after",
+            "measurement_limits": measurement_limits,
+            "complete": true,
+        }));
+    }
+
+    let before = wirk_core::jobs::available_space_bytes(&state.estate_root);
+    let mut removed: Vec<Value> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for item in &selected {
+        // Each item is attempted and its own outcome recorded. A failure
+        // part-way through does not roll back what already happened and
+        // is never reported as if it had: `complete` below is the honest
+        // answer, and `removed` is what is actually gone.
+        let outcome = if item.path.is_dir() {
+            std::fs::remove_dir_all(&item.path)
+        } else {
+            std::fs::remove_file(&item.path)
+        };
+        match outcome {
+            Ok(()) => removed.push(json!({
+                "id": item.id,
+                "path": item.path.display().to_string(),
+                "unique_allocated_bytes": item.measured.unique_allocated_bytes,
+            })),
+            Err(err) => failed.push(json!({
+                "id": item.id,
+                "path": item.path.display().to_string(),
+                "error": err.to_string(),
+            })),
+        }
+    }
+    let after = wirk_core::jobs::available_space_bytes(&state.estate_root);
+    let observed = match (&before, &after) {
+        (Ok(before), Ok(after)) => Some(after.saturating_sub(*before)),
+        _ => None,
+    };
+
+    ok_reply(json!({
+        "class": payload.class,
+        "dry_run": false,
+        "removed": removed,
+        "failed": failed,
+        "refused": refused,
+        "complete": failed.is_empty(),
+        "estimated_unique_allocated_bytes": estimate,
+        "reclaimed_observed_bytes": observed,
+        "reclaimed_observed_unavailable": observed.is_none().then_some(
+            "free space could not be read on both sides of this operation, so no observation is \
+             reported rather than an arithmetic guess",
+        ),
+        "reclaimed_observed_is_approximate":
+            "the filesystem's own free space before and after this call. It is the real \
+             measurement rather than an inference from block counts, and it is still approximate: \
+             anything else writing to this filesystem moves it in either direction, and bytes an \
+             open descriptor still holds are not returned until it closes",
+        "measurement_limits": measurement_limits,
+    }))
 }
 
 // ---- Atlas (P3 W3, BUILD-BRIEF.md "Public surface") ----------------------
@@ -14477,6 +15221,7 @@ fn actor_reviewed_readiness(
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
             artifacts,
+            ..
         } = &claim_event.kind
         else {
             continue;
@@ -21098,6 +21843,7 @@ fn validated_done_claim(
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
             artifacts,
+            ..
         } if event.run.as_ref() == Some(run_id) => Some((claim.clone(), artifacts.clone())),
         _ => None,
     })

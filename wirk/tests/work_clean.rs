@@ -485,6 +485,7 @@ fn wirk_work_clean_removes_a_claimed_committed_checkout_preserving_the_branch() 
         worktree_removed,
         runtime_pins_removed,
         complete,
+        outputs_staging_removed: _,
     } = &cleaned_events[0].kind
     {
         assert_eq!(runs, &[RunId(run_id.clone())]);
@@ -659,6 +660,7 @@ fn wirk_work_clean_refuses_a_live_registered_agent_and_a_plain_shell() {
             kind: ClaimKind::Done,
             artifacts: Default::default(),
             outputs,
+            origin: None,
         }),
     )
     .expect("claim call reaches wirkd");
@@ -1229,6 +1231,7 @@ fn wirk_work_clean_reconciles_a_real_partial_removal_on_retry() {
         worktree_removed,
         runtime_pins_removed,
         complete,
+        outputs_staging_removed: _,
     } = &cleaned_events[0].kind
     {
         assert_eq!(runs, &[RunId(run_id.clone())]);
@@ -1321,6 +1324,7 @@ fn wirk_work_clean_reconciles_a_real_partial_removal_on_retry() {
         worktree_removed,
         runtime_pins_removed,
         complete,
+        outputs_staging_removed: _,
     } = &cleaned_events[1].kind
     {
         assert_eq!(runs, &[RunId(run_id.clone())]);

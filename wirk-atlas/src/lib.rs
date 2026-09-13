@@ -35,6 +35,7 @@ pub use relationship::{
 };
 pub use retrieval::{
     CapacitySource, RankingMode, ResolvedCapacity, SemanticApplication, SemanticQueryConfig,
+    query_index_cache_capacity, query_index_cache_root,
 };
 pub use semantic::{
     BackendArgument, BackendEnvironment, BackendIdentity, CAPACITY_MAX, CAPACITY_POLICY,
@@ -51,4 +52,6 @@ pub use semantic::{
     SemanticEdition, SemanticVerification, TEXT_IDENTITY, TEXT_NORMALIZED, UnavailableEntry,
     VECTOR_FORMAT, VECTORS_FILE, VectorManifest,
 };
-pub use store::{AcquireOutcome, AtlasStore, BARRIER_RELEASE_SOCKET, checkpoint};
+pub use store::{
+    AcquireOutcome, AtlasLayout, AtlasStore, BARRIER_RELEASE_SOCKET, atlas_layout, checkpoint,
+};

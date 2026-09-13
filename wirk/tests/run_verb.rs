@@ -46,7 +46,7 @@ mod wirkd;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -522,22 +522,19 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
     // during QUIET_POLL — the defect this test pins: a stale read
     // timeout on a quiet pane must not fail the Run. `wirk run` itself
     // may exit on its own before the deadline (item C's no-progress
-    // check, legitimately, this test's own doc comment) — P2.3 W1
-    // journals that legitimate case as `RunFailed{cause.status:
-    // Some("stuck")}` now (states.md §1), so only a RunFailed whose
-    // `cause.status` is *not* `"stuck"` is the regression this poll
-    // still watches for.
+    // check, legitimately, this test's own doc comment) — P4.7 (ruling
+    // 0243, C2/B): that legitimate case now journals
+    // `LifecycleObserved{status: "NoObservableProgress"}`, never
+    // `RunFailed`, so any `RunFailed` landing here at all is the
+    // regression this poll watches for.
     let mut run_child = guard.0.pop().expect("wirk run child is in guard");
     let deadline = Instant::now() + QUIET_POLL;
     loop {
         if let Ok(journal) = Journal::open(estate.join("works").join(&work_id))
             && let Ok(events) = journal.replay()
-            && let Some(failed) = events.iter().find(|e| {
-                matches!(
-                    &e.kind,
-                    EventKind::RunFailed { cause } if cause.status.as_deref() != Some("stuck")
-                )
-            })
+            && let Some(failed) = events
+                .iter()
+                .find(|e| matches!(&e.kind, EventKind::RunFailed { .. }))
         {
             panic!("RunFailed landed during the quiet window: {failed:?}");
         }
@@ -574,6 +571,7 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
                 kind: ClaimKind::Done,
                 artifacts: BTreeMap::from([("report.md".to_string(), "report.md".to_string())]),
                 outputs: Default::default(),
+                origin: None,
             }),
         )
         .expect("claim call reaches wirkd");
@@ -596,16 +594,13 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
 
     let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
     let events = journal.replay().expect("journal replays cleanly");
-    // P2.3 W1: a `RunFailed{cause.status: Some("stuck")}` is the
-    // legitimate no-progress surfacing (exit 4, `NeedsInput`), not the
-    // stale-read-timeout defect this test pins — only a differently
-    // caused RunFailed is still a failure here.
-    let bogus_run_failed = events.iter().find(|e| {
-        matches!(
-            &e.kind,
-            EventKind::RunFailed { cause } if cause.status.as_deref() != Some("stuck")
-        )
-    });
+    // P4.7 (ruling 0243, C2/B): `LifecycleObserved{status:
+    // "NoObservableProgress"}` is the legitimate no-progress surfacing
+    // (exit 4, `NeedsInput`) now, never `RunFailed` — so any `RunFailed`
+    // at all is the stale-read-timeout defect this test pins.
+    let bogus_run_failed = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::RunFailed { .. }));
     assert!(
         matches!(run_status.code(), Some(0) | Some(4)),
         "wirk run exit status: {run_status:?} (0 Claimed or 4 NeedsInput expected); stderr: \
@@ -997,13 +992,15 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
         .unwrap_or_else(|| panic!("no NeedsInput outcome line in stdout: {stdout_lines:?}"));
     let stuck_index = stdout_lines
         .iter()
-        .position(|l| l.contains("stuck:"))
-        .unwrap_or_else(|| panic!("no stuck observation line in stdout: {stdout_lines:?}"));
+        .position(|l| l.contains("no observable progress:"))
+        .unwrap_or_else(|| {
+            panic!("no no-observable-progress observation line in stdout: {stdout_lines:?}")
+        });
     assert!(
         continuation_index < needs_input_index && needs_input_index < stuck_index,
         "expected order in the driver's stdout: the continuation prompt, then the NeedsInput \
-         outcome, then the stuck detail naming what was observed (rerun2's own driver.log \
-         order): {stdout_lines:?}"
+         outcome, then the no-observable-progress detail naming what was observed (rerun2's own \
+         driver.log order): {stdout_lines:?}"
     );
 
     assert_eq!(
@@ -1015,15 +1012,109 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
 
     let journal = Journal::open(estate.join("works").join(&work_id)).expect("open journal");
     let events = journal.replay().expect("journal replays cleanly");
-    let stuck_failed = events.iter().find(|e| {
+    // P4.7 (ruling 0243, C2/B): no longer a fabricated `RunFailed` — the
+    // actor may be genuinely, unobservably still waiting. The Run stays
+    // `Open`; the Work surfaces `NeedsInput` through `LifecycleObserved`.
+    let no_progress_observed = events.iter().find(|e| {
         matches!(
             &e.kind,
-            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck")
+            EventKind::LifecycleObserved { status, .. } if status == "NoObservableProgress"
         )
     });
     assert!(
-        stuck_failed.is_some(),
-        "expected a journaled RunFailed{{status: stuck}}: {events:?}"
+        no_progress_observed.is_some(),
+        "expected a journaled LifecycleObserved{{status: NoObservableProgress}}: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::RunFailed { .. })),
+        "no observable progress must never be journaled as a RunFailed: {events:?}"
+    );
+
+    // P4.7 completion (ruling 0250), C2 qualified against the real
+    // daemon rather than a fake: the *public* answer an operator gets
+    // names what was observed, not a verdict on the actor.
+    let status = Command::new(wirk_bin())
+        // An operator's own invocation, not an actor's: the injected
+        // triple is removed so an outer Run's `WIRK_ESTATE_ROOT` in the
+        // test runner's own environment cannot scope this read (the
+        // daemon refuses a foreign estate without `--requesting-work`
+        // or `--admin`, which is the behaviour, not a fixture detail).
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID")
+        .args(["work", "status", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work_id, "--json"])
+        .output()
+        .expect("work status runs");
+    assert!(
+        status.status.success(),
+        "work status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("work status emits json");
+    assert_eq!(status["state"].as_str(), Some("needs_input"), "{status}");
+    assert_eq!(
+        status["needs_input"]["reason"].as_str(),
+        Some("no_observable_progress"),
+        "the public reason says what was observed: {status}"
+    );
+    assert_eq!(
+        status["needs_input"]["run"].as_str(),
+        Some(_run_id.as_str()),
+        "the cause names this Run: {status}"
+    );
+    let detail = status["needs_input"]["detail"]
+        .as_str()
+        .expect("a detail naming what was compared");
+    assert!(
+        detail.contains("no observable progress") && detail.contains("unchanged"),
+        "the detail names both signals as they were actually observed: {detail:?}"
+    );
+
+    // The Run stayed `Open`, so the actor's own later, legitimate Claim
+    // on that *same* Run is still accepted and still completes the
+    // Work — the property a fabricated `RunFailed` would have
+    // foreclosed. Filed through the real CLI with the injected triple,
+    // exactly as an actor files it.
+    let staging = Command::new(wirk_bin())
+        .args(["output", "dir"])
+        .env("WIRK_ESTATE_ROOT", &estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", &_run_id)
+        .output()
+        .expect("wirk output dir runs");
+    assert!(
+        staging.status.success(),
+        "wirk output dir failed: {}",
+        String::from_utf8_lossy(&staging.stderr)
+    );
+    let staging = PathBuf::from(String::from_utf8_lossy(&staging.stdout).trim().to_string());
+    std::fs::write(
+        staging.join("report.md"),
+        b"the actor was working after all\n",
+    )
+    .expect("the actor writes its declared output after the observation");
+    let late_claim = Command::new(wirk_bin())
+        .args(["claim", "--output", "report.md"])
+        .env("WIRK_ESTATE_ROOT", &estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", &_run_id)
+        .output()
+        .expect("wirk claim runs");
+    assert_eq!(
+        late_claim.status.code(),
+        Some(0),
+        "a valid Claim on a Run left Open must still be accepted: stdout {}, stderr {}",
+        String::from_utf8_lossy(&late_claim.stdout),
+        String::from_utf8_lossy(&late_claim.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&late_claim.stdout).trim(),
+        "Validated"
     );
 
     let stop = Command::new(wirk_bin())
@@ -1044,7 +1135,8 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
 /// `wirk_run_stuck_after_the_first_continuation_exits_4` above), is
 /// retried (`wirk work retry`), and the retry's own driver — reading
 /// the real `wirkd watch` stream, which replays the *whole* journal
-/// including the first attempt's own `NeedsInput`-causing `RunFailed`
+/// including the first attempt's own `NeedsInput`-causing
+/// `LifecycleObserved{NoObservableProgress}` (P4.7, ruling 0243)
 /// before ever reaching the retry's own `RunOpened` — reaches `Claimed`
 /// through the scripted actor with no spurious `NeedsInput` printed in
 /// its own stdout.
@@ -1115,7 +1207,7 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
     wait_for_event(
         &estate,
         &work_id,
-        |kind| matches!(kind, EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck")),
+        |kind| matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "NoObservableProgress"),
     );
     drop(session1); // this attempt's pane/session is done with
 
@@ -1128,9 +1220,10 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
     // `wirk work retry`: journals a fresh `RunOpened` for a new run id
     // on the same Waypoint (`handle_retry`, `server.rs`) — the exact
     // race 0050 D151 named: the next `wirk run`'s own `watch` stream
-    // will replay the first attempt's `RunOpened`/`RunFailed{stuck}`
-    // (which already put the Work in `NeedsInput`) *before* it ever
-    // reaches this new `RunOpened`.
+    // will replay the first attempt's `RunOpened`/`LifecycleObserved{
+    // NoObservableProgress}` (which already put the Work in
+    // `NeedsInput`, P4.7 ruling 0243) *before* it ever reaches this new
+    // `RunOpened`.
     let retry = Command::new(wirk_bin())
         .args(["work", "retry", "--estate"])
         .arg(&estate)
@@ -1347,7 +1440,7 @@ fn wirk_run_retry_reuses_the_worktree_and_branch() {
     wait_for_event(
         &estate,
         &work_id,
-        |kind| matches!(kind, EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck")),
+        |kind| matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "NoObservableProgress"),
     );
     drop(session1);
 

@@ -37,6 +37,7 @@
 //! directory. No host setting, no parent controller, no harness setting
 //! and no other owner's cgroup is ever written.
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -816,6 +817,23 @@ pub struct ResourcePolicy {
     /// requested but unsupported, the caller is told, never silently
     /// ignored.
     pub job_memory_max_bytes: Option<u64>,
+    /// Per-class **soft** storage limits, in bytes, keyed by a name in
+    /// [`crate::storage::CLASSES`]. Default empty.
+    ///
+    /// Soft is the whole contract and it is deliberate (P4.5 A, ruling
+    /// 0256). Being over one of these is *disclosed* — on
+    /// `wirk estate storage` and, where a class total is already in
+    /// hand, on an admission's own notes — and refuses nothing. A hard
+    /// storage refusal would turn an operator's budget into an outage
+    /// on a Work that was already admitted, and there is no automatic
+    /// reclamation behind it to make room: cleanup here is always
+    /// user-selected (ruling 0124, "age is not evidence of orphanhood"
+    /// applied to size).
+    ///
+    /// A key that is not a known class is reported rather than ignored,
+    /// because a limit silently attached to nothing is worse than no
+    /// limit at all.
+    pub storage_soft_limits: BTreeMap<String, u64>,
     /// Whether this estate's `max_host_expensive` may *set* the shared
     /// host pool's agreed capacity, rather than merely be bound by it.
     ///
@@ -842,6 +860,7 @@ impl Default for ResourcePolicy {
             job_memory_max_bytes: None,
             host_pool_dir: None,
             host_pool_capacity_authority: false,
+            storage_soft_limits: BTreeMap::new(),
         }
     }
 }
@@ -863,6 +882,7 @@ struct ConfiguredPolicy {
     job_memory_max_bytes: Option<u64>,
     host_pool_dir: Option<String>,
     host_pool_capacity_authority: Option<bool>,
+    storage_soft_limits: Option<BTreeMap<String, u64>>,
 }
 
 impl ResourcePolicy {
@@ -919,6 +939,24 @@ impl ResourcePolicy {
         }
         if let Some(directory) = configured.host_pool_dir {
             policy.host_pool_dir = Some(PathBuf::from(directory));
+        }
+        if let Some(limits) = configured.storage_soft_limits {
+            // Every key is checked against the one class vocabulary, so
+            // a limit written for a class that does not exist is named
+            // in the same complaint channel a zero concurrency value is
+            // — never applied to nothing in silence.
+            let (known, unknown): (BTreeMap<String, u64>, BTreeMap<String, u64>) = limits
+                .into_iter()
+                .partition(|(class, _)| crate::storage::is_class(class));
+            if !unknown.is_empty() {
+                complaints.push(format!(
+                    "storage_soft_limits names {} that is not a storage class and was not \
+                     applied; the classes are {}",
+                    unknown.keys().cloned().collect::<Vec<_>>().join(", "),
+                    crate::storage::CLASSES.join(", ")
+                ));
+            }
+            policy.storage_soft_limits = known;
         }
         for (label, value) in [
             ("max_expensive", &mut policy.max_expensive),

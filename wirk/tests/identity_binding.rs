@@ -290,6 +290,7 @@ fn question(socket: &Path, estate: &Path, work: &str, run: &str) -> Reply {
             kind: ClaimKind::Question("need retry".to_owned()),
             artifacts: BTreeMap::new(),
             outputs: Default::default(),
+            origin: None,
         }),
     )
     .expect("question claim call")
@@ -509,6 +510,7 @@ fn claim_refuses_a_different_estate_root() {
             kind: ClaimKind::Question("wrong estate".to_owned()),
             artifacts: BTreeMap::new(),
             outputs: Default::default(),
+            origin: None,
         }),
     )
     .expect("claim call");
@@ -670,6 +672,7 @@ fn record_refuses_unknown_mismatched_duplicate_and_terminal_run_transitions() {
             kind: ClaimKind::Done,
             artifacts: BTreeMap::from([("report.md".to_string(), "report.md".to_string())]),
             outputs: Default::default(),
+            origin: None,
         }),
     )
     .expect("done claim");
@@ -825,6 +828,7 @@ fn git_deterministic_unavailable_then_repaired_checkout_is_fail_closed() {
                 worktree.join("report.md").display().to_string(),
             )]),
             outputs: Default::default(),
+            origin: None,
         }),
     )
     .expect("claim call");
@@ -851,6 +855,7 @@ fn git_deterministic_unavailable_then_repaired_checkout_is_fail_closed() {
                 worktree.join("report.md").display().to_string(),
             )]),
             outputs: Default::default(),
+            origin: None,
         }),
     )
     .expect("repaired claim call");
@@ -1011,6 +1016,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
             kind: ClaimKind::Done,
             artifacts: BTreeMap::from([("report.md".to_string(), "report.md".to_string())]),
             outputs: Default::default(),
+            origin: None,
         }),
     )
     .expect("legacy claim");
@@ -1211,6 +1217,7 @@ fn question_before_actor_materialization_refuses_before_touching_daemon_cwd() {
                 kind: ClaimKind::Question("need retry".to_owned()),
                 artifacts: BTreeMap::from([(name.to_string(), path.clone())]),
                 outputs: Default::default(),
+                origin: None,
             }),
         )
         .expect("question claim with artifact call");

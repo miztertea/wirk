@@ -162,6 +162,7 @@ fn fold_question_claim_populates_needs_input_cause() {
             claim: wirk_core::ClaimId("claim-q".to_string()),
             claim_kind: wirk_core::ClaimKind::Question("which base branch?".to_string()),
             verdict: wirk_core::ClaimVerdict::Validated,
+            origin: None,
         },
     ));
     let work = wirk_core::fold(&events);
@@ -391,6 +392,53 @@ fn fold_lifecycle_blocked_moves_work_to_needs_input_with_screen_lines() {
     );
 }
 
+/// P4.7 correction (ruling 0243/0248, C2): a `LifecycleObserved{status:
+/// "NoObservableProgress"}` on a non-terminal Work surfaces the same
+/// `NeedsInput` shape, but its `reason` must be `"no_observable_progress"`
+/// — a truthful name for what was actually observed — never the earlier
+/// `"stuck"`, which read as a verdict on the actor rather than a report
+/// of what the loop saw. Probed by hand: reverting `fold`'s own
+/// `"NoObservableProgress"` arm to `reason: "stuck".into()` makes this
+/// fail on the `cause.reason` assertion alone; the Run itself is
+/// untouched by either wording (D9#2, `Run::apply`'s inert arm).
+#[test]
+fn fold_no_observable_progress_names_the_reason_truthfully() {
+    let mut events = base_events();
+    events.push(event(
+        "ev-4",
+        "work-1",
+        Some("run-1"),
+        1,
+        EventKind::LifecycleObserved {
+            status: "NoObservableProgress".to_string(),
+            detail: Some(
+                "no observable progress: pane p1 — no progress since the last prompt: worktree \
+                 fingerprint abc unchanged, declared managed-output content unchanged"
+                    .to_string(),
+            ),
+        },
+    ));
+    let work = wirk_core::fold(&events);
+    assert!(
+        matches!(work.state, WorkState::NeedsInput),
+        "{:?}",
+        work.state
+    );
+    let cause = work
+        .needs_input
+        .expect("needs_input must be Some after a NoObservableProgress observation");
+    assert_eq!(cause.run, RunId("run-1".to_string()));
+    assert_eq!(
+        cause.reason, "no_observable_progress",
+        "the public reason must name what was observed, never assert the actor is \"stuck\""
+    );
+    assert!(
+        cause
+            .detail
+            .contains("declared managed-output content unchanged")
+    );
+}
+
 /// (b) A later `LifecycleObserved{Working}` — the same event kind the
 /// loop already journals for every status — clears a `"blocked"`
 /// `NeedsInput` back to `Active` with `needs_input` reset to `None`.
@@ -452,6 +500,7 @@ fn fold_lifecycle_working_does_not_clear_a_non_blocked_needs_input() {
             claim: wirk_core::ClaimId("claim-q".to_string()),
             claim_kind: wirk_core::ClaimKind::Question("which base branch?".to_string()),
             verdict: wirk_core::ClaimVerdict::Validated,
+            origin: None,
         },
     ));
     events.push(event(
@@ -514,6 +563,7 @@ fn fold_claim_completion_after_run_vanished_clears_needs_input() {
             claim: wirk_core::ClaimId("claim-late".to_string()),
             claim_kind: wirk_core::ClaimKind::Done,
             verdict: wirk_core::ClaimVerdict::Validated,
+            origin: None,
         },
     ));
     let work = wirk_core::fold(&events);
@@ -588,6 +638,7 @@ fn fold_work_canceled_clears_a_stale_out_of_boundary_needs_input() {
             verdict: wirk_core::ClaimVerdict::Refused(wirk_core::ClaimRefusal::OutOfBoundary(
                 "/etc/passwd".to_string(),
             )),
+            origin: None,
         },
     ));
     let needs_input_work = wirk_core::fold(&events);

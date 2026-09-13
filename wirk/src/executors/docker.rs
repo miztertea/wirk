@@ -237,6 +237,7 @@ impl DockerExecutor {
             // wrote in its own `cwd`, a checkout it holds Write on. It
             // never reaches for the managed output area (ruling 0145).
             outputs: Default::default(),
+            origin: Some(wirk_core::ClaimOrigin::Deliberate),
         };
         match client::call(&pointer.socket, &Request::claim(payload)) {
             Ok(Reply::Ok { .. }) => Ok(()),

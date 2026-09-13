@@ -144,7 +144,14 @@ fn root_session_idle_runs_wirk_claim_with_the_panes_env() {
     let record = run_scenario("root-idle").expect("fake wirk must have run and recorded");
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{record}");
-    assert!(record.starts_with("ARGV:claim\n"), "got: {record}");
+    // Ruling 0257: the opencode implementation must state the same
+    // automatic intent the claude one does — two supported hooks, one
+    // meaning, or the daemon's decision depends on which harness the
+    // actor happened to be running under.
+    assert!(
+        record.starts_with("ARGV:claim --automatic\n"),
+        "got: {record}"
+    );
     assert!(
         record.contains("WIRK_ESTATE_ROOT=/estate/sentinel"),
         "got: {record}"

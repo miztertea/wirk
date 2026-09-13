@@ -28,7 +28,7 @@ use wirk_core::{
 };
 use wirk_herdr::fake::FakeHerdrClient;
 use wirk_herdr::run_loop::{
-    FakeWirkdApi, Outcome, RunLoop, RunLoopError, RunStatusEntry, WorkStatus,
+    FakeWirkdApi, Outcome, RunLoop, RunLoopError, RunStatusEntry, WirkdApi, WorkStatus,
 };
 use wirk_herdr::{
     AgentStatus, HerdrError, HerdrEvent, HerdrExecutor, PaneInfo, ensure_pinned_wirk_bin,
@@ -173,6 +173,7 @@ fn claim_recorded_done(claim_id: &str) -> EventKind {
         claim: ClaimId(claim_id.to_string()),
         claim_kind: ClaimKind::Done,
         verdict: ClaimVerdict::Validated,
+        origin: None,
     }
 }
 
@@ -217,6 +218,7 @@ fn claim_recorded_question(claim_id: &str) -> EventKind {
         claim: ClaimId(claim_id.to_string()),
         claim_kind: ClaimKind::Question("what should I do".to_string()),
         verdict: ClaimVerdict::Validated,
+        origin: None,
     }
 }
 
@@ -1061,20 +1063,20 @@ fn prompted_then_done_with_worktree_unchanged_is_stuck() {
         2,
         "no third prompt once the actor is judged stuck on a Done turn end"
     );
-    let stuck_failures: Vec<_> = wirkd
+    let no_progress: Vec<_> = wirkd
         .recorded()
         .into_iter()
         .filter_map(|(_, _, kind)| match kind {
-            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck") => {
-                Some(cause)
+            EventKind::LifecycleObserved { status, detail } if status == "NoObservableProgress" => {
+                Some(detail)
             }
             _ => None,
         })
         .collect();
     assert_eq!(
-        stuck_failures.len(),
+        no_progress.len(),
         1,
-        "the stuck observation must be journaled from a Done turn end too"
+        "the no-observable-progress observation must be journaled from a Done turn end too"
     );
 }
 
@@ -1256,22 +1258,34 @@ fn second_unchanged_turn_end_after_the_continuation_is_stuck() {
     assert_eq!(
         client.prompt_agent_calls.lock().unwrap().len(),
         2,
-        "no third prompt: the actor is judged stuck instead"
+        "no third prompt: no observable progress is judged instead"
     );
-    let stuck_failures: Vec<_> = wirkd
+    // P4.7 (ruling 0243, C2/B): no longer a fabricated `RunFailed` — the
+    // actor may be genuinely waiting on something no installed interface
+    // can see. Exactly one `LifecycleObserved{status:
+    // "NoObservableProgress"}` is journaled, and no `RunFailed` at all.
+    let no_progress: Vec<_> = wirkd
         .recorded()
         .into_iter()
         .filter_map(|(_, _, kind)| match kind {
-            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck") => {
-                Some(cause)
+            EventKind::LifecycleObserved { status, detail } if status == "NoObservableProgress" => {
+                Some(detail)
             }
             _ => None,
         })
         .collect();
     assert_eq!(
-        stuck_failures.len(),
+        no_progress.len(),
         1,
-        "the stuck observation must be journaled once told to continue and doing nothing since"
+        "the no-observable-progress observation must be journaled once told to continue and \
+         doing nothing since"
+    );
+    assert!(
+        wirkd
+            .recorded()
+            .into_iter()
+            .all(|(_, _, kind)| !matches!(kind, EventKind::RunFailed { .. })),
+        "no observable progress must never be journaled as a RunFailed"
     );
 }
 
@@ -1433,12 +1447,14 @@ fn the_loop_prints_one_line_per_prompt_it_sends() {
 
 // ---- P2.3 W1: the stuck observation is journaled, and notify fires once --
 
-/// The no-progress branch journals exactly one `RunFailed` whose
-/// `cause.status == Some("stuck")` and whose `detail` names the pane
-/// (build-brief.md §7 amendment 2), through `WirkdApi::record` — before
-/// this wave the branch journaled nothing (states.md's own red).
+/// The no-progress branch journals exactly one
+/// `LifecycleObserved{status: "NoObservableProgress"}` whose `detail`
+/// names the pane (build-brief.md §7 amendment 2; P4.7, ruling 0243,
+/// C2/B: no longer `RunFailed{status: "stuck"}` — the Run may be
+/// genuinely, and unobservably, still waiting on something legitimate),
+/// through `WirkdApi::record`.
 #[test]
-fn run_loop_no_progress_journals_run_failed_stuck() {
+fn run_loop_no_progress_journals_lifecycle_observed_no_observable_progress() {
     let run = open_run("run-1");
     let dir = tempdir().expect("tempdir");
     git_init_repo(dir.path());
@@ -1483,28 +1499,34 @@ fn run_loop_no_progress_journals_run_failed_stuck() {
     let outcome = handle.join().unwrap().expect("drive");
     assert_eq!(outcome, Outcome::NeedsInput);
 
-    let stuck_failures: Vec<_> = wirkd
+    let no_progress: Vec<_> = wirkd
         .recorded()
         .into_iter()
         .filter_map(|(_, _, kind)| match kind {
-            EventKind::RunFailed { cause } if cause.status.as_deref() == Some("stuck") => {
-                Some(cause)
+            EventKind::LifecycleObserved { status, detail } if status == "NoObservableProgress" => {
+                Some(detail)
             }
             _ => None,
         })
         .collect();
     assert_eq!(
-        stuck_failures.len(),
+        no_progress.len(),
         1,
-        "exactly one RunFailed{{status:\"stuck\"}} must be journaled"
+        "exactly one LifecycleObserved{{status:\"NoObservableProgress\"}} must be journaled"
     );
-    let detail = stuck_failures[0]
-        .detail
+    assert!(
+        wirkd
+            .recorded()
+            .into_iter()
+            .all(|(_, _, kind)| !matches!(kind, EventKind::RunFailed { .. })),
+        "no observable progress must never be journaled as a RunFailed"
+    );
+    let detail = no_progress[0]
         .as_deref()
-        .expect("the stuck cause carries a detail");
+        .expect("the no-observable-progress observation carries a detail");
     assert!(
         detail.contains(&run.id.0),
-        "the stuck observation must name the pane (run id {}): {detail:?}",
+        "the observation must name the pane (run id {}): {detail:?}",
         run.id.0
     );
 }
@@ -1576,6 +1598,831 @@ fn run_loop_needs_input_calls_notify_once() {
         notify_calls[0].body.contains(&run.id.0),
         "the notify body must name the run: {:?}",
         notify_calls[0]
+    );
+}
+
+// ---- P4.7 (ruling 0243): truthful progress from declared managed ---------
+// ---- output, and truthful native yield on no observable progress --------
+//
+// worker-waits/refine/REFINED.md's decisive checks, named there and run
+// here for the first time. `actor_world` already wires each fixture's
+// `ActorWorld.triple` to `fixture_estate_root()`/`work_id()`/`run.id`, so
+// `staged_file` below addresses the exact same staging directory
+// `progress_snapshot` reads through `wirk_core::outputs::staging_dir`.
+
+/// Writes `content` to `name` inside this Run's own staging directory —
+/// the declared managed-output area a Read Waypoint (`boundary: []`) is
+/// authorized to write, distinct from the worktree these tests also
+/// exercise.
+fn write_staged_file(run: &Run, name: &str, content: &[u8]) {
+    let dir = wirk_core::outputs::ensure_staging_dir(fixture_estate_root(), &work_id(), &run.id)
+        .expect("ensure this Run's own staging directory");
+    std::fs::write(dir.join(name), content).expect("write staged file");
+}
+
+/// Decisive check 1 (REFINED.md): a Waypoint whose worktree is never
+/// touched (a Read Waypoint) but which writes its declared managed
+/// output between the continuation's own baseline and the next turn end
+/// earns a third prompt — never judged stuck. **Red before C1**: with
+/// only the worktree fingerprint compared, this scenario's baseline and
+/// next reading are identical (the worktree never moves), so today's
+/// code reports `Outcome::NeedsInput` after exactly two prompts.
+#[test]
+fn staged_output_written_between_the_continuation_and_the_next_turn_end_is_not_stuck() {
+    let run = open_run("run-p47-staged-progress");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Progress since the continuation's own baseline: the declared
+    // managed output, not the worktree (git worktree untouched).
+    write_staged_file(&run, "report.md", b"first draft\n");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("third prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 3
+    });
+
+    assert!(
+        wirkd.recorded().into_iter().all(|(_, _, kind)| !matches!(
+            kind,
+            EventKind::LifecycleObserved { status, .. } if status == "NoObservableProgress"
+        )),
+        "declared managed-output progress must never be judged no-observable-progress"
+    );
+
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+}
+
+/// Decisive check, negative: rewriting the *same* bytes to the declared
+/// managed output is not progress — a content digest, not a mtime or a
+/// write count, is what `staging_content_digest` compares. Establishes
+/// a real baseline first (the file's first appearance, which *is*
+/// progress, W6-style), then rewrites identical content and asserts the
+/// loop still reports no observable progress with no extra prompt.
+#[test]
+fn identical_rewrite_of_declared_output_is_not_progress() {
+    let run = open_run("run-p47-identical-rewrite");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // First appearance of the file: real progress, earns a third prompt,
+    // and a new baseline is taken with this content's own digest.
+    write_staged_file(&run, "report.md", b"same content\n");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("third prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 3
+    });
+    // Rewrite the identical bytes: no observable progress.
+    write_staged_file(&run, "report.md", b"same content\n");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        3,
+        "no fourth prompt: rewriting identical bytes is not progress"
+    );
+    let no_progress_count = wirkd
+        .recorded()
+        .into_iter()
+        .filter(|(_, _, kind)| {
+            matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "NoObservableProgress")
+        })
+        .count();
+    assert_eq!(
+        no_progress_count, 1,
+        "exactly one no-observable-progress observation for the identical rewrite"
+    );
+}
+
+/// Decisive check 2 (REFINED.md), the negative case the rejected
+/// count-`ClaimFiled` proposal fails: a `ClaimFiled`/
+/// `ClaimRecorded{Refused}` cycle on the watch stream between the
+/// continuation and the next turn end writes no file anywhere, so it
+/// must not earn a third prompt — the loop still reports no observable
+/// progress. Passes both before and after C1; the rejected proposal
+/// (counting `ClaimFiled` itself) would fail it, since every automatic
+/// hook turn end would then earn an unbounded string of continuations.
+#[test]
+fn a_refused_claim_between_the_continuation_and_the_next_turn_end_is_not_progress() {
+    let run = open_run("run-p47-refused-claim");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // The automatic hook's own unconditional cycle: filed, then refused
+    // for a still-missing required artifact. No file is written by
+    // either event.
+    wirkd.push_watch_event(watch_event(
+        Some(&run.id),
+        EventKind::ClaimFiled {
+            claim: ClaimId("c-auto".to_string()),
+        },
+    ));
+    wirkd.push_watch_event(watch_event(
+        Some(&run.id),
+        EventKind::ClaimRecorded {
+            artifacts: Vec::new(),
+            claim: ClaimId("c-auto".to_string()),
+            claim_kind: ClaimKind::Done,
+            verdict: ClaimVerdict::Refused(wirk_core::ClaimRefusal::MissingArtifact(
+                "CHECKS.json".to_string(),
+            )),
+            origin: None,
+        },
+    ));
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        2,
+        "no third prompt: a refused Claim alone is never progress"
+    );
+    assert_eq!(
+        wirkd
+            .recorded()
+            .into_iter()
+            .filter(|(_, _, kind)| matches!(
+                kind,
+                EventKind::LifecycleObserved { status, .. } if status == "NoObservableProgress"
+            ))
+            .count(),
+        1,
+        "exactly one no-observable-progress observation, not an unbounded loop"
+    );
+}
+
+/// Decisive check 3 (REFINED.md), C2: the journaled no-progress record
+/// is not `RunFailed`, the folded `RunState` stays `Open` (not
+/// `Failed`), and the Work surfaces as `NeedsInput` — read back through
+/// `FakeWirkdApi::status`, which folds its own seeded-plus-appended
+/// journal exactly as the real daemon does (0040 D127). A late, valid
+/// `Done` Claim recorded afterward on the same Run is still honored:
+/// the Run settles `Claimed`, never blocked by the earlier observation.
+#[test]
+fn no_observable_progress_leaves_the_run_open_and_a_late_claim_still_completes_it() {
+    let run = open_run("run-p47-open-late-claim");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default().with_journal(vec![
+        watch_event(None, work_submitted()),
+        watch_event(Some(&run.id), run_opened(&run)),
+    ]));
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+
+    let status = wirkd.status(&work_id()).expect("status");
+    assert_eq!(
+        status.work_state,
+        WorkState::NeedsInput,
+        "the Work surfaces as NeedsInput after no observable progress"
+    );
+    let run_entry = status
+        .runs
+        .iter()
+        .find(|entry| entry.run_id == run.id)
+        .expect("this Run is in status");
+    assert!(
+        matches!(run_entry.state, RunState::Open),
+        "the Run itself must stay Open — LifecycleObserved is inert at the Run level: {:?}",
+        run_entry.state
+    );
+
+    // The actor's own late, legitimate Claim: still honored.
+    wirkd
+        .record(&work_id(), &run.id, claim_recorded_done("late-claim"))
+        .expect("record the late claim");
+    let status = wirkd.status(&work_id()).expect("status after late claim");
+    let run_entry = status
+        .runs
+        .iter()
+        .find(|entry| entry.run_id == run.id)
+        .expect("this Run is in status");
+    assert!(
+        matches!(&run_entry.state, RunState::Claimed(claim) if claim.0 == "late-claim"),
+        "a late valid Claim after no observable progress still settles the Run truthfully: {:?}",
+        run_entry.state
+    );
+}
+
+/// The current/latest-Run guard (`wirkd`'s own `handle_record`
+/// supersession check, unchanged by this wave — exercised here through
+/// the same `RunSettled` outcome the real daemon answers with) applies
+/// to the no-observable-progress write exactly as it already does to
+/// every other `record` call: a write that arrives after this Run (or
+/// its Waypoint) has settled elsewhere is refused and dropped, never
+/// folded as a stale `NeedsInput`. The drive itself does not stop on
+/// this refusal — it keeps observing, and a Claim that already landed
+/// on the watch stream still ends it `Claimed`.
+#[test]
+fn a_settled_or_superseded_no_observable_progress_write_is_dropped_not_stuck() {
+    let run = open_run("run-p47-superseded");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // A newer Run already opened for this Waypoint elsewhere (or this
+    // Run already settled) by the time the no-progress write would
+    // land.
+    wirkd.refuse_records_as_settled(
+        "record names Run run-1, but Waypoint route-1/wp-1 has since opened Run run-2: a \
+         superseded Run's record is never folded into the current one",
+    );
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+
+    // The drive does not report NeedsInput for this stale write; it
+    // keeps observing, and a Claim already on the watch stream still
+    // ends it Claimed.
+    wirkd.push_watch_event(watch_event(Some(&run.id), claim_recorded_done("c1")));
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::Claimed);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        2,
+        "the superseded no-progress write earns no third prompt"
+    );
+    assert!(
+        wirkd.recorded().into_iter().all(|(_, _, kind)| !matches!(
+            kind,
+            EventKind::LifecycleObserved { status, .. } if status == "NoObservableProgress"
+        )),
+        "a refused, superseded write is never actually journaled"
+    );
+}
+
+/// Decisive check (C1 correction, ruling 0248): a write to a name this
+/// Waypoint never declared must not be observed as progress at all — the
+/// earlier recursive walk of the whole staging subtree counted *any*
+/// file under it, undeclared names included. `actor_world`'s own
+/// `output_contract` declares only `report.md`; this writes a different
+/// name and asserts no third prompt and no progress recorded. **Red
+/// before the correction**: the old `collect_staged_files` walk finds
+/// `extra.bin` too and moves the digest, earning a false third prompt.
+#[test]
+fn undeclared_staged_file_is_not_observed_as_progress() {
+    let run = open_run("run-p47-undeclared-file");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Not the declared name (`report.md`) — a stray or unrelated write
+    // this Waypoint's own contract never named.
+    write_staged_file(&run, "extra.bin", b"not a declared output\n");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        2,
+        "no third prompt: an undeclared file is never observed as declared-output progress"
+    );
+    let no_progress_count = wirkd
+        .recorded()
+        .into_iter()
+        .filter(|(_, _, kind)| {
+            matches!(kind, EventKind::LifecycleObserved { status, .. } if status == "NoObservableProgress")
+        })
+        .count();
+    assert_eq!(
+        no_progress_count, 1,
+        "exactly one no-observable-progress observation despite the undeclared write"
+    );
+}
+
+/// Decisive check (C1 correction, ruling 0248): creating this Run's own
+/// staging directory (a mkdir side effect, e.g. an actor's tool creating
+/// the directory before ever writing into it) without writing any
+/// declared name is not progress. **Red before the correction**: the old
+/// code turned `None` (nothing written) into `Some` of an empty
+/// listing's digest the moment the directory existed, which differs from
+/// the prior `None` baseline and would have earned a false third prompt.
+#[test]
+fn empty_staging_directory_is_not_progress() {
+    let run = open_run("run-p47-empty-dir");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // Directory created, nothing written into it.
+    wirk_core::outputs::ensure_staging_dir(fixture_estate_root(), &work_id(), &run.id)
+        .expect("ensure this Run's own staging directory");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        2,
+        "no third prompt: an empty staging directory is nothing written, not progress"
+    );
+}
+
+/// The shared shape of every "unknown observation" check below: build a
+/// real baseline over a genuine declared output, then make that output
+/// unobservable in one specific way and drive two more turn ends.
+///
+/// **Red before ruling 0250's correction, green after.** The old
+/// reading was an `Option<String>` compared with `==`: the entry going
+/// from readable to unreadable looked exactly like content changing, so
+/// it *earned another prompt* (a fourth), and the no-progress line that
+/// eventually followed said "declared managed-output content unchanged"
+/// about a reading that never completed. The contract is that an
+/// incomplete observation is neither progress nor proof of no change:
+/// exactly three prompts, one no-observable-progress observation, and
+/// an observation detail that names the unavailability and its reason.
+///
+/// Deterministic and bounded: every wait is `wait_until`'s own 10s
+/// assertion, and the drive returns `NeedsInput` on its own, so a
+/// failure is a failed assertion rather than a hang to be killed by
+/// hand.
+fn an_unobservable_declared_output_is_unknown_not_progress(
+    run_name: &str,
+    make_unobservable: impl FnOnce(&Run, &std::path::Path),
+    expected_reason_fragment: &str,
+) {
+    let run = open_run(run_name);
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let world = actor_world(&run, dir.path());
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+
+    let handle = spawn_drive(loop_, run.clone(), world);
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("first continuation prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 2
+    });
+    // First appearance of the real, declared file: genuine progress,
+    // earns the third prompt and a new baseline over its own bytes.
+    write_staged_file(&run, "report.md", b"first draft\n");
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Working)))
+        .unwrap();
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Done)))
+        .unwrap();
+    wait_until("third prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 3
+    });
+
+    let staging_dir = wirk_core::outputs::staging_dir(fixture_estate_root(), &work_id(), &run.id)
+        .expect("staging dir path");
+    make_unobservable(&run, &staging_dir);
+
+    // Two more turn ends over the same unobservable state.
+    for _ in 0..2 {
+        herdr_tx
+            .send(Ok(status_changed(&run, AgentStatus::Working)))
+            .unwrap();
+        herdr_tx
+            .send(Ok(status_changed(&run, AgentStatus::Done)))
+            .unwrap();
+    }
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        3,
+        "an observation that could not be completed is unknown, and unknown never earns a \
+         continuation"
+    );
+    let observations: Vec<String> = wirkd
+        .recorded()
+        .into_iter()
+        .filter_map(|(_, _, kind)| match kind {
+            EventKind::LifecycleObserved { status, detail } if status == "NoObservableProgress" => {
+                Some(detail.unwrap_or_default())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        observations.len(),
+        1,
+        "exactly one no-observable-progress observation: {observations:?}"
+    );
+    let detail = &observations[0];
+    assert!(
+        detail.contains("could not be observed") && detail.contains(expected_reason_fragment),
+        "the observation must name the unavailability and its reason, never claim the content \
+         was unchanged: {detail:?}"
+    );
+    assert!(
+        !detail.contains("declared managed-output content unchanged"),
+        "an incomplete observation is not proof the content was unchanged: {detail:?}"
+    );
+}
+
+/// A symlink placed where the declared output should be is never
+/// resolved as its *target's* bytes — the same symlink-safety
+/// discipline `wirk_core::outputs::observe_staged_output` enforces, and
+/// which `wirk/tests/work_owned_outputs.rs`'s "containment: a symlink
+/// out of the staging area" enforces at Claim time. Under ruling 0250
+/// the swap is *unknown*, not the `Some(hash) -> None` "change" the
+/// previous pass rewarded with another prompt.
+#[test]
+fn a_symlinked_declared_output_is_unknown_and_never_earns_another_prompt() {
+    // Outside the worktree entirely, so only the declared-output signal
+    // is exercised here — the worktree fingerprint is a separate,
+    // already-covered signal and must not be conflated with this one.
+    let elsewhere_dir = tempdir().expect("tempdir for symlink target");
+    let elsewhere = elsewhere_dir.path().join("elsewhere.md");
+    std::fs::write(&elsewhere, b"different content, reached only via symlink\n")
+        .expect("write symlink target");
+    an_unobservable_declared_output_is_unknown_not_progress(
+        "run-p47-symlink-swap",
+        |_run, staging_dir| {
+            let staged_path = staging_dir.join("report.md");
+            std::fs::remove_file(&staged_path).expect("remove baseline file");
+            std::os::unix::fs::symlink(&elsewhere, &staged_path).expect("swap in a symlink");
+        },
+        "does not address a regular file inside this Run's own staging area",
+    );
+}
+
+/// The staging directory itself redirected out of the Work's own area:
+/// the case a containment check anchored at that same directory cannot
+/// see, because canonicalizing it moves the root along with the
+/// redirection (`wirk_core::outputs::
+/// a_redirected_staging_root_or_ancestor_is_out_of_boundary`). Anchored
+/// at the estate root, it is a boundary failure, so the loop observes
+/// unknown rather than digesting whatever the foreign directory holds.
+#[test]
+fn a_redirected_staging_root_is_unknown_and_never_earns_another_prompt() {
+    let elsewhere_dir = tempdir().expect("tempdir for the foreign staging area");
+    let elsewhere = elsewhere_dir.path().to_path_buf();
+    std::fs::write(
+        elsewhere.join("report.md"),
+        b"foreign bytes, never observed\n",
+    )
+    .expect("write the foreign file");
+    an_unobservable_declared_output_is_unknown_not_progress(
+        "run-p47-root-escape",
+        move |_run, staging_dir| {
+            std::fs::remove_dir_all(staging_dir).expect("clear the real staging directory");
+            std::os::unix::fs::symlink(&elsewhere, staging_dir)
+                .expect("redirect the staging root itself");
+        },
+        "does not address a regular file inside this Run's own staging area",
+    );
+}
+
+/// The same redirection, to a destination that holds no file by the
+/// declared name — an empty directory, and a link to nothing at all.
+/// The lookup then fails with `NotFound` instead of finding a foreign
+/// file, and the previous reading answered *known absence*: it spent a
+/// fourth prompt on the `Some(hash) -> None` transition and then said
+/// "declared managed-output content unchanged" about a directory
+/// outside the Work's own area. Absence is only known when it was
+/// established at this Run's own address
+/// (`wirk_core::outputs::a_missing_entry_under_a_redirected_address_is_out_of_boundary`).
+#[test]
+fn a_redirected_staging_root_with_no_output_there_is_unknown_not_absent() {
+    let elsewhere_dir = tempdir().expect("tempdir for the empty foreign staging area");
+    let elsewhere = elsewhere_dir.path().to_path_buf();
+    an_unobservable_declared_output_is_unknown_not_progress(
+        "run-p47-root-escape-empty",
+        move |_run, staging_dir| {
+            std::fs::remove_dir_all(staging_dir).expect("clear the real staging directory");
+            std::os::unix::fs::symlink(&elsewhere, staging_dir)
+                .expect("redirect the staging root at an empty directory");
+        },
+        "does not address a regular file inside this Run's own staging area",
+    );
+}
+
+/// The dangling case: the staging root replaced by a link to a path
+/// that does not exist. Nothing there is legitimately absent — the
+/// address itself is no longer this Run's — so the observation is
+/// unknown and earns no further prompt.
+#[test]
+fn a_dangling_staging_root_is_unknown_not_absent() {
+    let elsewhere_dir = tempdir().expect("tempdir for the dangling target's parent");
+    let elsewhere = elsewhere_dir.path().join("nothing-here");
+    an_unobservable_declared_output_is_unknown_not_progress(
+        "run-p47-root-escape-dangling",
+        move |_run, staging_dir| {
+            std::fs::remove_dir_all(staging_dir).expect("clear the real staging directory");
+            std::os::unix::fs::symlink(&elsewhere, staging_dir)
+                .expect("redirect the staging root at nothing");
+        },
+        "does not address a regular file inside this Run's own staging area",
+    );
+}
+
+/// A declared output that cannot be read at all — here by removing
+/// every permission bit from the file the baseline was taken over.
+/// Unreadable is unknown: not progress, and not evidence the bytes are
+/// the same as before.
+#[test]
+fn an_unreadable_declared_output_is_unknown_and_never_earns_another_prompt() {
+    an_unobservable_declared_output_is_unknown_not_progress(
+        "run-p47-unreadable",
+        |_run, staging_dir| {
+            use std::os::unix::fs::PermissionsExt;
+            let staged_path = staging_dir.join("report.md");
+            std::fs::write(&staged_path, b"second draft, but unreadable\n").expect("rewrite");
+            std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o000))
+                .expect("drop every permission bit");
+        },
+        "could not be inspected",
+    );
+}
+
+/// A declared output larger than one observation's own byte budget.
+/// The file is legitimate — it is simply more reading than a per-turn
+/// change check does — so the observation answers unknown rather than
+/// hashing an unbounded number of bytes on every turn end, and rather
+/// than comparing a truncated digest against a whole one.
+///
+/// Sparse (`set_len`), so the test writes a byte, not 64 MiB.
+#[test]
+fn a_declared_output_past_the_observation_byte_budget_is_unknown() {
+    an_unobservable_declared_output_is_unknown_not_progress(
+        "run-p47-byte-budget",
+        |_run, staging_dir| {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(staging_dir.join("report.md"))
+                .expect("reopen the declared output");
+            file.set_len(64 * 1024 * 1024 + 1)
+                .expect("grow past the budget");
+        },
+        "budget one progress observation reads",
+    );
+}
+
+/// More declared outputs than one observation iterates. The bound is on
+/// the *declaration list*, which a Waypoint author writes by hand; a
+/// Route that declares more than the observation reads gets an honest
+/// unknown rather than an unbounded loop and an unbounded allocation.
+///
+/// Every reading here is unknown from the start, the baseline included,
+/// so there is no genuine-progress step to take first: the turn end
+/// after the first continuation is already no observable progress, on
+/// two prompts, with a truthful reason.
+#[test]
+fn more_declared_outputs_than_the_entry_budget_is_unknown() {
+    let run = open_run("run-p47-entry-budget");
+    let dir = tempdir().expect("tempdir");
+    git_init_repo(dir.path());
+    let World::Actor(mut actor) = actor_world(&run, dir.path()) else {
+        unreachable!("actor_world builds an Actor world")
+    };
+    actor.output_contract = OutputContract(
+        (0..65)
+            .map(|n| ArtifactSpec {
+                name: format!("extra-{n}.md"),
+                required: n == 0,
+            })
+            .collect(),
+    );
+    let (client, herdr_tx) = client_for(&run);
+    let wirkd = Arc::new(FakeWirkdApi::default());
+    let loop_ = RunLoop::new(client.clone(), wirkd.clone());
+    let handle = spawn_drive(loop_, run.clone(), World::Actor(actor));
+
+    herdr_tx
+        .send(Ok(status_changed(&run, AgentStatus::Idle)))
+        .unwrap();
+    wait_until("intent prompt sent", || {
+        client.prompt_agent_calls.lock().unwrap().len() == 1
+    });
+    for _ in 0..2 {
+        herdr_tx
+            .send(Ok(status_changed(&run, AgentStatus::Working)))
+            .unwrap();
+        herdr_tx
+            .send(Ok(status_changed(&run, AgentStatus::Done)))
+            .unwrap();
+    }
+
+    let outcome = handle.join().unwrap().expect("drive");
+    assert_eq!(outcome, Outcome::NeedsInput);
+    assert_eq!(
+        client.prompt_agent_calls.lock().unwrap().len(),
+        2,
+        "the intent and its one unconditional continuation, and no more"
+    );
+    let detail = wirkd
+        .recorded()
+        .into_iter()
+        .find_map(|(_, _, kind)| match kind {
+            EventKind::LifecycleObserved { status, detail } if status == "NoObservableProgress" => {
+                Some(detail.unwrap_or_default())
+            }
+            _ => None,
+        })
+        .expect("a no-observable-progress observation");
+    assert!(
+        detail.contains("could not be observed")
+            && detail.contains("more than the 64 one observation reads"),
+        "the observation must name the entry budget as the reason: {detail:?}"
     );
 }
 
@@ -2884,6 +3731,7 @@ fn claim_refused_out_of_boundary(claim_id: &str) -> EventKind {
         verdict: ClaimVerdict::Refused(wirk_core::ClaimRefusal::OutOfBoundary(
             "/etc/passwd".to_string(),
         )),
+        origin: None,
     }
 }
 

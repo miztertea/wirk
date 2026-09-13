@@ -4433,6 +4433,7 @@ fn restart_settles_and_indexes_a_terminal_works_missing_finding() {
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
             artifacts: Vec::new(),
+            origin: None,
         },
     );
     let claim_event_id = journal_events(&estate, &work_id.0)
@@ -4598,6 +4599,7 @@ fn a_settlement_journaled_by_the_previous_revision_stays_readable_and_reads_as_h
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
             artifacts: Vec::new(),
+            origin: None,
         },
     );
     let claim_event_id = journal_events(&estate, &work_id.0)

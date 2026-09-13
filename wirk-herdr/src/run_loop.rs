@@ -31,20 +31,47 @@
 //! installed for it — reused for every prompt, not only the first).
 //! Prompting stops on a
 //! `ClaimRecorded` for this Run (`Claimed`), the Work moving to
-//! `NeedsInput`, Herdr saying the pane is gone, or **no progress**: a
-//! prompt's own baseline (one worktree fingerprint,
-//! `wirk_herdr::git::fingerprint`) compared against the same reading at
-//! the *next* Idle — unchanged is the actor stuck (`Outcome::
-//! NeedsInput`, `stuck_observation()` names what was observed); changed
-//! prompts again. **P2.3 W4 (build-brief.md §8 finding 1):** the pane's
+//! `NeedsInput`, Herdr saying the pane is gone, or **no observable
+//! progress**: a prompt's own baseline (the worktree fingerprint,
+//! `wirk_herdr::git::fingerprint`, and this Run's own declared
+//! managed-output content digest, `staging_content_digest` — P4.7,
+//! ruling 0243) compared against the same reading at the *next* Idle —
+//! no *observable* change in either is no observable progress
+//! (`Outcome::NeedsInput`, `stuck_observation()` names what was
+//! observed); an observed change in either prompts again. **P4.7
+//! completion (ruling 0250):** an output reading that could not be
+//! completed — unreadable, redirected out of the Work's own area, or
+//! past this observation's own work budget — is *unknown*
+//! (`OutputObservation::Unavailable`). Unknown never earns a
+//! continuation and is never reported as "unchanged"
+//! (`observable_progress`, `describe_outputs`). **P2.3 W4 (build-brief.md §8 finding 1):** the pane's
 //! own `revision` left this comparison — any output by the actor
 //! (answering a prompt, thinking aloud) advances the pane's revision
 //! whether or not it did anything, so counting it as progress meant an
 //! actor that only ever answers prompts and never edits was never
-//! judged stuck. Progress since the last prompt now means the worktree
-//! changed; the journal's own movement (a Claim, a Question) already
+//! judged stuck. **P4.7 (ruling 0243, C1):** the worktree fingerprint
+//! alone was a second, opposite false positive — a Read Waypoint
+//! (`boundary: []`) is *required* to leave the worktree untouched, so
+//! it could never pass this check no matter what it wrote to its
+//! declared output. The content digest closes that gap without opening
+//! the one the rejected proposal (counting each `ClaimFiled`) would
+//! have: a refused Claim writes no artifact, and rewriting identical
+//! bytes leaves the digest exactly as it was, so neither ever counts as
+//! progress. The journal's own movement (a Claim, a Question) already
 //! ends the loop through `observe_watch`'s own `NeedsInput` fold and
-//! needs no part in this snapshot either.
+//! needs no part in this snapshot either. **C2 (ruling 0243/0248):** no
+//! observable progress is journaled as `LifecycleObserved{status:
+//! "NoObservableProgress"}`, not `RunFailed` — the actor may genuinely
+//! be waiting on a live, correctly-scoped background job or a
+//! correctly-refused intermediate Claim, and `RunFailed` would set
+//! `RunState::Failed`, which `wirkd`'s own `record` handler (not Claim
+//! handling: `handle_claim_inner` checks the *Work's* terminal state,
+//! never the Run's) then refuses to accept any further write against —
+//! foreclosing this loop's own ability to later observe or correct that
+//! Run, though not a still-live actor's own eventual Claim, which is
+//! filed and validated straight through regardless. `LifecycleObserved`
+//! is inert on the Run (D9#2): the Run stays `Open`, and `fold`'s own
+//! new arm surfaces the Work as `NeedsInput` instead.
 //!
 //! Blocked (P2.3 W4, build-brief.md §8 finding 2): the loop never
 //! prompts a `Blocked` pane (unchanged), but on the *transition* to
@@ -346,15 +373,267 @@ enum LoopMsg {
     WatchEnded(Option<String>),
 }
 
+/// How much filesystem work one progress observation may do before it
+/// answers "unknown" instead of finishing.
+///
+/// **Why a bound exists at all.** This observation runs at the end of
+/// every actor turn, for the whole life of a Run, purely to answer "did
+/// anything change?". A 64 KiB streaming buffer bounds the *memory* one
+/// read holds; it bounds neither the total bytes a read-to-EOF loop
+/// consumes nor the number of declarations iterated. A declared
+/// artifact that legitimately grows, or a Route declaring a long list of
+/// outputs, would otherwise make every turn end do unbounded work.
+///
+/// **Why these numbers, and what they are not.** Neither is derived
+/// from this machine: the byte budget bounds *I/O work per observation*
+/// (memory stays the streaming buffer, whatever the budget is), and the
+/// entry budget bounds a declaration list that a Waypoint author writes
+/// by hand. 64 declared outputs is far beyond any Route shape this
+/// product has ever carried, and 64 MiB is far beyond a report, a
+/// receipt or a diff — the artifact kinds a Waypoint declares — while
+/// still being work a turn end can finish promptly on ordinary storage.
+///
+/// **What exceeding them does and does not mean.** Exceeding either
+/// makes *this observation* unknown (`OutputObservation::Unavailable`);
+/// it never limits what a Waypoint may legitimately produce and never
+/// affects whether its Claim validates. Claim-time reading
+/// (`wirkd::server::read_staged_output`) has no budget of its own and is
+/// untouched by these constants, so an artifact larger than the budget
+/// is still admitted, digested and recorded in full.
+///
+/// **The honest limit.** These bound bytes and entries, not wall time.
+/// A read that blocks — a stalled network filesystem, a device that
+/// never answers — is not made to return by a byte budget. Bounding
+/// that would require a timer or a supervisor, neither of which this
+/// correction introduces.
+const MAX_OBSERVED_OUTPUTS: usize = 64;
+const MAX_OBSERVED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What one observation of this Run's declared managed outputs
+/// established — **or could not establish**.
+///
+/// P4.7 completion (ruling 0250): the previous shape was
+/// `Option<String>`, which folded three different facts into `None` —
+/// "every declared output is definitively absent", "one of them could
+/// not be read", and "one of them no longer addresses a file inside
+/// this Run's own area". Comparing those `Option`s then made an entry
+/// going from readable to unreadable look exactly like content
+/// changing, so an unreadable or escaped output *earned another
+/// prompt*. An incomplete observation is neither evidence of progress
+/// nor evidence that nothing changed; it is unknown, and it is reported
+/// as unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutputObservation {
+    /// Every declared output was observed to a definite state. `Some`
+    /// is the combined digest of those present; `None` is every
+    /// declared name definitively absent (including the ordinary case
+    /// of a Run that has written nothing yet, whose staging directory
+    /// does not exist).
+    Observed(Option<String>),
+    /// At least one declared output could not be observed, for the
+    /// reason carried. Never compared for equality against anything:
+    /// see `observable_progress`.
+    Unavailable(String),
+}
+
 /// Captured right after a prompt is sent, compared against the same
 /// reading at the next Idle (item C's no-progress check). P2.3 W4
 /// (build-brief.md §8 finding 1): the pane's own revision left this —
-/// only the worktree fingerprint (`wirk_herdr::git::fingerprint`, which
+/// the worktree fingerprint (`wirk_herdr::git::fingerprint`, which
 /// never fails: an unreadable/non-repo path folds to "" via its own
-/// `unwrap_or_default`) counts as progress.
+/// `unwrap_or_default`) counts as progress. P4.7 (ruling 0243): a
+/// second, independent signal joins it — `outputs`, a sorted
+/// (declared name, sha256) digest over exactly this Run's own declared
+/// managed outputs. A Read Waypoint (`boundary: []`) is required to
+/// leave the worktree untouched, so the fingerprint alone is a
+/// guaranteed false positive for that whole class; a Waypoint that only
+/// writes its required artifacts there is real, observable work the
+/// fingerprint cannot see. Rewriting identical bytes, or a `ClaimFiled`/
+/// `ClaimRecorded{Refused}` cycle (which touches no file at all), leaves
+/// this reading exactly as it was — the bound the rejected
+/// count-`ClaimFiled` proposal lacked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProgressBaseline {
     fingerprint: String,
+    outputs: OutputObservation,
+}
+
+/// Whether anything the loop can actually *see* moved between the two
+/// readings — the one question the continuation decision turns on.
+///
+/// Deliberately not `before != after`. Derived equality would make two
+/// different `Unavailable` reasons compare unequal and count as
+/// progress, and would make a reading going from `Observed` to
+/// `Unavailable` (the symlink swap) count as progress too. A change is
+/// only observable when both readings are `Observed` and the content
+/// they establish differs. Unknown at either end is not a change:
+/// `Unavailable -> Observed` is not evidence the content changed
+/// either, because the earlier content was never established.
+fn observable_progress(before: &ProgressBaseline, after: &ProgressBaseline) -> bool {
+    if before.fingerprint != after.fingerprint {
+        return true;
+    }
+    matches!(
+        (&before.outputs, &after.outputs),
+        (OutputObservation::Observed(a), OutputObservation::Observed(b)) if a != b
+    )
+}
+
+/// What the declared-output signal did between the two readings, said
+/// truthfully — including when it says nothing at all.
+///
+/// "Unchanged" is only ever printed when both ends were actually
+/// observed. Otherwise the line names the unavailability and its
+/// reason, so a reader is never told content was unchanged on the
+/// strength of a reading that never completed.
+fn describe_outputs(before: &OutputObservation, after: &OutputObservation) -> String {
+    match (before, after) {
+        (OutputObservation::Observed(_), OutputObservation::Observed(_)) => {
+            "declared managed-output content unchanged".to_string()
+        }
+        (_, OutputObservation::Unavailable(reason)) => {
+            format!("declared managed-output content could not be observed ({reason})")
+        }
+        (OutputObservation::Unavailable(reason), OutputObservation::Observed(_)) => format!(
+            "declared managed-output content was not observable at the last prompt ({reason}), so \
+             no change could be established"
+        ),
+    }
+}
+
+/// A sorted (declared name, sha256) digest over exactly this Run's own
+/// *declared* managed outputs (`actor.output_contract.0` — every entry,
+/// required and optional alike: an actor still filling in a legitimate
+/// optional artifact is real progress too).
+///
+/// There is nothing to walk here: `check_output_name` (`staged_path`'s
+/// own precondition) already requires a declared name to be one
+/// ordinary filename component, so every declared output addresses
+/// exactly one file directly under the staging directory, never a
+/// subtree. An undeclared file, an empty directory the actor happened to
+/// create, or any other write anywhere under the staging area is not
+/// this Run's declared output and never moves this reading.
+///
+/// R2: `wirk_core::outputs::observe_staged_output` derives each
+/// candidate address the same way the actor's own writes do and
+/// reapplies the area's escape rules against the **estate root** — the
+/// trusted anchor an actor cannot move — so a staging directory or
+/// ancestor redirected outside the Work's own area is a boundary
+/// failure rather than a silent read of foreign bytes. Reading is
+/// streamed in bounded chunks against a per-observation work budget
+/// (`MAX_OBSERVED_BYTES`, `MAX_OBSERVED_OUTPUTS`).
+///
+/// Allocation is bounded by the contract itself, not by what is on
+/// disk: at most `MAX_OBSERVED_OUTPUTS` entries, each a declared name
+/// (`check_output_name`: at most 128 bytes) and a fixed-width hex
+/// digest. No file's bytes are ever held whole.
+fn staging_content_digest(actor: &ActorWorld) -> OutputObservation {
+    let estate_root = std::path::Path::new(&actor.triple.estate_root);
+    let declared = &actor.output_contract.0;
+    if declared.len() > MAX_OBSERVED_OUTPUTS {
+        return OutputObservation::Unavailable(format!(
+            "this Run declares {} managed outputs, more than the {MAX_OBSERVED_OUTPUTS} one \
+             observation reads",
+            declared.len()
+        ));
+    }
+    let mut budget = MAX_OBSERVED_BYTES;
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(declared.len());
+    for spec in declared {
+        let name = &spec.name;
+        match wirk_core::outputs::observe_staged_output(
+            estate_root,
+            &actor.triple.work_id,
+            &actor.triple.run_id,
+            name,
+        ) {
+            wirk_core::outputs::StagedObservation::Absent => continue,
+            wirk_core::outputs::StagedObservation::OutOfBoundary => {
+                return OutputObservation::Unavailable(format!(
+                    "the declared output {name} does not address a regular file inside this Run's \
+                     own staging area"
+                ));
+            }
+            wirk_core::outputs::StagedObservation::Unreadable => {
+                return OutputObservation::Unavailable(format!(
+                    "the declared output {name} could not be inspected"
+                ));
+            }
+            wirk_core::outputs::StagedObservation::Open(file) => {
+                match stream_digest(file, &mut budget) {
+                    Ok(digest) => entries.push((name.clone(), digest)),
+                    Err(reason) => {
+                        return OutputObservation::Unavailable(format!(
+                            "the declared output {name} {reason}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if entries.is_empty() {
+        return OutputObservation::Observed(None);
+    }
+    entries.sort();
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (rel, digest) in &entries {
+        hasher.update((rel.len() as u64).to_be_bytes());
+        hasher.update(rel.as_bytes());
+        hasher.update((digest.len() as u64).to_be_bytes());
+        hasher.update(digest.as_bytes());
+    }
+    OutputObservation::Observed(Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
+}
+
+/// The sha256 of `file`'s bytes, read in bounded chunks and charged
+/// against this observation's remaining byte budget.
+///
+/// `Err` — an explicit reason, never a digest — when the file cannot be
+/// read through or when finishing it would exceed the budget. Both are
+/// *unknown*: a partial digest compared against a whole one would
+/// report a content change that did not happen, which is exactly the
+/// "skip the entry into a partial aggregate" mistake this correction
+/// exists to remove.
+///
+/// Deliberately not `ArtifactReceipt::digest_of`: its own `fs::read`
+/// allocates the whole file at once, which is fine for a one-time
+/// Claim-time snapshot but not for a comparison this loop repeats on
+/// every turn end.
+fn stream_digest(mut file: std::fs::File, budget: &mut u64) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|err| format!("could not be read ({err})"))?;
+        if read == 0 {
+            break;
+        }
+        let read = read as u64;
+        if read > *budget {
+            return Err(format!(
+                "is larger than the {MAX_OBSERVED_BYTES}-byte budget one progress observation \
+                 reads; this bounds the observation only, never what the Waypoint may produce or \
+                 claim"
+            ));
+        }
+        *budget -= read;
+        hasher.update(&buf[..read as usize]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// P2.3 W3: what `observe_herdr` found when it decided this Idle earns
@@ -369,7 +648,8 @@ struct ProgressBaseline {
 /// `RunLoop` will ever judge for progress is the one after this. Every
 /// later prompt is `SinceLastPrompt`, carrying both readings
 /// `observe_herdr` already took to decide the actor was not stuck
-/// (always a genuine worktree change -- an unchanged fingerprint is the
+/// (always a genuine worktree change, a genuine declared managed-output
+/// content change, or both -- baselines equal on every signal is the
 /// stuck path, returned before `maybe_prompt` is ever reached, so
 /// `describe` never needs to print "unchanged" for a prompt line).
 enum PromptProgress {
@@ -386,10 +666,38 @@ impl PromptProgress {
         match self {
             PromptProgress::First => "first prompt, no earlier baseline to compare".to_string(),
             PromptProgress::FirstContinuation => "first continuation, baseline taken".to_string(),
-            PromptProgress::SinceLastPrompt { before, after } => format!(
-                "progress since the last prompt: worktree changed, fingerprint {} -> {}",
-                before.fingerprint, after.fingerprint
-            ),
+            // P4.7 (ruling 0243): named truthfully -- a Waypoint that
+            // only wrote its declared managed output (a Read Waypoint,
+            // `boundary: []`) never touches the worktree fingerprint, so
+            // this line must not claim "worktree changed" when it did
+            // not. Both signals are reported only when both actually
+            // moved.
+            PromptProgress::SinceLastPrompt { before, after } => {
+                let worktree_changed = before.fingerprint != after.fingerprint;
+                // Only an `Observed`-to-`Observed` difference is a
+                // change: an unknown reading never earns this line.
+                let output_changed = matches!(
+                    (&before.outputs, &after.outputs),
+                    (OutputObservation::Observed(a), OutputObservation::Observed(b)) if a != b
+                );
+                let what = match (worktree_changed, output_changed) {
+                    (true, true) => format!(
+                        "worktree changed, fingerprint {} -> {}, and declared output changed",
+                        before.fingerprint, after.fingerprint
+                    ),
+                    (true, false) => format!(
+                        "worktree changed, fingerprint {} -> {}",
+                        before.fingerprint, after.fingerprint
+                    ),
+                    (false, true) => "declared managed output changed".to_string(),
+                    (false, false) => {
+                        "no signal changed (unreachable: this arm is only reached after a \
+                         difference was found)"
+                            .to_string()
+                    }
+                };
+                format!("progress since the last prompt: {what}")
+            }
         }
     }
 }
@@ -1365,44 +1673,70 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
 
         let progress = if let Some(baseline) = self.progress_baseline.take() {
             let now = self.progress_snapshot(actor);
-            if now == baseline {
+            // P4.7 completion (ruling 0250): not `now == baseline`. An
+            // observation that could not be completed is unknown, and
+            // unknown is neither a change nor proof of no change — it
+            // must not earn another prompt, and the line below must not
+            // claim the content was unchanged.
+            if !observable_progress(&baseline, &now) {
                 let pane_id = self.launched_pane.clone().unwrap_or_default();
                 // build-brief.md §7 amendment 2: the observation names
                 // the pane (it stays alive after the loop exits, a
-                // human reads it there) and the fingerprint compared
-                // (P2.3 W4, build-brief.md §8 finding 1: the pane's own
+                // human reads it there) and both signals compared (P2.3
+                // W4, build-brief.md §8 finding 1: the pane's own
                 // revision no longer participates — any output by the
                 // actor advanced it whether or not the actor did
-                // anything, so it never actually pinned "stuck"). The
-                // pane's own screen text is not read here — Herdr's
-                // `pane.read` is not on `HerdrClient` today (map row 23:
-                // available, never called, 0017 D57 kept wirk off it for
-                // Claim evidence) and adding it crosses this wave's file
-                // allow-list (`wirk-herdr/src/lib.rs`, `socket.rs`);
-                // named gap, BUILD.md.
+                // anything, so it never actually pinned "stuck"; P4.7,
+                // ruling 0243: the worktree fingerprint alone was a
+                // guaranteed false positive for every output-only
+                // Waypoint, so the declared managed-output content
+                // digest joins it — this line is honest about both
+                // having stayed the same). The pane's own screen text is
+                // not read here — Herdr's `pane.read` is not on
+                // `HerdrClient` today (map row 23: available, never
+                // called, 0017 D57 kept wirk off it for Claim evidence)
+                // and adding it crosses this wave's file allow-list
+                // (`wirk-herdr/src/lib.rs`, `socket.rs`); named gap,
+                // BUILD.md.
                 let observation = format!(
-                    "stuck: pane {pane_id} — no progress since the last prompt: worktree \
-                     fingerprint {} unchanged",
-                    baseline.fingerprint
+                    "no observable progress: pane {pane_id} — no progress since the last \
+                     prompt: worktree fingerprint {} unchanged, {}",
+                    baseline.fingerprint,
+                    describe_outputs(&baseline.outputs, &now.outputs)
                 );
-                // Same race, decisive side (item 1a): if this Run
-                // settled while the no-progress check was running, the
-                // actor did make progress — it claimed — and calling it
-                // stuck would be false. wirkd refuses the write; this
-                // loop drops its own stuck verdict with it rather than
-                // reporting `NeedsInput` over a settled Run.
+                // P4.7 (ruling 0243, C2/B): this is not evidence the
+                // actor failed — every installed interface is blind to
+                // a live, correctly-scoped background job or a
+                // correctly-refused intermediate Claim (QUALIFICATION.md
+                // "Conclusion: a detached background process is
+                // unobservable through every installed interface").
+                // Journaling `RunFailed` here was false: it set
+                // `RunState::Failed` (`Run::apply`), and `wirkd`'s
+                // `record` handler thereafter refuses every further
+                // write for this Run — foreclosing this loop's own
+                // ability to observe or correct it further. It does not
+                // foreclose the actor's own later legitimate Claim:
+                // `handle_claim_inner` gates on the *Work's* terminal
+                // state, never the Run's, and journals `ClaimFiled`/
+                // `ClaimRecorded` directly rather than through `record`
+                // — a distinction correction item 2 (0248) made explicit
+                // after an earlier report overstated the reverse.
+                // `LifecycleObserved` is `Run::apply`'s own deliberately
+                // inert kind (D9#2) — the Run this event names stays
+                // `Open`, exactly as an actor that is honestly still
+                // working should. `fold`'s own `LifecycleObserved` match
+                // gets one more arm, beside its existing `"Blocked"`/
+                // `"Working"`/`"Idle"`/`"Done"` arms, to surface the Work
+                // as `NeedsInput` and return control to the operator —
+                // R2 reuse of the existing kind, no new `EventKind`.
                 match self
                     .wirkd
                     .record(
                         work_id,
                         &run.id,
-                        EventKind::RunFailed {
-                            cause: FailureCause {
-                                status: Some("stuck".to_string()),
-                                request_id: None,
-                                at: Timestamp(0),
-                                detail: Some(observation.clone()),
-                            },
+                        EventKind::LifecycleObserved {
+                            status: "NoObservableProgress".to_string(),
+                            detail: Some(observation.clone()),
                         },
                     )
                     .map_err(RunLoopError::Wirkd)?
@@ -1416,7 +1750,7 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                     }
                 }
                 self.stuck_observation = Some(observation.clone());
-                self.notify_needs_input(work_id, "stuck", &observation);
+                self.notify_needs_input(work_id, "no_observable_progress", &observation);
                 return Ok(Some(Outcome::NeedsInput));
             }
             // Progress *was* observed: the worktree fingerprint changed.
@@ -1742,16 +2076,21 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         Ok(())
     }
 
-    /// One worktree fingerprint (P2.3 W4, build-brief.md §8 finding 1:
+    /// The worktree fingerprint (P2.3 W4, build-brief.md §8 finding 1:
     /// the pane's own revision left this — item C's original "one
     /// `get_pane` request and one worktree fingerprint" is now just the
     /// fingerprint). `wirk_herdr::git::fingerprint` never fails on its
     /// own terms (an unreadable or non-repo path folds to `""` via its
     /// own `unwrap_or_default`), so this always returns a value; kept
     /// non-fallible rather than wrapped in `Option` for the same reason.
+    /// P4.7 (ruling 0243, C1): plus this Run's own declared managed
+    /// output reading (`staging_content_digest`) — the second signal
+    /// `ProgressBaseline`'s own doc names, which unlike the fingerprint
+    /// can answer *unknown* (ruling 0250).
     fn progress_snapshot(&self, actor: &ActorWorld) -> ProgressBaseline {
         ProgressBaseline {
             fingerprint: crate::git::fingerprint(&actor.worktree_path),
+            outputs: staging_content_digest(actor),
         }
     }
 
@@ -2007,11 +2346,35 @@ pub fn compose_first_prompt(
              \"...\" instead."
         )
     };
+    // Ruling 0257: this sentence is the *delivered* statement of the
+    // completion rule — for a hook-installed actor it is the only
+    // statement of it — so it has to be accurate about all three things
+    // an actor can get wrong here, and it was accurate about only the
+    // first. Its "end your turn once they do" is right and is kept
+    // word for word — measured: an earlier rewrite of this paragraph
+    // that offered `wirk claim` as the general way to finish got a live
+    // Sonnet actor to type it by hand instead of ending its turn, which
+    // quietly replaces the accepted automatic path (0212) with a manual
+    // one. The explicit command belongs only where it is the actual
+    // remedy: after a question. What the old text left unsaid was two
+    // things: that a required output's *name* appearing is the whole of
+    // the completion signal (so a draft parked under the final name can
+    // finish the Work before the actor means it — rr2, exactly that),
+    // and what now happens to a standing question at a turn boundary. Validation is deliberately not described as
+    // more than it is: it reads the named bytes and records their
+    // digest. Nothing in it judges whether those bytes say what the
+    // actor set out to say, and this text must not suggest otherwise.
     let automatic = format!(
         "A claim is attempted automatically at the end of every turn and is refused \
          until the required outputs above exist, so end your turn once they do — a \
-         refusal before then is a normal record, not a failure. If you need input \
-         before you can finish, run {wirk} claim --question \"...\" instead."
+         refusal before then is a normal record, not a failure. That check is on names \
+         and bytes: it cannot tell a finished output from a draft parked under the same \
+         required name, so put a required output's final name on final content and keep \
+         working notes under any other name. If you need input before you can finish, \
+         run {wirk} claim --question \"...\" instead. That hold survives the turn \
+         boundary — the automatic attempt will not complete this Run while your question \
+         stands, and will say so rather than closing over it — so once you have what you \
+         asked for, run {wirk} claim yourself to finish this same Run."
     );
     let claim_line = match claim_hook {
         Some(wirk_core::ClaimHookDelivery::Installed) => automatic,

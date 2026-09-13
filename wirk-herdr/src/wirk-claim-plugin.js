@@ -21,6 +21,15 @@
 // 0044) -- this plugin does not pre-check anything, it fires and
 // lets wirkd judge.
 //
+// --automatic (ruling 0257) states what wirkd otherwise cannot see:
+// this claim is a turn boundary, not a decision. wirkd reads it under
+// its own journal lock and refuses to complete a Run whose own
+// deliberate `wirk claim --question` is still standing, leaving the
+// question visible instead of quietly closing over it. The actor's
+// own `wirk claim` -- no --automatic -- still finishes that same Run
+// whenever it is actually ready. Deliberately still no pre-check
+// here: asking first and claiming second would only move the race.
+//
 // WIRK_CLAIM_BIN names the driver's own absolute binary path, spliced
 // in by wirk-herdr/src/claim_hook.rs's wirk_claim_plugin_js at write
 // time (this file, as shipped in the crate, is a template -- the
@@ -59,7 +68,7 @@ export const WirkClaimPlugin = async () => {
       }
 
       if (type === "session.idle") {
-        execFile(WIRK_CLAIM_BIN, ["claim"], () => {});
+        execFile(WIRK_CLAIM_BIN, ["claim", "--automatic"], () => {});
       }
     },
   };

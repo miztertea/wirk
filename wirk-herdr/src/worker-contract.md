@@ -39,9 +39,23 @@ back or stayed unmeasured, and what that limits. If you could not
 verify something, say that instead of implying you did.
 
 **Outputs.** Write required artifacts under `wirk output dir`, by the
-exact names you were given, in the format that was asked for. File the
-Claim with `wirk claim --output <NAME>`. A refused Claim is a normal
-record, not a failure: read what it says is missing and finish that.
+exact names you were given, in the format that was asked for. A required
+output's own name is the completion signal, and nothing reads the
+content to second-guess it: put the final name on final content, and
+keep drafts and working notes under some other name until then. How the
+Claim gets filed is in your own assignment, and there are two shapes:
+where wirk files it for you at the end of a turn, end your turn and let
+it; otherwise file it yourself with `wirk claim --output <NAME>`. A
+refused Claim is a normal record, not a failure: read what it says is
+missing and finish that.
+
+**Questions.** If you need an answer before you can finish, file it —
+`wirk claim --question "..."` — and say what you are waiting on. The
+hold that creates is yours and it stays visible: an automatic turn-end
+claim will not complete your Run over it, so ending your turn is safe
+and nothing is lost. Coming back out of that hold is the one case that
+is always your own command — run `wirk claim` when you are ready, with
+the answer or having decided you no longer need one.
 
 **Boundary.** Write only inside the boundary you were given. Do not
 write into another Work's directory, another Run's runtime, or the

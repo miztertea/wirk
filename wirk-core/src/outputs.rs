@@ -320,6 +320,175 @@ pub fn contained_regular_file(root: &Path, candidate: &Path) -> Option<PathBuf> 
     canonical.starts_with(&canonical_root).then_some(canonical)
 }
 
+/// What one *observation* of a staged declared output found.
+///
+/// Distinct from `contained_regular_file`'s `Option`, which folds
+/// "absent" and "could not be established" into the same `None`. A
+/// progress observation has to tell those apart: an output that is
+/// definitively not there yet is a *known* state that can be compared
+/// across turn ends, while an output that could not be inspected, or
+/// that no longer addresses a file inside this Run's own area, is
+/// *unknown* — it is neither evidence of a change nor evidence that
+/// nothing changed.
+pub enum StagedObservation {
+    /// A regular file at exactly this Run's own canonical staged
+    /// address, held open. The descriptor is the same file object whose
+    /// identity was checked, so the bytes read from it are the bytes
+    /// that were checked.
+    Open(File),
+    /// No entry by that name, or no staging area yet, *at this Run's
+    /// own address*. A known state — and a state a missing entry alone
+    /// does not establish (`staging_address`).
+    Absent,
+    /// The name does not address a regular file inside this Run's own
+    /// staging area: a symlink at the name, or an ancestor — the
+    /// staging directory itself included — redirected away from the
+    /// address the estate's own trusted root derives.
+    OutOfBoundary,
+    /// The area could not be inspected at all.
+    Unreadable,
+}
+
+/// Whether this Run's own staging directory is *established* at the
+/// address the trusted estate root derives — the question a missing
+/// entry cannot answer for itself.
+///
+/// `symlink_metadata` answering `NotFound` says only that nothing is
+/// there under whatever directory the lookup happened to traverse into.
+/// That is known absence when the traversal stayed on this Run's own
+/// address, and unknown when it did not: a staging root or an ancestor
+/// replaced by a symlink — to an empty directory, or to nothing at all
+/// — produces the identical `NotFound`. So the address itself is walked
+/// one derived component at a time from the canonical estate root, each
+/// required to be a real directory and not a link, which is the same
+/// anchor and the same "no redirection below it" rule
+/// `observe_staged_output` applies to a file that *is* there.
+///
+/// A component that genuinely does not exist is `Missing`, not a
+/// failure: a Run that has never written an output has no staging
+/// directory, and that is a true, known "nothing staged".
+enum StagingAddress {
+    /// Every derived component exists and is a real directory.
+    Established,
+    /// A derived component does not exist at all.
+    Missing,
+    /// A derived component is not a real directory: a symlink
+    /// (dangling or not), or some other entry in a directory's place.
+    Redirected,
+    /// A derived component could not be inspected.
+    Unreadable,
+}
+
+fn staging_address(trusted_root: &Path, staging: &Path) -> StagingAddress {
+    let Ok(relative) = staging.strip_prefix(trusted_root) else {
+        return StagingAddress::Redirected;
+    };
+    let mut walked = trusted_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return StagingAddress::Redirected;
+        };
+        walked.push(part);
+        match fs::symlink_metadata(&walked) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return StagingAddress::Redirected,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return StagingAddress::Missing;
+            }
+            Err(_) => return StagingAddress::Unreadable,
+        }
+    }
+    StagingAddress::Established
+}
+
+/// Opens this Run's staged `name` for observation, or says why it
+/// could not be.
+///
+/// **Why not `contained_regular_file(staging_dir, ..)`.** That call
+/// canonicalizes *both* the root it is given and the candidate, and its
+/// callers here pass the staging directory itself as the root. A
+/// staging directory — or any ancestor of it — replaced by a symlink
+/// therefore moves both sides of the comparison together, and the
+/// prefix test passes against a directory outside the Work's own area.
+/// The root of a containment check has to be an anchor the thing being
+/// checked cannot move. Here that anchor is the **estate root**: the
+/// operator's own directory, established before any Run and not inside
+/// any actor's area. It is canonicalized once — so an estate legitimately
+/// reached through a symlinked path still resolves — and every component
+/// below it is then required to be exactly what `staged_path` derives,
+/// with no redirection of its own.
+///
+/// **What the identity check closes.** `symlink_metadata` proves the
+/// entry itself is a regular file, but the open that follows is a
+/// second, fresh path lookup. Comparing the opened descriptor's
+/// `(dev, ino)` against the entry that was inspected proves the file
+/// read is the file checked; a swap in between answers `OutOfBoundary`
+/// rather than digesting whatever replaced it.
+///
+/// **This is an observation, not Claim evidence.** It is deliberately
+/// weaker than `wirkd::server::read_staged_output`, whose `openat`/
+/// `O_NOFOLLOW` walk holds every ancestor open and repeats no lookup at
+/// all. That walk is what validates the bytes a Claim records. This one
+/// answers a repeated "did anything change?" and reports *unknown*
+/// whenever it cannot establish the answer, which is the safe direction
+/// for a question whose false answer would be "the actor is making
+/// progress".
+pub fn observe_staged_output(
+    estate_root: &Path,
+    work_id: &crate::WorkId,
+    run_id: &crate::RunId,
+    name: &str,
+) -> StagedObservation {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(trusted_root) = fs::canonicalize(estate_root) else {
+        return StagedObservation::Unreadable;
+    };
+    // The address the actor actually writes to, and the canonical
+    // address it must resolve to. Both are derived by the same function
+    // from the same ids; only the root differs.
+    let (Some(candidate), Some(expected)) = (
+        staged_path(estate_root, work_id, run_id, name),
+        staged_path(&trusted_root, work_id, run_id, name),
+    ) else {
+        return StagedObservation::OutOfBoundary;
+    };
+    let inspected = match fs::symlink_metadata(&candidate) {
+        Ok(meta) if meta.file_type().is_file() => (meta.dev(), meta.ino()),
+        Ok(_) => return StagedObservation::OutOfBoundary,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Nothing is there — but *there* has to be this Run's own
+            // address before "nothing" is a known state rather than a
+            // reading of some other directory (`staging_address`).
+            let Some(staging) = expected.parent() else {
+                return StagedObservation::OutOfBoundary;
+            };
+            return match staging_address(&trusted_root, staging) {
+                StagingAddress::Established | StagingAddress::Missing => StagedObservation::Absent,
+                StagingAddress::Redirected => StagedObservation::OutOfBoundary,
+                StagingAddress::Unreadable => StagedObservation::Unreadable,
+            };
+        }
+        Err(_) => return StagedObservation::Unreadable,
+    };
+    let Ok(canonical) = fs::canonicalize(&candidate) else {
+        return StagedObservation::Unreadable;
+    };
+    if canonical != expected {
+        return StagedObservation::OutOfBoundary;
+    }
+    let Ok(file) = File::open(&canonical) else {
+        return StagedObservation::Unreadable;
+    };
+    let Ok(opened) = file.metadata() else {
+        return StagedObservation::Unreadable;
+    };
+    if !opened.file_type().is_file() || (opened.dev(), opened.ino()) != inspected {
+        return StagedObservation::OutOfBoundary;
+    }
+    StagedObservation::Open(file)
+}
+
 /// Why a managed output could not be snapshotted.
 #[derive(Debug)]
 pub enum OutputWriteError {
@@ -519,6 +688,200 @@ mod tests {
         assert!(matches!(
             store_claimed_bytes(estate, &work, &claim, "../escape", b"x"),
             Err(OutputWriteError::Unaddressable(_))
+        ));
+    }
+
+    /// The case `contained_regular_file(staging_dir, ..)` cannot see:
+    /// the staging directory itself (or an ancestor of it) redirected
+    /// out of the Work's own area. Canonicalizing that directory as the
+    /// containment root moves the root along with the redirection, so
+    /// the prefix test passes. Anchored at the estate root instead, the
+    /// same swap is out of boundary.
+    #[test]
+    fn a_redirected_staging_root_or_ancestor_is_out_of_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let estate = dir.path().join("estate");
+        let work = WorkId("work-1".into());
+        let run = RunId("run-1".into());
+
+        // Elsewhere entirely: a directory no id of this Work addresses.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("elsewhere");
+        fs::write(elsewhere.join("report.md"), b"foreign bytes\n").expect("foreign file");
+
+        // The old check's own root, proving it passes on this input.
+        let staging = staging_dir(&estate, &work, &run).expect("staging path");
+        fs::create_dir_all(staging.parent().unwrap()).expect("staging parent");
+        std::os::unix::fs::symlink(&elsewhere, &staging).expect("redirect the staging root");
+        let candidate = staged_path(&estate, &work, &run, "report.md").expect("staged path");
+        assert!(
+            contained_regular_file(&staging, &candidate).is_some(),
+            "the prefix check anchored at the moved root passes — this is the defect"
+        );
+        assert!(
+            matches!(
+                observe_staged_output(&estate, &work, &run, "report.md"),
+                StagedObservation::OutOfBoundary
+            ),
+            "anchored at the estate root, the redirected staging root is out of boundary"
+        );
+
+        // The same, one level up: `outputs/staging` redirected.
+        fs::remove_file(&staging).expect("undo the root swap");
+        let staging_parent = staging.parent().unwrap().to_path_buf();
+        fs::remove_dir_all(&staging_parent).expect("clear staging parent");
+        std::os::unix::fs::symlink(&elsewhere, &staging_parent).expect("redirect an ancestor");
+        fs::create_dir_all(elsewhere.join(&run.0)).expect("target run dir");
+        fs::write(elsewhere.join(&run.0).join("report.md"), b"foreign\n").expect("foreign");
+        assert!(
+            matches!(
+                observe_staged_output(&estate, &work, &run, "report.md"),
+                StagedObservation::OutOfBoundary
+            ),
+            "a redirected ancestor is out of boundary too"
+        );
+    }
+
+    /// Legitimate use is unaffected, including an estate whose own path
+    /// is reached through a symlink: the estate root is canonicalized
+    /// once as the trusted anchor, so only redirection *below* it is a
+    /// boundary failure.
+    #[test]
+    fn ordinary_and_symlinked_estate_paths_observe_the_real_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let estate = dir.path().join("estate");
+        let work = WorkId("work-1".into());
+        let run = RunId("run-1".into());
+        let staging = ensure_staging_dir(&estate, &work, &run).expect("staging");
+        fs::write(staging.join("report.md"), b"real bytes\n").expect("write");
+
+        for root in [estate.clone(), {
+            let link = dir.path().join("estate-link");
+            std::os::unix::fs::symlink(&estate, &link).expect("symlink the estate path");
+            link
+        }] {
+            let StagedObservation::Open(mut file) =
+                observe_staged_output(&root, &work, &run, "report.md")
+            else {
+                panic!("a real declared output under {root:?} must be observable");
+            };
+            let mut read = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut read).expect("read");
+            assert_eq!(read, b"real bytes\n");
+        }
+
+        // Absent is a known state, and distinct from a boundary failure.
+        assert!(matches!(
+            observe_staged_output(&estate, &work, &run, "missing.md"),
+            StagedObservation::Absent
+        ));
+        // A symlink at the declared name itself is never followed.
+        let target = dir.path().join("target.md");
+        fs::write(&target, b"never read\n").expect("target");
+        std::os::unix::fs::symlink(&target, staging.join("linked.md")).expect("symlink");
+        assert!(matches!(
+            observe_staged_output(&estate, &work, &run, "linked.md"),
+            StagedObservation::OutOfBoundary
+        ));
+        // A directory where an output should be is not an output.
+        fs::create_dir(staging.join("adir")).expect("dir");
+        assert!(matches!(
+            observe_staged_output(&estate, &work, &run, "adir"),
+            StagedObservation::OutOfBoundary
+        ));
+        // An unaddressable name never becomes a path.
+        assert!(matches!(
+            observe_staged_output(&estate, &work, &run, ".."),
+            StagedObservation::OutOfBoundary
+        ));
+    }
+
+    /// Absence is only a *known* state when it was established at this
+    /// Run's own address. `symlink_metadata` answering `NotFound` says
+    /// nothing about which directory the name was looked up under: a
+    /// staging root — or an ancestor of it — redirected to an empty or
+    /// dangling destination produces exactly that `NotFound`, and
+    /// reporting it as `Absent` states "definitively nothing there yet"
+    /// about a directory outside the Work's own area. The present-file
+    /// case is caught by the canonical comparison below it; this is the
+    /// missing-file case, which never reaches that comparison.
+    #[test]
+    fn a_missing_entry_under_a_redirected_address_is_out_of_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = WorkId("work-1".into());
+        let run = RunId("run-1".into());
+
+        // Empty and dangling destinations, each in turn, for the
+        // staging root itself and for its `outputs/staging` ancestor.
+        // A fresh estate per case: a redirection is not undone by the
+        // next one, and each has to be observed on its own.
+        let empty = dir.path().join("empty");
+        fs::create_dir_all(&empty).expect("empty elsewhere");
+        let dangling = dir.path().join("nothing-here");
+        for (case, destination) in [
+            ("root-empty", empty.clone()),
+            ("root-dangling", dangling.clone()),
+            ("ancestor-empty", empty.clone()),
+            ("ancestor-dangling", dangling.clone()),
+        ] {
+            let estate = dir.path().join(format!("estate-{case}"));
+            let staging = staging_dir(&estate, &work, &run).expect("staging path");
+            let redirected = if case.starts_with("root") {
+                staging.clone()
+            } else {
+                staging.parent().expect("staging parent").to_path_buf()
+            };
+            fs::create_dir_all(redirected.parent().expect("parent")).expect("area");
+            std::os::unix::fs::symlink(&destination, &redirected).expect("redirect");
+            assert!(
+                matches!(
+                    observe_staged_output(&estate, &work, &run, "report.md"),
+                    StagedObservation::OutOfBoundary
+                ),
+                "{case}: a name missing from a redirected address is unknown, not known absence"
+            );
+        }
+
+        // Positive controls, on an estate nothing redirected: genuine
+        // absence stays known, before any staging directory exists and
+        // after a real output is legitimately deleted from a real one.
+        let estate = dir.path().join("estate-ordinary");
+        fs::create_dir_all(&estate).expect("estate root");
+        assert!(
+            matches!(
+                observe_staged_output(&estate, &work, &run, "report.md"),
+                StagedObservation::Absent
+            ),
+            "a Run that has never written an output is known to have none"
+        );
+        let staging = ensure_staging_dir(&estate, &work, &run).expect("staging");
+        assert!(matches!(
+            observe_staged_output(&estate, &work, &run, "report.md"),
+            StagedObservation::Absent
+        ));
+        fs::write(staging.join("report.md"), b"drafted\n").expect("write");
+        assert!(matches!(
+            observe_staged_output(&estate, &work, &run, "report.md"),
+            StagedObservation::Open(_)
+        ));
+        fs::remove_file(staging.join("report.md")).expect("delete");
+        assert!(
+            matches!(
+                observe_staged_output(&estate, &work, &run, "report.md"),
+                StagedObservation::Absent
+            ),
+            "a legitimate deletion inside a real staging directory is still known absence"
+        );
+
+        // And the same, through an estate legitimately reached by a
+        // symlinked path: the trusted anchor is the estate root
+        // *canonicalized*, so only redirection below it is a boundary
+        // failure and ordinary absence there stays known.
+        let link = dir.path().join("estate-ordinary-link");
+        std::os::unix::fs::symlink(&estate, &link).expect("symlink the estate path");
+        assert!(matches!(
+            observe_staged_output(&link, &work, &run, "report.md"),
+            StagedObservation::Absent
         ));
     }
 

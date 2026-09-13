@@ -1197,3 +1197,59 @@ fn a_staged_ancestor_symlink_out_of_the_area_is_refused_and_never_followed() {
 
     stop_wirkd(&estate, wirkd_child);
 }
+
+/// P4.7 completion (ruling 0250): the per-observation work budget the
+/// run loop applies to *progress observation*
+/// (`wirk-herdr/src/run_loop.rs::MAX_OBSERVED_BYTES`) is not a size
+/// limit on what a Waypoint may legitimately produce.
+///
+/// An artifact one byte past that budget — which the loop reports as an
+/// unknown observation rather than reading on every turn end — is still
+/// staged, still claimed, still validated, and still recorded at its
+/// own whole-file digest by the real daemon. Proved against a real
+/// `wirkd` and the real `wirk claim`, not against the loop's own
+/// constant: the two paths are independent, and this is the test that
+/// says so.
+#[test]
+fn an_artifact_past_the_progress_observation_budget_still_claims_and_validates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    let (wirkd_child, pointer) = start_wirkd(&estate);
+    let reviewer = read_bound_reviewer(&estate, &dir.path().join("repo"), &pointer.socket);
+
+    let staging = output_dir(&estate, &reviewer.work_id, &reviewer.run_id);
+    // One byte past the loop's own 64 MiB observation budget, written
+    // as real bytes (not a sparse hole): the daemon reads and digests
+    // every one of them.
+    let body = vec![b'w'; 64 * 1024 * 1024 + 1];
+    fs::write(staging.join("report.md"), &body).expect("actor writes a large output");
+
+    let (code, stdout) = claim(
+        &estate,
+        &reviewer.work_id,
+        &reviewer.run_id,
+        &["--output", "report.md"],
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "an artifact larger than the progress-observation budget must still claim: {stdout}"
+    );
+    assert_eq!(stdout, "Validated");
+    assert_eq!(state_of(&pointer.socket, &reviewer.work_id), "completed");
+
+    let evidence = evidence_for(&pointer.socket, &reviewer.work_id, "report.md");
+    assert_eq!(evidence["available"].as_bool(), Some(true));
+    let expected: String = <sha2::Sha256 as sha2::Digest>::digest(&body)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        evidence["digest"].as_str(),
+        Some(expected.as_str()),
+        "the receipt records the whole file's digest, not a budgeted prefix"
+    );
+
+    stop_wirkd(&estate, wirkd_child);
+}

@@ -68,14 +68,21 @@ mod atlas;
 // thin JSON-capable clients over wirkd's own Finding verbs.
 mod finding;
 
+/// P4.5 increment A (ruling 0256): `wirk estate storage` and
+/// `wirk estate clean` — the operator's view of what this estate owns,
+/// and the explicit, guarded way to remove an optional derivation from
+/// it. Its own module beside `atlas` and `finding` for the same reason
+/// those are: one noun, its own verbs, its own rendering.
+mod estate;
+
 use wirkd::{
     ClaimPayload, FailPayload, Reply, Request, RetryPayload, StatusPayload, SubmitPayload,
     WorkFailPayload,
 };
 
 use wirk_core::{
-    Access, ClaimId, ClaimKind, ClaimVerdict, DeterministicWorld, Event, EventId, EventKind,
-    ExecutionTriple, Executor, FailureCause, Journal, JournalError, OutputContract,
+    Access, ClaimId, ClaimKind, ClaimOrigin, ClaimVerdict, DeterministicWorld, Event, EventId,
+    EventKind, ExecutionTriple, Executor, FailureCause, Journal, JournalError, OutputContract,
     RepositoryBinding, RouteId, Run, RunId, RunObservation, SourceBasis, WaypointId, WorkId,
     WorkState, World, WorldHash,
 };
@@ -103,9 +110,10 @@ fn main() -> ExitCode {
         Some("finding") => finding::finding_command(&args[2..]),
         Some("world") => world_command(&args[2..]),
         Some("output") => output_command(&args[2..]),
+        Some("estate") => estate::estate_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json]"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json] | wirk estate storage|clean --estate <root> ..."
             );
             ExitCode::FAILURE
         }
@@ -126,9 +134,17 @@ fn claim(args: &[String]) -> ExitCode {
     let mut artifacts: BTreeMap<String, String> = BTreeMap::new();
     let mut outputs: BTreeSet<String> = BTreeSet::new();
     let mut question: Option<String> = None;
+    // Ruling 0257: stated by wirk's own turn-end hook and by nothing
+    // else. An actor typing `wirk claim` never passes it, which is the
+    // whole distinction — the hook fires because a turn ended, the
+    // actor files because it decided it was done.
+    let mut automatic = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--automatic" => {
+                automatic = true;
+            }
             "--artifact" => {
                 i += 1;
                 let Some(pair) = args.get(i) else {
@@ -269,6 +285,15 @@ fn claim(args: &[String]) -> ExitCode {
         kind,
         artifacts,
         outputs,
+        // Ruling 0257: carried to wirkd, which decides on it under its
+        // own journal lock. Nothing is pre-checked here: a hook that
+        // asked first and claimed second would still be racing whatever
+        // happened in between.
+        origin: Some(if automatic {
+            ClaimOrigin::Automatic
+        } else {
+            ClaimOrigin::Deliberate
+        }),
     };
 
     match wirkd::client::call(&pointer.socket, &Request::claim(payload)) {
@@ -1134,13 +1159,21 @@ fn world_usage() -> ExitCode {
 
 fn claim_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk claim [--artifact NAME=PATH]... [--output NAME]... [--question TEXT]\n  \
+        "usage: wirk claim [--artifact NAME=PATH]... [--output NAME]... [--question TEXT] \
+         [--automatic]\n  \
          --artifact  a file in this Run's own checkout, at the path you name\n  \
          --output    a declared output this Work owns, by name; run `wirk output` for where to \
          write it\n  \
-         with neither flag: claims every *required* declared output at its own name, addressed \
-         the way its World writes it — managed for an actor Waypoint, checkout for a \
-         deterministic one; an optional declared output is claimed only by naming it explicitly"
+         --question  ask instead of finishing: the Run stays open and the Work waits on the \
+         answer\n  \
+         --automatic wirk's own turn-end hook fired this, nobody decided it (ruling 0257): the \
+         daemon refuses such an attempt while this Run's own question is still standing, and \
+         leaves the question visible. Never pass it by hand — your own `wirk claim` is the \
+         deliberate completion that finishes this Run, question or no question\n  \
+         with none of --artifact/--output/--question: claims every *required* declared output at \
+         its own name, addressed the way its World writes it — managed for an actor Waypoint, \
+         checkout for a deterministic one; an optional declared output is claimed only by naming \
+         it explicitly"
     );
     ExitCode::from(1)
 }
@@ -2373,12 +2406,14 @@ fn work_clean_command(rest: &[String]) -> ExitCode {
     };
     let dry_run = rest.iter().any(|arg| arg == "--dry-run");
     let json = rest.iter().any(|arg| arg == "--json");
+    let outputs_staging = rest.iter().any(|arg| arg == "--outputs-staging");
 
     wirkd_client_call(
         &estate,
         &Request::clean(wirkd::CleanPayload {
             work_id: WorkId(work_id.clone()),
             dry_run,
+            outputs_staging,
         }),
         |result| {
             if json {
@@ -2404,11 +2439,28 @@ fn work_clean_command(rest: &[String]) -> ExitCode {
                         .join(", ")
                 })
                 .unwrap_or_default();
+            let outputs_staging_removed = result["outputs_staging_removed"]
+                .as_array()
+                .map(|runs| {
+                    runs.iter()
+                        .filter_map(|run| run.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
             let verb = if dry_run { "would clean" } else { "cleaned" };
             println!(
                 "{verb} {work_id} (runs: {runs}): worktree_removed={worktree_removed} \
-                 runtime_pins_removed=[{runtime_pins_removed}]"
+                 runtime_pins_removed=[{runtime_pins_removed}] \
+                 outputs_staging_removed=[{outputs_staging_removed}]"
             );
+            if !outputs_staging {
+                println!(
+                    "this Work's output staging was left in place; --outputs-staging removes it \
+                     too. A validated Claim's own artifacts are a separate write-once copy under \
+                     outputs/claims/ and are never touched either way"
+                );
+            }
         },
     )
 }
@@ -2900,9 +2952,61 @@ fn work_obligations_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json] | wirk work clean --estate <root> --work <id> [--dry-run] [--json]"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json] | wirk work clean --estate <root> --work <id> [--dry-run] [--outputs-staging] [--json]"
     );
     ExitCode::from(1)
+}
+
+/// Reject an unknown flag, an unexpected positional, and a flag whose
+/// value is missing — before the daemon is located and before anything
+/// is read.
+///
+/// `command` is the whole command as a reader types it (`atlas cancel`,
+/// `estate clean`), so one implementation serves every subcommand
+/// instead of each carrying its own copy of this loop.
+pub(crate) fn check_flags(
+    command: &str,
+    rest: &[String],
+    allowed: &[(&str, bool)],
+) -> Result<(), ExitCode> {
+    let mut index = 0;
+    while index < rest.len() {
+        let arg = &rest[index];
+        let Some((_, takes_value)) = allowed.iter().find(|(name, _)| name == arg) else {
+            if arg.starts_with('-') {
+                eprintln!(
+                    "wirk {command}: unknown flag {arg}\n\
+                     accepted flags: {}",
+                    allowed
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            } else {
+                eprintln!("wirk {command}: unexpected argument {arg}");
+            }
+            return Err(ExitCode::from(2));
+        };
+        index += 1;
+        if *takes_value {
+            if index >= rest.len() {
+                eprintln!("wirk {command}: {arg} requires a value");
+                return Err(ExitCode::from(2));
+            }
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Every value given for a repeatable `flag`, in command-line order.
+pub(crate) fn flag_values(args: &[String], flag: &str) -> Vec<String> {
+    args.iter()
+        .zip(args.iter().skip(1))
+        .filter(|(name, _)| name.as_str() == flag)
+        .map(|(_, value)| value.clone())
+        .collect()
 }
 
 /// Returns the value following `flag` in `args`, or `None` if the flag
@@ -3477,6 +3581,9 @@ fn demo_events() -> Vec<Event> {
                 claim_kind: ClaimKind::Done,
                 verdict: ClaimVerdict::Validated,
                 artifacts: Vec::new(),
+                // `journal demo`'s synthetic shape: nobody filed this,
+                // so there is no origin to state (ruling 0257).
+                origin: None,
             },
         ),
     ]

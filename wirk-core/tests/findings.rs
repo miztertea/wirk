@@ -178,6 +178,7 @@ fn claim_recorded_with(id: &str, run: &str, claim: &str, artifacts: Vec<Artifact
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
             artifacts,
+            origin: None,
         },
     }
 }

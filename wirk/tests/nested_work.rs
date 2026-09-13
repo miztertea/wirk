@@ -608,6 +608,7 @@ fn restart_reevaluates_held_container_after_crash_between_journals() {
             claim: wirk_core::ClaimId("claim-crash".to_string()),
             claim_kind: wirk_core::ClaimKind::Done,
             verdict: wirk_core::ClaimVerdict::Validated,
+            origin: None,
         },
     );
     let child_events = journal_events(&estate, &child.work_id);

@@ -116,6 +116,7 @@ fn claim_recorded(claim: &str, kind: ClaimKind, verdict: ClaimVerdict) -> EventK
         claim: ClaimId(claim.to_string()),
         claim_kind: kind,
         verdict,
+        origin: None,
     }
 }
 
@@ -259,6 +260,7 @@ fn d9_2_lifecycle_events_never_advance_a_waypoint() {
             verdict: ClaimVerdict::Refused(wirk_core::ClaimRefusal::MissingArtifact(
                 "report.md".to_string(),
             )),
+            origin: None,
         },
     ));
     assert!(matches!(run.state, RunState::Open));
@@ -274,6 +276,7 @@ fn d9_2_lifecycle_events_never_advance_a_waypoint() {
             claim: ClaimId("claim-question".to_string()),
             claim_kind: ClaimKind::Question("which base branch?".to_string()),
             verdict: ClaimVerdict::Validated,
+            origin: None,
         },
     ));
     assert!(matches!(run.state, RunState::Open));
@@ -286,6 +289,7 @@ fn d9_2_lifecycle_events_never_advance_a_waypoint() {
             claim: ClaimId("claim-good".to_string()),
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
+            origin: None,
         },
     ));
     match &run.state {
@@ -532,6 +536,7 @@ fn d9_5_vanished_run_ends_unresolved_not_complete() {
             claim: ClaimId("claim-late".to_string()),
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
+            origin: None,
         },
     ));
     match &run.state {

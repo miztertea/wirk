@@ -65,6 +65,12 @@ use wirk_core::{
 /// directly.
 mod boundary;
 pub mod client;
+/// P4.5 increment A (ruling 0256): what this estate owns, what still
+/// needs it, and what an explicit cleanup may therefore remove. Its own
+/// module because it is a self-contained derivation (classes, retention
+/// tiers, measurement discipline) rather than another face of the
+/// request handlers in `server`.
+mod inventory;
 pub mod server;
 
 // ---- Request ---------------------------------------------------------
@@ -200,6 +206,15 @@ pub enum Verb {
     /// blockers/eligible resources a real call would act on, with no
     /// mutation at all.
     Clean,
+    /// `wirk estate storage` (P4.5 increment A, ruling 0256): the
+    /// read-only inventory of what this estate owns, what still needs
+    /// it, and how much of the disk it occupies. Creates nothing,
+    /// removes nothing, and takes no slot.
+    EstateStorage,
+    /// `wirk estate clean` (P4.5 increment A, ruling 0256): explicit,
+    /// guarded, `--dry-run`-able removal of optional derivations this
+    /// estate owns. Never automatic, never age-based, never global.
+    EstateClean,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -285,6 +300,20 @@ impl Request {
         Request {
             verb: Verb::Fail,
             payload: serde_json::to_value(payload).expect("FailPayload always serializes"),
+        }
+    }
+
+    pub fn estate_storage(payload: EstateStoragePayload) -> Self {
+        Request {
+            verb: Verb::EstateStorage,
+            payload: serde_json::to_value(payload).expect("EstateStoragePayload always serializes"),
+        }
+    }
+
+    pub fn estate_clean(payload: EstateCleanPayload) -> Self {
+        Request {
+            verb: Verb::EstateClean,
+            payload: serde_json::to_value(payload).expect("EstateCleanPayload always serializes"),
         }
     }
 
@@ -566,6 +595,20 @@ pub struct ClaimPayload {
     /// client sends none and means none.
     #[serde(default)]
     pub outputs: BTreeSet<String>,
+    /// Ruling 0257: whether this Claim is wirk's own turn-end hook
+    /// firing (`ClaimOrigin::Automatic`, set by `wirk claim
+    /// --automatic` and by nothing else) or a decision someone took
+    /// (`Deliberate`). The daemon reads it at its own serialized
+    /// validation, which is the only place a decision cannot be raced
+    /// by a client-side pre-check: a hook that looked before it leapt
+    /// would still be submitting unconditionally a moment later.
+    ///
+    /// `#[serde(default)]` -> `None`: a client built before this field
+    /// existed states no automatic intent, and is treated as
+    /// deliberate — the behaviour it already had. The daemon acts only
+    /// on an explicit `Some(Automatic)`.
+    #[serde(default)]
+    pub origin: Option<wirk_core::ClaimOrigin>,
 }
 
 /// `status`'s payload (transport.md §2): the `Work` to report on.
@@ -736,6 +779,65 @@ pub struct CancelPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanPayload {
     pub work_id: WorkId,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// P4.5 increment A (ruling 0256): also remove this Work's own
+    /// `outputs/staging/<run>` scratch.
+    ///
+    /// Opt-in, and separate from the checkout for a reason worth
+    /// stating: a Claim's artifacts are an independent write-once copy
+    /// under `outputs/claims/`, taken at validation time, so staging is
+    /// genuinely optional once the Work is terminal — but an operator
+    /// who asked to tidy a checkout did not thereby ask to drop the
+    /// actor's own working files, and this verb does not decide that for
+    /// them. Every refusal the checkout half applies is checked first
+    /// and applies here too.
+    #[serde(default)]
+    pub outputs_staging: bool,
+}
+
+/// `estate storage`'s payload (P4.5 A, ruling 0256).
+///
+/// `work` carries the identical meaning it carries on `atlas status` and
+/// `atlas cancel`: present, this is a scoped read and the per-item
+/// identities — source aliases, generation and edition ids, other Works
+/// — are withheld, because naming them is the existence disclosure
+/// ruling 0095 removed from Work-scoped verbs. The class totals, the
+/// measurement caveats and this estate's own policy are answered either
+/// way, since none of them names anything a scoped caller may not know.
+/// Absent, this is estate administration, reached deliberately through
+/// `--admin` or an absent actor context, never by omission (ruling 0117).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstateStoragePayload {
+    #[serde(default)]
+    pub work: Option<WorkId>,
+}
+
+/// `estate clean`'s payload (P4.5 A, ruling 0256).
+///
+/// Administrative only, and deliberately: these assets belong to the
+/// estate rather than to any one Work, so there is no Work whose
+/// authority could scope their removal. A scoped caller is refused with
+/// that reason rather than silently answered administratively. A Work's
+/// *own* residue is reached through `wirk work clean`, which has a real
+/// authority model for it — the Work's own terminality.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstateCleanPayload {
+    #[serde(default)]
+    pub work: Option<WorkId>,
+    /// A name in `wirk_core::storage::CLEANABLE_CLASSES`.
+    pub class: String,
+    /// The exact item identities to remove. Mutually exclusive with
+    /// `all_unreferenced`; naming neither is refused rather than
+    /// defaulted, the same way `atlas cancel` refuses a missing target.
+    #[serde(default)]
+    pub ids: Vec<String>,
+    /// Every item in the class that nothing this estate records still
+    /// needs. Still selected item by item, still reported item by item.
+    #[serde(default)]
+    pub all_unreferenced: bool,
+    /// Run every guard and report exactly what a real call would act on,
+    /// with no mutation at all.
     #[serde(default)]
     pub dry_run: bool,
 }

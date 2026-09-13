@@ -75,48 +75,17 @@ fn is_json(rest: &[String]) -> bool {
 /// unsupported flag must fail visibly instead of quietly changing what
 /// the caller thinks the request was — the same honesty rule the JSON
 /// dispositions already follow.
+/// This module's own spelling of the shared checker: every verb here is
+/// `wirk atlas <verb>`, so the prefix is supplied once instead of at
+/// eleven call sites (R2 — one implementation, in `crate`).
 fn check_flags(verb: &str, rest: &[String], allowed: &[(&str, bool)]) -> Result<(), ExitCode> {
-    let mut index = 0;
-    while index < rest.len() {
-        let arg = &rest[index];
-        let Some((_, takes_value)) = allowed.iter().find(|(name, _)| name == arg) else {
-            if arg.starts_with('-') {
-                eprintln!(
-                    "wirk atlas {verb}: unknown flag {arg}\n\
-                     accepted flags: {}",
-                    allowed
-                        .iter()
-                        .map(|(name, _)| *name)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
-            } else {
-                eprintln!("wirk atlas {verb}: unexpected argument {arg}");
-            }
-            return Err(ExitCode::from(2));
-        };
-        index += 1;
-        if *takes_value {
-            if index >= rest.len() {
-                eprintln!("wirk atlas {verb}: {arg} requires a value");
-                return Err(ExitCode::from(2));
-            }
-            index += 1;
-        }
-    }
-    Ok(())
+    crate::check_flags(&format!("atlas {verb}"), rest, allowed)
 }
 
 const ESTATE: (&str, bool) = ("--estate", true);
 const JSON: (&str, bool) = ("--json", false);
 
-fn flag_values(rest: &[String], flag: &str) -> Vec<String> {
-    rest.iter()
-        .zip(rest.iter().skip(1))
-        .filter(|(name, _)| name.as_str() == flag)
-        .map(|(_, value)| value.clone())
-        .collect()
-}
+use crate::flag_values;
 
 /// The first 16 characters of a digest, for a line a human reads. The
 /// full value is always in `--json`; this never replaces it.

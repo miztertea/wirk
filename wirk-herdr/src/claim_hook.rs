@@ -26,7 +26,8 @@
 //! opencode's config above
 //! (`<estate>/.wirk/claude/<run_id>/wirk-claim-plugin/`). The plugin
 //! declares a `Stop` hook (`type: "command"`) running the driver's own
-//! binary, by absolute path, with `claim` and nothing else — no
+//! binary, by absolute path, with `claim --automatic` and nothing
+//! else — no
 //! permissions, no other hooks, no commands, no agents, no MCP servers
 //! (0054 D163a: no permission policy is written by wirk).
 //!
@@ -44,6 +45,18 @@
 //! wirkd's validator judge — a refused claim is state the run loop
 //! already acts on (0049, 0052, 0044); neither hook pre-checks
 //! anything.
+//!
+//! Ruling 0257: both hooks now say *which* of the two they are, with
+//! `claim --automatic`. That word is the only thing wirkd could not
+//! otherwise recover — a hook-filed Claim and a hand-typed one were
+//! byte-identical on the wire — and it is read at wirkd's own
+//! serialized validation, never here: a hook that checked for a
+//! standing question and then submitted anyway would simply have
+//! moved the race into the gap between the two calls. The effect is
+//! narrow: an automatic attempt no longer completes a Run whose own
+//! `wirk claim --question` is still unanswered. Everything else is
+//! unchanged, the actor's own deliberate `wirk claim` included — that
+//! is still what finishes the Run, after an answer or without one.
 //!
 //! `hook_installed_for` is the one predicate for "does this Run's
 //! actor kind get wirk's own Claim-filing hook" — shared by the
@@ -519,12 +532,14 @@ pub fn claude_plugin_manifest_json() -> serde_json::Value {
 }
 
 /// The plugin's hook file: a `Stop` hook (`type: "command"`) running
-/// `<exe> claim` — `exe` shell-quoted (`shell_quote`) so a path
-/// containing spaces or shell metacharacters still names exactly one
-/// command, `claim` bare (W1's flagless form asks wirkd for the
-/// Waypoint's declared outputs itself) — and nothing else. Byte-for-byte
-/// the same hook entry the `--settings` file used to carry; only the
-/// envelope that delivers it changed.
+/// `<exe> claim --automatic` — `exe` shell-quoted (`shell_quote`) so a
+/// path containing spaces or shell metacharacters still names exactly
+/// one command; no `--artifact`/`--output` (W1's flagless form asks
+/// wirkd for the Waypoint's declared outputs itself) and `--automatic`
+/// to state that a turn ended rather than that anyone decided
+/// (ruling 0257) — and nothing else. Otherwise the same hook entry the
+/// `--settings` file used to carry; only the envelope that delivers it
+/// changed.
 pub fn claude_plugin_hooks_json(exe: &Path) -> serde_json::Value {
     serde_json::json!({
         "hooks": {
@@ -533,7 +548,7 @@ pub fn claude_plugin_hooks_json(exe: &Path) -> serde_json::Value {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": format!("{} claim", shell_quote(exe))
+                            "command": format!("{} claim --automatic", shell_quote(exe))
                         }
                     ]
                 }

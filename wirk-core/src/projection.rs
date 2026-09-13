@@ -1218,6 +1218,23 @@ impl DeliveredContent {
         }
     }
 
+    /// The captured admitted generation vector this projection was
+    /// assembled against, whatever format wrote it.
+    ///
+    /// Every format has carried one, because it is what makes a World
+    /// resolvable at all. Exposed for the storage inventory (P4.5 A,
+    /// ruling 0256): deciding whether a generation is still required
+    /// means asking which delivered Worlds name it, and that question
+    /// must not be answered by re-parsing these files by hand somewhere
+    /// else.
+    pub fn generations(&self) -> &[(String, String)] {
+        match self {
+            Self::V3(content) => &content.generations,
+            Self::V2(content) => &content.generations,
+            Self::V1(content) => &content.generations,
+        }
+    }
+
     pub fn waypoint(&self) -> &WaypointId {
         match self {
             Self::V3(content) => &content.waypoint,

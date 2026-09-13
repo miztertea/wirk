@@ -206,14 +206,56 @@ impl JobContext {
     }
 }
 
+/// Where one estate's Atlas keeps each kind of thing it owns.
+///
+/// One owner for the layout, as a free function so a caller that is
+/// *inventorying* the estate can name these paths without opening the
+/// store and taking its exclusive lock (P4.5 A, ruling 0256). Reading
+/// what is on disk must not require becoming the estate's single writer;
+/// it must also never invent a second spelling of these joins, which is
+/// why `AtlasStore::open` resolves its own root through here.
+#[derive(Debug, Clone)]
+pub struct AtlasLayout {
+    /// `<estate>/atlas`.
+    pub root: PathBuf,
+    /// `<estate>/atlas/generations` — one immutable directory per
+    /// acquired generation (`manifest.json` + `resources.ndjson`). The
+    /// indexed *bytes* are not here: they are read live from the source
+    /// repository (`crate::git::blob`), which is why removing a
+    /// generation never removes anything the user authored.
+    pub generations: PathBuf,
+    /// `<estate>/atlas/semantic` — one directory per semantic edition.
+    pub editions: PathBuf,
+    /// `<estate>/atlas/catalog.json` — memberships, publications and
+    /// selections. Never an optional asset.
+    pub catalog: PathBuf,
+    /// `<estate>/atlas/findings.ndjson` — the derived findings index.
+    pub findings_index: PathBuf,
+    /// `<estate>/atlas/.owner` — B1's ownership lock file.
+    pub owner_lock: PathBuf,
+}
+
+pub fn atlas_layout(estate_root: &Path) -> AtlasLayout {
+    let root = estate_root.join("atlas");
+    AtlasLayout {
+        generations: root.join("generations"),
+        editions: root.join("semantic"),
+        catalog: root.join("catalog.json"),
+        findings_index: root.join(crate::findings::FINDINGS_INDEX_FILE),
+        owner_lock: root.join(".owner"),
+        root,
+    }
+}
+
 impl AtlasStore {
     pub fn open(
         estate_root: impl AsRef<Path>,
         scope: impl Into<String>,
     ) -> Result<Self, AtlasError> {
         let estate_root = estate_root.as_ref();
-        let root = estate_root.join("atlas");
-        fs::create_dir_all(root.join("generations"))?;
+        let layout = atlas_layout(estate_root);
+        let root = layout.root.clone();
+        fs::create_dir_all(&layout.generations)?;
         // B1: ownership BEFORE the sweep. Everything below this point
         // assumes no other live store holds this estate's atlas; that
         // assumption is only sound because the claim was taken first.
@@ -222,7 +264,7 @@ impl AtlasStore {
             eprintln!("wirk: {note}");
         }
         let owner = match wirk_core::jobs::OwnerLock::acquire_within(
-            &root.join(".owner"),
+            &layout.owner_lock,
             "AtlasStore",
             std::time::Duration::from_millis(policy.store_ownership_wait_millis),
         )? {
@@ -872,6 +914,19 @@ impl AtlasStore {
     /// Reads the same private in-memory catalog snapshot every other
     /// query reads, so a selection is visible to this handle exactly when
     /// its catalog write committed.
+    /// The generation id this membership currently publishes, **without
+    /// reading it back**.
+    ///
+    /// [`Self::current`] resolves the whole generation from disk and
+    /// therefore fails once its bytes are gone — which is correct for a
+    /// reader and exactly wrong for an inventory, whose whole job is to
+    /// say which ids are retained *before* deciding what may be removed.
+    /// A retention set built from `current` would forget to protect a
+    /// published generation the moment it became unreadable.
+    pub fn published_generation(&self, membership: &Membership) -> Option<GenerationId> {
+        self.catalog.published.get(&membership.id.0).cloned()
+    }
+
     pub fn selected_semantic(&self, membership: &Membership) -> Option<crate::EditionId> {
         self.catalog
             .semantic_selected

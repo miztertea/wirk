@@ -27,6 +27,11 @@ fn fixture_text(name: &str) -> &'static str {
     match name {
         "smoke" => include_str!("../fixtures/routes/smoke.json"),
         "proving" => include_str!("../fixtures/routes/proving.json"),
+        // Ruling 0257: one Actor Waypoint with one required *managed*
+        // declared output, so a Validated Done completes the Work
+        // outright — which is exactly what an automatic attempt must
+        // not do over a standing question.
+        "actor_question_hold" => include_str!("../fixtures/routes/actor_question_hold.json"),
         "proving_reversed" => include_str!("../fixtures/routes/proving_reversed.json"),
         "three_waypoint" => include_str!("../fixtures/routes/three_waypoint.json"),
         "two_waypoint_distinctive" => {

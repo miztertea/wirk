@@ -88,8 +88,8 @@ fn the_stop_hooks_command_runs_the_drivers_own_binary_with_the_panes_env() {
         .as_str()
         .expect("Stop hook command is a string")
         .to_string();
-    assert_ne!(command, "wirk claim");
-    assert!(command.ends_with(" claim"), "{command:?}");
+    assert_ne!(command, "wirk claim --automatic");
+    assert!(command.ends_with(" claim --automatic"), "{command:?}");
 
     let record = dir.path().join("record.txt");
 
@@ -119,8 +119,10 @@ fn the_stop_hooks_command_runs_the_drivers_own_binary_with_the_panes_env() {
 
     let recorded = std::fs::read_to_string(&record).expect("fake wirk must have run and recorded");
     assert!(
-        recorded.starts_with("ARGV:claim\n"),
-        "the hook command must run the driver's own binary with exactly `claim`, got: {recorded}"
+        recorded.starts_with("ARGV:claim --automatic\n"),
+        "the hook command must run the driver's own binary with exactly `claim --automatic` \
+         (ruling 0257: the hook states that a turn ended, not that anyone decided), got: \
+         {recorded}"
     );
     assert!(recorded.contains("WIRK_ESTATE_ROOT=/estate/sentinel\n"));
     assert!(recorded.contains("WIRK_WORK_ID=work-sentinel\n"));
@@ -172,5 +174,8 @@ fn the_written_plugin_hooks_file_names_the_same_absolute_driver_command() {
     let status = child.wait().expect("wait for sh");
     assert!(status.success(), "sh -c {command:?} exited non-zero");
     let recorded = std::fs::read_to_string(&record).expect("fake wirk must have run and recorded");
-    assert!(recorded.starts_with("ARGV:claim\n"), "got: {recorded}");
+    assert!(
+        recorded.starts_with("ARGV:claim --automatic\n"),
+        "got: {recorded}"
+    );
 }

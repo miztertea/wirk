@@ -38,6 +38,7 @@ fn claim_recorded_event(id: &str, work: &str, run: &str, claim: &str) -> Event {
             claim: ClaimId(claim.to_string()),
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
+            origin: None,
         },
     }
 }
@@ -317,6 +318,7 @@ fn replay_then_fold_equals_folding_the_original_events() {
                 claim: ClaimId("claim-1".to_string()),
                 claim_kind: ClaimKind::Done,
                 verdict: ClaimVerdict::Validated,
+                origin: None,
             },
         },
     ];
@@ -417,6 +419,7 @@ fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
                 claim: ClaimId("claim-1".to_string()),
                 claim_kind: ClaimKind::Done,
                 verdict: ClaimVerdict::Validated,
+                origin: None,
             },
         },
     ];
@@ -463,6 +466,7 @@ fn replay_then_fold_two_waypoints_completes_only_after_the_last() {
                 claim: ClaimId("claim-2".to_string()),
                 claim_kind: ClaimKind::Done,
                 verdict: ClaimVerdict::Validated,
+                origin: None,
             },
         },
     ];
@@ -572,6 +576,7 @@ fn fold_leaves_work_state_unchanged_on_a_refused_question_claim() {
                 claim: ClaimId("claim-1".to_string()),
                 claim_kind: ClaimKind::Question("what next?".to_string()),
                 verdict: ClaimVerdict::Refused(wirk_core::ClaimRefusal::TripleMismatch),
+                origin: None,
             },
         },
     ];

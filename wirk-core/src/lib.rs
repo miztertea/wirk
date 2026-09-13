@@ -36,6 +36,13 @@ use thiserror::Error;
 /// `Work`/`Run`/`Event`.
 pub mod jobs;
 pub mod outputs;
+
+/// P4.5 increment A (ruling 0256): what this estate's own derivations
+/// actually occupy on disk. Its own module for the same reason `jobs`
+/// is one — a self-contained measurement contract (apparent vs
+/// allocated vs unique-by-inode bytes, symlink and budget discipline,
+/// disclosed partiality) rather than another face of `Work`/`Run`.
+pub mod storage;
 pub use outputs::ArtifactStore;
 
 /// P3 W-C1: the stage projection — the delivered, immutable, inspectable
@@ -354,9 +361,13 @@ pub struct Work {
     /// reading.
     pub last_activity: Timestamp,
     /// P2.3 W1 (0033 D102; 0044): why the Work is (or last was)
-    /// `NeedsInput` — a failed Run, a vanished Run, a stuck actor
-    /// (`RunFailed` with `cause.status == Some("stuck")`), or a
-    /// validated Question claim. Set by `fold` on the transition, left
+    /// `NeedsInput` — a failed Run, a vanished Run, an actor with no
+    /// observable progress (P4.7, ruling 0243/0248: `LifecycleObserved{
+    /// status: "NoObservableProgress"}`, reason `"no_observable_progress"`
+    /// — no longer a `RunFailed`, since the Run itself stays `Open`, and
+    /// no longer the word "stuck": that public reason must say exactly
+    /// what was observed, never a verdict on the actor), or a validated
+    /// Question claim. Set by `fold` on the transition, left
     /// as history once the Work moves on (a retry verb clearing it is
     /// P2.3 W2's decision, out of scope here). `#[serde(default)]`: a
     /// `Work` is never itself journaled, only rebuilt fresh by `fold`
@@ -537,10 +548,12 @@ pub enum OutcomeReceipt {
 pub struct NeedsInputCause {
     pub run: RunId,
     /// `"run_failed"` | `"run_vanished"` | `"question"` | `"blocked"`
-    /// (ruling 0052 D156, P2.6 W2) — a stuck actor is a `RunFailed` too
-    /// (states.md §1), distinguished by `cause.status ==
-    /// Some("stuck")` on the Run, not a fifth string here. `"blocked"`
-    /// is the one reason `fold` also clears on its own (a later
+    /// (ruling 0052 D156, P2.6 W2) | `"no_observable_progress"` (P4.7,
+    /// ruling 0243/0248: journaled from `LifecycleObserved{status:
+    /// "NoObservableProgress"}`, never a `RunFailed` — the Run itself
+    /// stays `Open`, so this reason names exactly what was observed and
+    /// never asserts the actor failed or is "stuck"). `"blocked"` is the
+    /// one reason `fold` also clears on its own (a later
     /// `LifecycleObserved{Working}`), never through a human verb.
     pub reason: String,
     pub detail: String,
@@ -2307,6 +2320,49 @@ pub enum ClaimRefusal {
     /// not stale — so only `Claimed` refuses here). J1, recorded in the
     /// closing ruling.
     AlreadyClaimed,
+    /// Ruling 0257: an **automatic** `Done` attempt (`ClaimOrigin::
+    /// Automatic` — the turn-end Stop/idle hook, `wirk-herdr/src/
+    /// claim_hook.rs`) arrived while this same Run's own deliberate
+    /// `Question` is still standing. Carries the standing question's
+    /// text, so the refusal names the hold it preserved rather than
+    /// only reporting a failure.
+    ///
+    /// Deliberately **not** a refusal of the actor's own explicit
+    /// completion command: `wirk claim` typed by the actor (or any
+    /// caller that does not state automatic intent) still finishes the
+    /// same Run once it is ready, which is how a Question is answered
+    /// and the work closed out today. It is also not a refusal of an
+    /// ordinary automatic completion: with no standing question of this
+    /// Run's own, nothing here fires.
+    QuestionOutstanding(String),
+}
+
+/// Ruling 0257: *who asked for this Claim*, carried on the wire and
+/// journaled with the record — the one thing the daemon could not see
+/// before, and the only thing that distinguishes a turn boundary from
+/// a decision.
+///
+/// `Automatic` is stated by wirk's own turn-end hook and by nothing
+/// else: both hook implementations (`wirk-herdr/src/claim_hook.rs`'s
+/// claude `Stop` plugin and `wirk-claim-plugin.js`'s opencode
+/// `session.idle`) run `<wirk> claim --automatic`. `Deliberate` is
+/// every claim a caller actually decided to file — an actor typing
+/// `wirk claim`, an executor filing its own Run's Claim, an operator.
+///
+/// There is no third "unknown" variant on the wire because there is
+/// nothing to express: a payload that carries no `origin` at all (a
+/// client built before this field existed) means its sender never
+/// stated automatic intent, which is exactly `Deliberate`'s decision.
+/// What is *not* invented is history: `EventKind::ClaimRecorded`
+/// carries `Option<ClaimOrigin>`, and a journal written before this
+/// change replays as `None` — origin not recorded — rather than being
+/// back-filled with a value nobody stated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaimOrigin {
+    /// Fired by wirk's own turn-end hook, not decided by anyone.
+    Automatic,
+    /// Filed because a caller chose to file it.
+    Deliberate,
 }
 
 /// A Claim's completion verb (0001 D5: "the completion/question verb"),
@@ -3027,6 +3083,14 @@ pub enum EventKind {
         /// names and a mutable path.
         #[serde(default)]
         artifacts: Vec<ArtifactReceipt>,
+        /// Ruling 0257: the origin the filing client actually stated.
+        /// `None` — and `#[serde(default)]` is what produces it — is a
+        /// record from before origin existed: *not stated*, never
+        /// silently re-read as either value. A reader asking "was this
+        /// one the hook's?" gets `Some(Automatic)`, `Some(Deliberate)`
+        /// or an honest "that was not recorded".
+        #[serde(default)]
+        origin: Option<ClaimOrigin>,
     },
     /// D9#6.
     WorktreeCreated {
@@ -3300,6 +3364,17 @@ pub enum EventKind {
         runtime_pins_removed: Vec<RunId>,
         #[serde(default = "default_work_cleaned_complete")]
         complete: bool,
+        /// P4.5 increment A (ruling 0256): the Runs whose own
+        /// `outputs/staging/<run>` scratch this call removed.
+        ///
+        /// Additive and `default`ed, exactly as `complete` above already
+        /// is: a journal written before this field existed replays
+        /// unchanged as "this call removed no staging", which is the
+        /// truth about it. An event id is assigned by the journal rather
+        /// than hashed from this content, so no recorded identity moves
+        /// because this field exists.
+        #[serde(default)]
+        outputs_staging_removed: Vec<RunId>,
     },
     /// W-A (§3.1): explicit journaled identity for one container
     /// occurrence, even though a container has no execution Run
@@ -3562,6 +3637,43 @@ pub fn fold(events: &[Event]) -> Work {
                                 .clone()
                                 .expect("LifecycleObserved always names a run"),
                             reason: "blocked".into(),
+                            detail: detail.clone().unwrap_or_default(),
+                        });
+                    }
+                }
+                // P4.7 (ruling 0243/0248, C2/B): the loop's own
+                // no-progress check (`wirk-herdr/src/run_loop.rs`) used
+                // to journal `RunFailed{status: "stuck"}` here, which set
+                // `RunState::Failed` and thereafter left `wirkd`'s
+                // `record` handler refusing every further write for the
+                // Run. That did not, itself, foreclose the actor's own
+                // late, legitimate Claim — `handle_claim_inner` gates on
+                // the Work's terminal state, never the Run's, and never
+                // goes through `record` — but it did foreclose this loop
+                // ever observing or correcting that Run again, over an
+                // actor that may genuinely be waiting on a live
+                // background job or a correctly-refused intermediate
+                // Claim (neither is observable through any installed
+                // interface today, QUALIFICATION.md). `LifecycleObserved`
+                // is inert on the Run (D9#2, `Run::apply`'s own `{ .. }`
+                // arm) — this arm surfaces the Work as `NeedsInput`
+                // exactly as `Blocked` does, but the Run itself stays
+                // `Open`, so a later valid Claim on it is still folded
+                // truthfully (`ClaimRecorded` arm, `Run::apply`) and an
+                // explicit retry's own `RunOpened` clears this
+                // `NeedsInput` the same as any other (the arm above,
+                // unconditional on `w.state == NeedsInput`). The reason
+                // is `"no_observable_progress"`, not `"stuck"`: it names
+                // what was observed, never a verdict on the actor.
+                "NoObservableProgress" => {
+                    if !w.state.is_terminal() {
+                        w.state = WorkState::NeedsInput;
+                        w.needs_input = Some(NeedsInputCause {
+                            run: event
+                                .run
+                                .clone()
+                                .expect("LifecycleObserved always names a run"),
+                            reason: "no_observable_progress".into(),
                             detail: detail.clone().unwrap_or_default(),
                         });
                     }
@@ -4069,6 +4181,7 @@ fn deterministic_verified_readiness(
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
             artifacts,
+            ..
         } = &claim_event.kind
         else {
             continue;

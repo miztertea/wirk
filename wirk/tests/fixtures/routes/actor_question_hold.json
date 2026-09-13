@@ -1,0 +1,12 @@
+{
+  "id": "actor-question-hold",
+  "waypoints": [
+    {
+      "id": "actor-question-hold/report",
+      "kind": "Actor",
+      "intent": "write REPORT.md and return it",
+      "declared_outputs": [{"name": "REPORT.md", "required": true}],
+      "boundary": []
+    }
+  ]
+}
