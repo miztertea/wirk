@@ -224,6 +224,57 @@ struct Estate {
     scratch: PathBuf,
 }
 
+/// An estate whose store has been **ended**, the way a daemon restart
+/// ends it.
+///
+/// P4.5 B1 (ruling 0237) makes `AtlasStore` ownership exclusive for the
+/// store's whole lifetime, so "reopen" now means what it always said it
+/// meant: the previous owner is gone before the next one opens. The
+/// checks below were written when nothing was owned, so they held a live
+/// store and opened a second one beside it — which is precisely the
+/// concurrent-opener case B1 refuses, and which destroyed a live build's
+/// staging at `bf16369`. Releasing first is the correction; the contract
+/// each check pins is unchanged.
+struct ReleasedEstate {
+    _repo: TempDir,
+    _home: TempDir,
+    root: PathBuf,
+    membership: Membership,
+    generation: wirk_atlas::GenerationId,
+    backend: PathBuf,
+    model: PathBuf,
+    #[allow(dead_code)]
+    scratch: PathBuf,
+}
+
+impl Estate {
+    fn release(self) -> ReleasedEstate {
+        let Estate {
+            _repo,
+            _home,
+            root,
+            store,
+            membership,
+            generation,
+            backend,
+            model,
+            scratch,
+        } = self;
+        // The point of the whole exercise: the owner goes away first.
+        drop(store);
+        ReleasedEstate {
+            _repo,
+            _home,
+            root,
+            membership,
+            generation,
+            backend,
+            model,
+            scratch,
+        }
+    }
+}
+
 fn estate() -> Estate {
     estate_with_backend("honest")
 }
@@ -437,6 +488,7 @@ fn c_selection_survives_reopen() {
         .unwrap()
         .unwrap();
 
+    let estate = estate.release();
     let reopened = AtlasStore::open(&estate.root, estate.root.display().to_string()).unwrap();
     assert_eq!(
         reopened.selected_semantic(&membership),
@@ -451,7 +503,7 @@ fn c_selection_survives_reopen() {
 /// selected. The migration is additive.
 #[test]
 fn d_old_catalog_without_semantic_field_still_opens() {
-    let estate = estate();
+    let estate = estate().release();
     let catalog_path = estate.root.join("atlas").join("catalog.json");
     let mut catalog: serde_json::Value =
         serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
@@ -956,7 +1008,10 @@ fn o_mapping_rows_resolve_to_the_committed_bytes() {
 /// store failure.
 #[test]
 fn p_an_interrupted_build_stages_nothing() {
-    let estate = estate();
+    // B1: the child opens this same estate, so this process must not
+    // still own it. A real interrupted build is a *sole* owner crashing,
+    // which is exactly what releasing here reproduces.
+    let estate = estate().release();
     let output = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg("child_build_crash")
@@ -1005,6 +1060,9 @@ fn q_an_interrupted_selection_preserves_the_previous_selection() {
         .unwrap()
         .unwrap();
     let revision = estate.store.publication_revision();
+    // B1: same reason as `p` — the child is this estate's sole owner
+    // while it runs.
+    let estate = estate.release();
 
     let output = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")

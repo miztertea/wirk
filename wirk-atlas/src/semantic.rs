@@ -2503,6 +2503,12 @@ fn run_backend_v2(
     output: &Path,
     chunks: &Path,
     scratch: &Path,
+    jobs: &crate::store::JobContext,
+    staging: &Path,
+    // `scope`: the source alias this build is for — the target an
+    // operator names when cancelling, so a cancellation can reach one
+    // build rather than every job in the estate.
+    scope: &str,
 ) -> Result<EmbedV2Reply, String> {
     use std::process::{Command, Stdio};
     let mut command = Command::new(program);
@@ -2516,13 +2522,6 @@ fn run_backend_v2(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        format!(
-            "backend {} could not be started: {error}",
-            program.display()
-        )
-    })?;
-    let mut stdin = child.stdin.take().expect("stdin was piped");
     let header = serde_json::to_vec(&EmbedV2Header {
         protocol: EMBED_PROTOCOL_V2,
         mode,
@@ -2535,19 +2534,44 @@ fn run_backend_v2(
         path_convention: RANKING_PATH_CONVENTION,
     })
     .map_err(|error| format!("backend request could not be encoded: {error}"))?;
-    let write = (|| -> std::io::Result<()> {
-        stdin.write_all(&header)?;
-        stdin.write_all(b"\n")?;
-        for input in inputs {
-            stdin.write_all(&serde_json::to_vec(input)?)?;
-            stdin.write_all(b"\n")?;
+    // The request bytes are moved onto the writer thread the bounded
+    // child owns: the parent must not block writing a large request into
+    // a pipe whose reader has already been killed by the deadline.
+    let mut request = Vec::new();
+    request.extend_from_slice(&header);
+    request.push(b'\n');
+    for input in inputs {
+        request.extend_from_slice(
+            &serde_json::to_vec(input)
+                .map_err(|error| format!("backend request could not be encoded: {error}"))?,
+        );
+        request.push(b'\n');
+    }
+    // P4.5 B2 (ruling 0237): both backend protocols run under the same
+    // containment. Before this the spawn had no process group, no
+    // PDEATHSIG, no deadline and no kill — measured at `bf16369`, a
+    // backend of this shape outlived its parent, was reparented to
+    // `systemd --user`, and kept an inherited file lock held.
+    let finished = match jobs
+        .child("semantic build backend", scope, Some(staging.to_path_buf()))
+        .run(command, move |stdin| {
+            stdin.write_all(&request)?;
+            stdin.flush()
+        }) {
+        wirk_core::jobs::ChildEnd::Finished(output) => output,
+        wirk_core::jobs::ChildEnd::Cancelled { reason, elapsed } => {
+            return Err(format!(
+                "backend {} {reason} after {:.1}s and its job was killed; this is a bound this \
+                 estate applied, not a backend failure",
+                program.display(),
+                elapsed.as_secs_f64()
+            ));
         }
-        stdin.flush()
-    })();
-    drop(stdin);
-    let finished = child
-        .wait_with_output()
-        .map_err(|error| format!("backend {} failed: {error}", program.display()))?;
+        wirk_core::jobs::ChildEnd::Failed(detail) => {
+            return Err(format!("backend {} {detail}", program.display()));
+        }
+    };
+    let write: std::io::Result<()> = Ok(());
     if !finished.status.success() {
         return Err(format!(
             "backend {} exited {} : {}",
@@ -3062,6 +3086,9 @@ impl crate::AtlasStore {
             &vectors_path,
             &chunks_path,
             &scratch,
+            self.jobs(),
+            staging,
+            &membership.alias,
         ) {
             Ok(reply) => reply,
             Err(reason) => return Ok(SemanticBuildOutcome::Refused(reason)),

@@ -765,6 +765,18 @@ type SemanticOutcome = Result<
 /// retrieval side owns — which of those sources has a verified, current,
 /// compatible edition — and it applies the family filter to *rows* before
 /// the view exists, so an excluded row never reaches a corpus statistic.
+/// The cancellable target of one ranking: the source aliases it covers,
+/// sorted and joined so the same set always names itself the same way.
+fn query_scope(memberships: &[crate::Membership]) -> String {
+    let mut aliases: Vec<&str> = memberships
+        .iter()
+        .map(|membership| membership.alias.as_str())
+        .collect();
+    aliases.sort_unstable();
+    aliases.dedup();
+    aliases.join(",")
+}
+
 fn semantic_attempt(
     store: &AtlasStore,
     request: &SearchRequest,
@@ -855,6 +867,8 @@ fn semantic_attempt(
         &request.query,
         capacity,
         pinned_producer,
+        store.jobs(),
+        &query_scope(memberships),
     )? {
         Ok(result) => result,
         Err(detail) => return Ok(Err(detail)),

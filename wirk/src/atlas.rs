@@ -11,9 +11,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::wirkd::{
-    AtlasAcquirePayload, AtlasFindingsPayload, AtlasPublishPayload, AtlasRefreshPayload,
-    AtlasRelatePayload, AtlasResolvePayload, AtlasSearchPayload, AtlasSemanticBuildPayload,
-    AtlasSemanticSelectPayload, AtlasStatusPayload, Reply, Request,
+    AtlasAcquirePayload, AtlasCancelPayload, AtlasFindingsPayload, AtlasPublishPayload,
+    AtlasRefreshPayload, AtlasRelatePayload, AtlasResolvePayload, AtlasSearchPayload,
+    AtlasSemanticBuildPayload, AtlasSemanticSelectPayload, AtlasStatusPayload, CancelTarget, Reply,
+    Request,
 };
 use crate::{ActorContext, actor_context, flag_value, warn_if_index_incomplete, wirkd_client_call};
 use wirk_core::WorkId;
@@ -24,6 +25,10 @@ pub fn atlas_command(rest: &[String]) -> ExitCode {
         Some("refresh") => refresh_command(&rest[1..]),
         Some("publish") => publish_command(&rest[1..]),
         Some("status") => status_command(&rest[1..]),
+        // P4.5 B2 correction: the operator's reachable cancellation
+        // path. Before it, `cancel_jobs` had no caller and nothing but
+        // a deadline could stop a running backend child.
+        Some("cancel") => cancel_command(&rest[1..]),
         Some("search") => search_command(&rest[1..]),
         Some("resolve") => resolve_command(&rest[1..]),
         Some("relate") => relate_command(&rest[1..]),
@@ -42,6 +47,7 @@ fn atlas_usage() -> ExitCode {
          | wirk atlas refresh --estate <root> --source <name> --revision <ref> [--json] \
          | wirk atlas publish --estate <root> --source <name> --generation <id> [--json] \
          | wirk atlas status --estate <root> [--source <name>] [--work <id>] [--json] \
+         | wirk atlas cancel --estate <root> (--list | --job <id> | --source <name> | --all) [--reason <text>] [--wait <secs>] [--requesting-work <id> | --admin] [--json] \
          | wirk atlas resolve [--estate <root>] [--work <id>] --coordinate <encoded> [--json] \
          | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--semantic-backend <path>] [--semantic-backend-arg <arg>...] [--semantic-model <dir>] [--family code|knowledge|config]... [--limit <n>] [--capacity <n>] [--continue <token>] [--json] \
          | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--chunker units|native] [--json] \
@@ -157,7 +163,7 @@ fn call_expecting_outcome(
             }
         }
         Ok(Reply::Err { error, .. }) => {
-            eprintln!("wirk wirkd: {} {}", error.code, error.message);
+            crate::render_refusal(&error);
             ExitCode::from(2)
         }
         Err(err) => {
@@ -268,6 +274,156 @@ fn publish_command(rest: &[String]) -> ExitCode {
                     result["generation"].as_str().unwrap_or("?"),
                     result["publication_revision"].as_u64().unwrap_or(0)
                 );
+            });
+        },
+    )
+}
+
+/// `wirk atlas cancel`: stop a running expensive Atlas job.
+///
+/// The target is required and explicit — `--job`, `--source` or `--all`
+/// — because a cancellation that reaches further than the operator meant
+/// is the failure worth designing against. `--list` names no target and
+/// cancels nothing; it reports what is running, which is also how an
+/// operator observes whether a job they cancelled has actually ended.
+///
+/// Signalling and stopping are reported separately. Without `--wait` the
+/// reply says only that the jobs were signalled, because at that instant
+/// that is all that is known.
+fn cancel_command(rest: &[String]) -> ExitCode {
+    if let Err(code) = check_flags(
+        "cancel",
+        rest,
+        &[
+            ESTATE,
+            JSON,
+            ("--list", false),
+            ("--all", false),
+            ("--job", true),
+            ("--source", true),
+            ("--reason", true),
+            ("--wait", true),
+            ("--requesting-work", true),
+            ("--admin", false),
+        ],
+    ) {
+        return code;
+    }
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return atlas_usage();
+    };
+    // Ruling 0251 F4, through ruling 0117's existing resolution. Inside
+    // an actor context this verb is asked as that actor's own Work, so
+    // it reaches that Work's jobs and no others; `--admin` is the
+    // deliberate administrative surface, and the operator's own shell
+    // is unchanged. An incomplete or mismatched context is refused
+    // rather than widened — the one thing it must never do.
+    let scope = match crate::resolve_scope(
+        "wirk atlas cancel",
+        &estate,
+        flag_value(rest, "--requesting-work"),
+        rest.iter().any(|arg| arg == "--admin"),
+    ) {
+        Ok(scope) => scope,
+        Err(refusal) => {
+            eprintln!("wirk atlas cancel: {refusal}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = &scope.note {
+        eprintln!("wirk atlas cancel: {note}");
+    }
+    let list = rest.iter().any(|arg| arg == "--list");
+    let all = rest.iter().any(|arg| arg == "--all");
+    let job = flag_value(rest, "--job");
+    let source = flag_value(rest, "--source");
+    let named = usize::from(list)
+        + usize::from(all)
+        + usize::from(job.is_some())
+        + usize::from(source.is_some());
+    if named != 1 {
+        eprintln!(
+            "wirk atlas cancel needs exactly one of --list, --job <id>, --source <name> or \
+             --all: a cancellation states its target, and there is no default target on purpose"
+        );
+        return ExitCode::from(1);
+    }
+    let target = match (list, all, job, source) {
+        (true, _, _, _) => None,
+        (_, true, _, _) => Some(CancelTarget::All),
+        (_, _, Some(id), _) => Some(CancelTarget::Job(id)),
+        (_, _, _, Some(alias)) => Some(CancelTarget::Source(alias)),
+        _ => return atlas_usage(),
+    };
+    let wait_secs = match flag_value(rest, "--wait") {
+        None => 0,
+        Some(value) => match value.parse::<u64>() {
+            Ok(seconds) => seconds,
+            Err(_) => {
+                eprintln!("--wait takes a whole number of seconds, not {value:?}");
+                return ExitCode::from(1);
+            }
+        },
+    };
+    let json = is_json(rest);
+    wirkd_client_call(
+        &estate,
+        &Request::atlas_cancel(AtlasCancelPayload {
+            work: scope.requesting,
+            target,
+            reason: flag_value(rest, "--reason"),
+            wait_secs,
+        }),
+        |result| {
+            print_result(json, result, |result| {
+                let outcome = result["outcome"].as_str().unwrap_or("?");
+                println!("outcome {outcome}");
+                // Which surface answered. Without this an empty scoped
+                // listing reads as an idle estate, which is exactly the
+                // wrong conclusion to hand someone.
+                if let Some(applied) = result["scope"].as_str() {
+                    println!("scope {applied}");
+                }
+                if let Some(running) = result["running"].as_array() {
+                    println!("running {}", running.len());
+                    for job in running {
+                        println!(
+                            "  {} {} scope {} signalled {}",
+                            job["job_id"].as_str().unwrap_or("?"),
+                            job["verb"].as_str().unwrap_or("?"),
+                            job["scope"].as_str().unwrap_or("?"),
+                            job["cancel_signalled"].as_bool().unwrap_or(false)
+                        );
+                    }
+                }
+                if let Some(acknowledged) = result["acknowledged"].as_array() {
+                    println!("acknowledged {}", acknowledged.len());
+                    for job in acknowledged {
+                        println!(
+                            "  {} {} scope {} running_millis {}",
+                            job["job_id"].as_str().unwrap_or("?"),
+                            job["verb"].as_str().unwrap_or("?"),
+                            job["scope"].as_str().unwrap_or("?"),
+                            job["running_millis"].as_i64().unwrap_or(0)
+                        );
+                    }
+                }
+                // Completion is a separate line because it is a separate
+                // fact: `null` means unobserved, not "finished".
+                match result["completed"].as_array() {
+                    Some(completed) => println!(
+                        "completed {} still_running {}",
+                        completed.len(),
+                        result["still_running"].as_array().map_or(0, Vec::len)
+                    ),
+                    None => println!(
+                        "completed unobserved (signalling is not stopping; re-run with --list \
+                         or --wait to observe it)"
+                    ),
+                }
+                if let Some(detail) = result["detail"].as_str() {
+                    println!("{detail}");
+                }
             });
         },
     )
@@ -729,6 +885,8 @@ fn semantic_build_command(rest: &[String]) -> ExitCode {
             ("--backend-arg", true),
             ("--model", true),
             ("--chunker", true),
+            ("--requesting-work", true),
+            ("--admin", false),
         ],
     ) {
         return code;
@@ -742,6 +900,26 @@ fn semantic_build_command(rest: &[String]) -> ExitCode {
     ) else {
         return atlas_usage();
     };
+    // Ruling 0251 F4: a build starts a real backend child that an
+    // operator can later cancel, so it records who asked for it. Same
+    // resolution as every other scoped verb: the actor's own Work
+    // inside a context, `--admin` for an administrative build, and the
+    // operator's shell unchanged.
+    let scope = match crate::resolve_scope(
+        "wirk atlas semantic build",
+        &estate,
+        flag_value(rest, "--requesting-work"),
+        rest.iter().any(|arg| arg == "--admin"),
+    ) {
+        Ok(scope) => scope,
+        Err(refusal) => {
+            eprintln!("wirk atlas semantic build: {refusal}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = &scope.note {
+        eprintln!("wirk atlas semantic build: {note}");
+    }
     let json = is_json(rest);
     call_expecting_outcome(
         &estate,
@@ -752,6 +930,7 @@ fn semantic_build_command(rest: &[String]) -> ExitCode {
             backend_args: flag_values(rest, "--backend-arg"),
             model,
             chunker: flag_value(rest, "--chunker"),
+            work: scope.requesting,
         }),
         &["staged"],
         |result| {

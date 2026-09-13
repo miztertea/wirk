@@ -203,6 +203,21 @@ struct WirkdState {
     /// estate-local catalog (its own module doc); no other component
     /// opens a second handle on the same `<estate_root>/atlas/`.
     atlas: Mutex<wirk_atlas::AtlasStore>,
+    /// P4.5 B3 (ruling 0237): this estate's resource policy, read once at
+    /// start from `<estate>/.wirk/resources.json` over the defaults, and
+    /// reported by `wirkd status` so an operator sees what is actually in
+    /// force rather than guessing.
+    resource_policy: wirk_core::jobs::ResourcePolicy,
+    /// The expensive jobs this daemon is running right now, held
+    /// **beside** `atlas` and never inside it.
+    ///
+    /// That placement is the whole repair. Every atlas verb serializes on
+    /// `atlas`, so a cancellation routed the ordinary way would block on
+    /// the mutex the build it means to stop is holding, and arrive after
+    /// the build finished on its own. This handle is cloned out of the
+    /// store once, at startup, and `handle_atlas_cancel` touches nothing
+    /// else — it can therefore reach a running job mid-build.
+    job_registry: wirk_core::jobs::JobRegistry,
     /// This estate's own continuation-signing secret (ruling 0095;
     /// W3-SECOND-CORRECTION.md item 1) — 32 bytes from the kernel CSPRNG,
     /// created once at daemon start under `<estate_root>/.wirk/` mode
@@ -576,11 +591,23 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
             socket: socket_path.clone(),
             source,
         })?;
+    let (resource_policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(&estate_root);
+    if let Some(note) = policy_note {
+        eprintln!("wirkd: {note}");
+    }
+    if let Some(note) = resource_policy.capacity_note() {
+        eprintln!("wirkd: {note}");
+    }
+    // Cloned out before the store goes behind its mutex: after this
+    // point reaching it would mean taking the very lock a build holds.
+    let job_registry = atlas.job_registry();
     let state = Arc::new(WirkdState {
         estate_root,
         journals: Mutex::new(HashMap::new()),
         watchers: Mutex::new(HashMap::new()),
         atlas: Mutex::new(atlas),
+        resource_policy,
+        job_registry,
         continuation_key,
         index_health: Mutex::new(IndexHealth::unreconciled()),
         index_observations: AtomicU64::new(0),
@@ -1379,7 +1406,10 @@ fn dispatch(
     peer: PeerIdentity,
 ) -> Outcome {
     match request.verb {
-        Verb::Ping => Outcome::Reply(handle_ping()),
+        Verb::Ping => match serde_json::from_value::<super::PingPayload>(request.payload.clone()) {
+            Ok(payload) => Outcome::Reply(handle_ping(state, payload)),
+            Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+        },
         Verb::Submit => match serde_json::from_value::<SubmitPayload>(request.payload.clone()) {
             Ok(payload) => Outcome::Reply(handle_submit(state, payload)),
             Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
@@ -1445,6 +1475,12 @@ fn dispatch(
                 request.payload.clone(),
             ) {
                 Ok(payload) => Outcome::Reply(handle_atlas_semantic_select(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::AtlasCancel => {
+            match serde_json::from_value::<super::AtlasCancelPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_cancel(state, payload)),
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
@@ -1762,10 +1798,198 @@ fn write_event_line(writer: &mut &UnixStream, event: &Event) -> io::Result<()> {
     writer.flush()
 }
 
-fn handle_ping() -> Reply {
+/// P4.5 B (ruling 0237): the daemon's health answer now also carries
+/// **what this host can actually enforce**, because a bound nobody can
+/// see is not a bound. Every capability below is the result of probing,
+/// not of assuming a platform, and each unavailable one carries its
+/// reason — `memory_cap: unavailable (<why>)` rather than silence, which
+/// would read as a cap that is in force.
+///
+/// `recovery` reports what this daemon's own startup killed and removed
+/// from the previous owner's recorded jobs. It is deliberately phrased as
+/// recovery: between a `SIGKILL` of the previous wirkd and this pass, an
+/// escaped descendant was running, and that interval is the restart
+/// interval, which nothing here bounds.
+fn handle_ping(state: &Arc<WirkdState>, payload: super::PingPayload) -> Reply {
+    let capabilities = wirk_core::jobs::capabilities();
+    let policy = &state.resource_policy;
+    let memory = wirk_core::jobs::observe_memory();
+    // Ruling 0251 F4: the same authority `atlas cancel` applies. This
+    // verb named every running job's **source alias** to anyone who
+    // could open the socket, which is the alias-existence disclosure
+    // ruling 0095 removed from Work-scoped `atlas status` — reaching it
+    // through the health verb instead would have left that correction
+    // cosmetic.
+    let (running_jobs, jobs_scope) = if payload.jobs {
+        match authorized_jobs(state, &payload.work) {
+            Ok((jobs, true)) => (jobs, "requester"),
+            Ok((jobs, false)) => (jobs, "administrative"),
+            Err(reply) => return reply,
+        }
+    } else {
+        // The caller could resolve no scope and said so. Health still
+        // answers; the one Work-shaped field on this verb is withheld
+        // rather than widened, and the reply says which.
+        (Vec::new(), "undisclosed")
+    };
+    // Ruling 0251 F1: policy inspection has to be reachable *while the
+    // estate is busy*, because "why was my job refused?" is asked
+    // exactly then. The startup recovery outcome lives behind the atlas
+    // mutex, so it is read without blocking and reported as unobserved
+    // when a build holds the store — an honest gap in one field rather
+    // than a health verb that hangs for the length of a build.
+    let recovery = match state.atlas.try_lock() {
+        Ok(atlas) => {
+            let recovery = atlas.recovery();
+            json!({
+                "records_seen": recovery.records_seen,
+                "cgroups_killed": recovery.cgroups_killed,
+                "staging_removed": recovery.staging_removed,
+                "skipped": recovery.skipped,
+            })
+        }
+        Err(std::sync::TryLockError::Poisoned(poison)) => {
+            let atlas = poison.into_inner();
+            let recovery = atlas.recovery();
+            json!({
+                "records_seen": recovery.records_seen,
+                "cgroups_killed": recovery.cgroups_killed,
+                "staging_removed": recovery.staging_removed,
+                "skipped": recovery.skipped,
+            })
+        }
+        Err(std::sync::TryLockError::WouldBlock) => json!({
+            "unavailable": "this estate's atlas is held by a running job; the startup recovery \
+                            outcome was not read rather than making this health answer queue \
+                            behind that job",
+        }),
+    };
+    // The shared pool, read and never touched (ruling 0251 F1/F3). Three
+    // separate things, deliberately not collapsed into one number: what
+    // this estate asked for, what the pool itself has agreed, and what
+    // this estate would therefore actually be offered.
+    let pool = wirk_core::jobs::inspect_pool(
+        &wirk_core::jobs::host_pool_directory(policy),
+        policy.max_host_expensive,
+        policy.host_pool_capacity_authority,
+    );
     ok_reply(json!({
         "protocol_version": PROTOCOL_VERSION,
         "pid": std::process::id(),
+        "resources": {
+            "policy": {
+                "max_expensive": policy.max_expensive,
+                "max_host_expensive": policy.max_host_expensive,
+                "max_materialization": policy.max_materialization,
+                "effective_estate_slots": policy.effective_estate_slots(),
+                "capacity_note": policy.capacity_note(),
+                "admission_wait_secs": policy.admission_wait_secs,
+                "cheap_wait_millis": policy.cheap_wait_millis,
+                "store_ownership_wait_millis": policy.store_ownership_wait_millis,
+                "job_deadline_secs": policy.job_deadline_secs,
+                "memory_pressure_avg10_max": policy.memory_pressure_avg10_max,
+                "min_available_memory_bytes": policy.min_available_memory_bytes,
+                "job_memory_max_bytes": policy.job_memory_max_bytes,
+                "host_pool_capacity_authority": policy.host_pool_capacity_authority,
+                "configured_in": wirk_core::jobs::ResourcePolicy::config_path(&state.estate_root)
+                    .display()
+                    .to_string(),
+            },
+            // Pre-operation policy inspection: what an operator needs
+            // *before* starting expensive work, on a public surface, and
+            // read-only — asking does not make this estate the
+            // participant that initialized the pool.
+            "host_pool": {
+                "directory": pool.directory.display().to_string(),
+                // This estate's preference. Not a host bound, and not a
+                // shared agreement.
+                "configured_max_host_expensive": pool.configured_max_host_expensive,
+                "configured_capacity_authority": pool.configured_capacity_authority,
+                // "initialized", "uninitialized" or "unreadable".
+                "agreement_status": pool.agreement_status,
+                "agreed_capacity": pool.agreement.as_ref().map(|a| a.capacity),
+                "agreed_unix_millis": pool.agreement.as_ref().map(|a| a.agreed_unix_millis),
+                "agreement_note": pool.agreement.as_ref().map(|a| a.note.clone()),
+                // `null` where the pool has no agreement yet: there is
+                // no effective shared capacity to report until a first
+                // participant admits a job, and naming one here would be
+                // the false precision this view exists to remove.
+                "effective_usable_slots": pool.effective_usable_slots,
+                "notes": pool.notes,
+                "advisory": "this pool is advisory and scoped to this uid, this host and this \
+                             runtime directory. It does not see another user's jobs, a container \
+                             with its own /run/user, or any non-wirk consumer, and it is not an \
+                             allocation guarantee.",
+            },
+            "capabilities": {
+                "job_cgroup_kill": capabilities.kill_available,
+                "job_cgroup_kill_unavailable_reason": capabilities.kill_unavailable_reason,
+                "memory_cap": capabilities.memory_cap_available,
+                "memory_cap_unavailable_reason": capabilities.memory_cap_unavailable_reason,
+                "pressure_sample": capabilities.pressure_available,
+                "pressure_sample_unavailable_reason": capabilities.pressure_unavailable_reason,
+                "summary": capabilities.summary(),
+                "containment_limit": "killing wirkd runs none of wirk's cleanup. A descendant \
+                                      that left its process group survives until the next owner \
+                                      recovers this estate's recorded jobs; that interval is the \
+                                      restart interval and is not bounded.",
+            },
+            "observed": {
+                // Host figures kept, because they remain true and useful
+                // — they are simply not the whole answer. What admission
+                // now compares against is `effective_available_bytes`,
+                // the tightest bound that actually applies to this
+                // process (ruling 0246: those differed here by more than
+                // three times, in the direction that admits work which
+                // then stalls).
+                "host_mem_available_bytes": memory.host_available_bytes,
+                "host_memory_pressure_some_avg10": memory.host_some_avg10,
+                "memory_pressure_some_avg10": memory.admission_some_avg10(),
+                "memory_pressure_scope": memory.admission_some_avg10_origin(),
+                "soft_headroom_bytes": memory.soft_headroom_bytes,
+                "soft_headroom_from": memory.soft_headroom_from,
+                "hard_headroom_bytes": memory.hard_headroom_bytes,
+                "hard_headroom_from": memory.hard_headroom_from,
+                "effective_available_bytes": memory.effective_available_bytes(),
+                "effective_available_origin": memory.effective_available_origin(),
+                "cgroup_levels": memory
+                    .levels
+                    .iter()
+                    .map(|level| json!({
+                        "cgroup": level.relative,
+                        "current_bytes": level.current_bytes,
+                        "high_bytes": level.high_bytes,
+                        "max_bytes": level.max_bytes,
+                        "some_avg10": level.some_avg10,
+                        "full_avg10": level.full_avg10,
+                        "soft_headroom_bytes": level.soft_headroom(),
+                        "hard_headroom_bytes": level.hard_headroom(),
+                    }))
+                    .collect::<Vec<_>>(),
+                "unavailable": memory.unavailable,
+                "advisory": "memory.high is a soft throttling threshold and memory.max a hard \
+                             ceiling; MemAvailable, memory.current and the pressure averages are \
+                             samples. None of these is a guarantee that an admitted job can \
+                             allocate what it needs",
+            },
+            "running_jobs_scope": jobs_scope,
+            "running_jobs_undisclosed": (jobs_scope == "undisclosed").then_some(
+                "this caller resolved no Work scope for the job listing, so it was withheld \
+                 rather than answered administratively. Name --requesting-work <id> for a \
+                 scoped listing or --admin for the estate-wide one",
+            ),
+            "running_jobs": running_jobs
+                .into_iter()
+                .map(|job| json!({
+                    "job_id": job.job_id,
+                    "verb": job.verb,
+                    "scope": job.scope,
+                    "started_unix_millis": job.started_unix_millis,
+                    "cancel_signalled": job.cancel.is_cancelled(),
+                }))
+                .collect::<Vec<_>>(),
+            "recovery_at_start": recovery,
+        },
     }))
 }
 
@@ -6078,6 +6302,128 @@ fn work_state_name(state: WorkState) -> &'static str {
     }
 }
 
+/// P4.5 B3: a **cheap** atlas read must never queue invisibly behind an
+/// expensive job. Before this, every atlas verb took the one atlas mutex
+/// with a blocking `lock()`, so a long `semantic build` silently stalled
+/// `status`, `search` and `resolve` from every Work with no queue
+/// position, no deadline and no refusal — an invisible unbounded wait.
+///
+/// Now a cheap read waits a bounded moment (long enough to pass behind
+/// another cheap read, which is the common case) and then answers
+/// `AtlasBusy`. `std::sync::Mutex` has no timed acquire, so this polls
+/// `try_lock`, which is what a bounded wait on it amounts to.
+fn lock_atlas_cheap(
+    state: &Arc<WirkdState>,
+) -> Result<std::sync::MutexGuard<'_, wirk_atlas::AtlasStore>, Reply> {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(state.resource_policy.cheap_wait_millis);
+    loop {
+        match state.atlas.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poison)) => return Ok(poison.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err_reply(
+                        "AtlasBusy",
+                        &format!(
+                            "this estate's atlas is held by another job; a cheap read waited \
+                             {}ms and is answering rather than queueing invisibly behind it. \
+                             Retry, or raise cheap_wait_millis in .wirk/resources.json",
+                            state.resource_policy.cheap_wait_millis
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// Take an expensive-job admission slot **before** the atlas mutex.
+///
+/// Order matters: taking the mutex first and then queueing for a slot
+/// would hold the atlas — and so block every cheap read — for the whole
+/// wait. The refusal that comes back names the verb, the holder and the
+/// elapsed time.
+///
+/// `detail` is recorded in this **estate's own** slot file. It never
+/// reaches the per-user host slot file, which is shared with this user's
+/// other estates: a refusal one estate reads must not disclose another
+/// estate's source aliases, Work ids or paths.
+fn admit_expensive(
+    state: &Arc<WirkdState>,
+    verb: &str,
+    detail: &str,
+) -> Result<wirk_core::jobs::Admission, Reply> {
+    match wirk_core::jobs::admit(
+        &state.estate_root,
+        &state.resource_policy,
+        &wirk_core::jobs::JobRequest::new(verb, detail),
+    ) {
+        Ok(admission) => {
+            for note in &admission.notes {
+                eprintln!("wirkd: {note}");
+            }
+            Ok(admission)
+        }
+        // Ruling 0251 F2: the notes gathered before a refusal used to be
+        // dropped on the floor, so the one moment the operator needed
+        // "your own maximum is not the shared agreement; here is how to
+        // change it deliberately" was the one moment it was not said.
+        Err(refusal) => Err(err_reply_with_notes(
+            refusal.code,
+            &refusal.message,
+            &refusal.notes,
+        )),
+    }
+}
+
+/// The admission notes a reply carries to the **public caller**.
+///
+/// Ruling 0251 F1: these existed and went to `wirkd`'s own stderr and
+/// nowhere else, which is no disclosure at all to anyone running the
+/// CLI against a detached daemon. They are facts about the caller's own
+/// request — its clamped capacity, its self-restraint, what an
+/// unobserved check was — and they carry no other estate's path, source
+/// alias or Work id, because `Admission`'s own notes never did.
+fn admission_notes(admission: &wirk_core::jobs::Admission) -> Value {
+    Value::Array(
+        admission
+            .notes
+            .iter()
+            .map(|note| Value::String(note.clone()))
+            .collect(),
+    )
+}
+
+/// Attach this admission's notes to an otherwise finished `Ok` reply.
+///
+/// Written as a wrapper rather than into each `json!` literal so every
+/// expensive verb discloses the same field in the same place, and so a
+/// refusal path that never admitted anything carries nothing.
+fn with_admission_notes(reply: Reply, notes: Value) -> Reply {
+    let Reply::Ok { ok, mut result } = reply else {
+        return reply;
+    };
+    if let Value::Array(items) = &notes
+        && !items.is_empty()
+        && let Value::Object(map) = &mut result
+    {
+        map.insert("admission_notes".to_string(), notes);
+    }
+    Reply::Ok { ok, result }
+}
+
+fn err_reply_with_notes(code: &str, message: &str, notes: &[String]) -> Reply {
+    let mut reply = err_reply(code, message);
+    if !notes.is_empty()
+        && let Reply::Err { error, .. } = &mut reply
+    {
+        error.detail = Some(notes.join("\n"));
+    }
+    reply
+}
+
 fn ok_reply(result: Value) -> Reply {
     Reply::Ok { ok: true, result }
 }
@@ -7486,6 +7832,12 @@ fn generation_json(generation: &wirk_atlas::SourceGeneration) -> Value {
 /// only, never a query's side effect (BUILD-BRIEF.md: "Query and exact
 /// resolution cannot create, refresh, fetch, embed or repair stores").
 fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePayload) -> Reply {
+    // B3: admission first, atlas second.
+    let admission = match admit_expensive(state, "atlas acquire", &payload.source) {
+        Ok(admission) => admission,
+        Err(refusal) => return refusal,
+    };
+    let notes = admission_notes(&admission);
     let mut atlas = state
         .atlas
         .lock()
@@ -7495,7 +7847,10 @@ fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePay
             Ok(membership) => membership,
             Err(err) => return err_reply("AtlasError", &err.to_string()),
         };
-    acquire_reply(&mut atlas, &membership, &payload.revision)
+    with_admission_notes(
+        acquire_reply(&mut atlas, &membership, &payload.revision),
+        notes,
+    )
 }
 
 /// `handle_atlas_refresh`: reuses `source`'s existing registration and
@@ -7503,6 +7858,11 @@ fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePay
 /// creates a registration, only `acquire` does); stages a candidate
 /// generation without publishing it.
 fn handle_atlas_refresh(state: &Arc<WirkdState>, payload: super::AtlasRefreshPayload) -> Reply {
+    let admission = match admit_expensive(state, "atlas refresh", &payload.source) {
+        Ok(admission) => admission,
+        Err(refusal) => return refusal,
+    };
+    let notes = admission_notes(&admission);
     let mut atlas = state
         .atlas
         .lock()
@@ -7517,7 +7877,10 @@ fn handle_atlas_refresh(state: &Arc<WirkdState>, payload: super::AtlasRefreshPay
             &format!("no registered source named {}", payload.source),
         );
     };
-    acquire_reply(&mut atlas, &membership, &payload.revision)
+    with_admission_notes(
+        acquire_reply(&mut atlas, &membership, &payload.revision),
+        notes,
+    )
 }
 
 fn acquire_reply(
@@ -7591,15 +7954,329 @@ fn handle_atlas_publish(state: &Arc<WirkdState>, payload: super::AtlasPublishPay
 /// L4). Omitting `--work` remains estate-wide catalog administration —
 /// an explicit, distinct capability from Work-scoped retrieval, not a
 /// bug to close by removing it.
+/// `atlas cancel`: signal running expensive jobs, and report what is
+/// running.
+///
+/// **What this repairs.** `AtlasStore::cancel_jobs` had zero callers,
+/// there was no CLI verb, and the only thing that ever reached a backend
+/// child was the deadline watchdog. A `CancelToken` nothing calls is a
+/// library hook, not a cancellation path, and `wirkd`'s existing
+/// `cancel_work` is journal bookkeeping that never touches a child.
+///
+/// **Why it does not take the atlas lock.** Every other atlas verb does,
+/// and a build holds it for the build's whole duration. A cancel that
+/// queued there would arrive after the thing it meant to stop had
+/// finished, which is worse than no cancel at all because it would look
+/// like one. This reads `state.job_registry`, whose lock is held for
+/// microseconds.
+///
+/// **Authorization.** The estate's `wirkd` socket is the boundary, as it
+/// is for every other verb: the socket lives under the estate's own
+/// `.wirk/` and carries this uid's permissions. What is *additionally*
+/// true here, and is the part worth stating, is that the reachable set
+/// is closed by construction — the registry holds only jobs this daemon
+/// started for this estate. There is no pid argument, no name pattern
+/// and no path into another estate's daemon, another user's jobs, or
+/// anything under a shared cgroup parent that this daemon did not
+/// create. An unrelated job cannot be named, so it cannot be reached.
+/// How far up a parent chain job authority is followed before the walk
+/// is abandoned. Nested Work is a few levels deep in practice; this is a
+/// termination bound against a malformed or cyclic chain, not a policy.
+const JOB_AUTHORITY_DEPTH: usize = 32;
+
+/// The running jobs `work` may see and control, and whether a scope was
+/// applied at all (ruling 0251, F4).
+///
+/// `work` absent is explicit estate administration: every job, exactly
+/// as before. It is never reached by omission — the CLI resolves an
+/// injected actor context to that actor's own Work, and `--admin` is
+/// the deliberate way to ask for this surface (ruling 0117).
+///
+/// `work` present is resolved **against this daemon's own journals**,
+/// the same `resolve_query_scope` `atlas status` and `atlas search`
+/// already apply. A Work that does not exist is refused, not demoted:
+/// an unknown, mismatched or stale identity must never fall back to the
+/// wider answer, which is the single failure this whole correction
+/// exists to prevent.
+///
+/// What a scoped caller may control:
+///
+/// - its **own** jobs — the ones admitted while it was the requester;
+/// - the jobs of Works submitted **beneath** it, followed through each
+///   child's own recorded `parent` binding. This is existing authority,
+///   not a new grant: a container Work is already the thing that
+///   submitted those children, and being unable to stop work it caused
+///   would make the scope useless for the case it most obviously needs.
+///
+/// What it may **not** control, and cannot see:
+///
+/// - an administrative job (`requester: None`). Source-read access is
+///   not permission to interrupt, and an unattributed job belongs to
+///   the operator;
+/// - any other Work's job, **including one on a source both Works are
+///   bound to**. Sharing a source is not shared authority over each
+///   other's running work, so authority is decided by who asked for the
+///   job and never by what the job is reading.
+///
+/// This is not authentication and does not claim to be: the same uid
+/// runs the actor and the operator, and the injected triple is a
+/// transport hint (ruling 0117's own statement of its scope). What it
+/// establishes is that the administrative surface is never reached by
+/// omission, and that a bound caller's own reach is its own Work.
+fn authorized_jobs(
+    state: &Arc<WirkdState>,
+    work: &Option<WorkId>,
+) -> Result<(Vec<wirk_core::jobs::ActiveJob>, bool), Reply> {
+    let running = state.job_registry.list();
+    let Some(asker) = work else {
+        return Ok((running, false));
+    };
+    // Existence and readability are checked before anything is
+    // disclosed, so a scoped call by a caller naming no real Work costs
+    // it nothing and tells it nothing.
+    resolve_query_scope(state, work)?;
+    // One answer per distinct requester, not one per job: the chain walk
+    // replays journals, and a `--all` over several jobs of the same Work
+    // should not replay the same journal repeatedly.
+    let mut decided: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut mine = Vec::new();
+    for job in running {
+        let Some(requester) = job.requester.clone() else {
+            continue;
+        };
+        let allowed = match decided.get(&requester) {
+            Some(known) => *known,
+            None => {
+                let known = requester == asker.0 || descends_from(state, &requester, asker);
+                decided.insert(requester, known);
+                known
+            }
+        };
+        if allowed {
+            mine.push(job);
+        }
+    }
+    Ok((mine, true))
+}
+
+/// Whether the Work `requester` was submitted beneath `ancestor`,
+/// following each Work's own recorded `parent` binding.
+///
+/// Read from the journals, never from anything the client sent: a
+/// caller cannot assert a parent it does not have.
+fn descends_from(state: &Arc<WirkdState>, requester: &str, ancestor: &WorkId) -> bool {
+    let mut current = WorkId(requester.to_string());
+    for _ in 0..JOB_AUTHORITY_DEPTH {
+        let Some(work) = fold_work(state, &current) else {
+            return false;
+        };
+        let Some(parent) = work.parent else {
+            return false;
+        };
+        if parent.work == *ancestor {
+            return true;
+        }
+        current = parent.work;
+    }
+    false
+}
+
+/// Signal the jobs `selector` names **within an already-authorized
+/// set**.
+///
+/// `JobRegistry::cancel` matches the selector against the whole
+/// registry, which is right for the administrative caller and is
+/// precisely the reach a scoped one must not have. Selecting from the
+/// authorized slice first means a scoped `--all` is "all of mine", a
+/// scoped `--source` is "mine on that source", and a scoped `--job`
+/// naming someone else's job matches nothing — the same nothing an id
+/// that was never issued matches.
+fn cancel_authorized(
+    authorized: &[wirk_core::jobs::ActiveJob],
+    selector: &wirk_core::jobs::JobSelector,
+    reason: &str,
+) -> Vec<wirk_core::jobs::CancelAck> {
+    let now = wirk_core::jobs::now_unix_millis();
+    authorized
+        .iter()
+        .filter(|job| match selector {
+            wirk_core::jobs::JobSelector::Job(id) => job.job_id == *id,
+            wirk_core::jobs::JobSelector::Scope(scope) => job.scope == *scope,
+            wirk_core::jobs::JobSelector::All => true,
+        })
+        .map(|job| {
+            job.cancel.cancel_with(reason.to_string());
+            wirk_core::jobs::CancelAck {
+                job_id: job.job_id.clone(),
+                verb: job.verb.clone(),
+                scope: job.scope.clone(),
+                running_millis: now.saturating_sub(job.started_unix_millis),
+            }
+        })
+        .collect()
+}
+
+fn handle_atlas_cancel(state: &Arc<WirkdState>, payload: super::AtlasCancelPayload) -> Reply {
+    // Ruling 0251 F4. Everything below happens against *the jobs this
+    // caller is authorized to control*, computed once, before any target
+    // is interpreted.
+    //
+    // Three properties this ordering buys, none of which is optional:
+    //
+    // 1. Nothing here touches the atlas mutex. `authorized_jobs` reads
+    //    the job registry (held beside that mutex, which is the whole
+    //    reason this verb is reachable at all) and the requester Works'
+    //    own journals. A cancellation still returns while the build it
+    //    means to stop holds the store.
+    // 2. A target the caller may not control is answered exactly as a
+    //    target that does not exist. `--job`, `--source` and `--all`
+    //    select from the authorized set, so naming a foreign job id, a
+    //    source alias this Work is not working on, or nothing at all all
+    //    produce the same `no_match`. The verb is not an oracle for what
+    //    else is running.
+    // 3. The authorized set is **frozen** here. A foreign job admitted
+    //    while this call is waiting cannot drift into a `--all` wait,
+    //    because the wait watches the exact ids that were acknowledged.
+    let (authorized, scoped) = match authorized_jobs(state, &payload.work) {
+        Ok(jobs) => jobs,
+        Err(reply) => return reply,
+    };
+    let running = |jobs: &[wirk_core::jobs::ActiveJob]| {
+        jobs.iter()
+            .map(|job| {
+                json!({
+                    "job_id": job.job_id,
+                    "verb": job.verb,
+                    "scope": job.scope,
+                    "started_unix_millis": job.started_unix_millis,
+                    "cancel_signalled": job.cancel.is_cancelled(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let Some(target) = payload.target else {
+        // The listing half. Also the honest answer to "did the job I
+        // cancelled actually stop?": a job absent from this list has
+        // left, and one still present has not.
+        //
+        // Under a Work scope the absence of a job means "not yours or
+        // gone", and the reply says which surface answered rather than
+        // letting an empty list read as an empty estate.
+        return ok_reply(json!({
+            "outcome": "listed",
+            "scope": if scoped { "requester" } else { "administrative" },
+            "running": running(&authorized),
+        }));
+    };
+
+    let selector = match &target {
+        super::CancelTarget::Job(id) => wirk_core::jobs::JobSelector::Job(id.clone()),
+        super::CancelTarget::Source(alias) => wirk_core::jobs::JobSelector::Scope(alias.clone()),
+        super::CancelTarget::All => wirk_core::jobs::JobSelector::All,
+    };
+    let reason = match payload.reason.as_deref() {
+        Some(text) if !text.trim().is_empty() => {
+            format!("was cancelled by an operator ({})", text.trim())
+        }
+        _ => "was cancelled by an operator".to_string(),
+    };
+
+    let acknowledged = cancel_authorized(&authorized, &selector, &reason);
+    if acknowledged.is_empty() {
+        // Says nothing about jobs the caller did not name: a miss must
+        // not become a way to enumerate what else is running.
+        return ok_reply(json!({
+            "outcome": "no_match",
+            "scope": if scoped { "requester" } else { "administrative" },
+            "target": selector.describe(),
+            "acknowledged": [],
+            "detail": format!(
+                "nothing running in this estate matches {}; it may have already ended",
+                selector.describe()
+            ),
+        }));
+    }
+
+    let acknowledged_json: Vec<Value> = acknowledged
+        .iter()
+        .map(|ack| {
+            json!({
+                "job_id": ack.job_id,
+                "verb": ack.verb,
+                "scope": ack.scope,
+                "running_millis": ack.running_millis,
+            })
+        })
+        .collect();
+
+    // Acknowledgement and completion are separate answers. With no
+    // wait, only the first is known, and the reply says exactly that
+    // rather than implying the jobs have stopped.
+    if payload.wait_secs == 0 {
+        return ok_reply(json!({
+            "outcome": "signalled",
+            "scope": if scoped { "requester" } else { "administrative" },
+            "target": selector.describe(),
+            "acknowledged": acknowledged_json,
+            "completed": Value::Null,
+            "detail": "these jobs were signalled to stop. Signalling is not stopping: ask again \
+                       with no target, or with --wait, to observe whether they have actually \
+                       ended",
+        }));
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(payload.wait_secs);
+    let ids: Vec<String> = acknowledged.iter().map(|ack| ack.job_id.clone()).collect();
+    loop {
+        let outstanding: Vec<&String> = ids
+            .iter()
+            .filter(|id| state.job_registry.is_active(id))
+            .collect();
+        if outstanding.is_empty() {
+            return ok_reply(json!({
+                "outcome": "completed",
+                "scope": if scoped { "requester" } else { "administrative" },
+                "target": selector.describe(),
+                "acknowledged": acknowledged_json,
+                "completed": ids,
+                "still_running": [],
+            }));
+        }
+        if std::time::Instant::now() >= deadline {
+            let still: Vec<String> = outstanding.into_iter().cloned().collect();
+            let completed: Vec<String> = ids
+                .iter()
+                .filter(|id| !still.contains(id))
+                .cloned()
+                .collect();
+            return ok_reply(json!({
+                "outcome": "partial",
+                "scope": if scoped { "requester" } else { "administrative" },
+                "target": selector.describe(),
+                "acknowledged": acknowledged_json,
+                "completed": completed,
+                "still_running": still,
+                "detail": format!(
+                    "the wait of {}s elapsed with jobs still running; they remain signalled and \
+                     will stop when their current step yields",
+                    payload.wait_secs
+                ),
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn handle_atlas_status(state: &Arc<WirkdState>, payload: super::AtlasStatusPayload) -> Reply {
     let scope = match resolve_query_scope(state, &payload.work) {
         Ok(scope) => scope,
         Err(reply) => return reply,
     };
-    let atlas = state
-        .atlas
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let atlas = match lock_atlas_cheap(state) {
+        Ok(atlas) => atlas,
+        Err(busy) => return busy,
+    };
     // Ruling 0095 (correction-verify VERDICT §5 R3): under a Work scope,
     // both of these count only what this scope actually admits. Counting
     // — or answering `registered` over — every alias in the catalog made
@@ -8028,10 +8705,28 @@ fn handle_atlas_semantic_build(
     state: &Arc<WirkdState>,
     payload: super::AtlasSemanticBuildPayload,
 ) -> Reply {
+    // B3: the longest-running atlas verb there is. Admission before the
+    // mutex is what stops it from silently owning every cheap read for
+    // the length of the build.
+    // Ruling 0251 F4: resolve the named Work against this daemon's own
+    // journals *before* anything runs. A Work that does not exist is
+    // refused rather than quietly demoted to an administrative build —
+    // an unknown or stale identity must never widen to administration.
+    if let Err(reply) = resolve_query_scope(state, &payload.work) {
+        return reply;
+    }
+    let admission = match admit_expensive(state, "atlas semantic build", &payload.source) {
+        Ok(admission) => admission,
+        Err(refusal) => return refusal,
+    };
+    let notes = admission_notes(&admission);
     let mut atlas = state
         .atlas
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    let _requester = atlas
+        .jobs()
+        .bind_requester(payload.work.as_ref().map(|work| work.0.clone()));
     let Some(membership) = membership_by_alias(&atlas, &payload.source) else {
         return err_reply(
             "UnknownSource",
@@ -8055,7 +8750,7 @@ fn handle_atlas_semantic_build(
         },
     };
     let generation = wirk_atlas::GenerationId(payload.generation.clone());
-    match atlas.build_semantic(&membership, &generation, &config) {
+    let reply = match atlas.build_semantic(&membership, &generation, &config) {
         Ok(wirk_atlas::SemanticBuildOutcome::Staged(edition)) => ok_reply(json!({
             "membership": membership_json(&membership),
             "outcome": "staged",
@@ -8067,7 +8762,8 @@ fn handle_atlas_semantic_build(
             "detail": reason,
         })),
         Err(err) => err_reply("AtlasError", &err.to_string()),
-    }
+    };
+    with_admission_notes(reply, notes)
 }
 
 /// `handle_atlas_semantic_select`: the separate, atomic publication step.
@@ -9095,10 +9791,22 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
             (Some(pinned), decoded.offset)
         }
     };
-    let atlas = state
-        .atlas
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    // A search is a cheap read: it must not queue invisibly behind an
+    // expensive build. Note this bounds waiting for the *catalog*; the
+    // semantic query child it may then spawn is bounded separately, by
+    // its own job deadline.
+    let atlas = match lock_atlas_cheap(state) {
+        Ok(atlas) => atlas,
+        Err(busy) => return busy,
+    };
+    // Ruling 0251 F4: a semantic query spawns a real backend child and
+    // registers it as a running job. Bind whose job it is for exactly
+    // as long as this verb holds the atlas — every verb that can start
+    // a job takes the same mutex, so the child reads its own request's
+    // requester and the binding is cleared on every exit path.
+    let _requester = atlas
+        .jobs()
+        .bind_requester(payload.work.as_ref().map(|work| work.0.clone()));
     let request = wirk_atlas::SearchRequest {
         scope,
         requested_source: payload.source.clone(),
@@ -9232,10 +9940,10 @@ fn handle_atlas_resolve(state: &Arc<WirkdState>, payload: super::AtlasResolvePay
             "coordinate names a different estate than this daemon's own",
         );
     }
-    let atlas = state
-        .atlas
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let atlas = match lock_atlas_cheap(state) {
+        Ok(atlas) => atlas,
+        Err(busy) => return busy,
+    };
     let Some(membership) = admitted_membership_for(&atlas, &scope, &coordinate.membership) else {
         return err_reply(
             "Inadmissible",
@@ -16634,6 +17342,10 @@ mod projection_tests {
                 wirk_atlas::AtlasStore::open(dir.path(), dir.path().display().to_string())
                     .expect("atlas"),
             ),
+            // These in-file tests build a daemon state directly; the
+            // default policy is the one that changes no behaviour.
+            resource_policy: wirk_core::jobs::ResourcePolicy::default(),
+            job_registry: wirk_core::jobs::JobRegistry::new(),
             continuation_key: [0u8; 32],
             index_health: Mutex::new(IndexHealth::unreconciled()),
             // Integration seam: the index-recovery wave gave `WirkdState`
@@ -16707,6 +17419,10 @@ mod projection_tests {
                 wirk_atlas::AtlasStore::open(dir.path(), dir.path().display().to_string())
                     .expect("atlas"),
             ),
+            // These in-file tests build a daemon state directly; the
+            // default policy is the one that changes no behaviour.
+            resource_policy: wirk_core::jobs::ResourcePolicy::default(),
+            job_registry: wirk_core::jobs::JobRegistry::new(),
             continuation_key: [0u8; 32],
             index_health: Mutex::new(IndexHealth::unreconciled()),
             // Integration seam: the index-recovery wave gave `WirkdState`
@@ -17002,6 +17718,10 @@ mod tests {
             journals: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             atlas: Mutex::new(atlas),
+            // These in-file tests build a daemon state directly; the
+            // default policy is the one that changes no behaviour.
+            resource_policy: wirk_core::jobs::ResourcePolicy::default(),
+            job_registry: wirk_core::jobs::JobRegistry::new(),
             continuation_key: [0u8; 32],
             index_health: Mutex::new(IndexHealth::unreconciled()),
             index_observations: AtomicU64::new(0),

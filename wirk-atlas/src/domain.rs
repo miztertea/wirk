@@ -165,6 +165,14 @@ pub enum AtlasError {
     Edition(String),
     #[error("catalog is visible but its directory entry durability is uncertain: {0}")]
     DurabilityUncertain(String),
+    /// P4.5 B1 (ruling 0237): another live `AtlasStore` already owns this
+    /// estate's `atlas/`. Before this existed, a second opener swept
+    /// `.tmp-*` directories it merely assumed were abandoned and
+    /// destroyed a concurrent build's live staging mid-write. The
+    /// ownership claim is an `flock` held for the store's whole life, so
+    /// "abandoned" is now true by enforcement rather than by distance.
+    #[error("atlas store is already owned by a live holder: {0}")]
+    StoreInUse(String),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON: {0}")]

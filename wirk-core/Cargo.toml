@@ -16,9 +16,21 @@ sha2 = "0.11.0"
 # §1, R5, cache-confirmed). Latest-then-pin (0031 D97), checked against
 # crates.io 2026-09-04.
 serde_json = "1.0.151"
-# EventId minted by Journal::append (orient/store.md §2, R2+R5).
+# EventId minted by Journal::append (orient/store.md §2, R2+R5), and the
+# job id `jobs.rs` mints for a per-job cgroup.
 ulid = "3.0.0"
+# P4.5 B (ruling 0237): `jobs.rs`'s PR_SET_PDEATHSIG, flock, kill and
+# statvfs. R2, not an adoption — the exact pin `wirk/Cargo.toml` and
+# `wirk-atlas/Cargo.toml` already carry, already in Cargo.lock; the
+# mechanism moved here from `wirk/src/executors/child.rs` because a
+# binary crate is unreachable from `wirk-atlas`, which needs the same
+# hardening for both backend protocols.
+libc = "0.2.189"
 
 [dev-dependencies]
 # Journal round-trip test fixtures (orient/store.md §7). R5, cache-resolvable.
 tempfile = "3.27.0"
+# P4.5 B: tests/bounded_jobs.rs signals the real child processes it spawned.
+# Same pin the crate's own [dependencies] carry (R2); an integration test
+# is a separate crate and does not inherit them.
+libc = "0.2.189"

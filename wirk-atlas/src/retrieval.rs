@@ -672,6 +672,12 @@ pub(crate) fn rank(
     query: &str,
     capacity: ResolvedCapacity,
     pinned_producer: Option<&QueryProducerPin>,
+    jobs: &crate::store::JobContext,
+    // `scope`: the source alias, or aliases, this ranking covers — the
+    // target an operator names when cancelling. A query over several
+    // sources carries all of them joined, so `--job` remains the precise
+    // selector where `--source` would be ambiguous.
+    scope: &str,
 ) -> Result<Result<RankedView, String>, AtlasError> {
     // The producer's *configuration* is measured before anything else
     // happens, because it is the half a continuation can be refused on
@@ -893,6 +899,8 @@ pub(crate) fn rank(
             capacity.value,
             index_cache.as_deref(),
             &index_key,
+            jobs,
+            scope,
         ))
     })();
     let _ = std::fs::remove_dir_all(&scratch);
@@ -1005,6 +1013,8 @@ fn run_query_backend(
     capacity: u64,
     index_cache: Option<&Path>,
     index_key: &str,
+    jobs: &crate::store::JobContext,
+    scope: &str,
 ) -> Result<(Vec<RankedRow>, QueryReply), String> {
     use std::process::{Command, Stdio};
     let mut command = Command::new(&config.backend);
@@ -1037,13 +1047,6 @@ fn run_query_backend(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
-        format!(
-            "query backend {} could not be started: {error}",
-            config.backend.display()
-        )
-    })?;
-    let mut stdin = child.stdin.take().expect("stdin was piped");
     let header = serde_json::to_vec(&QueryHeader {
         protocol: QUERY_PROTOCOL,
         model_path: model,
@@ -1056,11 +1059,12 @@ fn run_query_backend(
         index_key: index_cache.and(Some(index_key)),
     })
     .map_err(|error| format!("query request could not be encoded: {error}"))?;
-    let write = (|| -> std::io::Result<()> {
-        stdin.write_all(&header)?;
-        stdin.write_all(b"\n")?;
-        for (index, row) in view.iter().enumerate() {
-            stdin.write_all(&serde_json::to_vec(&QueryRow {
+    let mut request = Vec::new();
+    request.extend_from_slice(&header);
+    request.push(b'\n');
+    for (index, row) in view.iter().enumerate() {
+        request.extend_from_slice(
+            &serde_json::to_vec(&QueryRow {
                 row: index as u64,
                 ranking_path: &row.ranking_path,
                 ranking_scope: &row.ranking_scope,
@@ -1069,15 +1073,39 @@ fn run_query_backend(
                 start_line: row.line_start,
                 end_line: row.line_end,
                 language: row.language.as_deref(),
-            })?)?;
-            stdin.write_all(b"\n")?;
-        }
-        stdin.flush()
-    })();
-    drop(stdin);
-    let finished = child
-        .wait_with_output()
-        .map_err(|error| format!("query backend {} failed: {error}", config.backend.display()))?;
+            })
+            .map_err(|error| format!("query request could not be encoded: {error}"))?,
+        );
+        request.push(b'\n');
+    }
+    // P4.5 B2: the *same* containment the embedding protocol gets. These
+    // two spawns were identically unhardened; they must not now diverge
+    // into one contained path and one uncontained one. A query child is
+    // shorter-lived, which is a reason to bound it, not an exemption.
+    let finished =
+        match jobs
+            .child("semantic query backend", scope, None)
+            .run(command, move |stdin| {
+                stdin.write_all(&request)?;
+                stdin.flush()
+            }) {
+            wirk_core::jobs::ChildEnd::Finished(output) => output,
+            wirk_core::jobs::ChildEnd::Cancelled { reason, elapsed } => {
+                return Err(format!(
+                    "query backend {} {reason} after {:.1}s and its job was killed; this is a \
+                 bound this estate applied, not a backend failure",
+                    config.backend.display(),
+                    elapsed.as_secs_f64()
+                ));
+            }
+            wirk_core::jobs::ChildEnd::Failed(detail) => {
+                return Err(format!(
+                    "query backend {} {detail}",
+                    config.backend.display()
+                ));
+            }
+        };
+    let write: std::io::Result<()> = Ok(());
     if !finished.status.success() {
         return Err(format!(
             "query backend {} exited {} : {}",

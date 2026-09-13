@@ -46,11 +46,164 @@ struct Catalog {
     semantic_selected: BTreeMap<String, crate::EditionId>,
 }
 
-/// A single-writer, estate-local catalog.  Opening cleans only abandoned
-/// private temp siblings; published generation directories are never edited.
+/// A single-writer, estate-local catalog.
+///
+/// P4.5 B1 (ruling 0237): "single-writer" is now **enforced**, not merely
+/// true by distance. Opening takes an exclusive `flock` on `atlas/.owner`
+/// and holds it for the store's whole life, and it does so *before*
+/// sweeping private temporaries — so a temporary this store removes is
+/// abandoned because no live owner holds it, not because the doc assumed
+/// so. Measured red at `bf16369`: a second `open` during a live
+/// `build_semantic` removed that build's `.tmp-<ULID>` staging directory
+/// mid-write and the build lost its work with `ENOENT`.
+///
+/// The lock is advisory, per open-file-description, and unreliable on
+/// some network filesystems; the kernel releases it when the holder dies,
+/// which is why no stale-lock reaper exists and why the pid recorded in
+/// the file is only a hint for the refusal text.
 pub struct AtlasStore {
     root: PathBuf,
     catalog: Catalog,
+    /// Ownership, held for this value's life and released by dropping it.
+    /// Never read; its existence *is* the claim.
+    _owner: wirk_core::jobs::OwnerLock,
+    /// What the ownership pass recovered from the previous owner's
+    /// recorded jobs, so a caller can report it instead of assuming the
+    /// estate started clean.
+    recovery: wirk_core::jobs::RecoveryOutcome,
+    /// P4.5 B2/B3: how this estate bounds and contains the children it
+    /// spawns. Held on the store because the store is what owns the
+    /// estate, and because both backend protocols need the same thing.
+    jobs: JobContext,
+}
+
+/// Everything one estate's expensive children are bounded by: what this
+/// host can actually do, what the operator configured, and the flag that
+/// cancels a job in flight.
+///
+/// One value, shared by both backend protocols, so `wirk-embed/v2` and
+/// the query protocol cannot drift into two different containment stories
+/// — they were identically unhardened before this, and they stay
+/// identical now.
+#[derive(Debug, Clone)]
+pub struct JobContext {
+    pub estate_root: PathBuf,
+    pub capabilities: &'static wirk_core::jobs::JobCapabilities,
+    pub policy: wirk_core::jobs::ResourcePolicy,
+    /// Where this estate's running expensive jobs announce themselves.
+    ///
+    /// Replaces the single `CancelToken` this held before. That token was
+    /// shared by every child and sticky once set, so one cancellation
+    /// silently cancelled the estate's next job too — and nothing in the
+    /// product called it in any case. A registry gives each job its own
+    /// token and gives an operator something addressable to cancel.
+    pub registry: wirk_core::jobs::JobRegistry,
+    /// P4.5 B correction (ruling 0251, F4): the Work every job started
+    /// from here is run *for*, as the daemon resolved it from the
+    /// request against its own journals.
+    ///
+    /// Shared and interior-mutable for the same reason the registry is:
+    /// the caller that knows the requester is the daemon handler, and
+    /// the place the job is actually created is several layers down
+    /// inside a backend run. Every atlas verb that can start a job
+    /// serializes on the daemon's single atlas mutex, and the handler
+    /// binds this for exactly the span it holds that mutex
+    /// ([`RequesterBinding`]), so the value a child reads is the one its
+    /// own request resolved and never a leftover from a previous verb.
+    requester: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Binds a [`JobContext`]'s requester for the life of one verb and
+/// clears it on drop — including on an early return or a panic, so a
+/// later administrative job can never inherit a previous caller's
+/// identity.
+/// Owned, not borrowed from the context: the daemon handler that binds
+/// a requester goes on to take `&mut` on the very store the context
+/// lives in, so a guard holding a reference into it would make the two
+/// mutually exclusive. It holds the shared slot directly instead.
+pub struct RequesterBinding {
+    slot: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl Drop for RequesterBinding {
+    fn drop(&mut self) {
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+impl JobContext {
+    pub fn detect(estate_root: &Path) -> Self {
+        let (policy, _) = wirk_core::jobs::ResourcePolicy::load(estate_root);
+        Self::with_policy(estate_root, policy)
+    }
+
+    pub fn with_policy(estate_root: &Path, policy: wirk_core::jobs::ResourcePolicy) -> Self {
+        Self {
+            estate_root: estate_root.to_path_buf(),
+            // Probed once per process, not once per open.
+            capabilities: wirk_core::jobs::capabilities(),
+            policy,
+            registry: wirk_core::jobs::JobRegistry::new(),
+            requester: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// The Work jobs started from here are currently being run for.
+    pub fn requester(&self) -> Option<String> {
+        self.requester
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    fn set_requester(&self, requester: Option<String>) {
+        *self
+            .requester
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = requester;
+    }
+
+    /// Bind `requester` until the returned guard is dropped. The caller
+    /// must already hold whatever lock serializes the verb — for the
+    /// daemon that is the atlas mutex, which every job-starting verb
+    /// takes.
+    pub fn bind_requester(&self, requester: Option<String>) -> RequesterBinding {
+        self.set_requester(requester);
+        RequesterBinding {
+            slot: self.requester.clone(),
+        }
+    }
+
+    /// A bounded child for one job of `verb` over `scope`, optionally
+    /// owning `staging` so a later recovery pass removes it if this
+    /// process is killed.
+    ///
+    /// `scope` is the target a cancellation can name — the source alias
+    /// in practice. Each child gets a **fresh** cancel token and
+    /// registers itself, so cancelling one job leaves the estate able to
+    /// do legitimate work immediately afterwards.
+    pub fn child<'a>(
+        &'a self,
+        verb: &str,
+        scope: &str,
+        staging: Option<PathBuf>,
+    ) -> wirk_core::jobs::BoundedChild<'a> {
+        wirk_core::jobs::BoundedChild {
+            capabilities: self.capabilities,
+            policy: &self.policy,
+            cancel: wirk_core::jobs::CancelToken::new(),
+            job_id: ulid::Ulid::generate().to_string(),
+            estate_root: Some(self.estate_root.clone()),
+            staging,
+            verb: verb.to_string(),
+            scope: scope.to_string(),
+            requester: self.requester(),
+            registry: Some(self.registry.clone()),
+        }
+    }
 }
 
 impl AtlasStore {
@@ -58,8 +211,46 @@ impl AtlasStore {
         estate_root: impl AsRef<Path>,
         scope: impl Into<String>,
     ) -> Result<Self, AtlasError> {
-        let root = estate_root.as_ref().join("atlas");
+        let estate_root = estate_root.as_ref();
+        let root = estate_root.join("atlas");
         fs::create_dir_all(root.join("generations"))?;
+        // B1: ownership BEFORE the sweep. Everything below this point
+        // assumes no other live store holds this estate's atlas; that
+        // assumption is only sound because the claim was taken first.
+        let (policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(estate_root);
+        if let Some(note) = &policy_note {
+            eprintln!("wirk: {note}");
+        }
+        let owner = match wirk_core::jobs::OwnerLock::acquire_within(
+            &root.join(".owner"),
+            "AtlasStore",
+            std::time::Duration::from_millis(policy.store_ownership_wait_millis),
+        )? {
+            Ok(owner) => owner,
+            Err(hint) => {
+                return Err(AtlasError::StoreInUse(format!(
+                    "{} is already owned by a live AtlasStore ({}). A second opener is refused \
+                     rather than allowed to sweep private temporaries a live build is still \
+                     writing into. The claim is an advisory flock held for the owner's life and \
+                     released by the kernel when it dies, so nothing needs to be cleaned up by \
+                     hand if that holder was killed",
+                    root.display(),
+                    hint.describe()
+                )));
+            }
+        };
+        // Under ownership, and only under it: kill and remove the jobs a
+        // previous owner of *this estate* recorded. Scoped to this
+        // estate's own `.wirk/jobs/` records, never to a name prefix
+        // under a shared cgroup parent — another live estate's jobs sit
+        // there too and are not ours to touch.
+        //
+        // This is bounded recovery, not bounded prevention: a descendant
+        // that escaped its process group kept running from the moment the
+        // previous owner died until now, and that interval is the restart
+        // interval, which nothing here bounds.
+        let recovery = wirk_core::jobs::recover_owned_jobs(estate_root);
+        let jobs = JobContext::with_policy(estate_root, policy);
         // P3 W4 A: `atlas/semantic/` holds edition directories and is
         // staged through the same private-temporary discipline, so
         // reopening cleans its abandoned temporaries too — a build
@@ -107,7 +298,47 @@ impl AtlasStore {
                 semantic_selected: BTreeMap::new(),
             }
         };
-        Ok(Self { root, catalog })
+        Ok(Self {
+            root,
+            catalog,
+            _owner: owner,
+            recovery,
+            jobs,
+        })
+    }
+
+    /// What this store's ownership pass recovered from the previous
+    /// owner's recorded jobs. Empty is the ordinary case.
+    pub fn recovery(&self) -> &wirk_core::jobs::RecoveryOutcome {
+        &self.recovery
+    }
+
+    /// How this estate bounds its expensive children.
+    pub fn jobs(&self) -> &JobContext {
+        &self.jobs
+    }
+
+    /// The registry of expensive jobs this store is running, cloned so a
+    /// caller can hold it **outside** whatever lock guards this store.
+    ///
+    /// That is the whole point. Every atlas verb serializes on one mutex
+    /// around this store, so a cancellation routed through the store
+    /// would queue behind the build it means to stop. A caller takes this
+    /// handle once, at startup, and cancels through it while a build
+    /// holds the store.
+    pub fn job_registry(&self) -> wirk_core::jobs::JobRegistry {
+        self.jobs.registry.clone()
+    }
+
+    /// Cancel every expensive job this store is currently running.
+    ///
+    /// In-process convenience over [`Self::job_registry`]; the reachable
+    /// operator path is the daemon's own cancel verb, which does not go
+    /// through the store at all.
+    pub fn cancel_jobs(&self, reason: &str) -> Vec<wirk_core::jobs::CancelAck> {
+        self.jobs
+            .registry
+            .cancel(&wirk_core::jobs::JobSelector::All, reason)
     }
 
     pub fn register_git(

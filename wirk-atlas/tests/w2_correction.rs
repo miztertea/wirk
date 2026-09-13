@@ -353,7 +353,11 @@ fn append_relationship_reports_durability_uncertain_on_post_rename_dir_fsync_fai
     assert_eq!(rows.len(), 1, "relationship must be visible after rename");
 
     // Retrying the identical admission after a DurabilityUncertain report
-    // must be idempotent: no duplicate, no lost row.
+    // must be idempotent: no duplicate, no lost row. B1 (ruling 0237):
+    // the reading handle above is ended first — a second live store on
+    // one estate is exactly what ownership now refuses, and "a fresh
+    // handle" has always meant a successor, not a rival.
+    drop(reopened);
     let mut retry_atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
     let retried = admit_relationship(
         &mut retry_atlas,

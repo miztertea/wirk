@@ -535,7 +535,48 @@ pub fn run_command(rest: &[String]) -> ExitCode {
 
     // Step 2 (loop.md §1): `git worktree add` from the World's own
     // repository/branch/base_sha, wirk-side, before any Herdr call.
+    //
+    // P4.5 B3 (ruling 0237): this is the materialization the daemon
+    // cannot see. It runs **here**, in the `wirk run` client process, so
+    // a guard living only inside wirkd would not cover it — which is why
+    // admission is a file lock rather than an in-process mutex. A
+    // checkout of a large repository is expensive in exactly the way an
+    // embedding build is, and it competes for the same disk and page
+    // cache; leaving it outside the bound would let any number of
+    // materializations run beside an admitted build.
+    //
+    // The estimate is the source tree's own allocated bytes, and it is
+    // declared an estimate: a worktree shares nothing with the source's
+    // object store and may be larger or smaller than the tree it checks
+    // out. Herdr is untouched — no agent and no pane is counted here.
     let worktree_path = estate_path.join("worktrees").join(&work_id.0);
+    let (policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(&estate_path);
+    if let Some(note) = policy_note {
+        eprintln!("wirk run: {note}");
+    }
+    let mut request = wirk_core::jobs::JobRequest::new("worktree materialization", &work_id.0)
+        .in_class(wirk_core::jobs::JobClass::Materialization);
+    if let Ok(estimate) = tree_allocated_bytes(Path::new(&actor.repository)) {
+        request = request.with_space(estate_path.clone(), estimate);
+    }
+    let _materialization = match wirk_core::jobs::admit(&estate_path, &policy, &request) {
+        Ok(admission) => {
+            for note in &admission.notes {
+                eprintln!("wirk run: {note}");
+            }
+            if admission.waited > std::time::Duration::from_millis(1) {
+                println!(
+                    "wirk run: admitted after waiting {:.1}s for an expensive slot",
+                    admission.waited.as_secs_f64()
+                );
+            }
+            admission
+        }
+        Err(refusal) => {
+            eprintln!("wirk run: {} — {}", refusal.code, refusal.message);
+            return ExitCode::from(2);
+        }
+    };
     let head = match wirk_herdr::git::worktree_add(
         Path::new(&actor.repository),
         &worktree_path,
@@ -1020,6 +1061,41 @@ fn conflicting_reinvocation(
         ));
     }
     None
+}
+
+/// A conservative estimate of what checking this repository out will
+/// cost, for the space check that precedes materialization.
+///
+/// **An estimate, and reported as one.** It sums the allocated bytes
+/// (`st_blocks * 512`) of the tree, which over-counts the `.git`
+/// directory a worktree does not duplicate and under-counts nothing it
+/// can see. It is not a measurement of the checkout, and the refusal that
+/// uses it says so.
+fn tree_allocated_bytes(repository: &Path) -> std::io::Result<u64> {
+    fn walk(directory: &Path, total: &mut u64, budget: &mut u32) -> std::io::Result<()> {
+        if *budget == 0 {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                *budget -= 1;
+                if *budget == 0 {
+                    return Ok(());
+                }
+                let _ = walk(&entry.path(), total, budget);
+            } else if metadata.is_file() {
+                *total += std::os::unix::fs::MetadataExt::blocks(&metadata) * 512;
+            }
+        }
+        Ok(())
+    }
+    let mut total = 0;
+    // Bounded: an estimate must not become its own expensive job.
+    let mut budget = 20_000u32;
+    walk(repository, &mut total, &mut budget)?;
+    Ok(total)
 }
 
 #[cfg(test)]

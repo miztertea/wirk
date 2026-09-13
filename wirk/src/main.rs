@@ -105,7 +105,7 @@ fn main() -> ExitCode {
         Some("output") => output_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json]"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json]"
             );
             ExitCode::FAILURE
         }
@@ -1168,13 +1168,217 @@ fn wirkd_command(rest: &[String]) -> ExitCode {
         "stop" => wirkd_client_call(&estate, &Request::stop(), |_| {
             println!("stopped");
         }),
-        "ping" => wirkd_client_call(&estate, &Request::ping(), |result| {
-            println!(
-                "protocol_version {} pid {}",
-                result["protocol_version"].as_u64().unwrap_or_default(),
-                result["pid"].as_u64().unwrap_or_default()
-            );
-        }),
+        // Ruling 0251 F4: `ping`'s resource answer lists every running
+        // job's source alias. Inside an actor context it is asked as
+        // that actor's own Work, so the listing is what that Work may
+        // control; `--admin` is the deliberate estate-wide read. The
+        // operator's own shell is unchanged.
+        "ping" => {
+            // `ping` is a health check and stays one: a scope this
+            // caller cannot resolve withholds the job listing and says
+            // so, rather than refusing the whole verb or widening to
+            // the administrative answer.
+            let (work, jobs) = match resolve_scope(
+                "wirk wirkd ping",
+                &estate,
+                flag_value(&rest[1..], "--requesting-work"),
+                rest[1..].iter().any(|arg| arg == "--admin"),
+            ) {
+                Ok(scope) => {
+                    if let Some(note) = &scope.note {
+                        eprintln!("wirk wirkd ping: {note}");
+                    }
+                    (scope.requesting, true)
+                }
+                Err(refusal) => {
+                    eprintln!("wirk wirkd ping: {refusal}");
+                    (None, false)
+                }
+            };
+            wirkd_client_call(
+                &estate,
+                &Request::ping_as(wirkd::PingPayload { work, jobs }),
+                |result| {
+                    println!(
+                        "protocol_version {} pid {}",
+                        result["protocol_version"].as_u64().unwrap_or_default(),
+                        result["pid"].as_u64().unwrap_or_default()
+                    );
+                    // P4.5 B (ruling 0237): what this daemon can actually
+                    // enforce, in the operator's own terms. A bound nobody can
+                    // see is not a bound, and an unavailable capability is
+                    // printed with its reason rather than left silent — silence
+                    // reads as "in force".
+                    let resources = &result["resources"];
+                    if resources.is_null() {
+                        return;
+                    }
+                    let policy = &resources["policy"];
+                    println!(
+                        "resources: expensive {}/{} (host {}), materialization {}, deadline {}s",
+                        policy["effective_estate_slots"]
+                            .as_u64()
+                            .unwrap_or_default(),
+                        policy["max_expensive"].as_u64().unwrap_or_default(),
+                        policy["max_host_expensive"].as_u64().unwrap_or_default(),
+                        policy["max_materialization"].as_u64().unwrap_or_default(),
+                        policy["job_deadline_secs"].as_u64().unwrap_or_default(),
+                    );
+                    if let Some(note) = policy["capacity_note"].as_str() {
+                        println!("resources: {note}");
+                    }
+                    println!(
+                        "resources: configured in {}",
+                        policy["configured_in"].as_str().unwrap_or("(defaults)")
+                    );
+                    if let Some(summary) = resources["capabilities"]["summary"].as_str() {
+                        println!("capabilities: {summary}");
+                    }
+                    if let Some(limit) = resources["capabilities"]["containment_limit"].as_str() {
+                        println!("capabilities: {limit}");
+                    }
+                    // Memory, at the scope that actually applies to this
+                    // process — soft threshold and hard ceiling reported
+                    // separately, because they are different promises.
+                    let observed = &resources["observed"];
+                    match (
+                        observed["memory_pressure_some_avg10"].as_f64(),
+                        observed["effective_available_bytes"].as_u64(),
+                    ) {
+                        (Some(avg10), Some(available)) => println!(
+                            "observed: memory pressure some avg10 {avg10:.2} from {}, {available} bytes \
+                     available against {} (advisory sample, not an allocation guarantee)",
+                            observed["memory_pressure_scope"]
+                                .as_str()
+                                .unwrap_or("an unnamed scope"),
+                            observed["effective_available_origin"]
+                                .as_str()
+                                .unwrap_or("an unidentified bound"),
+                        ),
+                        (Some(avg10), None) => println!(
+                            "observed: memory pressure some avg10 {avg10:.2} from {}; no byte figure \
+                     could be read",
+                            observed["memory_pressure_scope"]
+                                .as_str()
+                                .unwrap_or("an unnamed scope"),
+                        ),
+                        _ => println!("observed: memory unobserved"),
+                    }
+                    match (
+                        observed["soft_headroom_bytes"].as_u64(),
+                        observed["soft_headroom_from"].as_str(),
+                    ) {
+                        (Some(soft), Some(from)) => println!(
+                            "observed: {soft} bytes before the soft throttling threshold \
+                     (memory.high) of {from} — throttling, not a ceiling; it refuses nothing \
+                     by itself"
+                        ),
+                        _ => println!(
+                            "observed: no soft throttling threshold applies to this process"
+                        ),
+                    }
+                    if let Some(unavailable) = observed["unavailable"].as_array()
+                        && !unavailable.is_empty()
+                    {
+                        for reason in unavailable {
+                            if let Some(reason) = reason.as_str() {
+                                println!("observed: unavailable — {reason}");
+                            }
+                        }
+                    }
+                    if let Some(pool) = resources["host_pool"].as_object() {
+                        // Three separate facts, printed as three separate facts:
+                        // what this estate asked for, what the pool has agreed,
+                        // and what this estate would actually be offered. An
+                        // uninitialized pool says so instead of reporting a
+                        // number nobody has agreed to.
+                        println!(
+                            "host pool: {} at {}",
+                            pool.get("agreement_status")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("?"),
+                            pool.get("directory")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("?"),
+                        );
+                        match (
+                            pool.get("agreed_capacity")
+                                .and_then(serde_json::Value::as_u64),
+                            pool.get("effective_usable_slots")
+                                .and_then(serde_json::Value::as_u64),
+                        ) {
+                            (Some(agreed), Some(usable)) => println!(
+                                "host pool: agreed capacity {agreed}, this estate configured {} and is \
+                         offered {usable}",
+                                pool.get("configured_max_host_expensive")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or_default(),
+                            ),
+                            _ => println!(
+                                "host pool: no agreed capacity yet; this estate is configured {} and \
+                         nothing has been initialized by reading it",
+                                pool.get("configured_max_host_expensive")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or_default(),
+                            ),
+                        }
+                        if let Some(notes) = pool.get("notes").and_then(|value| value.as_array()) {
+                            for note in notes {
+                                if let Some(note) = note.as_str() {
+                                    println!("host pool: {note}");
+                                }
+                            }
+                        }
+                        if let Some(advisory) =
+                            pool.get("advisory").and_then(|value| value.as_str())
+                        {
+                            println!("host pool: {advisory}");
+                        }
+                    }
+                    if let Some(withheld) = resources["running_jobs_undisclosed"].as_str() {
+                        println!("running jobs: withheld — {withheld}");
+                    } else if let Some(running) = resources["running_jobs"].as_array() {
+                        println!(
+                            "running jobs ({}): {}",
+                            resources["running_jobs_scope"]
+                                .as_str()
+                                .unwrap_or("administrative"),
+                            running.len()
+                        );
+                        for job in running {
+                            println!(
+                                "  {} {} scope {} signalled {}",
+                                job["job_id"].as_str().unwrap_or("?"),
+                                job["verb"].as_str().unwrap_or("?"),
+                                job["scope"].as_str().unwrap_or("?"),
+                                job["cancel_signalled"].as_bool().unwrap_or(false)
+                            );
+                        }
+                    }
+                    let recovery = &resources["recovery_at_start"];
+                    let killed = recovery["cgroups_killed"]
+                        .as_array()
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let staged = recovery["staging_removed"]
+                        .as_array()
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let seen = recovery["records_seen"].as_u64().unwrap_or_default();
+                    if seen > 0 || killed > 0 || staged > 0 {
+                        println!(
+                            "recovery at start: {seen} recorded job(s), {killed} cgroup(s) killed, \
+                     {staged} staging directory/ies removed"
+                        );
+                    }
+                    // Recovery lives behind the atlas mutex; a busy estate
+                    // answers "unobserved" rather than making this read queue.
+                    if let Some(unavailable) = recovery["unavailable"].as_str() {
+                        println!("recovery at start: unobserved — {unavailable}");
+                    }
+                },
+            )
+        }
         // The 0035 follow-up (ruling 0034 D118: "`wirk wirkd status` as
         // a CLI verb does not exist... carried to item 8 W1"): a thin
         // client over the existing `status` wire verb (R6, same shape
@@ -1286,26 +1490,26 @@ pub(crate) fn actor_context() -> ActorContext {
 
 /// The scope `status`/`watch` will actually ask for, and the Work it
 /// will ask about when the caller named none.
-struct ResolvedScope {
+pub(crate) struct ResolvedScope {
     /// `Some(requester)` is the scoped read as that Work; `None` is the
     /// administrative read — reached only when it was named, or when
     /// there is no actor context at all (the operator's own default).
-    requesting: Option<WorkId>,
+    pub(crate) requesting: Option<WorkId>,
     /// The target when `--work` is absent: the actor's own Work inside
     /// an actor context, and `None` — every Work under the estate, the
     /// operator's listing — outside one.
-    default_target: Option<String>,
+    pub(crate) default_target: Option<String>,
     /// Printed once on stderr before anything is fetched, when the
     /// resolution is worth saying out loud: which scope answered and
     /// why. Silent for the plain operator, whose behavior is unchanged.
-    note: Option<String>,
+    pub(crate) note: Option<String>,
 }
 
 /// Resolves the scope for `status`/`watch` **before** the daemon is
 /// located or a single Work is read, so a refusal here costs no
 /// content. `Err` is the refusal text; the caller prints it and exits 1
 /// (usage), the same exit a malformed command line already takes.
-fn resolve_scope(
+pub(crate) fn resolve_scope(
     verb: &str,
     estate: &str,
     requesting: Option<String>,
@@ -2052,6 +2256,25 @@ fn wirkd_client_call(
 /// is rendered) reaches the same locate, the same diagnostics and the
 /// same exit codes through this, instead of bypassing its own contract
 /// by going through the generic `client::call` (the basis review's F1).
+/// How a daemon refusal reaches the operator, in **one** place.
+///
+/// Ruling 0251 F2: a refusal now carries the admission disclosure that
+/// used to reach `wirkd`'s own stderr and nowhere else — the pool's
+/// agreed number against this estate's own, and the deliberate way to
+/// change it. There were two independent renderers for `Reply::Err`
+/// (this one and `atlas::call_expecting_outcome`'s), and a fix applied
+/// to one of them left every `atlas` verb — the verbs that actually
+/// get refused for capacity — printing nothing. One renderer, so that
+/// cannot happen again (R2).
+pub(crate) fn render_refusal(error: &wirkd::ErrorDetail) {
+    eprintln!("wirk wirkd: {} {}", error.code, error.message);
+    if let Some(detail) = &error.detail {
+        for line in detail.lines() {
+            eprintln!("wirk wirkd: {line}");
+        }
+    }
+}
+
 fn wirkd_typed_call(
     estate: &str,
     call: impl FnOnce(&Path) -> Result<Reply, wirkd::client::ClientError>,
@@ -2070,7 +2293,7 @@ fn wirkd_typed_call(
             ExitCode::SUCCESS
         }
         Ok(Reply::Err { error, .. }) => {
-            eprintln!("wirk wirkd: {} {}", error.code, error.message);
+            render_refusal(&error);
             ExitCode::from(2)
         }
         Err(err) => {

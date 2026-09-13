@@ -122,6 +122,16 @@ pub enum Verb {
     /// P3 W3: reports registered sources, their published generation
     /// and coverage summary, and recent acquisition attempts.
     AtlasStatus,
+    /// P4.5 B2 correction: signals a running expensive Atlas job to
+    /// stop, and reports what is running.
+    ///
+    /// Deliberately **not** routed through the atlas store: it reads and
+    /// writes only the daemon's job registry, which is held outside the
+    /// atlas mutex, so it reaches a job while that job holds the store.
+    /// Everything it can reach is a job this daemon started for this
+    /// estate; it matches no pid, no name prefix and no other owner's
+    /// cgroup.
+    AtlasCancel,
     /// P3 W3: lexical (optionally semantic-requested) ranked search
     /// over admitted, published generations.
     AtlasSearch,
@@ -203,11 +213,23 @@ pub struct Request {
 }
 
 impl Request {
-    /// `{"verb":"ping","payload":{}}` — no fields (transport.md §2).
+    /// `{"verb":"ping","payload":{}}` for the plain administrative
+    /// health read; `{"work": "<id>"}` when a bound caller is asking as
+    /// its own Work (ruling 0251, F4).
     pub fn ping() -> Self {
         Request {
             verb: Verb::Ping,
             payload: Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    /// The same health read asked **as** a Work: identical facts, with
+    /// the running-job listing scoped to what that Work may control
+    /// (ruling 0251, F4).
+    pub fn ping_as(payload: PingPayload) -> Self {
+        Request {
+            verb: Verb::Ping,
+            payload: serde_json::to_value(payload).expect("PingPayload always serializes"),
         }
     }
 
@@ -335,6 +357,13 @@ impl Request {
             verb: Verb::AtlasSemanticSelect,
             payload: serde_json::to_value(payload)
                 .expect("AtlasSemanticSelectPayload always serializes"),
+        }
+    }
+
+    pub fn atlas_cancel(payload: AtlasCancelPayload) -> Self {
+        Request {
+            verb: Verb::AtlasCancel,
+            payload: serde_json::to_value(payload).expect("AtlasCancelPayload always serializes"),
         }
     }
 
@@ -761,6 +790,18 @@ pub struct AtlasSemanticBuildPayload {
     /// artifacts with different identities.
     #[serde(default)]
     pub chunker: Option<String>,
+    /// P4.5 B correction (ruling 0251, F4): the Work this build is run
+    /// for. It is bound onto the running job as its requester, so a
+    /// cancellation can be scoped to whoever actually asked for the
+    /// work.
+    ///
+    /// It changes **what the build may reach not at all** — this is job
+    /// origin, not a grant, and the daemon validates that the Work
+    /// exists rather than trusting anything the client says about it.
+    /// Absent is an administrative build, cancellable only
+    /// administratively.
+    #[serde(default)]
+    pub work: Option<WorkId>,
 }
 
 /// `atlas semantic select`'s payload (P3 W4 A).
@@ -768,6 +809,112 @@ pub struct AtlasSemanticBuildPayload {
 pub struct AtlasSemanticSelectPayload {
     pub source: String,
     pub edition: String,
+}
+
+/// Which jobs `atlas cancel` is aimed at.
+///
+/// There is no default. A caller states its target, because a
+/// cancellation that stops more than was meant is the failure worth
+/// designing against — `All` has to be asked for by name, and even then
+/// reaches only this daemon's own registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum CancelTarget {
+    /// One job, by the id `atlas cancel --list` and the job's own
+    /// admission report both name.
+    Job(String),
+    /// Every running job whose scope is exactly this source alias.
+    Source(String),
+    /// Every running expensive job in this estate.
+    All,
+}
+
+/// `ping`'s payload: empty for the operator's administrative health
+/// read, or naming the Work a bound caller is asking as.
+///
+/// The health facts themselves (protocol, pid, capabilities, the
+/// resource policy this daemon is running under) are the same either
+/// way. What the scope changes is the `running_jobs` listing, which
+/// names each job's **source alias** — exactly the disclosure ruling
+/// 0095 removed from Work-scoped `atlas status`, and which reappeared
+/// here on a verb that had no scope at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PingPayload {
+    /// Omitted entirely when absent, so the administrative health read
+    /// keeps its documented `{"verb":"ping","payload":{}}` wire shape
+    /// (transport.md §2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<WorkId>,
+    /// Whether to disclose the running-job listing at all.
+    ///
+    /// `ping` is **daemon health**, and its own usage says it "reports
+    /// nothing about any Work". Refusing it over a Work scope would
+    /// contradict that: a caller whose context names a different estate
+    /// still has a right to know whether this daemon is alive and what
+    /// it can enforce. So when no scope can be resolved the caller asks
+    /// for the health facts with the job listing switched off — never
+    /// widened to the administrative one, and never silently empty:
+    /// the reply says the listing was withheld and why.
+    #[serde(default = "PingPayload::disclose_by_default")]
+    pub jobs: bool,
+}
+
+impl Default for PingPayload {
+    fn default() -> Self {
+        Self {
+            work: None,
+            jobs: true,
+        }
+    }
+}
+
+impl PingPayload {
+    fn disclose_by_default() -> bool {
+        true
+    }
+}
+
+/// `atlas cancel`'s payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasCancelPayload {
+    /// P4.5 B correction (ruling 0251, F4): the Work this cancellation
+    /// is asked **as**, resolved by the daemon against its own journals
+    /// — the identical shape `AtlasStatusPayload::work` already carries,
+    /// and for the identical reason.
+    ///
+    /// Present, this verb reaches only the jobs that Work is authorized
+    /// to control: its own, and those of Works submitted beneath it.
+    /// Everything else is invisible to it, and a target it may not
+    /// control is answered exactly as a target that does not exist —
+    /// naming an alias, a Work or a job id must not become a way to
+    /// learn that any of them are there.
+    ///
+    /// Absent, this is explicit estate administration, unchanged and
+    /// still reaching everything. It is never reached by omission: the
+    /// CLI resolves an injected actor context to that actor's own Work,
+    /// and `--admin` is the deliberate way to ask for the wider surface
+    /// (ruling 0117).
+    #[serde(default)]
+    pub work: Option<WorkId>,
+    /// Absent means "report what is running and cancel nothing" — the
+    /// listing half, which is also how a caller observes whether a job
+    /// it cancelled has actually ended.
+    #[serde(default)]
+    pub target: Option<CancelTarget>,
+    /// Free-text reason, carried into the job's own end so the child's
+    /// outcome says it was cancelled deliberately rather than that the
+    /// backend failed.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// How long to wait, after signalling, for the named jobs to
+    /// actually leave the registry.
+    ///
+    /// Zero — the default — returns the acknowledgement immediately and
+    /// reports nothing about completion, because at that instant nothing
+    /// about completion is known. Signalling and stopping are two
+    /// events and this verb never merges them.
+    #[serde(default)]
+    pub wait_secs: u64,
 }
 
 /// `atlas status`'s payload: every registered source, or one named

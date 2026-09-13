@@ -34,6 +34,7 @@ use thiserror::Error;
 /// self-contained storage contract (name rules, derived addresses,
 /// containment, write-once snapshot) rather than another face of
 /// `Work`/`Run`/`Event`.
+pub mod jobs;
 pub mod outputs;
 pub use outputs::ArtifactStore;
 

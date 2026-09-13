@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -385,55 +385,14 @@ impl ChildExecutor {
     }
 }
 
-/// `orient/child.md` §3, R3+R5: own process group
-/// (`CommandExt::process_group(0)`, not wirkd's own group — sharing it
-/// would make a group-kill of one Run take wirkd with it) plus
-/// `libc::prctl(PR_SET_PDEATHSIG, SIGKILL)` armed in `pre_exec`,
-/// matching sergeant-rs `child.rs:150-181`'s mechanism verbatim, not a
-/// `nix` reimplementation of the same call.
-fn harden_execution_child(command: &mut Command) {
-    command.process_group(0);
-    // SAFETY: this closure runs on the single forked child thread,
-    // strictly after `fork` and strictly before `exec` — no other
-    // thread exists yet in this process image, and no lock any other
-    // thread held survives the fork to deadlock this one. Only
-    // async-signal-safe libc calls are made (`prctl`, `getppid`,
-    // `_exit`), no allocation, no `std` I/O — matching the SAFETY
-    // discipline sergeant-rs `child.rs:150-159` documents for the same
-    // call (`orient/child.md` §3, §6).
-    unsafe {
-        command.pre_exec(|| {
-            let parent_before = libc::getppid();
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Closes the fork/prctl race (`orient/child.md` §3): if the
-            // parent died between `fork` and arming `PDEATHSIG`, the
-            // signal was never armed against a still-live parent and
-            // never will be delivered for this death — better to
-            // `_exit` now than exec into a permanently orphaned child.
-            if libc::getppid() != parent_before {
-                libc::_exit(1);
-            }
-            Ok(())
-        });
-    }
-}
-
-/// Kill-then-reap on every exit path, not only a deadline (`orient/
-/// child.md` §1, §3: "a child that forked its own subprocess before
-/// dying leaves that grandchild in the same pgid"). `pgid` is always
-/// the child's own pid here (`process_group(0)`), so `-pgid` signals
-/// the whole group it leads. Reaping the primary child itself already
-/// happened inside `try_wait` returning `Some`; a grandchild is not
-/// this process's child to `waitpid` on, only to signal.
-fn kill_process_group(pgid: i32) {
-    // SAFETY: a plain `kill(2)` call; `ESRCH` (already gone) is the
-    // expected, ignored outcome on an already-exited group.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
-    }
-}
+// P4.5 B2 (ruling 0237): `harden_execution_child` and
+// `kill_process_group` moved verbatim to `wirk_core::jobs`, and are used
+// from there by this executor and by both Atlas backend protocols. They
+// lived in this binary crate, which `wirk-atlas` cannot reach — so the
+// embedding and query children ran with no process group, no PDEATHSIG,
+// no deadline and no kill while this executor's children had all four.
+// One implementation now, one behaviour.
+use wirk_core::jobs::{harden_execution_child, kill_process_group};
 
 fn spawn_stderr_reader(
     mut pipe: impl Read + Send + 'static,
