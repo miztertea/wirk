@@ -6,7 +6,7 @@
 //! `std::process::Command` over the box's installed `git` (R4 — native
 //! platform CLI, nothing to wrap).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use thiserror::Error;
@@ -247,6 +247,110 @@ pub fn changed_paths(worktree: &Path, base_sha: &str) -> Result<Vec<String>, Git
         }
     }
     Ok(paths.into_iter().collect())
+}
+
+/// Ignored paths present in `worktree` (P4.5 first increment, ruling
+/// 0203 QUALIFIED.md §5): `git status --porcelain --untracked-files=all
+/// --ignored` filtered to its own `"!! "`-prefixed lines. Deliberately a
+/// separate call from `changed_paths` (which never passes `--ignored`
+/// and so, correctly, never reports these — git's own tracked/untracked
+/// classification already excludes them because they are disposable
+/// build output, not source): `worktree_remove`'s underlying `git
+/// worktree remove` deletes the whole directory unconditionally,
+/// ignored content included (the qualified probe's own row 2, "file
+/// silently deleted"), so this is a distinct safety question from "is
+/// there uncommitted source here", asked and refused separately before
+/// removal, never folded into the dirty gate.
+pub fn ignored_paths(worktree: &Path) -> Result<Vec<String>, GitError> {
+    let status = run_git(
+        worktree,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+        ],
+    )?;
+    let mut paths = Vec::new();
+    for line in status.lines() {
+        if let Some(path) = line.strip_prefix("!! ") {
+            paths.push(path.trim().to_string());
+        }
+    }
+    Ok(paths)
+}
+
+/// Uncommitted or untracked (non-ignored) content in `worktree` —
+/// precisely what makes git's own `worktree remove` refuse (P4.5 first
+/// increment, correction pass: a `--dry-run` call must report this
+/// refusal too, not only a real one; the qualified candidate ran no
+/// git call at all on the dry-run path and could report eligibility it
+/// had never actually checked). `git status --porcelain
+/// --untracked-files=all`, deliberately without `--ignored` — ignored
+/// content is `ignored_paths`'s own separate refusal, asked and
+/// reported independently, never folded into this one.
+pub fn has_uncommitted_or_untracked(worktree: &Path) -> Result<bool, GitError> {
+    let status = run_git(
+        worktree,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )?;
+    Ok(!status.trim().is_empty())
+}
+
+/// One entry from `git worktree list --porcelain`, run from the
+/// repository itself (never `-C <worktree path>` — QUALIFIED.md §4: a
+/// listing asked *of the repo* is git's own administrative record, not
+/// whatever currently happens to be sitting at a worktree's path, so it
+/// cannot be fooled by a symlink swapped in at that path after the
+/// fact). `branch` is `None` for a detached HEAD or a bare repository
+/// line, which this Work-scoped caller never expects to match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
+/// `wirk work clean`'s own path-identity source (P4.5 first increment,
+/// ruling 0203; QUALIFIED.md §4): a common Git directory alone cannot
+/// tell two Works' checkouts in one repository apart (the qualified
+/// probe's own finding), so identity here is *(path, branch)* pair
+/// equality against this listing, not `repository_identity`'s common-
+/// dir check. Porcelain records are blank-line-separated stanzas, each
+/// starting with `worktree <path>`; a `branch refs/heads/<name>` line
+/// follows for a checked-out branch, absent for a detached or bare
+/// entry (git worktree porcelain format, stable since git 2.7).
+pub fn worktree_entries(repo: &Path) -> Result<Vec<WorktreeEntry>, GitError> {
+    let output = run_git(repo, &["worktree", "list", "--porcelain"])?;
+    let mut entries = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            if let Some(path) = path.take() {
+                entries.push(WorktreeEntry {
+                    path,
+                    branch: branch.take(),
+                });
+            }
+            path = Some(PathBuf::from(rest));
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            branch = Some(rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string());
+        } else if line.is_empty()
+            && let Some(path) = path.take()
+        {
+            entries.push(WorktreeEntry {
+                path,
+                branch: branch.take(),
+            });
+        }
+    }
+    if let Some(path) = path.take() {
+        entries.push(WorktreeEntry {
+            path,
+            branch: branch.take(),
+        });
+    }
+    Ok(entries)
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, GitError> {

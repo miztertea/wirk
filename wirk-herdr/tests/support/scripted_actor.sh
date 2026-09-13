@@ -21,6 +21,37 @@
 #   idle               -- do nothing; end the turn with no worktree change
 #   edit:<relpath>:<text> -- write <text> to <relpath> in cwd; end the turn
 #   claim:<argv...>    -- run `wirk claim <argv...>` in cwd; end the turn
+#   commit:<message>   -- `git add -A && git commit -q -m <message>` in
+#                         cwd; end the turn. P4.5 first increment
+#                         (ruling 0203): `wirk work clean`'s own "a
+#                         committed-ahead clean checkout is eligible"
+#                         claim needs a real actor that actually commits
+#                         its edit, which `edit:` alone never does (it
+#                         only writes bytes) -- this step is that,
+#                         nothing more.
+#   output:<name>:<text> -- write <text> to `$(wirk output dir)/<name>`
+#                         (ruling 0145's managed output area, outside
+#                         the checkout entirely); end the turn. P4.5
+#                         first increment: a Claim naming a managed
+#                         output rather than a checkout path is the
+#                         only kind `wirk work clean`'s own checkout-
+#                         evidence refusal (`ClaimEvidenceInCheckout`)
+#                         does not apply to.
+#   output_claim:<name>:<text> -- `output:<name>:<text>` immediately
+#                         followed, in the same turn, by a bare `wirk
+#                         claim`. A managed-output write alone leaves
+#                         the checkout's own fingerprint unchanged
+#                         (`output:` never touches it by design), and
+#                         wirk's own no-progress check (ruling 0044
+#                         D133) reads an unchanged fingerprint across a
+#                         whole turn as a stalled actor -- correct
+#                         product behavior, not a defect this test
+#                         works around by disabling anything. Combining
+#                         the write and the claim into one turn is what
+#                         a real actor able to do both in one message
+#                         would also do, and it is what keeps this
+#                         fixture out from under a check it was never
+#                         meant to race against.
 #   block              -- report blocked and wait; nothing here releases
 #                         it -- the test's own pane.release_agent /
 #                         pane.clear_agent_authority is the human/test's
@@ -186,6 +217,33 @@ while IFS= read -r _line; do
             argv=${step#claim:}
             report working
             eval "wirk claim $argv" || true
+            report idle
+            ;;
+        commit:*)
+            message=${step#commit:}
+            report working
+            git add -A >/dev/null 2>&1 || true
+            git -c user.name=scripted-actor -c user.email=scripted-actor@invalid \
+                commit -q -m "$message" >/dev/null 2>&1 || true
+            report idle
+            ;;
+        output:*)
+            rest=${step#output:}
+            name=${rest%%:*}
+            text=${rest#*:}
+            report working
+            out_dir=$(wirk output dir)
+            printf '%s' "$text" >"$out_dir/$name"
+            report idle
+            ;;
+        output_claim:*)
+            rest=${step#output_claim:}
+            name=${rest%%:*}
+            text=${rest#*:}
+            report working
+            out_dir=$(wirk output dir)
+            printf '%s' "$text" >"$out_dir/$name"
+            wirk claim || true
             report idle
             ;;
         block)

@@ -93,6 +93,7 @@ fn pane_info(pane_id: &str) -> PaneInfo {
         cwd: None,
         display_agent: None,
         foreground_cwd: None,
+        name: None,
         label: None,
         scroll: None,
         state_labels: None,

@@ -364,6 +364,10 @@ fn request_params_by_method() -> Vec<(&'static str, Value)> {
             wirk_herdr::socket::params::session_snapshot(),
         ),
         (
+            "pane.process_info",
+            wirk_herdr::socket::params::pane_process_info("pane1"),
+        ),
+        (
             "pane.report_agent_session",
             wirk_herdr::socket::params::pane_report_agent_session(&ReportAgentSession {
                 pane_id: "pane1".to_string(),

@@ -75,10 +75,12 @@ use wirk_core::{
     validate_claim,
 };
 
+use wirk_herdr::HerdrClient;
+
 use super::boundary;
 use super::{
-    CancelPayload, ClaimPayload, ErrorDetail, FailPayload, RecordPayload, Reply, Request,
-    RetryPayload, StatusPayload, SubmitPayload, Verb, WirkdPointer, WorkFailPayload,
+    CancelPayload, ClaimPayload, CleanPayload, ErrorDetail, FailPayload, RecordPayload, Reply,
+    Request, RetryPayload, StatusPayload, SubmitPayload, Verb, WirkdPointer, WorkFailPayload,
 };
 
 /// Envelope reply plus what the server does after writing it: `stop`
@@ -1530,6 +1532,11 @@ fn dispatch(
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
+        Verb::Clean => match serde_json::from_value::<super::CleanPayload>(request.payload.clone())
+        {
+            Ok(payload) => Outcome::Reply(handle_clean(state, payload)),
+            Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+        },
         Verb::Stop => Outcome::Stop(ok_reply(json!({}))),
         // `handle_connection` intercepts `watch` before ever calling
         // `dispatch` (its own long-lived, many-lines-out shape does not
@@ -2602,6 +2609,7 @@ fn handle_record(
             | EventKind::ClaimRecorded { .. }
             | EventKind::WorkFailed { .. }
             | EventKind::WorkCanceled { .. }
+            | EventKind::WorkCleaned { .. }
             | EventKind::ContainerActivated { .. }
             | EventKind::StageHeld { .. }
             | EventKind::StageClosed { .. }
@@ -3001,6 +3009,7 @@ fn handle_record(
         | EventKind::ClaimRecorded { .. }
         | EventKind::WorkFailed { .. }
         | EventKind::WorkCanceled { .. }
+        | EventKind::WorkCleaned { .. }
         | EventKind::ContainerActivated { .. }
         | EventKind::StageHeld { .. }
         | EventKind::StageClosed { .. }
@@ -4454,6 +4463,27 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
                     })
                 })
                 .collect();
+            // Correction (ruling 0221): "a World's captured source path
+            // is historical context, not proof of current presence" —
+            // taken from the same `binding` `orientation` above already
+            // reads before `binding_status` consumes it, and checked
+            // live so a checkout `wirk work clean` has actually removed
+            // (in full or in part, including a call that itself failed
+            // partway — see `cleanup` below) is never reported as
+            // present merely because the World that reserved it still
+            // names the path.
+            let worktree_present = match binding.as_ref() {
+                Ok(binding) => match &binding.world {
+                    World::Actor(actor) if !actor.worktree_path.as_os_str().is_empty() => {
+                        Some(actor.worktree_path.is_dir())
+                    }
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            let runtime_pin_present = run_pin_dirs(&state.estate_root, &run_id)
+                .iter()
+                .any(|dir| dir.exists());
             let (world, world_binding) = binding_status(binding);
             // P3 native launch selection (BUILD-BRIEF.md item 1): the
             // Route-authored default for this Run's own Waypoint —
@@ -4512,7 +4542,42 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
                 "prior_selection": prior_selection,
                 "worktree_created": worktree_created,
                 "orientation": orientation,
+                "worktree_present": worktree_present,
+                "runtime_pin_present": runtime_pin_present,
             }))
+        })
+        .collect();
+
+    // Correction (ruling 0221): the full, ordered account of every
+    // `wirk work clean` call this Work has recorded, each exactly as
+    // that call itself observed it — per-call effects, never collapsed
+    // into a single aggregate that could misstate what actually
+    // happened (the failure mode named in `verify/ASSESSMENT.md`: a
+    // journal that carries only `worktree_removed: false` entries after
+    // a call that, in reality, did remove the checkout before a later
+    // step of that same call failed). `complete: false` on an entry
+    // means exactly that: this call's own removal did not run to its
+    // own end, so a later status/retry must not assume anything this
+    // call did not itself journal. Absent entirely (`[]`) means no
+    // cleanup call has ever completed enough of itself to journal
+    // anything for this Work — distinct from a present, empty-effects
+    // entry, which means a call ran and found nothing left to do.
+    let cleanup: Vec<Value> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::WorkCleaned {
+                runs,
+                worktree_removed,
+                runtime_pins_removed,
+                complete,
+            } => Some(json!({
+                "runs": runs.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+                "worktree_removed": worktree_removed,
+                "runtime_pins_removed": runtime_pins_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+                "complete": complete,
+                "at": event.at,
+            })),
+            _ => None,
         })
         .collect();
 
@@ -4521,6 +4586,7 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
         "current_waypoint": work.current_waypoint.as_ref().map(|w| w.0.clone()),
         "events": events.len(),
         "runs": runs,
+        "cleanup": cleanup,
     });
 
     // P2.3 W1 (states.md §2): why the Work is (or last was) NeedsInput
@@ -6765,6 +6831,573 @@ fn cancel_work(
         return Err(("JournalError", err.to_string()));
     }
     Ok(())
+}
+
+// ---- `wirk work clean` (P4.5 first increment, ruling 0203) ---------------
+//
+// One terminal Work's own checkout and per-Run runtime residue, never a
+// cascade, a scheduler, or a global prune. Every refusal below leaves
+// the filesystem and the journal exactly as they were: this function
+// either journals one `WorkCleaned` at the very end, after every check
+// has passed (or reports what it would have done, under `dry_run`), or
+// it returns an error and touches nothing.
+
+fn handle_clean(state: &Arc<WirkdState>, payload: CleanPayload) -> Reply {
+    match clean_work(state, &payload.work_id, payload.dry_run) {
+        Ok(result) => ok_reply(result),
+        Err((code, message)) => err_reply(code, &message),
+    }
+}
+
+/// This Work's single worktree identity, resolved from whichever Run
+/// actually materialized it (`resolve_run_binding`, reused verbatim —
+/// R2: the exact same reservation/materialization authority `wirk run`
+/// itself relies on, not a second reading of the journal). `None` when
+/// no Run of this Work ever reached a materialized Actor World: a
+/// submitted-then-canceled Work, or one whose Runs never launched.
+struct WorktreeTarget {
+    repository: PathBuf,
+    worktree_path: PathBuf,
+    branch: String,
+}
+
+fn resolve_worktree_target(
+    events: &[Event],
+    estate_root: &Path,
+    work_id: &WorkId,
+    run_ids: &[RunId],
+) -> Result<Option<WorktreeTarget>, (&'static str, String)> {
+    for run_id in run_ids {
+        let binding = match resolve_run_binding(events, estate_root, work_id, run_id) {
+            Ok(binding) => binding,
+            // A Run whose binding cannot be resolved at all (never
+            // opened, corrupt) contributes nothing here; `find_run`
+            // above already establishes every `run_id` came from a real
+            // `RunOpened`, so this arm is reached only for a Run that
+            // never reached reservation — nothing to clean for it.
+            Err(_) => continue,
+        };
+        match binding.world {
+            World::Deterministic(_) => {
+                return Err((
+                    "DeterministicNotSupported",
+                    format!(
+                        "Run {} reserved a Deterministic World; wirk work clean covers Actor \
+                         checkouts only in this increment (ruling 0203) — Deterministic residue \
+                         is out of scope here",
+                        run_id.0
+                    ),
+                ));
+            }
+            World::Actor(actor) if !actor.worktree_path.as_os_str().is_empty() => {
+                return Ok(Some(WorktreeTarget {
+                    repository: PathBuf::from(actor.repository),
+                    worktree_path: actor.worktree_path,
+                    branch: actor.branch,
+                }));
+            }
+            World::Actor(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+/// Step 3 (QUALIFIED.md): every recorded Run's own liveness, checked
+/// against the live Herdr its launch actually attempted — never
+/// released, never killed, only observed.
+fn check_run_ownership(
+    run_id: &RunId,
+    run: &Run,
+    worktree_path: &Path,
+) -> Result<(), (&'static str, String)> {
+    if !run.launch_requested {
+        // Never launched: there is no live actor this Run could own.
+        return Ok(());
+    }
+    let Some(attempt) = &run.launch_attempt else {
+        return Err((
+            "NoRecordedDestination",
+            format!(
+                "Run {} was launch-requested but never recorded a launch attempt destination",
+                run_id.0
+            ),
+        ));
+    };
+    if attempt.destination.trim().is_empty() {
+        return Err((
+            "NoRecordedDestination",
+            format!("Run {} has no recorded Herdr destination", run_id.0),
+        ));
+    }
+    // Correction pass: the driver that actually holds this Run's launch
+    // attempt is checked with the same admission/liveness primitive
+    // `admit_launch_attempt` already uses (`holder_state`) — a terminal
+    // Claim releases nothing on its own (module doc, `handle_claim`);
+    // only the holder process itself exiting does. `Gone` is the only
+    // answer that clears this check; `Live` and `Unverifiable` both
+    // refuse, the latter naming the pid so the operator has something
+    // to check rather than a silent pass.
+    match holder_state(&attempt.holder) {
+        HolderState::Gone => {}
+        HolderState::Live => {
+            return Err((
+                "ActorLive",
+                format!(
+                    "Run {}'s launch-driver process {} is still running",
+                    run_id.0, attempt.holder.pid
+                ),
+            ));
+        }
+        HolderState::Unverifiable => {
+            return Err((
+                "ActorLive",
+                format!(
+                    "Run {}'s launch-driver process {} could not be established as gone",
+                    run_id.0, attempt.holder.pid
+                ),
+            ));
+        }
+    }
+    let unreachable = |detail: std::fmt::Arguments| {
+        (
+            "HerdrUnreachable",
+            format!(
+                "Run {}'s recorded Herdr destination {} {}",
+                run_id.0, attempt.destination, detail
+            ),
+        )
+    };
+    let client = wirk_herdr::SocketClient::connect(PathBuf::from(&attempt.destination))
+        .map_err(|err| unreachable(format_args!("did not answer: {err}")))?;
+
+    // agent.list: this Run's own agent, by name, in *any* status —
+    // done and idle included (QUALIFIED.md §3) — or any listed pane
+    // whose cwd/foreground_cwd already sits inside the worktree
+    // regardless of name (a renamed agent, a moved pane, another
+    // Work's actor left pointed here).
+    let agents = client
+        .list_agents()
+        .map_err(|err| unreachable(format_args!("did not answer agent.list: {err}")))?;
+    for pane in &agents {
+        if pane.name.as_deref() == Some(run_id.0.as_str()) {
+            return Err((
+                "ActorLive",
+                format!(
+                    "Run {}'s own agent is still registered with Herdr (status {:?})",
+                    run_id.0, pane.agent_status
+                ),
+            ));
+        }
+        if pane_cwd_within(pane.cwd.as_deref(), worktree_path)
+            || pane_cwd_within(pane.foreground_cwd.as_deref(), worktree_path)
+        {
+            return Err((
+                "ActorLive",
+                format!(
+                    "a live agent pane's cwd sits inside the worktree for Run {} (renamed or \
+                     moved actor)",
+                    run_id.0
+                ),
+            ));
+        }
+    }
+
+    // `session.snapshot`: every pane in the session, agent or not — the
+    // plain-shell gap QUALIFIED.md's own "Unresolved limits" left open
+    // (`agent.list` never lists a pane with no registered agent at
+    // all). Correction pass: every pane is checked via
+    // `pane.process_info`'s own live process table, never gated on
+    // whether Herdr's *cached* `cwd`/`foreground_cwd` (or an agent
+    // pane's registered name/status) happens to already match — a
+    // stale or foreign cached cwd must not hide a foreground process
+    // that is, right now, actually inside the worktree, and a pane
+    // already matched by name above is cheap to check again rather
+    // than special-cased out.
+    let snapshot = client
+        .snapshot()
+        .map_err(|err| unreachable(format_args!("did not answer session.snapshot: {err}")))?;
+    for pane in &snapshot.panes {
+        match client.pane_process_info(&pane.pane_id) {
+            Ok(info) => {
+                let confirmed_here = info
+                    .foreground_processes
+                    .iter()
+                    .any(|process| pane_cwd_within(process.cwd.as_deref(), worktree_path));
+                // No foreground process cwd could be read at all (the
+                // vector is empty, or every entry's own `cwd` is
+                // unknown) but the pane's own shell is a live process:
+                // unresolvable, treated as still live rather than
+                // guessed clear (J0's own "preserve the resource and
+                // say what check failed" applied to an inconclusive
+                // read, not a failed one).
+                let unresolvable = info.shell_pid.is_some()
+                    && info.foreground_processes.iter().all(|p| p.cwd.is_none());
+                if confirmed_here || unresolvable {
+                    return Err((
+                        "ActorLive",
+                        format!(
+                            "a live pane process is running with its cwd inside the worktree \
+                             for Run {} (pane {}, {})",
+                            run_id.0,
+                            pane.pane_id,
+                            if confirmed_here {
+                                "foreground cwd confirmed inside the worktree"
+                            } else {
+                                "live shell with no readable foreground cwd"
+                            }
+                        ),
+                    ));
+                }
+            }
+            // The pane closed between the snapshot and this call: no
+            // longer live, nothing to refuse.
+            Err(wirk_herdr::HerdrError::NotFound(_)) => {}
+            Err(err) => {
+                return Err(unreachable(format_args!(
+                    "could not confirm pane {}'s process identity: {err}",
+                    pane.pane_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `candidate` (a pane's cached `cwd`/`foreground_cwd`, or a
+/// live process's own `cwd`) sits at or inside `worktree_path`.
+/// Canonicalized on both sides when the filesystem allows it (a still-
+/// live directory almost always does); falls back to the raw strings
+/// so a candidate naming a path that no longer exists is still compared
+/// rather than silently treated as "cannot match".
+fn pane_cwd_within(candidate: Option<&str>, worktree_path: &Path) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    let candidate_path = Path::new(candidate);
+    let canon_candidate =
+        std::fs::canonicalize(candidate_path).unwrap_or_else(|_| candidate_path.to_path_buf());
+    let canon_worktree =
+        std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+    canon_candidate == canon_worktree || canon_candidate.starts_with(&canon_worktree)
+}
+
+/// Step 4 (QUALIFIED.md): the registered checkout at `target.worktree_path`
+/// is genuinely *this* Work's own — never a symlink substituted after
+/// the fact (ruling 0203: "do not follow a substituted symlink into
+/// another checkout"), and never another Work's checkout in the same
+/// repository (the qualified probe's own finding that a common Git
+/// directory cannot tell the two apart). Returns whether git still has
+/// *any* registration for this path at all: `Ok(true)` when a matching
+/// entry exists (the ordinary case, and the qualified probe's own
+/// "stale entry, directory gone" retry case — `worktree_remove` is
+/// itself idempotent over a missing directory as long as git's own
+/// record still names it); `Ok(false)` when neither the directory nor
+/// git's own administrative record names this path at all — already
+/// fully clean, nothing left to hand to `worktree_remove` at all (which
+/// would otherwise fail outright: git refuses `worktree remove` on a
+/// path it has no record of, `fatal: ... is not a working tree`, unlike
+/// its idempotent handling of a *registered* entry whose directory is
+/// merely gone).
+fn verify_worktree_identity(target: &WorktreeTarget) -> Result<bool, (&'static str, String)> {
+    if let Ok(metadata) = std::fs::symlink_metadata(&target.worktree_path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err((
+            "PathMismatch",
+            format!(
+                "{} is a symlink, not this Work's own checkout directory — refused rather than \
+                 followed",
+                target.worktree_path.display()
+            ),
+        ));
+    }
+
+    let entries = match wirk_herdr::git::worktree_entries(&target.repository) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return Err((
+                "PathMismatch",
+                format!(
+                    "could not read {}'s own worktree registration: {err}",
+                    target.repository.display()
+                ),
+            ));
+        }
+    };
+    let registered = entries
+        .iter()
+        .any(|entry| paths_equal(&target.worktree_path, &entry.path));
+    let matched = entries.iter().any(|entry| {
+        paths_equal(&target.worktree_path, &entry.path)
+            && entry.branch.as_deref() == Some(target.branch.as_str())
+    });
+    if matched {
+        return Ok(true);
+    }
+    if !target.worktree_path.exists() && !registered {
+        // Neither the directory nor git's own administrative record
+        // names this path at all: already fully clean, not a mismatch.
+        return Ok(false);
+    }
+    Err((
+        "PathMismatch",
+        format!(
+            "{} does not resolve to this Work's own registered worktree (branch {}) in {}",
+            target.worktree_path.display(),
+            target.branch,
+            target.repository.display()
+        ),
+    ))
+}
+
+fn clean_work(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    dry_run: bool,
+) -> Result<Value, (&'static str, String)> {
+    let journal = journal_for(state, work_id)
+        .map_err(|err| ("JournalError", err.to_string()))?
+        .ok_or_else(|| ("NotFound", "no such work".to_string()))?;
+    let events = {
+        let journal = lock_journal(&journal);
+        journal
+            .replay()
+            .map_err(|err| ("JournalError", err.to_string()))?
+    };
+    if events.is_empty() {
+        return Err(("NotFound", "no such work".to_string()));
+    }
+    let work = fold(&events);
+    if !work.state.is_terminal() {
+        return Err((
+            "NotTerminal",
+            format!(
+                "work {} is not terminal (state: {})",
+                work_id.0,
+                work_state_name(work.state)
+            ),
+        ));
+    }
+
+    let run_ids: Vec<RunId> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::RunOpened { run, .. } => Some(run.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Step 2: validated Claim evidence stored in the checkout (as
+    // opposed to this Work's own managed `WorkOutputs`) cannot be
+    // preserved once the checkout is gone — refuse rather than losing
+    // it silently.
+    let mut checkout_evidence: BTreeSet<String> = BTreeSet::new();
+    for event in &events {
+        if let EventKind::ClaimRecorded {
+            verdict: ClaimVerdict::Validated,
+            artifacts,
+            ..
+        } = &event.kind
+        {
+            for artifact in artifacts {
+                if artifact.store == wirk_core::ArtifactStore::Worktree {
+                    checkout_evidence.insert(artifact.name.clone());
+                }
+            }
+        }
+    }
+    if !checkout_evidence.is_empty() {
+        return Err((
+            "ClaimEvidenceInCheckout",
+            format!(
+                "validated Claim evidence lives only in the checkout, not this Work's managed \
+                 outputs, and would become unavailable: {}",
+                checkout_evidence.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+    }
+
+    let target = resolve_worktree_target(&events, &state.estate_root, work_id, &run_ids)?;
+
+    let mut worktree_registered = false;
+    if let Some(target) = &target {
+        for run_id in &run_ids {
+            let Some(run) = find_run(&events, run_id) else {
+                continue;
+            };
+            check_run_ownership(run_id, &run, &target.worktree_path)?;
+        }
+        worktree_registered = verify_worktree_identity(target)?;
+
+        if worktree_registered && target.worktree_path.is_dir() {
+            let ignored = wirk_herdr::git::ignored_paths(&target.worktree_path).map_err(|err| {
+                (
+                    "IgnoredContent",
+                    format!("could not check for ignored content: {err}"),
+                )
+            })?;
+            if !ignored.is_empty() {
+                return Err((
+                    "IgnoredContent",
+                    format!(
+                        "ignored content present in the checkout, which removal would silently \
+                         delete: {}",
+                        ignored.join(", ")
+                    ),
+                ));
+            }
+            // Correction pass: the dirty/untracked guard is real git
+            // status, asked here so `--dry-run` reports the identical
+            // refusal a real call would reach — the qualified candidate
+            // only discovered this via `git worktree remove`'s own
+            // refusal in the non-dry branch below, so a dry run could
+            // report an eligible checkout it had never actually
+            // checked for uncommitted content.
+            let dirty = wirk_herdr::git::has_uncommitted_or_untracked(&target.worktree_path)
+                .map_err(|err| {
+                    (
+                        "UncommittedWork",
+                        format!("could not check for uncommitted content: {err}"),
+                    )
+                })?;
+            if dirty {
+                return Err((
+                    "UncommittedWork",
+                    "uncommitted or untracked changes are present in the checkout; git would \
+                     refuse to remove it, nothing preserved has been touched"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    // Every check above passed with no mutation. From here on, a
+    // `dry_run` call stops: it reports exactly what a real call would
+    // do, having proven every refusal does not apply, but performs none
+    // of it.
+    let mut worktree_removed = false;
+    let mut runtime_pins_removed: Vec<RunId> = Vec::new();
+
+    if worktree_registered && let Some(target) = &target {
+        if !dry_run {
+            match wirk_herdr::git::worktree_remove(&target.repository, &target.worktree_path) {
+                Ok(()) => worktree_removed = true,
+                Err(err) => {
+                    return Err((
+                        "UncommittedWork",
+                        format!(
+                            "git refused to remove the worktree (uncommitted or untracked \
+                             changes preserved, nothing removed): {err}"
+                        ),
+                    ));
+                }
+            }
+        } else {
+            worktree_removed = true;
+        }
+    }
+
+    // Correction (ruling 0221): a failure partway through this loop must
+    // not lose the effects already real by that point — `worktree_removed`
+    // above, and any run's pin directories already removed in an earlier
+    // iteration of this same loop. The loop itself no longer returns
+    // early via `?`; it records the first failure and stops, so the
+    // journal append below (reached for both outcomes, as long as this
+    // call is not `dry_run`) always sees exactly what actually happened.
+    let mut pin_removal_error: Option<(&'static str, String)> = None;
+    'runs: for run_id in &run_ids {
+        let [runtime_dir, claude_dir, opencode_dir] = run_pin_dirs(&state.estate_root, run_id);
+
+        let mut had_any = false;
+        for dir in [&runtime_dir, &claude_dir, &opencode_dir] {
+            if dir.exists() {
+                had_any = true;
+                if !dry_run && let Err(err) = std::fs::remove_dir_all(dir) {
+                    pin_removal_error =
+                        Some(("JournalError", format!("removing {}: {err}", dir.display())));
+                    break 'runs;
+                }
+            }
+        }
+        if had_any {
+            runtime_pins_removed.push(run_id.clone());
+        }
+    }
+
+    if dry_run {
+        return Ok(json!({
+            "work_id": work_id.0,
+            "dry_run": true,
+            "runs": run_ids.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+            "worktree_removed": worktree_removed,
+            "runtime_pins_removed": runtime_pins_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        }));
+    }
+
+    let complete = pin_removal_error.is_none();
+    let event = new_event(
+        work_id,
+        None,
+        EventKind::WorkCleaned {
+            runs: run_ids.clone(),
+            worktree_removed,
+            runtime_pins_removed: runtime_pins_removed.clone(),
+            complete,
+        },
+    );
+    let mut journal = lock_journal(&journal);
+    let append_result = append_event(state, &mut journal, work_id, &event);
+
+    if let Some((code, message)) = pin_removal_error {
+        // The removal failed, but whatever it actually completed above
+        // (`worktree_removed`, any prefix of `runtime_pins_removed`) is
+        // real and, as of this line, either durably journaled or not —
+        // never silently claimed either way. `append_result`'s own error
+        // (the journal itself is unwritable) is reported alongside the
+        // original failure rather than in place of it: this call must
+        // not claim atomicity or a successful recording it did not
+        // achieve, in either direction.
+        return match append_result {
+            Ok(()) => Err((code, message)),
+            Err(journal_err) => Err((
+                "JournalError",
+                format!(
+                    "{message}; additionally, this partial outcome could not be recorded: \
+                     {journal_err}"
+                ),
+            )),
+        };
+    }
+    append_result.map_err(|err| ("JournalError", err.to_string()))?;
+
+    Ok(json!({
+        "work_id": work_id.0,
+        "dry_run": false,
+        "runs": run_ids.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        "worktree_removed": worktree_removed,
+        "runtime_pins_removed": runtime_pins_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        "complete": complete,
+    }))
+}
+
+/// This Run's three per-Run residue directories (`runtime`, `claude`,
+/// `opencode` pins) — the exact identity `clean_work`'s removal loop
+/// uses, reused as-is (R2) by `handle_status`'s own live presence check
+/// so "what cleanup would remove/removed" and "what is actually still
+/// there" never drift apart by naming the paths two different ways.
+fn run_pin_dirs(estate_root: &Path, run_id: &RunId) -> [PathBuf; 3] {
+    let runtime_dir = wirk_herdr::run_wirk_bin_dir(&estate_root.display().to_string(), &run_id.0)
+        .parent()
+        .expect("run_wirk_bin_dir always has a parent")
+        .to_path_buf();
+    let claude_dir =
+        wirk_herdr::claim_hook::claude_plugin_dir(&estate_root.display().to_string(), &run_id.0)
+            .parent()
+            .expect("claude_plugin_dir always has a parent")
+            .to_path_buf();
+    let opencode_dir =
+        wirk_herdr::claim_hook::run_dir(&estate_root.display().to_string(), &run_id.0);
+    [runtime_dir, claude_dir, opencode_dir]
 }
 
 // ---- Atlas (P3 W3, BUILD-BRIEF.md "Public surface") ----------------------
@@ -10369,6 +11002,10 @@ fn event_source_disclosure(event: &Event, producing: &[RepositoryBinding]) -> So
         | EventKind::RunOpened { .. }
         | EventKind::WorkFailed { .. }
         | EventKind::WorkCanceled { .. }
+        // P4.5 first increment: Run ids and observed booleans only —
+        // no source coordinate, no path, no checkout-derived digest
+        // (its own doc comment: "booleans/lists as observed").
+        | EventKind::WorkCleaned { .. }
         | EventKind::ContainerActivated { .. }
         | EventKind::StageHeld { .. }
         | EventKind::ChildWorkSpawned { .. }
@@ -17605,6 +18242,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- Correction pass: `check_run_ownership`'s driver-holder gate ----
+
+    /// Builds a folded `Run` whose `launch_attempt` names `holder` —
+    /// `RunOpened`, `RunLaunchRequested`, `RunLaunchAttempted`, replayed
+    /// through the real `find_run`/`fold` any live journal uses, not a
+    /// hand-built `Run` literal (the same discipline `attempt_events`
+    /// above already follows for the lineage tests).
+    fn run_with_holder(run_id: &str, holder: AttemptHolder, destination: &str) -> Run {
+        let work = WorkId("work-holder".to_string());
+        let run = RunId(run_id.to_string());
+        let events = vec![
+            new_event(
+                &work,
+                Some(run.clone()),
+                EventKind::RunOpened {
+                    run: run.clone(),
+                    waypoint: WaypointId("holder/wp-1".to_string()),
+                    attempt: 1,
+                    world_hash: WorldHash("hash".to_string()),
+                },
+            ),
+            new_event(
+                &work,
+                Some(run.clone()),
+                EventKind::RunLaunchRequested {
+                    run: run.clone(),
+                    actor_kind: ActorKind("opencode".to_string()),
+                    selection: ActorSelection {
+                        model: None,
+                        effort: None,
+                        args: Vec::new(),
+                    },
+                },
+            ),
+            new_event(
+                &work,
+                Some(run.clone()),
+                EventKind::RunLaunchAttempted {
+                    run: run.clone(),
+                    destination: destination.to_string(),
+                    holder,
+                },
+            ),
+        ];
+        find_run(&events, &run).expect("the Run this test just opened folds back")
+    }
+
+    /// The concrete gap the correction pass closes: a Run's recorded
+    /// launch-driver process is still running, but nothing about that
+    /// is visible to `agent.list`/`session.snapshot` at all (no Herdr
+    /// connection is even reachable at `destination` here) — a terminal
+    /// Claim settles nothing about this holder, and the qualified
+    /// candidate's ownership path never asked `holder_state` at all, so
+    /// it would have read this Run as clear. A real, live child process
+    /// stands in for the holder — `holder_state` reads the real kernel
+    /// `/proc`, not a fake of it.
+    #[test]
+    fn check_run_ownership_refuses_a_still_running_launch_driver_before_ever_asking_herdr() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn a real short-lived holder process");
+        let pid = child.id();
+        let holder = AttemptHolder {
+            pid,
+            start_token: process_start_token(pid),
+        };
+        let run = run_with_holder(
+            "run-holder-live",
+            holder,
+            "/nonexistent/unreachable-herdr.sock",
+        );
+        let worktree = tempfile::tempdir().expect("worktree tempdir");
+
+        let result =
+            check_run_ownership(&RunId("run-holder-live".to_string()), &run, worktree.path());
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let Err((code, message)) = result else {
+            panic!("expected a refusal while the launch-driver process is still running");
+        };
+        assert_eq!(
+            code, "ActorLive",
+            "expected ActorLive for a live driver holder, got {code}: {message}"
+        );
+        assert!(
+            message.contains(&pid.to_string()),
+            "expected the refusal to name the live pid {pid}, got: {message}"
+        );
+    }
+
+    /// The companion positive control: once the real holder process has
+    /// actually exited and been reaped, `holder_state` reads `Gone` and
+    /// the ownership check proceeds past it to the Herdr connection
+    /// attempt (refused here only because `destination` is unreachable,
+    /// proving the driver-holder gate itself is not what is blocking).
+    #[test]
+    fn check_run_ownership_does_not_block_on_a_driver_holder_that_has_exited() {
+        let mut child = Command::new("true")
+            .spawn()
+            .expect("spawn a real short-lived holder process");
+        let pid = child.id();
+        let start_token = process_start_token(pid);
+        let status = child.wait().expect("reap the holder process");
+        assert!(status.success());
+
+        let holder = AttemptHolder { pid, start_token };
+        let run = run_with_holder(
+            "run-holder-gone",
+            holder,
+            "/nonexistent/unreachable-herdr.sock",
+        );
+        let worktree = tempfile::tempdir().expect("worktree tempdir");
+
+        let result =
+            check_run_ownership(&RunId("run-holder-gone".to_string()), &run, worktree.path());
+
+        let Err((code, _message)) = result else {
+            panic!("expected a refusal from the unreachable Herdr destination, not a silent pass");
+        };
+        assert_eq!(
+            code, "HerdrUnreachable",
+            "a gone holder must fall through to the Herdr check, not stay blocked as ActorLive"
+        );
     }
 }
 

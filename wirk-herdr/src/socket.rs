@@ -98,9 +98,9 @@ use serde_json::{Value, json};
 
 use crate::{
     AgentStatus, Bearing, CloseWorkspace, CreateWorkspace, EventSubscription, FocusPane,
-    HerdrClient, HerdrError, HerdrEvent, Notify, OpenWorktree, PaneInfo, PromptAgent, ReleaseAgent,
-    RemoveWorktree, ReportAgent, ReportAgentSession, ReportMetadata, SendKeys, Snapshot, SplitPane,
-    StartAgent, WorkspaceInfo, WorktreeInfo,
+    HerdrClient, HerdrError, HerdrEvent, Notify, OpenWorktree, PaneInfo, PaneProcessInfo,
+    PromptAgent, ReleaseAgent, RemoveWorktree, ReportAgent, ReportAgentSession, ReportMetadata,
+    SendKeys, Snapshot, SplitPane, StartAgent, WorkspaceInfo, WorktreeInfo,
 };
 
 /// Every wire `method` name `SocketClient` sends, `ping` and
@@ -129,6 +129,7 @@ pub const METHODS: &[&str] = &[
     "pane.close",
     "workspace.close",
     "session.snapshot",
+    "pane.process_info",
     "pane.report_agent_session",
     "pane.report_agent",
     "pane.report_metadata",
@@ -711,6 +712,15 @@ pub mod params {
         json!({})
     }
 
+    /// `PaneProcessInfoParams` (vendored fixture, protocol 22):
+    /// `pane_id` is nullable on the wire (the server's own current-pane
+    /// default), but this client always names one explicitly — every
+    /// call site already has the pane id from a `snapshot()`/`agent.list`
+    /// read, so there is never a reason to lean on an implicit default.
+    pub fn pane_process_info(pane_id: &str) -> Value {
+        json!({"pane_id": pane_id})
+    }
+
     pub fn pane_report_agent_session(req: &ReportAgentSession) -> Value {
         json!({
             "pane_id": req.pane_id,
@@ -901,15 +911,23 @@ impl HerdrClient for SocketClient {
         let snap: SessionSnapshotPanes = extract(result, "session_snapshot", "snapshot")?;
         let workspaces = snap
             .panes
-            .into_iter()
+            .iter()
             .map(|pane| Bearing {
-                workspace_id: pane.workspace_id,
-                tab_id: pane.tab_id,
-                pane_id: pane.pane_id,
-                terminal_id: pane.terminal_id,
+                workspace_id: pane.workspace_id.clone(),
+                tab_id: pane.tab_id.clone(),
+                pane_id: pane.pane_id.clone(),
+                terminal_id: pane.terminal_id.clone(),
             })
             .collect();
-        Ok(Snapshot { workspaces })
+        Ok(Snapshot {
+            workspaces,
+            panes: snap.panes,
+        })
+    }
+
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        let result = self.call("pane.process_info", params::pane_process_info(pane_id))?;
+        extract(result, "pane_process_info", "process_info")
     }
 
     fn report_agent_session(&self, req: ReportAgentSession) -> Result<(), HerdrError> {

@@ -2103,6 +2103,7 @@ impl Run {
             | EventKind::WaypointReserved { .. }
             | EventKind::WorkFailed { .. }
             | EventKind::WorkCanceled { .. }
+            | EventKind::WorkCleaned { .. }
             | EventKind::ContainerActivated { .. }
             | EventKind::StageHeld { .. }
             | EventKind::StageClosed { .. }
@@ -3269,6 +3270,36 @@ pub enum EventKind {
         #[serde(default)]
         caused_by: Option<WorkId>,
     },
+    /// P4.5 first increment (ruling 0203): `wirk work clean`'s own
+    /// observed outcome for one terminal Work, journaled once. Carries
+    /// no single `run` (the event's own `Event.run` stays `None`,
+    /// exactly as `WorkCanceled`'s does) because the operation walks
+    /// every recorded Run of the Work, not the latest — `runs` is that
+    /// Work's own Run ids the checkout removal covers (there is exactly
+    /// one worktree per Work, `executor.rs`'s own derivation), and
+    /// `runtime_pins_removed` is the subset of those Run ids whose
+    /// per-Run runtime/hook directories were actually found and removed
+    /// this call. Booleans/lists as observed, never an implied
+    /// guarantee (QUALIFIED.md §"Journal once"): a repeat call that
+    /// finds nothing left to do still journals truthfully that it ran
+    /// and found nothing, rather than erroring or staying silent.
+    /// Correction (ruling 0221): whether *this call* ran every step to
+    /// its own end. `false` means a later step (today, only a per-Run
+    /// pin directory removal) failed after `worktree_removed` and/or a
+    /// prefix of `runtime_pins_removed` had already actually happened —
+    /// this event still exists specifically so those completed effects
+    /// are not lost, even though the call itself returned an error.
+    /// `#[serde(default)]` on an *old* journaled event (recorded when
+    /// every call that reached this far had, by construction, already
+    /// run to completion) decodes as `true`, matching what was actually
+    /// true of it at the time.
+    WorkCleaned {
+        runs: Vec<RunId>,
+        worktree_removed: bool,
+        runtime_pins_removed: Vec<RunId>,
+        #[serde(default = "default_work_cleaned_complete")]
+        complete: bool,
+    },
     /// W-A (§3.1): explicit journaled identity for one container
     /// occurrence, even though a container has no execution Run
     /// (BUILD-AMENDMENTS.md: "name it and journal it, rather than
@@ -3356,6 +3387,16 @@ pub enum EventKind {
         finding: FindingId,
         application: ApplicationRef,
     },
+}
+
+/// `#[serde(default)]` helper for `EventKind::WorkCleaned::complete`: an
+/// event journaled before this field existed was, by construction,
+/// already a fully-run call (the only kind that could reach the journal
+/// append at all, before ruling 0221's correction), so decoding it
+/// without the field present must read `true`, not the type's own
+/// `bool::default()` of `false`.
+fn default_work_cleaned_complete() -> bool {
+    true
 }
 
 /// D9#1: replay rebuilds Work state, no in-memory objects. The
@@ -3653,6 +3694,11 @@ pub fn fold(events: &[Event]) -> Work {
             EventKind::WorkCanceled { .. } => {
                 w.state = WorkState::Canceled;
             }
+            // No Work-state effect (fold.md §1's own pattern): a
+            // terminal Work stays exactly as terminal as it already
+            // was. A reader that needs to know cleanup happened replays
+            // for this event's presence, per its own doc comment.
+            EventKind::WorkCleaned { .. } => {}
             // W-A (§3.1): no *state* effect, but the activation itself
             // is folded (W-A correction, F1/F2): `activations` carries
             // each container's current generation, and a container

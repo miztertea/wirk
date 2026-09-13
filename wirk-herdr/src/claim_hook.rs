@@ -178,7 +178,14 @@ pub struct OpencodeOverlay {
 /// root wirk already owns, never the worktree (0050's boundary check
 /// never sees it: it is not written under `actor.worktree_path` at
 /// all) and never `~/`.
-fn run_dir(estate_root: &str, run_id: &str) -> PathBuf {
+///
+/// `pub` (P4.5 first increment, ruling 0203): `wirk work clean`'s own
+/// per-Run directory removal (`server::handle_clean`, a different
+/// crate) names this exact directory rather than re-deriving the
+/// `.wirk/opencode/<run_id>` join by hand — one layout owner, per this
+/// module's own established pattern for `claude_plugin_dir` and
+/// `run_wirk_bin_dir` below.
+pub fn run_dir(estate_root: &str, run_id: &str) -> PathBuf {
     Path::new(estate_root)
         .join(".wirk")
         .join("opencode")

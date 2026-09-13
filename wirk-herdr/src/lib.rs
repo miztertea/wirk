@@ -169,9 +169,24 @@ pub struct CloseWorkspace {
 }
 
 /// Row 19, `session.snapshot`; rebuilds the `PaneBinding` set (D51).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `panes` (P4.5 first increment, ruling 0203): the same reply's own
+/// `panes` list, kept in full rather than reduced to `Bearing`. The
+/// wire reply already names one `PaneInfo` per pane in the session —
+/// every pane, not only one Herdr also tracks as an agent (`agent:
+/// None` for a plain shell) — and `PaneInfo` already carries `cwd`/
+/// `foreground_cwd`. Discarding those two fields down to `Bearing`
+/// (identity alone) is what left `wirk work clean`'s ownership check
+/// unable to see a plain shell `cd`'d into a Work's checkout at all
+/// (QUALIFIED.md "Unresolved limits"): `agent.list` only ever lists a
+/// pane with a registered agent, so a plain shell was invisible to
+/// every ownership check this client could make. No new wire method —
+/// `session.snapshot` already answers this; only the Rust type was
+/// throwing the answer away.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub workspaces: Vec<Bearing>,
+    pub panes: Vec<PaneInfo>,
 }
 
 /// Row 20, `events.subscribe` — dotted names, D51's matching pair to
@@ -304,6 +319,22 @@ pub struct PaneInfo {
     pub cwd: Option<String>,
     pub display_agent: Option<String>,
     pub foreground_cwd: Option<String>,
+    /// `AgentInfo`'s own field (`agent.list`/`agent.get`'s reply type,
+    /// same required-field set as `PaneInfo` but not the same optional
+    /// fields — confirmed against both the vendored p20 fixture and a
+    /// live protocol-22 schema): the name `agent.start{name}` gave this
+    /// pane's agent, i.e. the Run id (`start_actor_agent`'s own doc:
+    /// "the live agent's name is the Run id"). `None` for an ordinary
+    /// `pane.get`/`session.snapshot` `PaneInfo` reply, which never
+    /// carries this property at all — reused here rather than a
+    /// separate `AgentInfo` type (R1/R2: identical required-field set,
+    /// one struct, one `agent`-vs-`name` distinction to remember, not
+    /// two near-duplicate types). P4.5 first increment (ruling 0203):
+    /// this is the field `wirk work clean`'s own ownership check
+    /// actually needs to match a live agent to its Run — `agent` alone
+    /// (the harness kind, e.g. `"opencode"`) never identifies *which*
+    /// Run's agent a pane holds.
+    pub name: Option<String>,
     pub label: Option<String>,
     pub scroll: Option<serde_json::Value>,
     pub state_labels: Option<BTreeMap<String, String>>,
@@ -355,6 +386,41 @@ pub struct TabInfo {
     pub focused: bool,
     pub pane_count: u32,
     pub agent_status: AgentStatus,
+}
+
+/// `success_response.$defs.PaneProcessInfo` (`pane.process_info`,
+/// protocol 22): the box's own actual process table for one pane, not
+/// the terminal's cached idea of its `cwd` (`PaneInfo.cwd`/
+/// `foreground_cwd`, which is Herdr's own last-observed value). P4.5
+/// first increment (ruling 0203, QUALIFIED.md "Unresolved limits"):
+/// this is the "pane.process_info (foreground_processes[].cwd)" the
+/// qualified design named as the one thing that would close the
+/// plain-shell ownership gap and left unimplemented ("has no product
+/// client"). Only `pane_id` is required on the wire; every other field
+/// is absent when the pane's process table could not be read (the pane
+/// closed between listing and querying it, or the platform does not
+/// expose it) — `None`/empty is "unknown", never "no process".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneProcessInfo {
+    pub pane_id: String,
+    pub shell_pid: Option<u32>,
+    pub tty: Option<String>,
+    pub foreground_process_group_id: Option<u32>,
+    #[serde(default)]
+    pub foreground_processes: Vec<PaneProcessInfoProcess>,
+}
+
+/// One process in `PaneProcessInfo.foreground_processes` — real fields
+/// off the box's own process table (`pid`/`name` required; the rest
+/// `None` where unreadable).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneProcessInfoProcess {
+    pub pid: u32,
+    pub name: String,
+    pub argv0: Option<String>,
+    pub argv: Option<Vec<String>>,
+    pub cmdline: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// `event.$defs.AgentStatus`: `["idle", "working", "blocked", "done",
@@ -553,6 +619,15 @@ pub trait HerdrClient: Send + Sync {
     /// text, not full scrollback); returns the pane's text as-is, one
     /// line per screen row.
     fn read_pane(&self, pane_id: &str) -> Result<String, HerdrError>;
+    /// `pane.process_info` (protocol 22; P4.5 first increment, ruling
+    /// 0203): the box's own live process table for one pane — real
+    /// terminal/pane process identity, not Herdr's cached `PaneInfo`
+    /// fields. `wirk work clean`'s ownership check uses this as the
+    /// authoritative confirmation once `snapshot()`'s `cwd`/
+    /// `foreground_cwd` has already narrowed to a candidate pane: a
+    /// cached path can be stale by one command; the process table
+    /// cannot.
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError>;
     /// Row 20: subscribe, hand back raw events; dedup-by-identity lives
     /// above this trait in `Reconciler`, not inside the client — a fake
     /// can replay a fixed `Vec<HerdrEvent>` with no dedup of its own.
@@ -664,6 +739,9 @@ impl<T: HerdrClient + ?Sized> HerdrClient for std::sync::Arc<T> {
     }
     fn read_pane(&self, pane_id: &str) -> Result<String, HerdrError> {
         (**self).read_pane(pane_id)
+    }
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        (**self).pane_process_info(pane_id)
     }
     fn subscribe(
         &self,

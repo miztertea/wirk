@@ -121,6 +121,7 @@ fn pane_info(pane_id: &str, agent_status: AgentStatus, revision: u64) -> PaneInf
         cwd: None,
         display_agent: None,
         foreground_cwd: None,
+        name: None,
         label: None,
         scroll: None,
         state_labels: None,

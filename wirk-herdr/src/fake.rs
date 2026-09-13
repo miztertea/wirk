@@ -12,9 +12,9 @@ use std::sync::Mutex;
 
 use crate::{
     AgentStatus, CloseWorkspace, CreateWorkspace, EventSubscription, FocusPane, HerdrClient,
-    HerdrError, HerdrEvent, Notify, OpenWorktree, PaneInfo, PromptAgent, ReleaseAgent,
-    RemoveWorktree, ReportAgent, ReportAgentSession, ReportMetadata, SendKeys, Snapshot, SplitPane,
-    StartAgent, WorkspaceInfo, WorktreeInfo,
+    HerdrError, HerdrEvent, Notify, OpenWorktree, PaneInfo, PaneProcessInfo, PromptAgent,
+    ReleaseAgent, RemoveWorktree, ReportAgent, ReportAgentSession, ReportMetadata, SendKeys,
+    Snapshot, SplitPane, StartAgent, WorkspaceInfo, WorktreeInfo,
 };
 
 /// A `HerdrClient` whose responses are fixed in advance, recording the
@@ -35,6 +35,13 @@ pub struct FakeHerdrClient {
     /// tests never touch `Blocked` and should not have to configure it.
     pub pane_read_responses: Mutex<BTreeMap<String, Result<String, HerdrError>>>,
     pub snapshots: Mutex<VecDeque<Snapshot>>,
+    /// P4.5 first increment: scripted `pane.process_info` replies, keyed
+    /// by `pane_id` — same shape as `get_pane_responses`, unset defaults
+    /// to `NotFound` (no test in this crate exercises `wirk work clean`
+    /// directly; the real ownership check is proven live, `tests.md`
+    /// discipline, so this fake exists only so the trait stays
+    /// implementable here at all).
+    pub pane_process_info_responses: Mutex<BTreeMap<String, Result<PaneProcessInfo, HerdrError>>>,
     pub subscribe_events: Mutex<Vec<HerdrEvent>>,
     /// Fix 2 (0040, ruling 0044): a real channel a test can feed and
     /// close, standing in for Herdr's own blocking subscription — used
@@ -275,6 +282,15 @@ impl HerdrClient for FakeHerdrClient {
 
     fn get_pane(&self, pane_id: &str) -> Result<PaneInfo, HerdrError> {
         self.get_pane_responses
+            .lock()
+            .unwrap()
+            .get(pane_id)
+            .cloned()
+            .unwrap_or_else(|| Err(HerdrError::NotFound(pane_id.to_string())))
+    }
+
+    fn pane_process_info(&self, pane_id: &str) -> Result<PaneProcessInfo, HerdrError> {
+        self.pane_process_info_responses
             .lock()
             .unwrap()
             .get(pane_id)

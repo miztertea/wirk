@@ -183,6 +183,13 @@ pub enum Verb {
     /// projection, so an expansion can only ever be of the caller's own
     /// delivered context.
     WorldExpand,
+    /// `wirk work clean` (P4.5 first increment, ruling 0203): the
+    /// operator's explicit single-Work checkout cleanup for one
+    /// *terminal* Work — refuses outright otherwise. Never cascades,
+    /// never forces, never global-prunes; `--dry-run` reports the same
+    /// blockers/eligible resources a real call would act on, with no
+    /// mutation at all.
+    Clean,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -356,6 +363,16 @@ impl Request {
         Request {
             verb: Verb::AtlasRelate,
             payload: serde_json::to_value(payload).expect("AtlasRelatePayload always serializes"),
+        }
+    }
+
+    /// `clean`'s request (P4.5 first increment, ruling 0203): the
+    /// terminal Work to clean, and whether this call is a dry run (no
+    /// mutation, blockers/eligible resources reported as they stand).
+    pub fn clean(payload: CleanPayload) -> Self {
+        Request {
+            verb: Verb::Clean,
+            payload: serde_json::to_value(payload).expect("CleanPayload always serializes"),
         }
     }
 
@@ -681,6 +698,17 @@ pub struct CancelPayload {
     pub cascade: bool,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// `clean`'s payload (P4.5 first increment, ruling 0203): the terminal
+/// Work to clean up. `dry_run` runs every refusal check with no
+/// mutation at all — the reply reports the same `blocked`/`eligible`
+/// shape a real call would have acted on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanPayload {
+    pub work_id: WorkId,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 // ---- Atlas (P3 W3) -------------------------------------------------------

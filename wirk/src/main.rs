@@ -1842,6 +1842,72 @@ fn wirkd_status_command(
                         activation["attempt"].as_u64().unwrap_or(1),
                     );
                 }
+                // Ruling 0224: the same current checkout/pin presence
+                // and per-call cleanup history `wirk work clean`'s own
+                // scoped JSON reply already carries, rendered on the
+                // ordinary human status verb instead of only being
+                // reachable with `--json`. Absent (`null`/missing) is
+                // printed as `?` — never folded into `absent`, since
+                // this World's own binding could not be resolved and
+                // "unknown" is a different fact than "checked and
+                // gone" (`verify/ASSESSMENT.md`'s own missing/absent
+                // distinction). Work completion, current resource
+                // presence, and each cleanup call's own effects are
+                // three separate facts and stay on three separate
+                // kinds of line. `any_run_pin` labels the wire's
+                // `runtime_pin_present`, which is true when *any* of
+                // this Run's pin components (runtime, Claude, OpenCode
+                // — `run_pin_dirs`) still exists, not only the runtime
+                // executable; a label of plain `runtime_pin` would read
+                // as absent once only the runtime component is gone
+                // even though a pin component remains.
+                for run in result["runs"].as_array().unwrap_or(&Vec::new()) {
+                    let worktree = match run["worktree_present"].as_bool() {
+                        Some(true) => "present",
+                        Some(false) => "absent",
+                        None => "?",
+                    };
+                    let pin = match run["runtime_pin_present"].as_bool() {
+                        Some(true) => "present",
+                        Some(false) => "absent",
+                        None => "?",
+                    };
+                    println!(
+                        "  run {} worktree {} any_run_pin {}",
+                        run["run"]["id"].as_str().unwrap_or("?"),
+                        worktree,
+                        pin,
+                    );
+                }
+                for entry in result["cleanup"].as_array().unwrap_or(&Vec::new()) {
+                    let runs = entry["runs"]
+                        .as_array()
+                        .map(|runs| {
+                            runs.iter()
+                                .filter_map(|run| run.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    let pins_removed = entry["runtime_pins_removed"]
+                        .as_array()
+                        .map(|runs| {
+                            runs.iter()
+                                .filter_map(|run| run.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .unwrap_or_default();
+                    println!(
+                        "  clean at {} runs [{}] worktree_removed {} runtime_pins_removed [{}] \
+                         complete {}",
+                        entry["at"].as_str().unwrap_or("?"),
+                        runs,
+                        entry["worktree_removed"].as_bool().unwrap_or(false),
+                        pins_removed,
+                        entry["complete"].as_bool().unwrap_or(false),
+                    );
+                }
                 for entry in result["evidence"].as_array().unwrap_or(&Vec::new()) {
                     for artifact in entry["artifacts"].as_array().unwrap_or(&Vec::new()) {
                         let availability = if artifact["available"].as_bool().unwrap_or(false) {
@@ -2038,8 +2104,68 @@ fn work_command(rest: &[String]) -> ExitCode {
         // World produces, and what this estate already admits. It
         // reports; it never admits.
         Some("obligations") => work_obligations_command(&rest[1..]),
+        // P4.5 first increment (ruling 0203): `wirk work clean --estate
+        // <root> --work <id> [--dry-run] [--json]`.
+        Some("clean") => work_clean_command(&rest[1..]),
         _ => work_usage(),
     }
+}
+
+/// `wirk work clean --estate <root> --work <id> [--dry-run] [--json]`
+/// (P4.5 first increment, ruling 0203): one terminal Work's own
+/// checkout and per-Run runtime residue. Refuses outright (nothing
+/// touched) for a non-terminal Work, a live actor or pane, checkout-
+/// backed validated Claim evidence, unresolvable path identity, or
+/// ignored content in the checkout. `--dry-run` runs every one of those
+/// checks with no mutation at all, reporting the same structured result
+/// a real call would have acted on.
+fn work_clean_command(rest: &[String]) -> ExitCode {
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return work_usage();
+    };
+    let Some(work_id) = flag_value(rest, "--work") else {
+        return work_usage();
+    };
+    let dry_run = rest.iter().any(|arg| arg == "--dry-run");
+    let json = rest.iter().any(|arg| arg == "--json");
+
+    wirkd_client_call(
+        &estate,
+        &Request::clean(wirkd::CleanPayload {
+            work_id: WorkId(work_id.clone()),
+            dry_run,
+        }),
+        |result| {
+            if json {
+                println!("{result}");
+                return;
+            }
+            let runs = result["runs"]
+                .as_array()
+                .map(|runs| {
+                    runs.iter()
+                        .filter_map(|run| run.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let worktree_removed = result["worktree_removed"].as_bool().unwrap_or(false);
+            let runtime_pins_removed = result["runtime_pins_removed"]
+                .as_array()
+                .map(|runs| {
+                    runs.iter()
+                        .filter_map(|run| run.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let verb = if dry_run { "would clean" } else { "cleaned" };
+            println!(
+                "{verb} {work_id} (runs: {runs}): worktree_removed={worktree_removed} \
+                 runtime_pins_removed=[{runtime_pins_removed}]"
+            );
+        },
+    )
 }
 
 /// `wirk work cancel --estate <root> --work <id> [--cascade] [--reason
@@ -2529,7 +2655,7 @@ fn work_obligations_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json]"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json] | wirk work clean --estate <root> --work <id> [--dry-run] [--json]"
     );
     ExitCode::from(1)
 }
@@ -3145,6 +3271,7 @@ fn event_kind_name(kind: &EventKind) -> &'static str {
         EventKind::RunLaunched { .. } => "RunLaunched",
         EventKind::WorkFailed { .. } => "WorkFailed",
         EventKind::WorkCanceled { .. } => "WorkCanceled",
+        EventKind::WorkCleaned { .. } => "WorkCleaned",
         EventKind::ContainerActivated { .. } => "ContainerActivated",
         EventKind::StageHeld { .. } => "StageHeld",
         EventKind::StageClosed { .. } => "StageClosed",
