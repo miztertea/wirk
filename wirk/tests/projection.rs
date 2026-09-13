@@ -1837,12 +1837,241 @@ fn an_unresolved_identifier_reports_examined_candidates_and_a_path_reports_exact
         .find(|text| text.contains("`notes/missing.md`"))
         .unwrap_or_else(|| panic!("the absent path must be an unknown: {unknowns:?}"));
     assert!(
-        path.contains("which no admitted source records at the captured generations"),
-        "exact path lookup may state its exact result: {path}"
+        path.contains(
+            "not found in any source this assembly selected at their captured \
+                        generations"
+        ),
+        "exact path lookup may state its exact result, scoped to what was examined: {path}"
     );
     assert!(
         !path.contains("candidates"),
         "a path is not resolved by candidate discovery: {path}"
+    );
+
+    estate.stop();
+}
+
+/// Ruling 0217, the real defect: a Work whose journaled bindings admit
+/// three sources, orienting with `orient.sources` narrowed to one. The
+/// first wrong reading called that narrowed selection the Work's whole
+/// admitted inventory and told the reader the estate had nothing else —
+/// this pins the corrected distinction against the real daemon.
+#[test]
+fn the_projection_distinguishes_this_assembly_selection_from_the_works_admitted_inventory() {
+    let mut estate = Estate::new();
+    let extra = source_repo(estate.root.parent().unwrap().join("extra-source").as_path());
+    publish(&estate.root, "extra", &extra);
+    let third = source_repo(estate.root.parent().unwrap().join("third-source").as_path());
+    publish(&estate.root, "third", &third);
+
+    // The Work binds all three; the orienting Waypoint's own
+    // `orient.sources` selects only one of them.
+    let route = orienting_route(&estate.root, r#"["demo"]"#);
+    let submitted = submit_kind(
+        &estate.root,
+        route.to_str().unwrap(),
+        &estate.repo,
+        &["demo:write", "extra:read", "third:read"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit");
+
+    let (code, shown, err) = world_show(&estate.root, &submitted.work_id, &submitted.run_id);
+    assert_eq!(code, Some(0), "{err}");
+    let assumptions = shown["projection"]["assumptions"]
+        .as_array()
+        .expect("assumptions");
+    let assembled = assumptions
+        .iter()
+        .map(|item| item["text"].as_str().unwrap_or_default())
+        .find(|text| text.starts_with("assembled under compilation policy"))
+        .unwrap_or_else(|| panic!("no assembled-under statement: {assumptions:?}"));
+
+    // The real defect: this must never read as "over 1 admitted
+    // source(s)" with no mention that the Work admits three.
+    assert!(
+        assembled.contains("1 of this Work's 3 admitted source(s)"),
+        "the assembly's own selection and the Work's full inventory must both be named: \
+         {assembled}"
+    );
+    assert!(
+        assembled.contains("wirk atlas status"),
+        "a discoverable route to the wider admitted inventory must be named: {assembled}"
+    );
+
+    // The real baseline this Work actually admits, independent of what
+    // this one Waypoint selected — read the same way root reads it.
+    let (ok, status, err) = atlas(&estate.root, &["status", "--work", &submitted.work_id]);
+    assert!(ok, "atlas status: {err}");
+    assert_eq!(
+        status["sources_total"], 3,
+        "native atlas status must still show all three admitted sources: {status}"
+    );
+
+    estate.stop();
+}
+
+/// Ruling 0217's remaining defect: the assembled-under statement claimed
+/// the assembly's selection is "never the Work's full inventory", which
+/// is false the moment an unfiltered orient (empty `orient.sources`)
+/// selects every admitted source that currently has a captured
+/// generation. This pins the corrected, count-driven wording against a
+/// real assembly where selection and inventory really do coincide.
+#[test]
+fn an_unfiltered_orient_reports_its_selection_as_the_works_full_admitted_inventory() {
+    let mut estate = Estate::new();
+    let extra = source_repo(
+        estate
+            .root
+            .parent()
+            .unwrap()
+            .join("unfiltered-extra")
+            .as_path(),
+    );
+    publish(&estate.root, "extra", &extra);
+
+    // Empty `sources`: the real "select everything bound" path, not a
+    // narrowed one.
+    let route = orienting_route(&estate.root, "[]");
+    let submitted = submit_kind(
+        &estate.root,
+        route.to_str().unwrap(),
+        &estate.repo,
+        &["demo:write", "extra:read"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit");
+
+    let (code, shown, err) = world_show(&estate.root, &submitted.work_id, &submitted.run_id);
+    assert_eq!(code, Some(0), "{err}");
+    let assumptions = shown["projection"]["assumptions"]
+        .as_array()
+        .expect("assumptions");
+    let assembled = assumptions
+        .iter()
+        .map(|item| item["text"].as_str().unwrap_or_default())
+        .find(|text| text.starts_with("assembled under compilation policy"))
+        .unwrap_or_else(|| panic!("no assembled-under statement: {assumptions:?}"));
+
+    assert!(
+        assembled.contains("2 of this Work's 2 admitted source(s)"),
+        "an unfiltered selection over two admitted sources must count both as selected: \
+         {assembled}"
+    );
+    assert!(
+        assembled.contains("this assembly selected every source the Work admits"),
+        "when selection equals the Work's full inventory the text must say so, not deny it: \
+         {assembled}"
+    );
+    assert!(
+        !assembled.contains("never the Work's full inventory"),
+        "an assembly that selects everything the Work admits must not be told it never can: \
+         {assembled}"
+    );
+
+    estate.stop();
+}
+
+/// Ruling 0217, the same corrected wording under the existing model's
+/// other narrowing path: a source the Work admits and this assembly
+/// would have selected, but which currently has no published (captured)
+/// generation at all. The existing `Omission::Unavailable` /
+/// `GenerationUnavailable` shape already carries this; this pins that
+/// the assembled-under count reflects it (selection short of the full
+/// admitted inventory for a reason distinct from `orient.sources`) and
+/// that a distractor source the Work never bound stays invisible
+/// throughout.
+#[test]
+fn a_bound_source_without_a_captured_generation_is_omitted_and_stays_out_of_selection() {
+    let mut estate = Estate::new();
+    let extra = source_repo(estate.root.parent().unwrap().join("stale-extra").as_path());
+    publish(&estate.root, "extra", &extra);
+
+    // Registered and staged, deliberately never published: a bound
+    // source with no captured generation, the existing model's own
+    // "unavailable" path.
+    let stale = source_repo(estate.root.parent().unwrap().join("stale-source").as_path());
+    let (ok, acquired, err) = atlas(
+        &estate.root,
+        &[
+            "acquire",
+            "--source",
+            "stale",
+            "--repository",
+            stale.to_str().unwrap(),
+            "--revision",
+            "HEAD",
+        ],
+    );
+    assert!(ok, "atlas acquire stale: {err}");
+    assert!(
+        acquired["generation"]["generation"].is_string(),
+        "acquire must stage a generation without publishing it: {acquired}"
+    );
+
+    // A distractor: fully published, but never bound to this Work.
+    let distractor = source_repo(
+        estate
+            .root
+            .parent()
+            .unwrap()
+            .join("distractor-source")
+            .as_path(),
+    );
+    publish(&estate.root, "distractor", &distractor);
+
+    let route = orienting_route(&estate.root, "[]");
+    let submitted = submit_kind(
+        &estate.root,
+        route.to_str().unwrap(),
+        &estate.repo,
+        &["demo:write", "extra:read", "stale:read"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit");
+
+    let (code, shown, err) = world_show(&estate.root, &submitted.work_id, &submitted.run_id);
+    assert_eq!(code, Some(0), "{err}");
+    let projection = &shown["projection"];
+    let assumptions = projection["assumptions"].as_array().expect("assumptions");
+    let assembled = assumptions
+        .iter()
+        .map(|item| item["text"].as_str().unwrap_or_default())
+        .find(|text| text.starts_with("assembled under compilation policy"))
+        .unwrap_or_else(|| panic!("no assembled-under statement: {assumptions:?}"));
+
+    // Three bound (demo, extra, stale); only two have a captured
+    // generation to select.
+    assert!(
+        assembled.contains("2 of this Work's 3 admitted source(s)"),
+        "a bound source with no captured generation narrows selection below the Work's full \
+         inventory: {assembled}"
+    );
+    assert!(
+        !assembled.contains("this assembly selected every source the Work admits"),
+        "selection short of the inventory must not claim it covers all of it: {assembled}"
+    );
+
+    let omitted = projection["omitted"].as_array().expect("omitted");
+    let unavailable_stale = omitted.iter().any(|item| {
+        item["kind"] == "unavailable"
+            && item["coordinate"] == "stale"
+            && item["reason"] == "generation_unavailable"
+    });
+    assert!(
+        unavailable_stale,
+        "the bound source with no captured generation must be disclosed as unavailable, not \
+         silently dropped: {omitted:?}"
+    );
+
+    let rendered = shown.to_string();
+    assert!(
+        !rendered.contains("distractor"),
+        "a source this Work never bound must not appear anywhere in the projection, even as an \
+         unavailable coordinate: {rendered}"
     );
 
     estate.stop();

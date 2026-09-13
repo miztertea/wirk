@@ -18494,18 +18494,22 @@ impl Reference {
 fn unresolved_statement(reference: &Reference) -> String {
     match reference {
         Reference::Path(path) => format!(
-            "the authored text names the path `{path}`, which no admitted source records at the \
-             captured generations: every admitted source's own captured generation was examined \
-             and none carries this path. Whether it exists elsewhere, is misspelled, or was never \
-             there is not decided here."
+            "the authored text names the path `{path}`, not found in any source this assembly \
+             selected at their captured generations: every source this assembly selected had \
+             its own captured generation examined and none carries this path. A source this \
+             Work admits but this assembly did not select was not examined at all; `wirk atlas \
+             status` for this Work lists the full admitted inventory. Whether it exists \
+             elsewhere, is misspelled, or was never there is not decided here."
         ),
         Reference::Identifier(name) => format!(
             "the authored text names the identifier `{name}`, which was not found among the \
              indexed candidates this assembly examined at the captured generations. That is what \
              bounded, ranked candidate discovery returned; it is not a statement that these bytes \
              are absent from the admitted sources, because a name that occurs only inside a \
-             longer indexed token is never itself a candidate. Whether it exists elsewhere, is \
-             misspelled, or was never there is not decided here."
+             longer indexed token is never itself a candidate, and because this assembly examined \
+             only the sources it selected out of this Work's full admitted inventory (`wirk atlas \
+             status` lists it). Whether it exists elsewhere, is misspelled, or was never there is \
+             not decided here."
         ),
     }
 }
@@ -18727,6 +18731,14 @@ fn prepare_projection(
         .iter()
         .map(|binding| binding.name.as_str())
         .collect();
+    // The Work's own admissible inventory: every source its journaled
+    // bindings actually grant, independent of `orient.sources`. This is
+    // the authoritative Work/catalog scope, read directly off the
+    // bindings this Route was submitted with — never derived from a
+    // ranked hit or from whatever this one assembly went on to select
+    // (ruling 0217). Kept distinct from `admitted.len()` below, which is
+    // this assembly's own selection out of that inventory.
+    let work_admitted_total = bound_aliases.len();
     // One count for everything this requester may not see: an alias the
     // Work never bound, and a governance edge whose far side or evidence
     // lies outside admission. A count, never a coordinate, an alias or an
@@ -18955,12 +18967,22 @@ fn prepare_projection(
         });
     }
 
+    let selection_scope = if admitted.len() == work_admitted_total {
+        "this assembly selected every source the Work admits".to_string()
+    } else {
+        "this assembly's own selection, narrowed by `orient.sources` and by which \
+         admitted sources currently have a captured generation"
+            .to_string()
+    };
     assumptions.push(wirk_core::Statement {
         text: format!(
-            "assembled under compilation policy {} over {} admitted source(s), pinned to the \
-             generation vector this projection names, at Atlas publication revision {}.",
+            "assembled under compilation policy {} over {} of this Work's {} admitted \
+             source(s) — {selection_scope}; `wirk atlas status` for this Work lists every \
+             source it admits — pinned to the generation vector this projection names, at \
+             Atlas publication revision {}.",
             wirk_core::ASSEMBLY_POLICY,
             admitted.len(),
+            work_admitted_total,
             publication_revision
         ),
         attributed_to: wirk_core::StatementOrigin::Assembly,
