@@ -6011,6 +6011,209 @@ fn verify_a_publication_route_relation_is_withheld_from_a_narrowed_child() {
     stop_wirkd(&estate, wirkd);
 }
 
+/// Ruling 0236: the estate Findings *index row* — `finding_row_json`/
+/// `finding_row_json_scoped`, the projection `wirk atlas findings`
+/// actually answers with — must carry the same typed `contradicts`
+/// relations the original Finding already renders through
+/// `finding_json_scoped`/`evidence_array_scoped`. Before this wave the
+/// row omitted `contradicts` entirely: a reader admitted to both the row
+/// and its named target could not see the relation at all, regardless of
+/// scope.
+///
+/// The parent settles its own row `B`, which typedly `--contradicts` an
+/// off-lineage producer's own settled, `EstateLocal` Finding `A`. Read
+/// back:
+///
+/// - the parent's own admitted view of its own row must carry `A`'s real
+///   identity, resolved through the exact same
+///   `settled_estate_publication` route the pinned publication tests
+///   already exercise (positive: the typed link arrives, not a marker);
+/// - the narrowed child, on lineage to the row itself (so the row is not
+///   merely absent) but missing the `embargo` grant the producer's own
+///   checkout requires, must see the contradicts entry as the one
+///   uniform `{"withheld": true}` every other withheld part already
+///   takes — never the row dropped whole, and never `A`'s work id,
+///   finding id or claim text anywhere in the reply.
+#[test]
+fn published_row_carries_admitted_typed_contradiction_and_withholds_a_denied_target() {
+    let family = build_family(&["scratch:write", "open:read", "helper:write"]);
+    let estate = &family.estate;
+
+    // An off-lineage producer, holding exactly what the parent holds,
+    // that settles the contradiction target `A` (`findings.rs`'s own
+    // "off-lineage producer" pattern, reused verbatim).
+    let producer_repo = family.dir.path().join("pub-contra-producer-repo");
+    init_repo(&producer_repo);
+    let producer = submit(
+        estate,
+        "disclosure_container",
+        &producer_repo,
+        &[
+            "embargo:write",
+            "open:read",
+            "helper:write",
+            "scratch:write",
+        ],
+        None,
+    )
+    .unwrap();
+    write_file(
+        &estate.join("worktrees").join(&producer.work_id),
+        "a.md",
+        "a\n",
+    );
+    claim_ok(estate, &producer.work_id, &producer.run_id, "a.md=a.md");
+    let producer_basis = obligation_basis_for(estate, &producer.work_id, "outer/leaf-a");
+
+    // The parent settles its own row `B` the same way, off the same
+    // Route, so its own `--contradicts` needs a second obligation.
+    write_file(
+        &estate.join("worktrees").join(&family.parent.work_id),
+        "a.md",
+        "a\n",
+    );
+    claim_ok(
+        estate,
+        &family.parent.work_id,
+        &family.parent.run_id,
+        "a.md=a.md",
+    );
+    let parent_basis = obligation_basis_for(estate, &family.parent.work_id, "outer/leaf-a");
+
+    let policy_dir = estate.join("policy");
+    fs::create_dir_all(&policy_dir).unwrap();
+    fs::write(
+        policy_dir.join("settlement.json"),
+        format!(
+            r#"{{"version":2,"classes":[{{"class":"deterministic_verified","scope":"estate_local","kinds":["verified_outcome"],"obligations":[{{"id":"a-produced","edition":"1","basis":"{producer_basis}"}},{{"id":"a-produced","edition":"1","basis":"{parent_basis}"}}]}}]}}"#
+        ),
+    )
+    .unwrap();
+
+    let claim_event_of = |work_id: &str| -> String {
+        journal_events(estate, work_id)
+            .into_iter()
+            .find_map(|event| {
+                matches!(&event.kind, EventKind::ClaimRecorded { .. }).then_some(event.id.0)
+            })
+            .expect("this work's own ClaimRecorded event")
+    };
+
+    let (code, raised_a, stderr) = raise_cli(
+        estate,
+        &producer.work_id,
+        &producer.run_id,
+        &[
+            "--kind",
+            "verified_outcome",
+            "--scope",
+            "estate_local",
+            "--claim",
+            "the off-lineage settled publication a typed contradiction will target",
+            "--evidence",
+            &format!(
+                "work/{}/event/{}",
+                producer.work_id,
+                claim_event_of(&producer.work_id)
+            ),
+            "--obligation",
+            "a-produced@1",
+        ],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let a_id = raised_a["id"].as_str().unwrap().to_string();
+    assert!(raised_a["settled"].is_object(), "{raised_a}");
+
+    let relation_a = format!("work/{}/finding/{a_id}", producer.work_id);
+    let (code, raised_b, stderr) = raise_cli(
+        estate,
+        &family.parent.work_id,
+        &family.parent.run_id,
+        &[
+            "--kind",
+            "verified_outcome",
+            "--scope",
+            "estate_local",
+            "--claim",
+            "the parent's own settled row, which typedly contradicts the off-lineage publication",
+            "--evidence",
+            &format!(
+                "work/{}/event/{}",
+                family.parent.work_id,
+                claim_event_of(&family.parent.work_id)
+            ),
+            "--obligation",
+            "a-produced@1",
+            "--contradicts",
+            &relation_a,
+        ],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let b_id = raised_b["id"].as_str().unwrap().to_string();
+    assert!(raised_b["settled"].is_object(), "{raised_b}");
+    // Raise time already resolves the relation through the parent's own
+    // admission of the off-lineage publication — the same route the
+    // pinned publication tests exercise elsewhere.
+    assert_eq!(
+        raised_b["contradicts"][0]["admitted_by"], "settled_estate_publication",
+        "{raised_b}"
+    );
+
+    let (ok, _, err) = atlas(estate, &["findings", "--rebuild", "--admin"]);
+    assert!(ok, "{err}");
+
+    let row_for = |requester: &str| -> serde_json::Value {
+        let (ok, reply, err) = atlas(estate, &["findings", "--requesting-work", requester]);
+        assert!(ok, "{err}");
+        reply["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["finding"]["id"].as_str() == Some(b_id.as_str()))
+            .unwrap_or_else(|| panic!("row {b_id} must be on {requester}'s own lineage: {reply}"))
+            .clone()
+    };
+
+    // Positive: the parent's own admitted view of its own row carries the
+    // typed link, with the target's real identity — this is the missing
+    // field the pre-fix projection has none of at all.
+    let parent_row = row_for(&family.parent.work_id);
+    eprintln!("VERIFY the parent's own admitted view of its published row: {parent_row}");
+    let contradicts = parent_row["finding"]["contradicts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the row's own finding must carry contradicts: {parent_row}"));
+    assert_eq!(contradicts.len(), 1, "{parent_row}");
+    assert_eq!(contradicts[0]["reference"], "finding", "{parent_row}");
+    assert_eq!(contradicts[0]["work"], producer.work_id, "{parent_row}");
+    assert_eq!(contradicts[0]["finding"], a_id, "{parent_row}");
+    assert_eq!(
+        contradicts[0]["admitted_by"], "settled_estate_publication",
+        "{parent_row}"
+    );
+
+    // Negative: the narrowed child is on the parent's own lineage — so
+    // the row itself is not merely absent — but holds no `embargo` grant,
+    // the one the producer's own checkout requires. The reference must
+    // be withheld exactly like every other denied part, not the row
+    // dropped whole and not the target's identity or claim leaked.
+    let child_row = row_for(&family.child.work_id);
+    eprintln!("VERIFY the narrowed child's view of the same row: {child_row}");
+    assert_eq!(
+        child_row["finding"]["contradicts"][0],
+        serde_json::json!({"withheld": true}),
+        "a denied typed contradiction must be withheld exactly like every \
+         other withheld part, never the row dropped whole: {child_row}"
+    );
+    let strings = serde_json::to_string(&child_row).unwrap();
+    assert!(
+        !strings.contains(&a_id) && !strings.contains(&producer.work_id),
+        "no target identity crosses to a reader that cannot itself reach it: {child_row}"
+    );
+
+    let Family { estate, wirkd, .. } = family;
+    stop_wirkd(&estate, wirkd);
+}
+
 /// **Red on the pre-correction tree.** `--json` was accepted on the
 /// command line of both named status entry points — `wirk work status`
 /// and `wirk wirkd status` — and then ignored: the human lines were

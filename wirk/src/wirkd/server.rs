@@ -15929,6 +15929,7 @@ fn finding_row_json(row: &wirk_atlas::FindingRow) -> Value {
             "claim": format!("recorded claim: {}, unverified", row.finding.claim),
             "claim_text": row.finding.claim,
             "claim_verified": false,
+            "contradicts": row.finding.contradicts.iter().map(admitted_evidence_json).collect::<Vec<_>>(),
         },
         "origin": {
             "work": row.origin.work.0,
@@ -16526,6 +16527,7 @@ fn finding_row_json_scoped(
     if !admits_authored_prose(state, view, &row.origin.work) {
         view.withheld += withhold_authored_prose(&mut value["finding"]);
     }
+    value["finding"]["contradicts"] = evidence_array_scoped(state, view, &row.finding.contradicts);
     if let Some(assertion) = &row.assertion
         && !admits_assertion_prose(state, view, assertion.author.as_ref())
     {
