@@ -40,7 +40,6 @@ use crate::semantic::{
 use crate::{AtlasError, AtlasStore, ContentFamily, Membership};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// How an answer was actually ranked. Bound into a continuation, because

@@ -57,19 +57,34 @@ fn open_run(run_id: &str) -> Run {
     }
 }
 
-/// A real, writable estate root for this binary's fixtures, created
-/// once and shared. P3 execution-recovery correction item 1: an actor
-/// launch pins this Run's own `wirk` under `<estate_root>/.wirk/
-/// runtime/` and *refuses* the launch when it cannot, so the former
-/// `/estate` placeholder no longer stands in for a real estate. It is
-/// deliberately not the worktree these fixtures pass in: wirk's own
-/// Run-scoped runtime and hook directories live under the estate root,
-/// never inside the actor's boundary-checked worktree.
-fn fixture_estate_root() -> &'static std::path::Path {
-    static ESTATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    ESTATE
-        .get_or_init(|| tempfile::tempdir().expect("fixture estate tempdir"))
-        .path()
+/// A real, writable estate root for this test's own fixtures. P3
+/// execution-recovery correction item 1: an actor launch pins this
+/// Run's own `wirk` under `<estate_root>/.wirk/runtime/` and *refuses*
+/// the launch when it cannot, so the former `/estate` placeholder no
+/// longer stands in for a real estate. It is deliberately not the
+/// worktree these fixtures pass in: wirk's own Run-scoped runtime and
+/// hook directories live under the estate root, never inside the
+/// actor's boundary-checked worktree.
+///
+/// Ruling 0306: a `static OnceLock<TempDir>` here never ran its
+/// destructor — statics are never dropped at process exit — so every
+/// run of this test binary leaked a whole estate into RAM-backed
+/// `/tmp`. This binary's `#[test]`s run under the ordinary, unconfigured
+/// libtest harness (ruling 0307; no `--test-threads=1` here, unlike the
+/// few fixtures elsewhere in this workspace that opt into it), which
+/// spawns each test function on its own fresh OS thread and joins it
+/// before moving on. A `thread_local` ties the `TempDir`'s ownership to
+/// that same thread: still one real writable estate per test, still the
+/// same path on every call within that one test, but now dropped —
+/// ordinary RAII, unwind included — the moment the test's own thread
+/// exits, exactly like the worktree `tempdir()` every one of these
+/// tests already takes as a plain local.
+fn fixture_estate_root() -> std::path::PathBuf {
+    thread_local! {
+        static ESTATE: tempfile::TempDir =
+            tempfile::tempdir().expect("fixture estate tempdir");
+    }
+    ESTATE.with(|dir| dir.path().to_path_buf())
 }
 
 fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
@@ -1615,7 +1630,7 @@ fn run_loop_needs_input_calls_notify_once() {
 /// authorized to write, distinct from the worktree these tests also
 /// exercise.
 fn write_staged_file(run: &Run, name: &str, content: &[u8]) {
-    let dir = wirk_core::outputs::ensure_staging_dir(fixture_estate_root(), &work_id(), &run.id)
+    let dir = wirk_core::outputs::ensure_staging_dir(&fixture_estate_root(), &work_id(), &run.id)
         .expect("ensure this Run's own staging directory");
     std::fs::write(dir.join(name), content).expect("write staged file");
 }
@@ -2089,7 +2104,7 @@ fn empty_staging_directory_is_not_progress() {
         client.prompt_agent_calls.lock().unwrap().len() == 2
     });
     // Directory created, nothing written into it.
-    wirk_core::outputs::ensure_staging_dir(fixture_estate_root(), &work_id(), &run.id)
+    wirk_core::outputs::ensure_staging_dir(&fixture_estate_root(), &work_id(), &run.id)
         .expect("ensure this Run's own staging directory");
     herdr_tx
         .send(Ok(status_changed(&run, AgentStatus::Working)))
@@ -2168,7 +2183,7 @@ fn an_unobservable_declared_output_is_unknown_not_progress(
         client.prompt_agent_calls.lock().unwrap().len() == 3
     });
 
-    let staging_dir = wirk_core::outputs::staging_dir(fixture_estate_root(), &work_id(), &run.id)
+    let staging_dir = wirk_core::outputs::staging_dir(&fixture_estate_root(), &work_id(), &run.id)
         .expect("staging dir path");
     make_unobservable(&run, &staging_dir);
 
@@ -3076,16 +3091,13 @@ fn pinned_wirk_path(estate_root: &std::path::Path, run_id: &str) -> std::path::P
         .join("wirk")
 }
 
-/// Like `actor_world`, but against a **private, per-test** estate root
-/// rather than the file-wide shared `fixture_estate_root()`. The two
-/// pin-restore/refusal tests below delete files under
+/// Like `actor_world`, but against an estate root the test keeps its
+/// own handle to, rather than the opaque path `fixture_estate_root()`
+/// hands back. The pin-restore/refusal tests below delete files under
 /// `.wirk/runtime/images/<digest>/` — content-addressed by this test
 /// *process's* own `current_exe()` bytes, so every test in this binary
-/// that pins a Run shares the very same digest. Doing that against the
-/// shared fixture would corrupt other tests' already-installed image
-/// out from under them if they happened to run concurrently (`cargo
-/// test`'s default); a private estate keeps each test's own image
-/// store — and any damage it deliberately does to it — fully isolated.
+/// that pins a Run shares the very same digest — and need `estate.
+/// path()` itself afterward to reach in and do that.
 fn actor_world_with_estate(
     run: &Run,
     worktree_path: &std::path::Path,

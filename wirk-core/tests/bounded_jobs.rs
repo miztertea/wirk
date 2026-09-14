@@ -21,7 +21,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use wirk_core::jobs::{
-    self, BoundedChild, CancelToken, ChildEnd, JobClass, JobRequest, ResourcePolicy,
+    self, BoundedChild, CancelToken, ChildEnd, JobCapabilities, JobClass, JobRequest,
+    ResourcePolicy,
 };
 
 fn estate() -> TempDir {
@@ -615,6 +616,349 @@ fn a_cancel_ends_a_running_child_promptly_and_is_not_reported_as_a_backend_failu
     for pid in pids_running(&script) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
+}
+
+// ---------------------------------------------------------------------
+// Containment under the *fallback* capability, on every host
+// ---------------------------------------------------------------------
+//
+// The two checks above assert the strong property where `cgroup.kill`
+// is available and the documented fallback where it is not, so on a host
+// that has delegation they never exercise the fallback at all. That is
+// how CI 34806268796 stalled on a path a developer box always skipped:
+// there, the escaped grandchild survived the group kill, kept the
+// inherited stdout/stderr write ends open, and the parent waited for an
+// EOF that could only arrive when that grandchild's own 600s sleep ended.
+//
+// These checks declare the fallback capability explicitly instead of
+// asking the host for it. Nothing else is simulated: a real child, a
+// real `setsid()` grandchild, real pipes, a real process-group kill.
+// Declaring the capability is what makes "where this host cannot contain
+// it" reachable on a host that can — and the bound under test is
+// precisely the one that must hold when containment is weak.
+
+/// The capability set a host without delegated `cgroup.kill` reports —
+/// a GitHub runner, a container without a delegated subtree. Stated, not
+/// probed, so the fallback path is checkable wherever this runs.
+fn without_strong_containment() -> JobCapabilities {
+    JobCapabilities {
+        own_cgroup: None,
+        kill_available: false,
+        kill_unavailable_reason: Some(
+            "declared unavailable by this check, which is about the fallback path".to_string(),
+        ),
+        ..JobCapabilities::default()
+    }
+}
+
+/// Children of this process that have exited and not been reaped.
+///
+/// A job whose direct child is killed but never `wait`ed for leaves a
+/// zombie, and "the bound returned promptly" is not the whole property:
+/// returning while leaking the one process this code unambiguously owns
+/// would be a different defect wearing the same green.
+fn own_zombies() -> Vec<i32> {
+    let me = std::process::id() as i32;
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // `comm` can contain spaces and parentheses, so the fields are
+        // read from after the last ')': state is the first, ppid the
+        // second.
+        let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or_default();
+        let parent: i32 = fields.next().unwrap_or_default().parse().unwrap_or(0);
+        if parent == me && state == "Z" {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// Kill whatever this check's own script still has running. Owned by
+/// path, not by name: another `python3` on this host is not ours.
+fn kill_own(script: &Path) {
+    for pid in pids_running(script) {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+/// A cancel must return on a host that cannot kill an escaped
+/// descendant.
+///
+/// The grandchild holds the job's stdout and stderr write ends and is
+/// unreachable by `kill(-pgid)`. Waiting for those pipes to reach EOF is
+/// therefore waiting for a process this host has already admitted it
+/// cannot stop — the exact wait that stalled CI 34806268796, where the
+/// direct child was a zombie and the escaped grandchild held the same
+/// two pipe inodes for its full 600s sleep.
+#[test]
+fn a_cancel_returns_when_an_escaped_descendant_holds_the_job_pipes_open() {
+    let scratch = TempDir::new().unwrap();
+    let estate = estate();
+    let script = escaping_child(scratch.path());
+    let capabilities = without_strong_containment();
+    let policy = ResourcePolicy {
+        job_deadline_secs: 600,
+        ..permissive()
+    };
+    let cancel = CancelToken::new();
+
+    let mut command = Command::new("python3");
+    command
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let flag = cancel.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        flag.cancel();
+    });
+
+    let child = BoundedChild {
+        capabilities: &capabilities,
+        policy: &policy,
+        cancel,
+        job_id: "fallback-cancel".into(),
+        estate_root: Some(estate.path().to_path_buf()),
+        staging: None,
+        verb: "test".into(),
+        scope: "test-scope".into(),
+        requester: None,
+        registry: None,
+    };
+    let started = Instant::now();
+    let end = child.run(command, |_stdin| Ok(()));
+    let elapsed = started.elapsed();
+    kill_own(&script);
+
+    match end {
+        ChildEnd::Cancelled { reason, .. } => {
+            assert!(reason.contains("cancelled"), "{reason}")
+        }
+        other => panic!("a cancelled job must report cancellation: {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the cancel must not wait on a descendant this host cannot kill, took {elapsed:?}"
+    );
+    assert!(
+        own_zombies().is_empty(),
+        "the direct child is this process's own and must be reaped, not left: {:?}",
+        own_zombies()
+    );
+}
+
+/// The same property for a deadline, which is the other way a job ends
+/// without the child agreeing to it.
+#[test]
+fn a_deadline_returns_when_an_escaped_descendant_holds_the_job_pipes_open() {
+    let scratch = TempDir::new().unwrap();
+    let estate = estate();
+    let script = escaping_child(scratch.path());
+    let capabilities = without_strong_containment();
+    let policy = ResourcePolicy {
+        job_deadline_secs: 1,
+        ..permissive()
+    };
+
+    let mut command = Command::new("python3");
+    command
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let child = BoundedChild {
+        capabilities: &capabilities,
+        policy: &policy,
+        cancel: CancelToken::new(),
+        job_id: "fallback-deadline".into(),
+        estate_root: Some(estate.path().to_path_buf()),
+        staging: None,
+        verb: "test".into(),
+        scope: "test-scope".into(),
+        requester: None,
+        registry: None,
+    };
+    let started = Instant::now();
+    let end = child.run(command, |_stdin| Ok(()));
+    let elapsed = started.elapsed();
+    kill_own(&script);
+
+    let ChildEnd::Cancelled { reason, .. } = &end else {
+        panic!("a child that sleeps 600s must hit its 1s deadline, got {end:?}");
+    };
+    assert!(reason.contains("deadline"), "{reason}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the deadline must bound the wait even where the grandchild survives, took {elapsed:?}"
+    );
+    assert!(
+        own_zombies().is_empty(),
+        "the direct child is this process's own and must be reaped, not left: {:?}",
+        own_zombies()
+    );
+}
+
+/// Input production is the other descriptor an escaped descendant holds.
+///
+/// The grandchild inherits stdin's *read* end and never reads it, so
+/// once the pipe buffer fills, a write to it can never complete and the
+/// reader never goes away to make it fail. A request larger than a pipe
+/// buffer is the ordinary case here — both real callers write a whole
+/// serialised batch — so the writer must be released when the job ends
+/// rather than left blocked in `write(2)` for the life of the process.
+///
+/// `run` joins its writer before returning, which is what makes this
+/// checkable: if the thread were still blocked, this check would not
+/// return at all.
+#[test]
+fn a_blocked_input_write_is_released_when_the_job_ends() {
+    let scratch = TempDir::new().unwrap();
+    let estate = estate();
+    let script = escaping_child(scratch.path());
+    let capabilities = without_strong_containment();
+    let policy = ResourcePolicy {
+        job_deadline_secs: 1,
+        ..permissive()
+    };
+
+    let mut command = Command::new("python3");
+    command
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let child = BoundedChild {
+        capabilities: &capabilities,
+        policy: &policy,
+        cancel: CancelToken::new(),
+        job_id: "fallback-input".into(),
+        estate_root: Some(estate.path().to_path_buf()),
+        staging: None,
+        verb: "test".into(),
+        scope: "test-scope".into(),
+        requester: None,
+        registry: None,
+    };
+    // Far larger than any pipe buffer this host configures, and nothing
+    // on the other end is reading it.
+    let request = vec![b'x'; 4 * 1024 * 1024];
+    let started = Instant::now();
+    let end = child.run(command, move |stdin| {
+        stdin.write_all(&request)?;
+        stdin.flush()
+    });
+    let elapsed = started.elapsed();
+    kill_own(&script);
+
+    let ChildEnd::Cancelled { reason, .. } = &end else {
+        panic!("the job ended by its deadline, whatever became of its input: {end:?}");
+    };
+    assert!(reason.contains("deadline"), "{reason}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a writer blocked on a pipe nothing will drain must be released, took {elapsed:?}"
+    );
+    assert!(
+        own_zombies().is_empty(),
+        "the direct child is this process's own and must be reaped, not left: {:?}",
+        own_zombies()
+    );
+}
+
+/// The ordinary path the bound must not cost anything: a child that
+/// reads its whole request and answers with far more than a pipe buffer
+/// on **both** descriptors still has every byte delivered.
+///
+/// Draining two pipes by hand is easy to get subtly wrong — one
+/// descriptor drained while the other is only polled, a short read taken
+/// for EOF — and each of those mistakes is invisible until the output is
+/// big enough to need more than one read.
+#[test]
+fn a_successful_child_still_delivers_all_of_a_large_stdout_and_stderr() {
+    let scratch = TempDir::new().unwrap();
+    let estate = estate();
+    let script = scratch.path().join("loud.py");
+    fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import sys
+request = sys.stdin.buffer.read()
+sys.stdout.buffer.write(b"o" * 3000000)
+sys.stdout.buffer.flush()
+sys.stderr.buffer.write(b"e" * 2000000)
+sys.stderr.buffer.flush()
+sys.stdout.buffer.write(b"|%d" % len(request))
+sys.stdout.buffer.flush()
+"#,
+    )
+    .unwrap();
+    let policy = ResourcePolicy {
+        job_deadline_secs: 120,
+        ..permissive()
+    };
+
+    let mut command = Command::new("python3");
+    command
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let child = BoundedChild {
+        capabilities: jobs::capabilities(),
+        policy: &policy,
+        cancel: CancelToken::new(),
+        job_id: "large-io".into(),
+        estate_root: Some(estate.path().to_path_buf()),
+        staging: None,
+        verb: "test".into(),
+        scope: "test-scope".into(),
+        requester: None,
+        registry: None,
+    };
+    let request = vec![b'x'; 5 * 1024 * 1024];
+    let sent = request.len();
+    let end = child.run(command, move |stdin| {
+        stdin.write_all(&request)?;
+        stdin.flush()
+    });
+
+    let ChildEnd::Finished(output) = end else {
+        panic!("an ordinary child must finish, not be bounded: {end:?}");
+    };
+    assert!(output.status.success(), "{:?}", output.status);
+    assert_eq!(
+        output.stdout.len(),
+        3_000_000 + format!("|{sent}").len(),
+        "every stdout byte is delivered, not just the first read"
+    );
+    assert_eq!(
+        output.stderr.len(),
+        2_000_000,
+        "stderr is drained alongside stdout, not starved by it"
+    );
+    assert!(
+        output.stdout.ends_with(format!("|{sent}").as_bytes()),
+        "the child read the whole request: {}",
+        String::from_utf8_lossy(&output.stdout[output.stdout.len() - 32..])
+    );
 }
 
 // ---------------------------------------------------------------------

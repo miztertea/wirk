@@ -2496,8 +2496,9 @@ impl JobRegistry {
 /// How a bounded child ended.
 #[derive(Debug)]
 pub enum ChildEnd {
-    /// It ran to completion. The output is the ordinary
-    /// `wait_with_output` result.
+    /// It ran to completion. Both pipes were drained to EOF, so this is
+    /// the whole output and not a prefix of it. An output that could not
+    /// be read to its end is [`ChildEnd::Failed`], never this.
     Finished(std::process::Output),
     /// A deadline or an explicit cancel ended it. The group and the job
     /// cgroup were killed; this is not a backend failure and must not be
@@ -2532,6 +2533,214 @@ pub struct BoundedChild<'a> {
     pub registry: Option<JobRegistry>,
 }
 
+/// Read `stdout` and `stderr` until both reach EOF, or until `ended`
+/// says the job is over.
+///
+/// EOF on a job's pipe is not this process's to wait for. Every
+/// descendant that inherited the write end holds it open, and the whole
+/// reason [`JobCapabilities::kill_available`] is reported at all is that
+/// some hosts cannot kill the descendant that escaped. So the loop stops
+/// on the job ending as readily as on EOF.
+///
+/// `poll(2)` with a timeout, then a single read of a descriptor it has
+/// just called ready — which therefore does not block — is what makes
+/// each iteration bounded by `POLL_INTERVAL`. R5: the same `libc` this
+/// module already signals with, rather than an async runtime or a reader
+/// thread per pipe. A reader thread would only move the unbounded wait
+/// somewhere this function cannot join it.
+///
+/// An unrecoverable `poll` or `read` failure is returned, not swallowed.
+/// What is in hand at that point is a prefix of the output, and a prefix
+/// presented as [`ChildEnd::Finished`] is a truncation the caller cannot
+/// see: the bytes are missing and the status says they are not.
+///
+/// Generic over the descriptor-bearing readers rather than fixed to
+/// `ChildStdout`/`ChildStderr`, so the failure branch is reachable by a
+/// check without a test-only path through [`BoundedChild::run`].
+fn drain_until_ended<O, E>(
+    mut stdout: Option<O>,
+    mut stderr: Option<E>,
+    ended: &AtomicBool,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)>
+where
+    O: std::io::Read + AsRawFd,
+    E: std::io::Read + AsRawFd,
+{
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+    while stdout.is_some() || stderr.is_some() {
+        if ended.load(Ordering::SeqCst) {
+            break;
+        }
+        let mut watched: Vec<libc::pollfd> = Vec::with_capacity(2);
+        if let Some(pipe) = &stdout {
+            watched.push(readable(pipe.as_raw_fd()));
+        }
+        if let Some(pipe) = &stderr {
+            watched.push(readable(pipe.as_raw_fd()));
+        }
+        // SAFETY: `poll(2)` over descriptors this function owns for the
+        // whole call — `stdout` and `stderr` are moved in and dropped
+        // only by this loop — and over a slice the kernel writes
+        // `revents` back into, whose length is passed with it.
+        let ready = unsafe {
+            libc::poll(
+                watched.as_mut_ptr(),
+                watched.len() as libc::nfds_t,
+                POLL_INTERVAL.as_millis() as libc::c_int,
+            )
+        };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        let mut next = 0;
+        if stdout.is_some() {
+            let revents = watched[next].revents;
+            next += 1;
+            if revents != 0 {
+                read_once(&mut stdout, &mut out, &mut buffer)?;
+            }
+        }
+        if stderr.is_some() && watched[next].revents != 0 {
+            read_once(&mut stderr, &mut err, &mut buffer)?;
+        }
+    }
+    Ok((out, err))
+}
+
+fn readable(fd: RawFd) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }
+}
+
+/// One read from a descriptor `poll` has just called ready, so a read
+/// that does not block. `Ok(0)` is EOF and retires the pipe.
+///
+/// A signal that landed on the read, and a wakeup that turned out to
+/// carry nothing, say nothing about the rest of the output: both are
+/// retried on the next pass. Any other error is returned. A descriptor
+/// that cannot be read is not going to produce the rest of the output,
+/// and retiring it here would hand the caller a prefix that looks
+/// complete — which is the failure this returns instead.
+fn read_once<R: std::io::Read>(
+    pipe: &mut Option<R>,
+    into: &mut Vec<u8>,
+    buffer: &mut [u8],
+) -> std::io::Result<()> {
+    let Some(source) = pipe.as_mut() else {
+        return Ok(());
+    };
+    match source.read(buffer) {
+        Ok(0) => *pipe = None,
+        Ok(count) => into.extend_from_slice(&buffer[..count]),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+            ) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+/// The child's stdin, with the one property a plain `ChildStdin` does
+/// not have: a write that cannot make progress is reconsidered rather
+/// than waited out forever.
+///
+/// The read end of this pipe is inherited by everything the child
+/// spawned, an escaped `setsid()` descendant included. If that
+/// descendant never reads it, a full pipe never drains and never reports
+/// `EPIPE` either — the writer simply stops, for the life of this
+/// process. Both real callers write a whole serialised request, which is
+/// routinely larger than a pipe buffer, so this is the ordinary shape of
+/// the work and not a corner of it.
+///
+/// R4/R5: `O_NONBLOCK` on our own write end plus `poll(2)` for
+/// `POLLOUT` — a native property of the descriptor, and the same `libc`
+/// this module already uses. The child's read end is a different open
+/// file description, so nothing about the child's own I/O changes.
+///
+/// There is no degraded mode. Where `O_NONBLOCK` cannot be set, the one
+/// property this type exists for does not hold, and a blocking write to
+/// a pipe nothing drains stops for the life of the process — so
+/// [`BoundedStdin::over`] refuses instead, and the caller ends the job it
+/// cannot bound. Generic over the descriptor-bearing writer so that
+/// refusal is reachable by a check.
+struct BoundedStdin<W> {
+    stdin: W,
+    ended: Arc<AtomicBool>,
+}
+
+impl<W: AsRawFd> BoundedStdin<W> {
+    /// `Err` where the write end could not be made non-blocking. The
+    /// caller must not start a writer over it: that is the unbounded
+    /// wait this type was introduced to remove.
+    fn over(stdin: W, ended: Arc<AtomicBool>) -> std::io::Result<Self> {
+        set_nonblocking(stdin.as_raw_fd())?;
+        Ok(Self { stdin, ended })
+    }
+}
+
+impl<W: Write + AsRawFd> Write for BoundedStdin<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        loop {
+            if self.ended.load(Ordering::SeqCst) {
+                // Deliberately not `Interrupted`: `write_all` retries
+                // that kind, which would spin here instead of returning.
+                return Err(std::io::Error::other(
+                    "the job ended before its input had been written",
+                ));
+            }
+            match self.stdin.write(buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut watched = libc::pollfd {
+                        fd: self.stdin.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: `poll(2)` on a descriptor `self` owns, over
+                    // one entry whose length is passed with it.
+                    unsafe {
+                        libc::poll(&mut watched, 1, POLL_INTERVAL.as_millis() as libc::c_int)
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                other => return other,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stdin.flush()
+    }
+}
+
+/// `O_NONBLOCK` on one descriptor, read-modify-write so nothing else it
+/// already carries is dropped.
+fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: `fcntl(2)` on a descriptor the caller owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl BoundedChild<'_> {
     /// Spawn `command` under this process's containment, feed it `write`,
     /// and wait no longer than the policy deadline.
@@ -2551,7 +2760,7 @@ impl BoundedChild<'_> {
     pub fn run(
         &self,
         mut command: Command,
-        write: impl FnOnce(&mut std::process::ChildStdin) -> std::io::Result<()> + Send + 'static,
+        write: impl FnOnce(&mut dyn Write) -> std::io::Result<()> + Send + 'static,
     ) -> ChildEnd {
         let cgroup = JobCgroup::create(self.capabilities, &self.job_id);
         let mut cap_note = None;
@@ -2614,7 +2823,26 @@ impl BoundedChild<'_> {
             }
         };
         let pgid = child.id() as i32;
-        let mut stdin = child.stdin.take().expect("stdin was piped by the caller");
+        // `ended` releases everything still waiting on a descriptor this
+        // job's escaped descendants also hold: the input writer and the
+        // output drain. The watchdog sets it once it has ended the job,
+        // and this thread sets it once the direct child is reaped.
+        let ended = Arc::new(AtomicBool::new(false));
+        let mut stdin = match BoundedStdin::over(
+            child.stdin.take().expect("stdin was piped by the caller"),
+            ended.clone(),
+        ) {
+            Ok(stdin) => stdin,
+            Err(error) => {
+                // The child is already running and nothing can bound the
+                // write it is waiting for, so end it here rather than
+                // start a writer that may never return.
+                self.stop_and_reap(&mut child, pgid, cgroup, &ended);
+                return ChildEnd::Failed(format!(
+                    "could not be given a bounded input pipe: {error}"
+                ));
+            }
+        };
         let writer = std::thread::spawn(move || write(&mut stdin));
 
         let deadline = Duration::from_secs(self.policy.job_deadline_secs);
@@ -2624,6 +2852,7 @@ impl BoundedChild<'_> {
         let watchdog_cgroup = cgroup.as_ref().map(|value| value.dir().to_path_buf());
         let reason = Arc::new(std::sync::Mutex::new(None::<String>));
         let watchdog_reason = reason.clone();
+        let watchdog_ended = ended.clone();
         let watchdog = std::thread::spawn(move || {
             let start = Instant::now();
             while !watchdog_finished.load(Ordering::SeqCst) {
@@ -2651,13 +2880,46 @@ impl BoundedChild<'_> {
                         let _ = fs::write(dir.join("cgroup.kill"), "1");
                     }
                     kill_process_group(pgid);
+                    // Only now. Whatever still holds this job's pipes
+                    // open is exactly what this host could not kill, so
+                    // nothing may go on waiting for it to let go.
+                    watchdog_ended.store(true, Ordering::SeqCst);
                     return;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
         });
 
-        let output = child.wait_with_output();
+        // Not `wait_with_output`. That reads both pipes to EOF *before*
+        // it reaps, and EOF arrives only once every holder of the write
+        // end has closed it — an escaped `setsid()` descendant inherited
+        // those write ends and, where `cgroup.kill` is unavailable, is
+        // precisely the process the kill cannot reach. The parent was
+        // waiting out a descendant it had already reported it could not
+        // stop. Measured on CI 34806268796 and reproduced here under a
+        // non-delegated cgroup: the direct child was a zombie, the
+        // escaped grandchild held the same two pipe inodes, and the wait
+        // ran until the job was cancelled from outside.
+        let drained = drain_until_ended(child.stdout.take(), child.stderr.take(), &ended);
+        if drained.is_err() {
+            // The output cannot be read to its end, so this job has no
+            // whole result to deliver. Release everything still waiting
+            // on this job's descriptors and end it, rather than reap a
+            // child whose remaining output is already lost.
+            ended.store(true, Ordering::SeqCst);
+            if let Some(cgroup) = &cgroup {
+                let _ = cgroup.kill();
+            }
+            kill_process_group(pgid);
+        }
+        // The direct child *is* ours to reap, and this `wait(2)` is
+        // bounded by the watchdog that is still armed: it returns as
+        // soon as that one process is dead, whatever an escaped
+        // descendant is still doing with the descriptors it inherited.
+        let status = child.wait();
+        // Reaped. Release the writer on this path too, where the job
+        // succeeded and nothing was ever killed.
+        ended.store(true, Ordering::SeqCst);
         finished.store(true, Ordering::SeqCst);
         let _ = watchdog.join();
         let _ = writer.join();
@@ -2670,12 +2932,52 @@ impl BoundedChild<'_> {
 
         let cancelled = reason.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(reason) = cancelled {
+            // A job the watchdog ended is a cancellation, whatever the
+            // drain saw on its way out: the classification the callers
+            // depend on is unchanged.
             return ChildEnd::Cancelled { reason, elapsed };
         }
-        match output {
-            Ok(output) => ChildEnd::Finished(output),
+        let (stdout, stderr) = match drained {
+            Ok(output) => output,
+            Err(error) => {
+                return ChildEnd::Failed(format!("its output could not be read: {error}"));
+            }
+        };
+        match status {
+            Ok(status) => ChildEnd::Finished(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            }),
             Err(error) => ChildEnd::Failed(format!("failed: {error}")),
         }
+    }
+
+    /// Stop and reap a job that cannot be run at all, where no watchdog
+    /// and no writer exist yet and so there is no thread to join.
+    ///
+    /// `ended` first, so anything waiting on one of this job's
+    /// descriptors is released. Then the cgroup, because it is what
+    /// reaches a `setsid()` descendant; then the process group, which is
+    /// all there is where no cgroup was available; then a `wait(2)` on
+    /// the one process this code unambiguously owns, so it is reaped
+    /// rather than left a zombie. Finally the same [`Self::clear`] every
+    /// other exit path runs.
+    fn stop_and_reap(
+        &self,
+        child: &mut std::process::Child,
+        pgid: i32,
+        cgroup: Option<JobCgroup>,
+        ended: &AtomicBool,
+    ) {
+        ended.store(true, Ordering::SeqCst);
+        if let Some(cgroup) = &cgroup {
+            let _ = cgroup.kill();
+        }
+        kill_process_group(pgid);
+        let _ = child.wait();
+        drop(cgroup);
+        self.clear();
     }
 
     /// Every trace this job leaves behind, removed on every exit path:
@@ -2689,5 +2991,192 @@ impl BoundedChild<'_> {
         if let Some(registry) = &self.registry {
             registry.deregister(&self.job_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A descriptor number that was never opened, so the kernel answers
+    /// `EBADF` to `fcntl(2)`, `poll(2)` and `read(2)` alike.
+    ///
+    /// This is an *injected* fault. No host this runs on is expected to
+    /// refuse `O_NONBLOCK` on a pipe it just created, which is exactly
+    /// why the branch that handles that refusal was never executed
+    /// before. What the injection pins is the branch; real processes,
+    /// in `tests/bounded_jobs.rs` and in
+    /// `a_job_stopped_before_its_watchdog_existed_is_reaped_and_deregistered`
+    /// below, are what verify the lifecycle around it.
+    const NEVER_OPENED: RawFd = libc::c_int::MAX;
+
+    struct Unbindable;
+
+    impl AsRawFd for Unbindable {
+        fn as_raw_fd(&self) -> RawFd {
+            NEVER_OPENED
+        }
+    }
+
+    impl Write for Unbindable {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Unreadable;
+
+    impl AsRawFd for Unreadable {
+        fn as_raw_fd(&self) -> RawFd {
+            NEVER_OPENED
+        }
+    }
+
+    impl std::io::Read for Unreadable {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            // SAFETY: `read(2)` into a buffer whose length is passed with
+            // it. The descriptor is deliberately invalid, so this call
+            // only ever fails — nothing is written into `buf`.
+            let count = unsafe {
+                libc::read(
+                    self.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if count < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(count as usize)
+        }
+    }
+
+    /// Input that cannot be bounded is refused, not written anyway.
+    ///
+    /// Before this correction `over` printed the failure and returned an
+    /// ordinary blocking writer, so a write to a pipe nothing drains
+    /// still stopped for the life of the process — the unbounded wait
+    /// the type exists to remove, reintroduced on its own error path.
+    #[test]
+    fn an_input_pipe_that_cannot_be_bounded_is_refused() {
+        let ended = Arc::new(AtomicBool::new(false));
+        let Err(refusal) = BoundedStdin::over(Unbindable, ended) else {
+            panic!("an unbindable descriptor must be refused, not accepted unbounded");
+        };
+        assert_eq!(
+            refusal.raw_os_error(),
+            Some(libc::EBADF),
+            "the refusal must carry what the kernel actually said: {refusal}"
+        );
+    }
+
+    /// An output descriptor that cannot be read fails the drain.
+    ///
+    /// Before this correction the read error retired the pipe and the
+    /// drain returned what it had: a prefix of the output, which
+    /// `BoundedChild::run` then handed back as `Finished` — a truncation
+    /// the caller has no way to see.
+    #[test]
+    fn an_unreadable_output_descriptor_fails_the_drain_rather_than_truncating() {
+        let ended = AtomicBool::new(false);
+        let Err(failure) = drain_until_ended(Some(Unreadable), None::<std::fs::File>, &ended)
+        else {
+            panic!("output that cannot be read is not a complete output");
+        };
+        assert_eq!(
+            failure.raw_os_error(),
+            Some(libc::EBADF),
+            "the failure must carry what the kernel actually said: {failure}"
+        );
+    }
+
+    /// The ordinary path is unchanged: both of a real child's pipes are
+    /// drained whole, to EOF, and returned.
+    #[test]
+    fn an_ordinary_child_has_both_pipes_drained_whole() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf 'out-bytes'; printf 'err-bytes' >&2")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().expect("sh must be available");
+        let ended = AtomicBool::new(false);
+        let (out, err) = drain_until_ended(child.stdout.take(), child.stderr.take(), &ended)
+            .expect("an ordinary child's pipes must drain without failure");
+        let status = child.wait().expect("the direct child is ours to reap");
+        assert!(status.success(), "{status}");
+        assert_eq!(String::from_utf8_lossy(&out), "out-bytes");
+        assert_eq!(String::from_utf8_lossy(&err), "err-bytes");
+    }
+
+    /// The teardown the failed-setup path runs, against a real child.
+    ///
+    /// `run` reaches this with a live child, no watchdog and no writer.
+    /// Returning a failure while leaving that child running, or leaving
+    /// it a zombie, or leaving the registry saying the job is still
+    /// active, would be a different defect wearing the same `Failed`.
+    #[test]
+    fn a_job_stopped_before_its_watchdog_existed_is_reaped_and_deregistered() {
+        let capabilities = JobCapabilities::default();
+        let policy = ResourcePolicy::default();
+        let registry = JobRegistry::new();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        harden_execution_child(&mut command);
+        let mut child = command.spawn().expect("sh must be available");
+        let pid = child.id() as i32;
+
+        let job = BoundedChild {
+            capabilities: &capabilities,
+            policy: &policy,
+            cancel: CancelToken::new(),
+            job_id: "stop-and-reap".into(),
+            estate_root: None,
+            staging: None,
+            verb: "test".into(),
+            scope: "test-scope".into(),
+            requester: None,
+            registry: Some(registry.clone()),
+        };
+        registry.register(ActiveJob {
+            job_id: job.job_id.clone(),
+            verb: job.verb.clone(),
+            scope: job.scope.clone(),
+            requester: None,
+            started_unix_millis: now_unix_millis(),
+            cancel: job.cancel.clone(),
+        });
+
+        let ended = AtomicBool::new(false);
+        job.stop_and_reap(&mut child, pid, None, &ended);
+
+        // SAFETY: signal 0 on a pid, which checks for it without sending
+        // anything. `ESRCH` is the answer for a process that has been
+        // reaped; a zombie would still answer `Ok`.
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_eq!(alive, -1, "the direct child must be reaped, not left");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "a reaped child is gone, not a zombie"
+        );
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "anything waiting on this job's descriptors must be released"
+        );
+        assert!(
+            !registry.is_active(&job.job_id),
+            "a job that was stopped must not still answer \"running\""
+        );
     }
 }

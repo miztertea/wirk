@@ -80,11 +80,35 @@ fn model_dir(directory: &Path) -> PathBuf {
     model
 }
 
-fn executable(script: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(script).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(script, permissions).unwrap();
+/// The executable copy of a fixture script, made by `install(1)` rather
+/// than by this process.
+///
+/// `fs::write` + `chmod` leaves the descriptor of the very file that is
+/// about to be executed open in *this* process for the length of the
+/// write. These 56 checks run in parallel and the product's job spawns
+/// install a `pre_exec` hook, which takes Rust off `posix_spawn` and
+/// onto fork + exec: another check's fork inside that window inherits
+/// the writable descriptor, and the kernel then refuses to execute the
+/// script — `ETXTBSY` — until that child reaches its own `exec`.
+/// Observed once as `backend .../chunk-grammar_none_loaded.py could not
+/// be started: Text file busy (os error 26)`.
+///
+/// `install(1)` is a separate process, so the descriptor of the file it
+/// creates is never open here and there is nothing for a concurrent fork
+/// to inherit. The written script keeps its name and is never executed;
+/// the executed copy is `<name>.run`.
+fn installed(written: &Path) -> PathBuf {
+    let mut name = written.file_name().expect("script name").to_os_string();
+    name.push(".run");
+    let script = written.with_file_name(name);
+    let status = Command::new("install")
+        .args(["-m", "0755"])
+        .arg(written)
+        .arg(&script)
+        .status()
+        .expect("install(1) runs");
+    assert!(status.success(), "install {}: {status}", script.display());
+    script
 }
 
 /// A real `wirk-embed/v2` backend in `chunk-embed` mode.
@@ -266,8 +290,7 @@ print(json.dumps(reply))
         ),
     )
     .unwrap();
-    executable(&script);
-    script
+    installed(&script)
 }
 
 /// A real `wirk-query/v2` backend. It writes the exact view it was handed
@@ -369,8 +392,7 @@ if FLAVOUR == "out_of_range":
         ),
     )
     .unwrap();
-    executable(&script);
-    script
+    installed(&script)
 }
 
 struct Estate {
@@ -1451,8 +1473,7 @@ for rank, row in enumerate(ordered, 1):
         ),
     )
     .unwrap();
-    executable(&script);
-    script
+    installed(&script)
 }
 
 /// A file a query backend can claim as a loaded module, so its answer
@@ -2250,8 +2271,7 @@ for rank, row in enumerate(rows, 1):
         ),
     )
     .unwrap();
-    executable(&script);
-    script
+    installed(&script)
 }
 
 /// A `wirk-query/v2` backend that reports an environment carrying no
@@ -2306,8 +2326,7 @@ for rank, row in enumerate(rows, 1):
 "#,
     )
     .unwrap();
-    executable(&script);
-    script
+    installed(&script)
 }
 
 fn tree_digest(root: &Path) -> String {

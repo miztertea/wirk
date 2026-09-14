@@ -74,13 +74,23 @@ fn json(args: &[&str]) -> serde_json::Value {
 /// protocol: the job is admitted, registered and killable, which is
 /// every part of it these checks are about.
 fn blocking_backend(dir: &Path) -> PathBuf {
-    let path = dir.join("blocking-backend.sh");
-    fs::write(&path, "#!/bin/sh\nexec sleep 600\n").expect("write backend");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod backend");
-    }
+    let written = dir.join("blocking-backend.sh");
+    fs::write(&written, "#!/bin/sh\nexec sleep 600\n").expect("write backend");
+    // `install(1)`, not `fs::set_permissions`: writing a file here and
+    // then executing that same file leaves this process holding its
+    // writable descriptor for the length of the write, and a fork by any
+    // other check in this binary during that window inherits it — the
+    // kernel then refuses to execute the script with `ETXTBSY` until
+    // that child execs. The copy `install` makes was never open for
+    // writing in this process, so there is nothing to inherit.
+    let path = dir.join("blocking-backend.sh.run");
+    let status = Command::new("install")
+        .args(["-m", "0755"])
+        .arg(&written)
+        .arg(&path)
+        .status()
+        .expect("install(1) runs");
+    assert!(status.success(), "install backend: {status}");
     path
 }
 
@@ -402,19 +412,88 @@ fn a_work_sees_and_stops_its_own_job_and_signalling_is_not_stopping() {
         "the owner cannot see its own job: {listed}"
     );
     assert_eq!(running[0]["job_id"], job.as_str());
+    assert_eq!(
+        running[0]["cancel_signalled"], false,
+        "nothing has signalled this job yet: {listed}"
+    );
 
-    // Acknowledgement and completion stay two separate answers.
+    // Acknowledgement and completion stay two separate answers, and the
+    // signalling call knows only the first.
     let signalled = fx.cancel_as(&owner.work_id, &["--job", &job]);
     assert_eq!(signalled["outcome"], "signalled", "{signalled}");
     assert!(
         signalled["completed"].is_null(),
         "completion was claimed without being observed: {signalled}"
     );
-    let after = fx.list_as(&owner.work_id);
-    assert_eq!(after["running"][0]["cancel_signalled"], true, "{after}");
+    assert_eq!(
+        signalled["acknowledged"][0]["job_id"],
+        job.as_str(),
+        "the acknowledgement must name the job it signalled: {signalled}"
+    );
 
+    // "Signalling is not stopping: ask again with no target, or with
+    // --wait, to observe whether they have actually ended" — the reply's
+    // own words, and the listing is that second answer.
+    //
+    // A single listing taken after the signal cannot be asserted to show
+    // the job still present: the watchdog ends a signalled job within
+    // `POLL_INTERVAL` (50ms) and a CLI round trip under load is slower
+    // than that, which is exactly how this check failed intermittently.
+    // What holds without a window is that the registry never reports the
+    // job as present-but-unsignalled — deregistration is the job's own
+    // exit path, not the signal — and that the job does end.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let after = fx.list_as(&owner.work_id);
+        let Some(entry) = after["running"]
+            .as_array()
+            .expect("running array")
+            .first()
+            .cloned()
+        else {
+            break;
+        };
+        assert_eq!(entry["job_id"], job.as_str(), "{after}");
+        assert_eq!(
+            entry["cancel_signalled"], true,
+            "a signalled job was listed as unsignalled: {after}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "a signalled job never ended: {after}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Gone from the listing must mean *ended*, not merely forgotten: a
+    // registry that dropped the entry on the signal would read the same
+    // way here. The build this job belongs to is a real child of this
+    // check, and it exits only once its job actually stopped.
+    let mut build = build;
+    let exited = loop {
+        match build.try_wait().expect("wait on the build") {
+            Some(_) => break true,
+            None if Instant::now() >= deadline => break false,
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert!(
+        exited,
+        "the job left the listing but its build kept running: signalling had not stopped it"
+    );
+
+    // The waiting form answers acknowledgement *and* completion in one
+    // call, so it is asked of a job that is certainly running when it is
+    // asked rather than of one that may already have ended.
+    let (second_build, second) = fx.start_job(Some(&owner.work_id));
     let completed = fx.cancel_as(&owner.work_id, &["--all", "--wait", "20"]);
     assert_eq!(completed["outcome"], "completed", "{completed}");
+    assert_eq!(
+        completed["completed"].as_array().expect("array").len(),
+        1,
+        "{completed}"
+    );
+    assert_eq!(completed["completed"][0], second.as_str(), "{completed}");
     assert_eq!(
         completed["still_running"].as_array().expect("array").len(),
         0
@@ -425,7 +504,7 @@ fn a_work_sees_and_stops_its_own_job_and_signalling_is_not_stopping() {
         "the registry did not empty"
     );
 
-    fx.drain(build);
+    fx.drain(second_build);
     stop_wirkd(&fx.estate, wirkd);
 }
 
