@@ -3588,7 +3588,29 @@ fn run_deterministic_command(args: &[String]) -> ExitCode {
         return run_deterministic_usage();
     }
 
-    let estate_root = PathBuf::from(&estate);
+    // A relative `--estate` stays correct for every call this function
+    // itself makes (its own process's cwd never moves), but both
+    // executors spawn their real process into a *different* directory
+    // (`det.cwd`, the Work's own worktree) and then inject
+    // `WIRK_ESTATE_ROOT` from this `PathBuf`'s own display string
+    // (`ChildExecutor::launch`, `DockerExecutor`'s env/argv): an
+    // unresolved relative value is then read back relative to that
+    // other cwd, not this one, and a real child spawned that way filed
+    // its Claim against the wrong path and was refused
+    // (`TripleMismatch`, reproduced live with a relative `--estate` and
+    // an output-only World whose worktree differs from the launch
+    // directory). Canonicalizing once, here, before either executor is
+    // constructed, fixes the value both then inject and the
+    // `owned_execution_address` equality check just below, which
+    // compares this same `estate_root` against wirkd's own (always
+    // absolute) reservation.
+    let estate_root = match std::fs::canonicalize(&estate) {
+        Ok(root) => root,
+        Err(err) => {
+            eprintln!("wirk run-deterministic: --estate {estate} could not be resolved: {err}");
+            return ExitCode::from(2);
+        }
+    };
     let work_id = WorkId(work_id_str);
 
     let status = match wirkd_status(&estate, &work_id) {

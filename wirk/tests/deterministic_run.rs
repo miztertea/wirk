@@ -228,6 +228,64 @@ fn run_deterministic_child_completes_and_fails() {
     assert!(!estate.join(".wirk").join("wirkd.sock").exists());
 }
 
+/// A real operator's `cwd` when they run `run-deterministic` is not
+/// always the estate root, and `--estate` is not always given
+/// absolute. Submits and runs against the estate by a *relative*
+/// `--estate`, invoked from a separate launch directory the estate does
+/// not itself sit under — the exact shape that, before this fix,
+/// injected the unresolved relative string into the real child's own
+/// `WIRK_ESTATE_ROOT` (correct only relative to *this* process's cwd,
+/// not the child's, which is the Work's own worktree) and made the
+/// child's own Claim attempt fail `TripleMismatch` even though the
+/// child ran, and wrote its output, in exactly the right place.
+#[test]
+fn run_deterministic_child_succeeds_with_a_relative_estate_from_a_different_launch_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    let launch_dir = dir.path().join("launch");
+    std::fs::create_dir_all(&estate).expect("make estate dir");
+    std::fs::create_dir_all(&launch_dir).expect("make launch dir");
+
+    let mut wirkd_child = KillOnDrop(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_wirkd(&estate);
+
+    let (work, run) = submit_deterministic(&estate, &["sh", "-c", "echo x > report.md"]);
+
+    let output = wirk_cli()
+        .current_dir(&launch_dir)
+        .args(["run-deterministic", "--estate", "../estate", "--work"])
+        .arg(&work)
+        .args(["--executor", "child"])
+        .output()
+        .expect("run-deterministic runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "a relative --estate from a launch dir other than the estate root must still let the \
+         real child file its own Claim: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("Claimed {run}")),
+        "stdout: {stdout}"
+    );
+    assert_eq!(status_state(&pointer.socket, &work), "completed");
+
+    let _ = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output();
+    let _ = wirkd_child.0.wait();
+}
+
 /// P3 native closeout item 4. The auto-advanced Deterministic World
 /// used to carry a compiled-in absolute cache path for this one
 /// development box (`CARGO_TARGET_DIR=/var/tmp/wirk-target`,

@@ -4422,3 +4422,41 @@ fn an_unrecorded_delivery_falls_back_to_the_kind_predicate_it_always_used() {
         "{text:?}"
     );
 }
+
+// ---- the composer names this Run's actual managed-output destination,
+// not only the required output names -------------------------------
+//
+// `compose_first_prompt` renders the required artifact *names* via
+// `artifacts_line`, but never their destination. A real `ActorWorld`
+// against a real estate root, the same `wirk_core::outputs::
+// staging_dir` the fix reuses computing the expected path
+// independently of the composer.
+
+#[test]
+fn the_first_prompt_names_this_runs_actual_output_destination() {
+    let run = open_run("run-1");
+    let estate = tempdir().expect("estate tempdir");
+    let dir = tempdir().expect("worktree tempdir");
+    let World::Actor(actor) = actor_world_with_estate(&run, dir.path(), estate.path()) else {
+        unreachable!("actor_world_with_estate builds an Actor World")
+    };
+    let expected_staging =
+        wirk_core::outputs::staging_dir(estate.path(), &actor.triple.work_id, &actor.triple.run_id)
+            .expect("well-formed work/run ids stage a directory");
+
+    let text = wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, None);
+
+    assert!(
+        text.contains("report.md"),
+        "the required output's name must still appear: {text:?}"
+    );
+    assert!(
+        text.contains(expected_staging.to_str().expect("utf8 fixture path")),
+        "the prompt must name this Run's actual staging destination, not just the \
+         required names: {text:?}"
+    );
+    assert!(
+        !expected_staging.exists(),
+        "this test's own premise: nothing has created the staging directory yet"
+    );
+}

@@ -224,6 +224,27 @@ impl Executor for ChildExecutor {
         command.args(words);
         command.current_dir(&det.cwd);
         command.envs(&det.env);
+        // Applied here, after `det.env` and over whatever this process's
+        // own environment already inherited, so this Run's real
+        // identity — the executor's own `estate_root`/`work_id` plus
+        // this launch's `run.id` — is authoritative over both a foreign
+        // caller's inherited triple and a Route-declared `det.env`
+        // entry that happens to name one of these three keys. Everything
+        // else in `det.env` and the inherited environment (host build
+        // settings included) passes through untouched — only these
+        // three keys are ever overwritten, and only here at launch:
+        // `det.env` itself, and the `WorldHash` computed over it, are
+        // never touched, so the reservation's hash does not move per
+        // attempt. `self.estate_root` is the caller's `--estate`,
+        // canonicalized before either executor is constructed
+        // (`run_deterministic_command`): the raw argument stays correct
+        // for this process's own later calls, whose cwd never moves, but
+        // an unresolved relative value read back here — against the
+        // child's own cwd, `det.cwd`, not this one — would name the
+        // wrong estate.
+        command.env("WIRK_ESTATE_ROOT", self.estate_root.display().to_string());
+        command.env("WIRK_WORK_ID", &self.work_id.0);
+        command.env("WIRK_RUN_ID", &run.id.0);
         command.stdin(Stdio::null());
         command.stdout(Stdio::from(stdout_file));
         command.stderr(Stdio::piped());

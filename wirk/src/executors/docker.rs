@@ -481,17 +481,24 @@ pub(crate) fn create_argv(
         "/work".to_string(),
         "--mount".to_string(),
         format!("type=bind,source={},target=/work", det.cwd.display()),
-        "-e".to_string(),
-        format!("WIRK_ESTATE_ROOT={}", triple.estate_root),
-        "-e".to_string(),
-        format!("WIRK_WORK_ID={}", triple.work_id.0),
-        "-e".to_string(),
-        format!("WIRK_RUN_ID={}", triple.run_id.0),
     ];
     for (key, value) in &det.env {
         argv.push("-e".to_string());
         argv.push(format!("{key}={value}"));
     }
+    // After `det.env`'s own `-e` flags, not before — verified live
+    // (2026-09-14, `docker run -e FOO=bar -e FOO=baz alpine:3.24 sh -c
+    // 'echo $FOO'` prints `baz`: Docker's own rule for a repeated `-e`
+    // is last flag wins, not first), so this Run's real triple is
+    // authoritative over a Route-declared `det.env` entry that happens
+    // to name one of these three keys, the same precedence
+    // `ChildExecutor::launch` applies for a real process.
+    argv.push("-e".to_string());
+    argv.push(format!("WIRK_ESTATE_ROOT={}", triple.estate_root));
+    argv.push("-e".to_string());
+    argv.push(format!("WIRK_WORK_ID={}", triple.work_id.0));
+    argv.push("-e".to_string());
+    argv.push(format!("WIRK_RUN_ID={}", triple.run_id.0));
     argv.push(IMAGE.to_string());
     argv.extend(det.command.iter().cloned());
     argv

@@ -249,13 +249,13 @@ fn d5_7_docker_create_argv_is_exact_and_ordered() {
         "--mount",
         "type=bind,source=/var/tmp/wirk-estate/works/work-1/run-run-1/worktree,target=/work",
         "-e",
+        "FOO=bar",
+        "-e",
         "WIRK_ESTATE_ROOT=/var/tmp/wirk-estate",
         "-e",
         "WIRK_WORK_ID=work-1",
         "-e",
         "WIRK_RUN_ID=run-1",
-        "-e",
-        "FOO=bar",
         "alpine:3.24",
         "sh",
         "-c",
@@ -266,6 +266,48 @@ fn d5_7_docker_create_argv_is_exact_and_ordered() {
     .collect();
 
     assert_eq!(argv, expected);
+}
+
+// ---- the triple's own -e flags are authoritative over a
+// Route-declared det.env entry naming the same key -------------------
+//
+// Verified live 2026-09-14 (`docker run -e FOO=bar -e FOO=baz
+// alpine:3.24 sh -c 'echo $FOO'` prints `baz`): Docker's own rule is
+// last `-e` wins, so the triple's flags must come after `det.env`'s in
+// the argv this test checks directly (no daemon), matching the live
+// rule this comment records.
+
+#[test]
+fn d5_7b_the_triples_own_e_flags_win_over_an_authored_collision() {
+    let mut env = BTreeMap::new();
+    env.insert("WIRK_RUN_ID".to_string(), "foreign-run".to_string());
+    let det = DeterministicWorld {
+        command: vec!["true".to_string()],
+        base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
+        cwd: std::path::PathBuf::from("/var/tmp/wirk-estate/works/work-1/run-run-1/worktree"),
+        env,
+        expected_artifacts: OutputContract(Vec::new()),
+    };
+    let triple = ExecutionTriple {
+        estate_root: "/var/tmp/wirk-estate".to_string(),
+        work_id: WorkId("work-1".to_string()),
+        run_id: RunId("run-1".to_string()),
+    };
+
+    let argv = create_argv("wirk-run-1", 4242, 1001, 1001, &det, &triple);
+
+    let last_run_id = argv
+        .windows(2)
+        .rfind(|pair| pair[0] == "-e" && pair[1].starts_with("WIRK_RUN_ID="))
+        .expect("a WIRK_RUN_ID -e flag is present");
+    assert_eq!(
+        last_run_id[1], "WIRK_RUN_ID=run-1",
+        "the last WIRK_RUN_ID= flag — the one Docker's own last-wins rule actually \
+         applies — must be this Run's real id, not det.env's authored collision: {argv:?}"
+    );
 }
 
 // ---- d5_8: a Deterministic World without base_sha is refused (docker) -
@@ -416,6 +458,161 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
             .lines()
             .any(|name| name == container_name)),
         "container {container_name} was not removed by --rm"
+    );
+
+    let stop = std::process::Command::new(env!("CARGO_BIN_EXE_wirk"))
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let _ = wirkd_guard.0.kill();
+    let _ = wirkd_guard.0.wait();
+}
+
+// ---- a live container gets its own real identity, overriding a
+// foreign det.env collision --------------------------------------------
+//
+// Proved against the actual daemon rather than only the argv it
+// launches with: `det.env` here deliberately collides on all three keys
+// with plainly wrong values, so the container's own environment — read
+// back through the bind mount, not merely asserted from argv order —
+// must show this Run's real triple regardless.
+
+#[test]
+#[ignore]
+fn d5_9b_docker_live_container_gets_its_own_identity_over_an_authored_collision() {
+    if !docker_live_enabled() {
+        eprintln!("skipped: set WIRK_DOCKER_LIVE=1 to run");
+        return;
+    }
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path().to_path_buf();
+
+    let mut wirkd_guard = KillWirkdOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_wirk"))
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer_live(&estate);
+    let (work_id, run_id, waypoint) = submit_deterministic(
+        &estate,
+        "abc123",
+        &[
+            "sh",
+            "-c",
+            "printf '%s\\n%s\\n%s\\n' \"$WIRK_ESTATE_ROOT\" \"$WIRK_WORK_ID\" \"$WIRK_RUN_ID\" \
+             > identity.txt; echo hi > report.md",
+        ],
+    );
+
+    let executor = DockerExecutor::new(estate.clone(), WorkId(work_id.clone()));
+    let run = Run {
+        id: RunId(run_id.clone()),
+        waypoint: WaypointId(waypoint),
+        attempt: 1,
+        world_hash: WorldHash("deadbeef".to_string()),
+        state: RunState::Open,
+        kind: Default::default(),
+        selection: Default::default(),
+        launched: false,
+        launch_requested: false,
+        launch_argv: Vec::new(),
+        launch_attempt: None,
+        expansions: Vec::new(),
+        contract_delivery: None,
+        claim_hook: None,
+    };
+    let owned = wirk_core::owned_execution_address(&estate, &WorkId(work_id.clone()));
+    std::fs::create_dir_all(&owned).expect("this Work's own execution directory");
+
+    // A Route-declared `det.env` naming all three keys with plainly
+    // foreign values — an authored collision the injected triple must
+    // still win over.
+    let mut env = BTreeMap::new();
+    env.insert(
+        "WIRK_ESTATE_ROOT".to_string(),
+        "/nonexistent/foreign-estate".to_string(),
+    );
+    env.insert("WIRK_WORK_ID".to_string(), "foreign-work".to_string());
+    env.insert("WIRK_RUN_ID".to_string(), "foreign-run".to_string());
+    let world = World::Deterministic(DeterministicWorld {
+        command: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf '%s\\n%s\\n%s\\n' \"$WIRK_ESTATE_ROOT\" \"$WIRK_WORK_ID\" \"$WIRK_RUN_ID\" \
+             > identity.txt; echo hi > report.md"
+                .to_string(),
+        ],
+        base_sha: "abc123".to_string(),
+        source_basis: wirk_core::SourceBasis::OutputOnly {
+            reference: "abc123".to_string(),
+        },
+        cwd: owned.clone(),
+        env,
+        expected_artifacts: OutputContract(vec![wirk_core::ArtifactSpec {
+            name: "report.md".to_string(),
+            required: true,
+        }]),
+    });
+    executor.launch(&run, &world).expect("launch");
+    let container_name = executor
+        .container_name(&run.id)
+        .expect("container name recorded after launch");
+    let _guard = RemoveContainerOnDrop(container_name.clone());
+
+    let journal_path = estate.join("works").join(&work_id);
+    let deadline = Instant::now() + POLL_DEADLINE;
+    let claimed = loop {
+        match executor.poll(&run) {
+            Ok(RunObservation::Running) => {}
+            other => panic!("expected Running throughout (no Completed variant), got {other:?}"),
+        }
+        if let Ok(journal) = wirk_core::Journal::open(&journal_path)
+            && let Ok(events) = journal.replay()
+            && events.iter().any(|e| {
+                matches!(
+                    &e.kind,
+                    wirk_core::EventKind::ClaimRecorded {
+                        verdict: wirk_core::ClaimVerdict::Validated,
+                        ..
+                    }
+                )
+            })
+        {
+            break true;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "DockerExecutor never filed a claim within the deadline"
+        );
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert!(
+        claimed,
+        "the real wirkd's journal never recorded ClaimRecorded{{Validated}}"
+    );
+
+    let identity = std::fs::read_to_string(owned.join("identity.txt"))
+        .expect("the container's write through the /work bind mount lands on the host cwd");
+    let lines: Vec<String> = identity.lines().map(str::to_string).collect();
+    assert_eq!(
+        lines,
+        vec![
+            estate.display().to_string(),
+            work_id.clone(),
+            run_id.clone()
+        ],
+        "the container's own WIRK_ESTATE_ROOT/WIRK_WORK_ID/WIRK_RUN_ID must be this Run's \
+         real triple, not det.env's authored collision: {identity:?}"
     );
 
     let stop = std::process::Command::new(env!("CARGO_BIN_EXE_wirk"))

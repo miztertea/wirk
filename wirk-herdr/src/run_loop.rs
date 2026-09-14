@@ -2322,6 +2322,38 @@ pub fn compose_first_prompt(
         &actor.triple.estate_root,
         &actor.triple.run_id.0,
     ));
+    // The composer already names required output *names* above, but
+    // never *where* to put them. `staging_dir` is a pure function of
+    // the triple this `ActorWorld` already carries (R2: the same
+    // helper `wirk output dir` itself prints), so the destination
+    // named here can never drift from the one a `wirk output dir`/
+    // `wirk claim` call would actually use. Told truthfully: the
+    // directory is created only by `wirk output dir`/`wirk output
+    // list` (`ensure_staging_dir`, reached through `handle_run_
+    // outputs`), never by a bare filesystem write, so the actor is
+    // told to call it first. `None` only for a malformed work/run id,
+    // a state a real launched Run cannot reach (`well_formed_id`), so
+    // this line is silently absent rather than panicking on the
+    // composer's own path.
+    let destination_line = wirk_core::outputs::staging_dir(
+        std::path::Path::new(&actor.triple.estate_root),
+        &actor.triple.work_id,
+        &actor.triple.run_id,
+    )
+    .map(|dir| {
+        format!(
+            "\n\nWrite managed outputs there, including every required artifact named \
+             above, under {} — this Run's own output destination, the same path {wirk} \
+             output dir prints. Run {wirk} output dir once before your first write: that \
+             call is what creates the directory, so writing into it first, before you \
+             have asked wirk for it, fails. A bare {wirk} claim already selects every \
+             required output by name; an additional, optional output is included only if \
+             you name it explicitly: {wirk} claim --output NAME. Do not leave a required \
+             output out of that call.",
+            dir.display(),
+        )
+    })
+    .unwrap_or_default();
     let runtime_line = format!(
         "This Run's own `wirk` is the executable at {wirk} — invoke it by that exact \
          absolute path for every wirk command. It is pinned for the whole life of this \
@@ -2416,7 +2448,7 @@ pub fn compose_first_prompt(
         _ => String::new(),
     };
     format!(
-        "{contract_block}{intent}{artifacts_line}\n\n{runtime_line}\n\n{claim_line}",
+        "{contract_block}{intent}{artifacts_line}{destination_line}\n\n{runtime_line}\n\n{claim_line}",
         intent = actor.intent,
     )
 }
