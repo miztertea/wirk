@@ -125,11 +125,11 @@ pub(crate) const QUERY_INDEX_CACHE: &str = "the uid-shared query index cache";
 #[derive(Debug, Default)]
 pub(crate) struct Retention {
     /// generation id -> the concrete consumers that retain it.
-    pub(crate) generations: BTreeMap<String, Vec<String>>,
+    pub(crate) generations: BTreeMap<String, Vec<RetentionHolder>>,
     /// edition id -> the concrete consumers that retain it.
-    pub(crate) editions: BTreeMap<String, Vec<String>>,
+    pub(crate) editions: BTreeMap<String, Vec<RetentionHolder>>,
     /// contract digest -> the concrete consumers that retain it.
-    pub(crate) contracts: BTreeMap<String, Vec<String>>,
+    pub(crate) contracts: BTreeMap<String, Vec<RetentionHolder>>,
     /// Every Work this estate holds a journal for.
     pub(crate) works: Vec<WorkFacts>,
     /// Each registered source's alias and locator — named so a reader can
@@ -149,21 +149,87 @@ pub(crate) struct Retention {
     pub(crate) unreadable: Vec<Unreadable>,
 }
 
+/// *Who* retains an asset, as a structure rather than as a sentence.
+///
+/// Every consumer here is disclosed to an operator as prose, and for a
+/// long time prose was all it was. That is enough to explain a refusal
+/// and not enough to reason about one. `atlas remove` has to answer a
+/// question no sentence can be asked: is the only thing still holding
+/// this source's evidence *the source's own publication*, which
+/// removing the source would itself release? Recovering that from a
+/// rendered string would mean matching on wording that exists to be
+/// read, not to be parsed — so the identity is carried, and
+/// [`describe`](RetentionHolder::describe) renders it at the edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetentionHolder {
+    /// This membership's own currently published generation. Released by
+    /// removing that membership, and by nothing else.
+    Publication { membership: String, alias: String },
+    /// This membership's own currently selected semantic edition. Same.
+    Selection { membership: String, alias: String },
+    /// A non-terminal Work whose delivered World names it. Not released
+    /// by removing anything: the Work can still run, expand its World or
+    /// write an output against it.
+    Work { work: String },
+    /// An unsettled finding recorded against it.
+    Finding { finding: String },
+    /// A non-terminal Work reserving a worker contract.
+    Reservation { work: String },
+    /// This build's own worker contract, which the next reservation
+    /// would write back anyway.
+    OwnContract,
+}
+
+impl RetentionHolder {
+    /// The operator-facing sentence for this holder. What every
+    /// disclosure of retention has always said, unchanged.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Publication { alias, .. } => format!("published generation of source {alias}"),
+            Self::Selection { alias, .. } => {
+                format!("selected semantic edition of source {alias}")
+            }
+            Self::Work { work } => format!("a delivered World of work {work} (not terminal)"),
+            Self::Finding { finding } => format!("unsettled finding {finding}"),
+            Self::Reservation { work } => format!("work {work} is not terminal and reserves it"),
+            Self::OwnContract => "this build's own worker contract".to_string(),
+        }
+    }
+
+    /// Whether this holder is `membership`'s own publication or
+    /// selection — the one kind of retention that removing that
+    /// membership releases.
+    pub(crate) fn is_own_catalog_entry_of(&self, membership_id: &str) -> bool {
+        match self {
+            Self::Publication { membership, .. } | Self::Selection { membership, .. } => {
+                membership == membership_id
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Retention {
     /// Whether every record the retention set depends on was read.
     pub(crate) fn complete(&self) -> bool {
         self.unreadable.is_empty()
     }
 
-    pub(crate) fn retain(map: &mut BTreeMap<String, Vec<String>>, id: &str, consumer: String) {
+    pub(crate) fn retain(
+        map: &mut BTreeMap<String, Vec<RetentionHolder>>,
+        id: &str,
+        consumer: RetentionHolder,
+    ) {
         let holders = map.entry(id.to_string()).or_default();
         if !holders.contains(&consumer) {
             holders.push(consumer);
         }
     }
 
-    fn holders(map: &BTreeMap<String, Vec<String>>, id: &str) -> Vec<String> {
-        map.get(id).cloned().unwrap_or_default()
+    fn holders(map: &BTreeMap<String, Vec<RetentionHolder>>, id: &str) -> Vec<String> {
+        map.get(id)
+            .map(|holders| holders.iter().map(RetentionHolder::describe).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -600,14 +666,23 @@ pub(crate) fn survey(
     classes.push(ClassReport {
         class: "worktrees",
         path: estate_root.join("worktrees"),
-        what: "the git checkout each Actor World was materialized into",
+        // Ruling 0292: an output-only World — Actor or Deterministic —
+        // has no git checkout, and its execution directory is this same
+        // address. Calling every one of these a git checkout named the
+        // common case and hid the one whose residue had no class at all
+        // while it was still executing in the estate root.
+        what: "the execution directory each Work was materialized into: a git checkout for a \
+               Git-basis World, an owned directory for an output-only one",
         measured: worktrees,
         items: worktree_items,
         cleanable: false,
         retention_rule:
             "retained while the Work is not terminal. Removed by `wirk work clean`, which \
              additionally refuses on a live actor or pane, uncommitted or ignored content, and \
-             checkout-backed Claim evidence (ruling 0228)",
+             checkout-backed Claim evidence (ruling 0228). An owned output-only directory is \
+             removed only once it proves itself this Work's own by the creation identity its \
+             materialization journaled; a validated Claim of such a Work keeps its own bytes in \
+             claims/, which this removal never touches (ruling 0292)",
         soft_limit_bytes: policy.storage_soft_limits.get("worktrees").copied(),
     });
     classes.push(ClassReport {

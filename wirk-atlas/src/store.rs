@@ -1,3 +1,4 @@
+use crate::doctree;
 use crate::domain::{actual_line_bounds, now_unix_millis};
 use crate::extract::ExtractorPolicy;
 use crate::git;
@@ -25,6 +26,35 @@ impl AcquireOutcome {
             Self::Unavailable(_) => None,
         }
     }
+}
+
+/// The result of `AtlasStore::remove_source`: a **catalog-only
+/// unregister**.
+///
+/// It never touches the source's original files, and it does not sweep
+/// this estate's own generation or edition directories either. Byte
+/// removal has one owner — `wirk estate clean --class
+/// atlas-generations|atlas-editions --all-unreferenced` — which
+/// re-derives what every *other* membership still needs before removing
+/// anything. A sweep inside this crate could not see a non-terminal
+/// Work's delivered World or an unsettled finding, because both live in
+/// `wirkd`'s own journals, so it would have no way to avoid deleting
+/// bytes that facility would refuse to touch.
+///
+/// This struct reports what this membership's catalog entry pointed at
+/// *before* the unregister, so a caller can name it to that cleanup
+/// facility without a second read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalOutcome {
+    pub membership: MembershipId,
+    /// This membership's published generation immediately before
+    /// removal, if it had one. Now unreferenced by this estate's
+    /// catalog (nothing else can name it through this membership any
+    /// more) — not yet removed from disk.
+    pub released_generation: Option<GenerationId>,
+    /// This membership's selected semantic edition immediately before
+    /// removal, if any. Also now unreferenced, also not yet removed.
+    pub released_edition: Option<crate::EditionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +234,30 @@ impl JobContext {
             registry: Some(self.registry.clone()),
         }
     }
+
+    /// A registered job for expensive work that runs on **this** thread
+    /// rather than in a child process — a document collection's walk,
+    /// its extraction, and the revalidation a publish re-runs.
+    ///
+    /// The same registry, the same `scope` a cancellation names and the
+    /// same requester identity [`Self::child`] carries, so `atlas
+    /// cancel --source <alias>` reaches document work exactly as it
+    /// reaches a semantic build. The registration is released when the
+    /// returned value drops, which is every return path out of the
+    /// verb.
+    ///
+    /// What it delivers is a **cooperative** stop, not an interruption:
+    /// see [`wirk_core::jobs::JobStop`]. Work already blocked in a
+    /// syscall is not interrupted by it.
+    pub fn in_process(&self, verb: &str, scope: &str) -> wirk_core::jobs::InProcessJob {
+        wirk_core::jobs::InProcessJob::register(
+            Some(self.registry.clone()),
+            verb,
+            scope,
+            self.requester(),
+            self.policy.job_deadline_secs,
+        )
+    }
 }
 
 /// Where one estate's Atlas keeps each kind of thing it owns.
@@ -244,6 +298,40 @@ pub fn atlas_layout(estate_root: &Path) -> AtlasLayout {
         findings_index: root.join(crate::findings::FINDINGS_INDEX_FILE),
         owner_lock: root.join(".owner"),
         root,
+    }
+}
+
+/// Which acquisition policy one `acquire`/`refresh` call runs under. Private dispatch only — the public surface is the
+/// named methods (`acquire`/`acquire_document_tree`, ...), never this
+/// enum, so a caller cannot pass the wrong variant for the method it
+/// meant to call; a source's kind is fixed on `Membership::policy` at
+/// registration (`register_git`/`register_document_tree`) and this
+/// enum only ever mirrors what `acquire_kind` was asked to verify
+/// against it.
+///
+/// The two policies deliberately do not share one `identity`/
+/// `resources` method pair. Git's `git ls-tree` identity and its
+/// resource walk are two separate, separately cheap operations. A
+/// document tree's identity and its resources both come from hashing
+/// the same file bytes, so computing them as two unrelated calls would
+/// read and hash every file twice — and would allow staging a
+/// generation whose `revision` named one tree state and whose
+/// `resources` named another, if the tree changed in between.
+/// `acquire_kind` dispatches the whole document-tree capture as one
+/// operation (`doctree::capture` + `doctree::finish`); this enum keeps
+/// only what both policies share verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquisitionKind {
+    Git,
+    DocumentTree,
+}
+
+impl AcquisitionKind {
+    fn policy_label(self) -> &'static str {
+        match self {
+            Self::Git => git::ACQUISITION_POLICY,
+            Self::DocumentTree => doctree::ACQUISITION_POLICY,
+        }
     }
 }
 
@@ -389,6 +477,52 @@ impl AtlasStore {
         locator: impl AsRef<Path>,
         requested_ref: &str,
     ) -> Result<Membership, AtlasError> {
+        self.register(alias, locator, requested_ref, git::ACQUISITION_POLICY)
+    }
+
+    /// Explicit admission of a local non-Git document collection as its
+    /// own source. Shares every catalog
+    /// mechanic `register_git` already has (alias validation,
+    /// canonicalization, idempotent re-registration) — the only
+    /// difference recorded is `Membership::policy`, which is what later
+    /// makes `acquire`/`refresh`/`publish`/`resolve_exact` treat this
+    /// source as a document tree rather than a Git repository. This
+    /// function itself runs no `git` and performs no repository
+    /// discovery of any kind, so a directory nested inside an ambient
+    /// Git repository — including one the workspace ignores — is
+    /// admitted as exactly the directory named, never as that ambient
+    /// repository.
+    ///
+    /// `requested_ref` is checked against `doctree::CURRENT_OBSERVATION`
+    /// and refused by name otherwise. A document tree has no revision
+    /// besides its own current state; recording an arbitrary
+    /// caller-supplied string here would later be read back — by `atlas
+    /// status`, among others — as if it named something this policy had
+    /// actually honoured.
+    pub fn register_document_tree(
+        &mut self,
+        alias: &str,
+        locator: impl AsRef<Path>,
+        requested_ref: &str,
+    ) -> Result<Membership, AtlasError> {
+        if requested_ref != doctree::CURRENT_OBSERVATION {
+            return Err(AtlasError::InvalidRequest(format!(
+                "a document-tree source observes only its current state; pass {:?} for \
+                 --revision (or omit it) rather than {requested_ref:?}, which this policy has \
+                 nothing to check it against",
+                doctree::CURRENT_OBSERVATION
+            )));
+        }
+        self.register(alias, locator, requested_ref, doctree::ACQUISITION_POLICY)
+    }
+
+    fn register(
+        &mut self,
+        alias: &str,
+        locator: impl AsRef<Path>,
+        requested_ref: &str,
+        policy: &str,
+    ) -> Result<Membership, AtlasError> {
         if alias.is_empty() || alias.contains('/') || alias.contains('\0') {
             return Err(AtlasError::InvalidCoordinate("invalid source alias".into()));
         }
@@ -398,11 +532,19 @@ impl AtlasStore {
             .to_string_lossy()
             .into_owned();
         if let Some(existing) = self.catalog.memberships.get(alias) {
-            if existing.locator == locator {
+            if existing.locator == locator && existing.policy == policy {
                 return Ok(existing.clone());
             }
+            if existing.locator != locator {
+                return Err(AtlasError::InvalidCoordinate(
+                    "alias already belongs to another source".into(),
+                ));
+            }
             return Err(AtlasError::InvalidCoordinate(
-                "alias already belongs to another source".into(),
+                "alias already belongs to a source registered under a different acquisition \
+                 policy; a source's kind is decided once, at first registration, and is never \
+                 changed underneath the same alias"
+                    .into(),
             ));
         }
         let source = SourceId(Ulid::generate().to_string());
@@ -419,6 +561,7 @@ impl AtlasStore {
             source,
             locator,
             requested_ref: requested_ref.into(),
+            policy: policy.into(),
         };
         let mut next = self.catalog.clone();
         next.memberships.insert(alias.into(), membership.clone());
@@ -432,30 +575,141 @@ impl AtlasStore {
         requested_ref: &str,
         policy: ExtractorPolicy,
     ) -> Result<AcquireOutcome, AtlasError> {
+        self.acquire_kind(
+            "atlas acquire",
+            membership,
+            requested_ref,
+            policy,
+            AcquisitionKind::Git,
+        )
+    }
+
+    /// Acquisition over the document-tree policy.
+    ///
+    /// Identical staging and attempt-recording mechanics to
+    /// `acquire`; the only difference is where identity and resources
+    /// come from (`doctree::capture`/`doctree::finish`, one walk and one
+    /// read per file, instead of `git::commit_and_tree`/`git::
+    /// resources`). Refused outright (`InvalidRequest`, before touching
+    /// the filesystem) if `membership` was not itself registered under
+    /// `doctree::ACQUISITION_POLICY` — a source's kind, once explicitly
+    /// chosen at registration, is never silently reinterpreted by a
+    /// later call — or if `requested_ref` is not
+    /// `doctree::CURRENT_OBSERVATION`.
+    pub fn acquire_document_tree(
+        &mut self,
+        membership: &Membership,
+        requested_ref: &str,
+        policy: ExtractorPolicy,
+    ) -> Result<AcquireOutcome, AtlasError> {
+        // Refused by name here too, not only at registration: a later
+        // `refresh` can be asked with a different, equally arbitrary
+        // string.
+        if requested_ref != doctree::CURRENT_OBSERVATION {
+            return Err(AtlasError::InvalidRequest(format!(
+                "a document-tree source observes only its current state; pass {:?} for \
+                 --revision (or omit it) rather than {requested_ref:?}",
+                doctree::CURRENT_OBSERVATION
+            )));
+        }
+        self.acquire_kind(
+            "atlas acquire",
+            membership,
+            requested_ref,
+            policy,
+            AcquisitionKind::DocumentTree,
+        )
+    }
+
+    fn acquire_kind(
+        &mut self,
+        verb: &str,
+        membership: &Membership,
+        requested_ref: &str,
+        policy: ExtractorPolicy,
+        kind: AcquisitionKind,
+    ) -> Result<AcquireOutcome, AtlasError> {
         self.check_membership(membership)?;
+        if membership.policy != kind.policy_label() {
+            return Err(AtlasError::InvalidRequest(format!(
+                "source {:?} was registered under {}, not {}",
+                membership.alias,
+                membership.policy,
+                kind.policy_label()
+            )));
+        }
         let repo = Path::new(&membership.locator);
+        // Announced for the document arm only, and before any walking
+        // starts. Git's identity and resource walk are `git`'s own child
+        // processes, already bounded and already registered by
+        // `JobContext::child`; a document collection is walked on this
+        // thread, so this is the registration that makes `atlas cancel
+        // --source <alias>` reach it. Held for the whole verb and
+        // released when `job` drops, on every return path below.
+        let job = match kind {
+            AcquisitionKind::DocumentTree => Some(self.jobs.in_process(verb, &membership.alias)),
+            AcquisitionKind::Git => None,
+        };
+        let stop = job
+            .as_ref()
+            .map(|job| job.stop())
+            .unwrap_or_else(wirk_core::jobs::JobStop::unbounded);
         let result = (|| {
-            let (revision, content) = git::commit_and_tree(repo, requested_ref)?;
+            // A document tree's identity and its resources come from
+            // the same file bytes, so both are taken from one walk and
+            // one bounded read per file (`doctree::capture`), never two.
+            // Git's identity (`git ls-tree`) is cheap and structurally
+            // independent of its resource walk, so that path stays two
+            // operations.
+            let (revision, content, doctree_captured) = match kind {
+                AcquisitionKind::Git => {
+                    let (revision, content) = git::commit_and_tree(repo, requested_ref)?;
+                    (revision, content, None)
+                }
+                AcquisitionKind::DocumentTree => {
+                    let (revision, content, captured) =
+                        doctree::capture(repo, &policy, &self.capture_limits(), &stop)?;
+                    (revision, content, Some(captured))
+                }
+            };
             let id = GenerationId(ExtractorPolicy::generation_id(
                 &membership.source.0,
                 &revision,
                 &content,
                 policy.id(),
+                kind.policy_label(),
             ));
             let destination = self.generation_dir(&id)?;
             let generation = if destination.exists() {
                 self.read_generation(&id)?
             } else {
-                let resources = git::resources(repo, &revision, &id, &policy)?;
-                if let Some(unavailable) = resources
-                    .iter()
-                    .find(|resource| resource.disposition == CoverageDisposition::Unavailable)
+                let resources = match (kind, doctree_captured) {
+                    (AcquisitionKind::Git, _) => git::resources(repo, &revision, &id, &policy)?,
+                    (AcquisitionKind::DocumentTree, Some(captured)) => {
+                        doctree::finish(&id, &policy, captured, &stop)?
+                    }
+                    (AcquisitionKind::DocumentTree, None) => {
+                        unreachable!("DocumentTree always produces captured resources above")
+                    }
+                };
+                // A single unavailable document does not refuse the
+                // whole document-tree generation: every other readable
+                // document stays usable, and the unavailable one's own
+                // disposition discloses it. Git's behaviour is
+                // deliberately different and unchanged — a missing or
+                // unreadable Git object still fails the whole
+                // acquisition, because a committed object that cannot be
+                // read means the object store itself is incomplete.
+                if kind == AcquisitionKind::Git
+                    && let Some(unavailable) = resources
+                        .iter()
+                        .find(|resource| resource.disposition == CoverageDisposition::Unavailable)
                 {
-                    return Err(AtlasError::GitUnavailable(
+                    return Err(AtlasError::SourceBytesUnavailable(
                         unavailable
                             .detail
                             .clone()
-                            .unwrap_or_else(|| "required Git object is unavailable".into()),
+                            .unwrap_or_else(|| "a required source object is unavailable".into()),
                     ));
                 }
                 let generation = SourceGeneration {
@@ -464,7 +718,7 @@ impl AtlasStore {
                     revision,
                     content,
                     extractor_set: policy.id().into(),
-                    acquisition_policy: "git-tree-policy/v1".into(),
+                    acquisition_policy: kind.policy_label().into(),
                     locator: membership.locator.clone(),
                     requested_ref: requested_ref.into(),
                     resources,
@@ -486,7 +740,7 @@ impl AtlasStore {
                 })?;
                 Ok(AcquireOutcome::Staged(generation))
             }
-            Err(AtlasError::GitUnavailable(detail)) => {
+            Err(AtlasError::SourceBytesUnavailable(detail)) => {
                 self.record_attempt(AcquisitionAttempt {
                     at_unix_millis: now_unix_millis(),
                     membership: membership.id.clone(),
@@ -519,7 +773,93 @@ impl AtlasStore {
         requested_ref: &str,
         policy: ExtractorPolicy,
     ) -> Result<AcquireOutcome, AtlasError> {
-        self.acquire(membership, requested_ref, policy)
+        self.acquire_kind(
+            "atlas refresh",
+            membership,
+            requested_ref,
+            policy,
+            AcquisitionKind::Git,
+        )
+    }
+
+    /// `refresh`'s document-tree counterpart.
+    pub fn refresh_document_tree(
+        &mut self,
+        membership: &Membership,
+        requested_ref: &str,
+        policy: ExtractorPolicy,
+    ) -> Result<AcquireOutcome, AtlasError> {
+        // Refused by name here too, not only at initial acquisition: a
+        // later `refresh` can be asked with a different, equally
+        // arbitrary string.
+        if requested_ref != doctree::CURRENT_OBSERVATION {
+            return Err(AtlasError::InvalidRequest(format!(
+                "a document-tree source observes only its current state; pass {:?} for \
+                 --revision (or omit it) rather than {requested_ref:?}",
+                doctree::CURRENT_OBSERVATION
+            )));
+        }
+        self.acquire_kind(
+            "atlas refresh",
+            membership,
+            requested_ref,
+            policy,
+            AcquisitionKind::DocumentTree,
+        )
+    }
+
+    /// Removes this source's own catalog membership, publication and
+    /// semantic selection —
+    /// never the source's own original files, which this crate has
+    /// never copied anywhere (`AtlasLayout::generations`'s own doc
+    /// comment), and never this estate's own generation/edition
+    /// directories on disk either.
+    ///
+    /// **This is deliberately narrow.** Sweeping generation directories
+    /// from here would mean matching only on `generation.source`, after
+    /// the catalog commit had already erased the very membership,
+    /// publication and selection records `wirk estate clean`'s own
+    /// retention derivation needs in order to tell a *referenced*
+    /// generation from an *orphaned* one.
+    /// This crate cannot see what `wirk estate clean` can: a
+    /// non-terminal Work's delivered World, or an unsettled finding,
+    /// both live in `wirkd`'s own journals and findings index, entirely
+    /// outside `wirk-atlas`. So this method now does only the one thing
+    /// it can safely do on its own — unregister the catalog entry — and
+    /// the caller (`wirk/src/wirkd/server.rs::handle_atlas_remove`) is
+    /// responsible for checking, *before* calling this, that nothing
+    /// still needs this membership's published generation or selected
+    /// edition (the same retention derivation `estate clean` refuses
+    /// against). Once unregistered, this membership's own generation
+    /// and edition directories are unreferenced by this estate's
+    /// catalog like any other orphaned one, and `wirk estate clean
+    /// --class atlas-generations|atlas-editions --all-unreferenced`
+    /// reclaims them — re-deriving retention against every *other*
+    /// membership first, reporting failures and remaining work
+    /// honestly, and reachable exactly the way `wirk estate storage`
+    /// already inventories them. They are reachable through a public
+    /// verb, not stranded.
+    pub fn remove_source(&mut self, membership: &Membership) -> Result<RemovalOutcome, AtlasError> {
+        self.check_membership(membership)?;
+        let released_generation = self.catalog.published.get(&membership.id.0).cloned();
+        let released_edition = self
+            .catalog
+            .semantic_selected
+            .get(&membership.id.0)
+            .cloned();
+        let mut next = self.catalog.clone();
+        next.memberships.remove(&membership.alias);
+        next.published.remove(&membership.id.0);
+        next.semantic_selected.remove(&membership.id.0);
+        next.attempts
+            .retain(|attempt| attempt.membership != membership.id);
+        next.publication_revision += 1;
+        self.commit_catalog(next)?;
+        Ok(RemovalOutcome {
+            membership: membership.id.clone(),
+            released_generation,
+            released_edition,
+        })
     }
 
     pub fn publish(
@@ -537,6 +877,39 @@ impl AtlasStore {
                 "generation does not belong to this membership or is incomplete".into(),
             ));
         }
+        match staged.acquisition_policy.as_str() {
+            git::ACQUISITION_POLICY => self.publish_verify_git(membership, &staged)?,
+            // Registered for the same reason the acquisition is: this
+            // arm re-runs the whole walk and extraction on this thread.
+            // The registration is released when `job` drops at the end
+            // of this arm, before the catalog is touched, so a cancel
+            // that arrives after verification passes finds nothing to
+            // stop rather than stopping a catalog commit half way.
+            doctree::ACQUISITION_POLICY => {
+                let job = self.jobs.in_process("atlas publish", &membership.alias);
+                self.publish_verify_doctree(&staged, &job.stop())?
+            }
+            other => {
+                return Err(AtlasError::Generation(format!(
+                    "generation names an unknown acquisition policy {other:?}"
+                )));
+            }
+        }
+        if self.catalog.published.get(&membership.id.0) == Some(generation) {
+            return Ok(());
+        }
+        let mut next = self.catalog.clone();
+        next.published
+            .insert(membership.id.0.clone(), generation.clone());
+        next.publication_revision += 1;
+        self.commit_catalog(next)
+    }
+
+    fn publish_verify_git(
+        &self,
+        membership: &Membership,
+        staged: &SourceGeneration,
+    ) -> Result<(), AtlasError> {
         let (revision, content) =
             git::commit_and_tree(Path::new(&membership.locator), &staged.revision)?;
         if revision != staged.revision || content != staged.content {
@@ -558,14 +931,49 @@ impl AtlasStore {
                 "generation resources do not exactly enumerate the committed tree".into(),
             ));
         }
-        if self.catalog.published.get(&membership.id.0) == Some(generation) {
-            return Ok(());
+        Ok(())
+    }
+
+    /// `publish`'s document-tree counterpart.
+    ///
+    /// `publish_verify_git` can compare cheap `git ls-tree` identity
+    /// without re-running extraction. A document tree has no equivalent
+    /// free structural listing, so this re-runs the same
+    /// `doctree::capture` walk the acquisition ran and compares the full
+    /// result against what was staged. Still one walk and one bounded
+    /// read per file, and bounded by the estate's configured document
+    /// capture limits.
+    ///
+    /// That makes a document publish genuinely acquisition-priced rather
+    /// than a catalog edit, which is why its caller admits it as
+    /// expensive work. Dropping the revalidation instead is not an
+    /// option: it is the only thing standing between a publication and a
+    /// collection that has changed underneath its staged generation.
+    fn publish_verify_doctree(
+        &self,
+        staged: &SourceGeneration,
+        stop: &wirk_core::jobs::JobStop,
+    ) -> Result<(), AtlasError> {
+        let root = Path::new(&staged.locator);
+        let policy = ExtractorPolicy::from_id(&staged.extractor_set).ok_or_else(|| {
+            AtlasError::Generation("generation names an unknown extraction edition".into())
+        })?;
+        let limits = self.capture_limits();
+        let (revision, content, captured) = doctree::capture(root, &policy, &limits, stop)?;
+        if revision != staged.revision || content != staged.content {
+            return Err(AtlasError::Generation(
+                "document tree has changed since this generation was staged; re-acquire before \
+                 publishing"
+                    .into(),
+            ));
         }
-        let mut next = self.catalog.clone();
-        next.published
-            .insert(membership.id.0.clone(), generation.clone());
-        next.publication_revision += 1;
-        self.commit_catalog(next)
+        let current = doctree::finish(&staged.id, &policy, captured, stop)?;
+        if current != staged.resources {
+            return Err(AtlasError::Generation(
+                "document tree resources do not exactly match the staged generation".into(),
+            ));
+        }
+        Ok(())
     }
     pub fn current(&self, membership: &Membership) -> Result<Option<SourceGeneration>, AtlasError> {
         self.check_membership(membership)?;
@@ -609,7 +1017,7 @@ impl AtlasStore {
         };
         let Some(record_object_id) = &record.object_id else {
             return Ok(ResolveOutcome::Unavailable(
-                "resource has no Git object identity".into(),
+                "resource has no recorded content identity".into(),
             ));
         };
         if coordinate.object_id != *record_object_id {
@@ -646,10 +1054,25 @@ impl AtlasStore {
             }
             CoverageDisposition::Indexed => {}
         }
+        match generation.acquisition_policy.as_str() {
+            git::ACQUISITION_POLICY => self.resolve_exact_git(membership, &generation, coordinate),
+            doctree::ACQUISITION_POLICY => self.resolve_exact_doctree(&generation, coordinate),
+            other => Err(AtlasError::Generation(format!(
+                "generation names an unknown acquisition policy {other:?}"
+            ))),
+        }
+    }
+
+    fn resolve_exact_git(
+        &self,
+        membership: &Membership,
+        generation: &SourceGeneration,
+        coordinate: &ExactCoordinate,
+    ) -> Result<ResolveOutcome, AtlasError> {
         let repo = Path::new(&membership.locator);
         let (_, content) = match git::commit_and_tree(repo, &generation.revision) {
             Ok(identity) => identity,
-            Err(AtlasError::GitUnavailable(detail)) => {
+            Err(AtlasError::SourceBytesUnavailable(detail)) => {
                 return Ok(ResolveOutcome::Unavailable(detail));
             }
             Err(error) => return Err(error),
@@ -666,34 +1089,88 @@ impl AtlasStore {
                     "committed path no longer names the recorded blob".into(),
                 ));
             }
-            Err(AtlasError::GitUnavailable(detail)) => {
+            Err(AtlasError::SourceBytesUnavailable(detail)) => {
                 return Ok(ResolveOutcome::Unavailable(detail));
             }
             Err(error) => return Err(error),
         }
         match git::blob(repo, &coordinate.object_id) {
-            Ok(bytes) => {
-                let Some((line_start, line_end)) =
-                    actual_line_bounds(&bytes, coordinate.byte_start, coordinate.byte_end)
-                else {
-                    return Err(AtlasError::InvalidCoordinate(
-                        "byte bounds are invalid or split committed UTF-8".into(),
-                    ));
-                };
-                if line_start != coordinate.line_start || line_end != coordinate.line_end {
-                    return Err(AtlasError::InvalidCoordinate(
-                        "line bounds do not match committed Git bytes".into(),
-                    ));
-                }
-                Ok(ResolveOutcome::Resolved(ResolvedEvidence {
-                    coordinate: coordinate.clone(),
-                    bytes: bytes[coordinate.byte_start as usize..coordinate.byte_end as usize]
-                        .to_vec(),
-                }))
+            Ok(bytes) => Self::resolved_from_bytes(coordinate, &bytes, "committed Git bytes"),
+            Err(AtlasError::SourceBytesUnavailable(detail)) => {
+                Ok(ResolveOutcome::Unavailable(detail))
             }
-            Err(AtlasError::GitUnavailable(detail)) => Ok(ResolveOutcome::Unavailable(detail)),
             Err(e) => Err(e),
         }
+    }
+
+    /// `resolve_exact`'s document-tree counterpart.
+    ///
+    /// **The precondition is per-resource, deliberately.** Recomputing
+    /// the whole tree's manifest identity first and reporting
+    /// `Unavailable` whenever it differed would make editing **any**
+    /// file in the collection invalidate **every** coordinate previously
+    /// issued against that generation — the ordinary case in a live
+    /// document collection, not an edge. It would also be a mis-analogy
+    /// with `resolve_exact_git`, which re-resolves the *recorded
+    /// commit*: that asks whether the recorded history is still
+    /// available, not whether the whole working tree stood still.
+    ///
+    /// `doctree::blob` below already re-reads and re-hashes exactly the
+    /// one named path and refuses unless its SHA-256 equals the
+    /// coordinate's own `object_id` — proving the returned bytes are
+    /// exactly the bytes the coordinate names. That is now the only
+    /// check this method runs: honest `Unavailable` still fires exactly
+    /// when *this resource's own bytes* moved, vanished, or stopped
+    /// being an ordinary file (all three distinguished inside `blob`),
+    /// which is the disclosed-rather-than-silently-wrong boundary this
+    /// policy actually promises — it does not require, and this does
+    /// not add, any historical byte store.
+    fn resolve_exact_doctree(
+        &self,
+        generation: &SourceGeneration,
+        coordinate: &ExactCoordinate,
+    ) -> Result<ResolveOutcome, AtlasError> {
+        let root = Path::new(&generation.locator);
+        match doctree::blob(
+            root,
+            &coordinate.path,
+            &coordinate.object_id,
+            &self.capture_limits(),
+        ) {
+            Ok(bytes) => Self::resolved_from_bytes(coordinate, &bytes, "document-tree bytes"),
+            Err(AtlasError::SourceBytesUnavailable(detail)) => {
+                Ok(ResolveOutcome::Unavailable(detail))
+            }
+            Err(AtlasError::Io(io_error)) => Ok(ResolveOutcome::Unavailable(io_error.to_string())),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Shared by both policies' final step: exact bytes have been read
+    /// and their identity already confirmed by the caller: only the
+    /// byte/line-bound arithmetic and the coordinate's own promised
+    /// line bounds remain to check, identically either way.
+    fn resolved_from_bytes(
+        coordinate: &ExactCoordinate,
+        bytes: &[u8],
+        bytes_label: &str,
+    ) -> Result<ResolveOutcome, AtlasError> {
+        let Some((line_start, line_end)) =
+            actual_line_bounds(bytes, coordinate.byte_start, coordinate.byte_end)
+        else {
+            return Err(AtlasError::InvalidCoordinate(format!(
+                "byte bounds are invalid or split {bytes_label}"
+            )));
+        };
+        if line_start != coordinate.line_start || line_end != coordinate.line_end {
+            return Err(AtlasError::InvalidCoordinate(format!(
+                "line bounds do not match {bytes_label}"
+            )));
+        }
+        Ok(ResolveOutcome::Resolved(ResolvedEvidence {
+            coordinate: coordinate.clone(),
+            bytes: bytes[coordinate.byte_start as usize..coordinate.byte_end as usize].to_vec(),
+        }))
     }
     fn stage(&self, generation: &SourceGeneration) -> Result<(), AtlasError> {
         let temp = self.root.join(format!(".tmp-{}", Ulid::generate()));
@@ -775,6 +1252,14 @@ impl AtlasStore {
     /// mechanism continuation (W3-CORRECTION.md item 1) relies on to pin
     /// an answer to the exact generations it began with, immune to a
     /// later `refresh`/`publish` on the same estate.
+    /// What one document-collection capture or read is bounded by in
+    /// this estate, resolved from the estate's own configured resource
+    /// policy. Irrelevant to a Git source, which is bounded by its own
+    /// object store.
+    pub(crate) fn capture_limits(&self) -> doctree::CaptureLimits {
+        doctree::CaptureLimits::from_policy(&self.jobs.policy)
+    }
+
     pub fn generation(&self, id: &GenerationId) -> Result<SourceGeneration, AtlasError> {
         self.read_generation(id)
     }
@@ -806,20 +1291,37 @@ impl AtlasStore {
         generation: &SourceGeneration,
         id: &GenerationId,
     ) -> Result<(), AtlasError> {
+        // The revision/content *shape* a generation must carry depends on which acquisition policy produced it —
+        // a Git commit sha (40 hex) and root-tree sha1, or a
+        // document-tree manifest hash (64 hex) and its own sha256 tag.
+        // An `acquisition_policy` naming neither known label is refused
+        // outright, the same way an unknown `extractor_set` already is
+        // below.
+        let identity_shape_valid = match generation.acquisition_policy.as_str() {
+            git::ACQUISITION_POLICY => {
+                valid_sha1(&generation.revision)
+                    && generation.content.starts_with("sha1:")
+                    && valid_sha1(&generation.content[5..])
+            }
+            doctree::ACQUISITION_POLICY => {
+                valid_sha256(&generation.revision)
+                    && generation.content.starts_with("sha256:")
+                    && valid_sha256(&generation.content[7..])
+            }
+            _ => false,
+        };
         if generation.id != *id
             || !valid_generation_id(&generation.id.0)
             || generation.source.0.is_empty()
-            || !valid_sha1(&generation.revision)
-            || !generation.content.starts_with("sha1:")
-            || !valid_sha1(&generation.content[5..])
+            || !identity_shape_valid
             || generation.extractor_set.is_empty()
-            || generation.acquisition_policy != "git-tree-policy/v1"
             || generation.id.0
                 != ExtractorPolicy::generation_id(
                     &generation.source.0,
                     &generation.revision,
                     &generation.content,
                     &generation.extractor_set,
+                    &generation.acquisition_policy,
                 )
         {
             return Err(AtlasError::Generation(
@@ -1067,6 +1569,12 @@ fn valid_generation_id(id: &str) -> bool {
 }
 fn valid_sha1(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+/// The document-tree policy's revision/content shape — a bare or
+/// `sha256:`-tagged 64-character hex SHA-256, the length alone already
+/// enough to tell it apart from `valid_sha1`'s 40-character Git shape.
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 fn valid_path(path: &[u8]) -> bool {
     !path.is_empty()

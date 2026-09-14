@@ -2285,10 +2285,525 @@ impl ArtifactReceipt {
     /// which is the "explicit unavailable" answer, never a silent pass.
     /// R3: `sha2` is already this crate's hash dependency (`WorldHash`).
     pub fn digest_of(path: &std::path::Path) -> Option<String> {
-        let bytes = std::fs::read(path).ok()?;
+        Some(Self::digest_of_bytes(&std::fs::read(path).ok()?))
+    }
+
+    /// The sha256 of bytes already in hand.
+    ///
+    /// The reason this exists beside [`Self::digest_of`] is custody, not
+    /// convenience. A caller that hashes a *path* and then reads that
+    /// path again has vouched for one read and delivered another: the
+    /// two buffers are only the same file if nothing changed in
+    /// between, which is exactly the thing a digest is supposed to
+    /// establish. Every consumer that both hashes and delivers bytes
+    /// reads once and calls this on the buffer it is actually going to
+    /// hand over (`wirk artifact`, `handle_run_artifact`).
+    ///
+    /// Same hasher, same crate dependency (`sha2`, already here for
+    /// `WorldHash`) — R2/R6, no new dependency and no second digest
+    /// definition.
+    pub fn digest_of_bytes(bytes: &[u8]) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        Some(hex_lower(&hasher.finalize()))
+        hasher.update(bytes);
+        hex_lower(&hasher.finalize())
+    }
+}
+
+/// The administrative record an *owned execution directory* carries, and
+/// the only creation-time evidence a non-Git owned directory has.
+///
+/// A Git worktree proves it is this estate's own by a record git itself
+/// wrote into it at creation (`.git`, plus the registration
+/// `worktree_entries` reads back). An output-only Actor's directory has
+/// no such record, and the two properties that were standing in for one
+/// — the address equals `<estate>/worktrees/<work>`, and something at
+/// that address is a directory — are both properties an *unrelated*
+/// directory moved into that address satisfies exactly as well as the
+/// genuine materialization does. Address is where a thing is, not what
+/// it is.
+///
+/// So materialization writes this marker, naming the Work and the Run
+/// that created the directory, and every later consumer (reattachment,
+/// `wirk work clean`) requires it and checks it against the journal. A
+/// directory this estate did not create does not carry it; a marker
+/// naming another Work is not this Work's.
+///
+/// It is deliberately not a store, a lock or a state file: written once
+/// at creation, read-only afterwards, and removed with the directory it
+/// describes. Nothing migrates — a pre-marker owned directory simply
+/// reports unregistered, which is the honest answer (nothing proves it
+/// is ours) and the conservative one (it is left alone rather than
+/// removed).
+pub const OWNED_EXECUTION_MARKER: &str = ".wirk-owned";
+
+/// Where the marker lives inside an owned execution directory.
+pub fn owned_marker_path(directory: &Path) -> PathBuf {
+    directory.join(OWNED_EXECUTION_MARKER)
+}
+
+/// Writes the creation-time marker for `work`/`run` into `directory`.
+///
+/// Refuses rather than overwrites: `create_new` means a second Run can
+/// never silently re-stamp a directory as its own, and a directory that
+/// already carries a marker is a reattachment, which
+/// [`read_owned_marker`] verifies instead.
+pub fn write_owned_marker(directory: &Path, work: &WorkId, run: &RunId) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(owned_marker_path(directory))?;
+    write!(file, "work={}\nrun={}\n", work.0, run.0)
+}
+
+/// The `(work, run)` a marker names, or `None` when there is no marker,
+/// it cannot be read, it is not a regular file, or it is not the two
+/// lines this module writes. Every `None` means the same thing to a
+/// caller — *this is not proven to be ours* — so they are deliberately
+/// not distinguished here.
+pub fn read_owned_marker(directory: &Path) -> Option<(String, String)> {
+    let path = owned_marker_path(directory);
+    let text = read_registration_record(&path)?;
+    let mut work: Option<String> = None;
+    let mut run: Option<String> = None;
+    for line in text.lines() {
+        match line.split_once('=') {
+            Some(("work", value)) => work = Some(value.to_string()),
+            Some(("run", value)) => run = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    match (work, run) {
+        (Some(work), Some(run)) if !work.is_empty() && !run.is_empty() => Some((work, run)),
+        _ => None,
+    }
+}
+
+/// The text of a small administrative record, read the way every other
+/// record this estate reads is read (R2, `read_claimed_bytes`'s own
+/// discipline): `O_NOFOLLOW` so a symlink where the record should be is
+/// refused rather than followed, `O_NONBLOCK` so a FIFO or a device
+/// returns instead of parking the caller, `fstat` on the descriptor that
+/// survives rather than a second path lookup, and a hard cap so nothing
+/// here can be made to read an arbitrary amount.
+///
+/// `None` for every failure, because every failure means the same thing
+/// to a caller: *this is not a record this estate can read*. Never a
+/// partial record — a file at or over the cap is refused outright rather
+/// than truncated into something that might still parse.
+fn read_registration_record(path: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    const MAX_REGISTRATION_BYTES: u64 = 4096;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.file_type().is_file() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_REGISTRATION_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 >= MAX_REGISTRATION_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// The identity of a directory *object*: the `(st_dev, st_ino)` pair the
+/// kernel gives for the directory a descriptor is open on, together with
+/// that object's creation time where the filesystem records one.
+///
+/// Recorded at creation (`EventKind::WorktreeCreated::identity`) and
+/// compared later, this is what tells "the directory this estate made"
+/// from "whatever is standing at that address now". Address equality,
+/// `is_dir`, and a marker file naming a Work are all satisfied by an
+/// unrelated directory moved into place; this is not.
+///
+/// **Why the creation time is part of it (ruling 0297).** An inode
+/// number is a reusable slot, not a durable name. Observed in an actual
+/// estate on ext4, through the frozen CLI: a Work's directory was
+/// registered as `dev 64512, ino 30833`; `rm -rf` followed by `mkdir` at
+/// the same address returned `ino 30833` again, because the kernel hands
+/// a just-freed inode straight back to the next create in the same
+/// parent. The pair matched, so `wirk work clean` removed a directory
+/// this estate had not created. `(dev, ino)` alone therefore
+/// distinguishes a *different* object reliably and a *recreated* one only
+/// by luck.
+///
+/// `created` closes that: a recreated directory is a new object with a
+/// new birth time, so the recreation the pair could not see is visible
+/// here. It is an `Option` because it is a filesystem capability, not a
+/// guarantee — `statx(STATX_BTIME)` through `Metadata::created()`, which
+/// some filesystems and older kernels do not answer — and because
+/// registrations written before this field existed carry none. Where it
+/// is missing the identity is *indistinguishable*, never silently
+/// "matching": see `identity_proof`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryIdentity {
+    pub dev: u64,
+    pub ino: u64,
+    /// Nanoseconds since the Unix epoch, from the filesystem's own
+    /// creation timestamp for this object. `None` where the filesystem
+    /// does not report one, or where the registration predates this
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<u64>,
+}
+
+/// What comparing a registered identity against the object now at the
+/// address establishes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityProof {
+    /// The same object: device, inode and creation time all agree.
+    SameObject,
+    /// Provably a different object: the pair differs, or the pair
+    /// matches and the creation times differ — which is the recreated
+    /// directory whose inode was reused.
+    DifferentObject { detail: String },
+    /// The pair agrees and at least one side carries no creation time,
+    /// so a recreation at this address cannot be told from the original.
+    /// Not a match: every caller treats this as unproven (ruling 0297).
+    /// Reattachment held its own exception for this until ruling 0300,
+    /// which removed it — a marker can be copied into any directory, so
+    /// accepting the weaker proof to authorize a child's write was the
+    /// same substitution weakness ruling 0283 named, just reached one
+    /// step later.
+    Indistinguishable { reason: String },
+}
+
+/// Whether the object now at an address is the one a Work registered.
+///
+/// The whole of ruling 0297's answer lives here, so execution,
+/// reattachment and cleanup cannot each decide it differently.
+pub fn identity_proof(
+    registered: &DirectoryIdentity,
+    present: &DirectoryIdentity,
+) -> IdentityProof {
+    if registered.dev != present.dev || registered.ino != present.ino {
+        return IdentityProof::DifferentObject {
+            detail: format!(
+                "the journal registers {}:{} and the address now holds {}:{}",
+                registered.dev, registered.ino, present.dev, present.ino
+            ),
+        };
+    }
+    match (registered.created, present.created) {
+        (Some(registered_at), Some(present_at)) if registered_at == present_at => {
+            IdentityProof::SameObject
+        }
+        (Some(registered_at), Some(present_at)) => IdentityProof::DifferentObject {
+            detail: format!(
+                "{}:{} is the same inode number, and it is not the same object: this estate \
+                 created a directory born at {registered_at}ns and the one at the address was \
+                 born at {present_at}ns, so the inode was reused by a later directory",
+                registered.dev, registered.ino
+            ),
+        },
+        (None, _) => IdentityProof::Indistinguishable {
+            reason: format!(
+                "this Work registered {}:{} before a creation time was recorded, so a directory \
+                 recreated at this address with the same inode number cannot be told from the \
+                 one this estate created",
+                registered.dev, registered.ino
+            ),
+        },
+        (Some(_), None) => IdentityProof::Indistinguishable {
+            reason: format!(
+                "the filesystem holding {}:{} does not report a creation time for the directory \
+                 now at this address, so a directory recreated here with the same inode number \
+                 cannot be told from the one this estate created",
+                registered.dev, registered.ino
+            ),
+        },
+    }
+}
+
+/// The identity of the directory at `path`, or `None` when there is no
+/// directory there this estate can inspect.
+///
+/// `O_NOFOLLOW | O_DIRECTORY` and `fstat` on the descriptor: the object
+/// inspected is the object opened, and a symlink standing where a
+/// directory should be is refused rather than followed. A failed
+/// inspection is deliberately not distinguished from an absent one here
+/// — both mean *no identity established*, and the callers that must
+/// tell absent from unproven establish that from the address itself.
+pub fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = dir.metadata().ok()?;
+    if !meta.file_type().is_dir() {
+        return None;
+    }
+    Some(DirectoryIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        // `Metadata::created()` is `statx(STATX_BTIME)` here. It answers
+        // `Unsupported` on a filesystem or kernel that keeps no birth
+        // time, which is a real platform limit and is carried as `None`
+        // rather than defaulted to something comparable.
+        created: meta
+            .created()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since| u64::try_from(since.as_nanos()).ok()),
+    })
+}
+
+/// Whether two paths name the same place, canonicalized where both
+/// resolve and compared verbatim where either does not (an address that
+/// does not exist yet is still comparable).
+///
+/// Lifted out of `wirkd::server` unchanged so the execution-directory
+/// checks a *client* makes (`wirk run-deterministic`, before it spawns
+/// anything into an owned directory) and the ones the daemon makes
+/// answer the same question the same way (R2).
+pub fn paths_equal(expected: &Path, actual: &Path) -> bool {
+    match (
+        std::fs::canonicalize(expected),
+        std::fs::canonicalize(actual),
+    ) {
+        (Ok(expected), Ok(actual)) => expected == actual,
+        _ => expected == actual,
+    }
+}
+
+/// The address this estate materializes one Work's own execution
+/// directory at.
+///
+/// One expression, one authority. It was written out identically in
+/// `handle_submit`, `advance_to_next_waypoint`, `resolve_run_binding`,
+/// `resolve_worktree_target` and `executor.rs`, and every one of those
+/// sites is a place where "is this directory this Work's own?" is
+/// decided — so a second spelling of it anywhere is a place the answer
+/// could quietly differ. R2/R6: the join those callers already made,
+/// named once.
+pub fn owned_execution_address(estate_root: &Path, work: &WorkId) -> PathBuf {
+    estate_root.join("worktrees").join(&work.0)
+}
+
+/// What materializing an owned execution directory established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedMaterialization {
+    /// This call created the directory and wrote its marker.
+    Created,
+    /// The directory was already there and proved itself the way the
+    /// journal registers it: `(dev, ino, created)` all agree with the
+    /// object this Work's own materialization created.
+    ReattachedByIdentity(DirectoryIdentity),
+}
+
+/// Why an owned execution directory could not be established as this
+/// Work's own. Every variant leaves the filesystem untouched except
+/// `MarkerUnwritable`, which names a directory this call did create and
+/// could not stamp.
+#[derive(Debug)]
+pub enum OwnedMaterializationError {
+    /// The address has no parent directory to materialize under.
+    NoParent,
+    /// `<estate>/worktrees` is not a real directory of this estate (a
+    /// symlink standing in for it redirects the address itself).
+    ContainerNotOwned(PathBuf),
+    /// Something is at the address, and it is not a directory.
+    NotADirectory(PathBuf),
+    /// The journal registers an identity and the address holds
+    /// something else — the substitution case, which since ruling 0297
+    /// includes a directory recreated at the address on the same reused
+    /// inode number. `detail` is the proof's own account of which.
+    IdentityMismatch {
+        registered: DirectoryIdentity,
+        present: Option<DirectoryIdentity>,
+        detail: String,
+    },
+    /// The marker names a different Work.
+    ForeignMarker(String),
+    /// A directory stands at the address and nothing proves this estate
+    /// created it.
+    Unregistered,
+    /// The marker names this Work, but the identity comparison could not
+    /// prove it: either no creation identity was ever recorded for this
+    /// Work at this address, or the recorded one and the object standing
+    /// there now agree on `(dev, ino)` but cannot be told apart because
+    /// one side carries no creation time (`IdentityProof::
+    /// Indistinguishable`, ruling 0297). Ruling 0300: a copied marker
+    /// does not close that gap, so this refuses rather than reattaching
+    /// — the directory is left exactly as it is, same as every other
+    /// refusal here.
+    Unproven {
+        reason: String,
+    },
+    /// The directory was created and its marker could not be written,
+    /// so it could not be proven ours later.
+    MarkerUnwritable(std::io::Error),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for OwnedMaterializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoParent => write!(f, "the owned execution address has no parent directory"),
+            Self::ContainerNotOwned(path) => write!(
+                f,
+                "{} is not a real directory of this estate, so the address under it is not this \
+                 estate's own; nothing was created or executed",
+                path.display()
+            ),
+            Self::NotADirectory(path) => write!(
+                f,
+                "{} is not a directory this Run owns; it was not created here and nothing was \
+                 executed in it",
+                path.display()
+            ),
+            Self::IdentityMismatch { detail, .. } => write!(
+                f,
+                "{detail}; nothing was executed in it and it was not touched"
+            ),
+            Self::ForeignMarker(work) => write!(
+                f,
+                "it was created by work {work}; nothing was executed in it and it was not touched"
+            ),
+            Self::Unregistered => write!(
+                f,
+                "it exists but carries no record of this estate having created it, so it is not \
+                 this Run's owned execution directory; nothing was executed in it and it was not \
+                 touched"
+            ),
+            Self::Unproven { reason } => write!(
+                f,
+                "{reason}; nothing was executed in it and it was not touched"
+            ),
+            Self::MarkerUnwritable(err) => {
+                write!(f, "could not record this Run's ownership: {err}")
+            }
+            Self::Io(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// Establishes `address` as this Work's own execution directory, or
+/// refuses without touching it.
+///
+/// This is the *one* implementation of the three things that have to
+/// hold before anything is executed in a non-Git owned directory, which
+/// `executor.rs` worked out for the output-only Actor path and wrote
+/// inline:
+///
+/// 1. **The route to the address is this estate's own.** `create_dir_all`
+///    walks happily through a symlinked `<estate>/worktrees`, and
+///    canonical comparison does not catch that either — canonicalizing
+///    both sides follows the same redirect, so they agree. The container
+///    is checked directly.
+/// 2. **The entry at the address is a real directory**, not a symlink
+///    standing in for one.
+/// 3. **This estate created it, provably.** `create_dir` (not
+///    `create_dir_all`) distinguishes creating from finding; on a
+///    directory already there, only the journal-held creation identity
+///    proves whose it is (ruling 0300). The marker is still written on
+///    every creation and still names whose directory a refusal is
+///    about, but it does not itself authorize reattachment: a marker is
+///    copyable by construction, so it never closes the gap a missing or
+///    indistinguishable identity leaves.
+///
+/// `registered` is the identity this Work's own materialization
+/// journaled, as the caller read it back — `None` only where no
+/// identity was ever recorded. Nothing migrates: a directory whose
+/// identity cannot be proven this Work's own is refused and left
+/// exactly as it is, whether that is because none was ever recorded, or
+/// because the recorded and present identities cannot be told apart, or
+/// because the marker names another Work.
+pub fn materialize_owned_directory(
+    address: &Path,
+    work: &WorkId,
+    run: &RunId,
+    registered: Option<DirectoryIdentity>,
+) -> Result<OwnedMaterialization, OwnedMaterializationError> {
+    let Some(container) = address.parent().map(Path::to_path_buf) else {
+        return Err(OwnedMaterializationError::NoParent);
+    };
+    std::fs::create_dir_all(&container).map_err(OwnedMaterializationError::Io)?;
+    match std::fs::symlink_metadata(&container) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        _ => return Err(OwnedMaterializationError::ContainerNotOwned(container)),
+    }
+    match std::fs::create_dir(address) {
+        Ok(()) => match write_owned_marker(address, work, run) {
+            Ok(()) => Ok(OwnedMaterialization::Created),
+            Err(err) => Err(OwnedMaterializationError::MarkerUnwritable(err)),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(address) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                Ok(_) => {
+                    return Err(OwnedMaterializationError::NotADirectory(
+                        address.to_path_buf(),
+                    ));
+                }
+                Err(err) => return Err(OwnedMaterializationError::Io(err)),
+            }
+            let here = directory_identity(address);
+            // Ruling 0297. Three answers, not two: the same object, a
+            // provably different one, or a pair that cannot be told
+            // apart because no creation time is recorded on one side.
+            // Ruling 0300: the third answer no longer authorizes a
+            // child to write into the directory just because a marker
+            // is standing there naming this Work — a marker is copyable
+            // by construction, so it never closes the gap the identity
+            // comparison itself could not. Read below only to say
+            // *whose* directory this looks like in the refusal; never
+            // to grant it.
+            let unproven_reason = match (registered, here) {
+                (Some(registered), Some(present)) => match identity_proof(&registered, &present) {
+                    IdentityProof::SameObject => {
+                        return Ok(OwnedMaterialization::ReattachedByIdentity(registered));
+                    }
+                    IdentityProof::DifferentObject { detail } => {
+                        return Err(OwnedMaterializationError::IdentityMismatch {
+                            registered,
+                            present: Some(present),
+                            detail,
+                        });
+                    }
+                    IdentityProof::Indistinguishable { reason } => reason,
+                },
+                (Some(registered), None) => {
+                    return Err(OwnedMaterializationError::IdentityMismatch {
+                        registered,
+                        present: None,
+                        detail: format!(
+                            "the journal registers {}:{} and there is no directory this estate \
+                             can inspect at the address",
+                            registered.dev, registered.ino
+                        ),
+                    });
+                }
+                (None, _) => format!(
+                    "a directory stands at {} and this Work's journal registers no creation \
+                     identity to match it against, so this estate cannot prove it created it",
+                    address.display()
+                ),
+            };
+            match read_owned_marker(address) {
+                Some((marked_work, _)) if marked_work == work.0 => {
+                    Err(OwnedMaterializationError::Unproven {
+                        reason: unproven_reason,
+                    })
+                }
+                Some((marked_work, _)) => {
+                    Err(OwnedMaterializationError::ForeignMarker(marked_work))
+                }
+                None => Err(OwnedMaterializationError::Unregistered),
+            }
+        }
+        Err(err) => Err(OwnedMaterializationError::Io(err)),
     }
 }
 
@@ -3096,6 +3611,27 @@ pub enum EventKind {
     WorktreeCreated {
         repo: String,
         base_sha: String,
+        /// Ruling 0283: the *object* the materialization created, not
+        /// the address it created it at. `<estate>/worktrees/<work>` is
+        /// an address, and an unrelated directory moved onto it answers
+        /// every address-shaped question exactly as the genuine
+        /// materialization does. The `(st_dev, st_ino)` pair recorded
+        /// here is taken from the directory this Run actually created,
+        /// through a descriptor rather than a path, and it lives in the
+        /// journal — outside the directory an actor writes in — so an
+        /// actor removing its own files cannot silently invalidate this
+        /// estate's registration of what it made.
+        ///
+        /// `#[serde(default)]` for the same reason every later field on
+        /// this enum carries it: journals written before this existed
+        /// still replay, and report `None` — *not registered by
+        /// identity*, which is the honest answer rather than a claim
+        /// either way. An inode number is reused after a directory is
+        /// removed, so a match is evidence of identity on an estate
+        /// whose storage has not been rebuilt under it, never a proof
+        /// of provenance on its own.
+        #[serde(default)]
+        identity: Option<DirectoryIdentity>,
     },
     /// Work doesn't exist until submitted; `waypoints` is the Route's
     /// ordered plan at submission time — the only way `fold`'s

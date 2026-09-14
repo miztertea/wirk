@@ -51,10 +51,7 @@ fn atlas(estate: &Path, args: &[&str]) -> (Option<i32>, Value, String) {
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk atlas runs");
+    let output = wirk_cli().args(&full).output().expect("wirk atlas runs");
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     (
@@ -73,10 +70,7 @@ fn atlas_text(estate: &Path, args: &[&str]) -> (Option<i32>, String, String) {
     full.push("--estate");
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk atlas runs");
+    let output = wirk_cli().args(&full).output().expect("wirk atlas runs");
     (
         output.status.code(),
         String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -91,10 +85,7 @@ fn finding_cli(estate: &Path, args: &[&str]) -> (Option<i32>, Value, String) {
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk finding runs");
+    let output = wirk_cli().args(&full).output().expect("wirk finding runs");
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     (
@@ -113,7 +104,7 @@ fn raise_cli(
     let mut full = vec!["finding", "raise"];
     full.extend_from_slice(args);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -5336,4 +5327,26 @@ fn journal_state(estate: &Estate) -> Vec<(PathBuf, Vec<u8>)> {
     }
     out.sort();
     out
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

@@ -56,7 +56,7 @@ fn wait_for_pointer(estate: &Path) -> WirkdPointer {
 /// run_id <id>
 /// waypoint <id>` stdout line.
 fn submit(estate: &Path, repo: &str) -> (String, String, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args([
@@ -104,7 +104,7 @@ fn submit(estate: &Path, repo: &str) -> (String, String, String) {
 /// decisive-check shape) and the given extra args, returning its exit
 /// code and stdout.
 fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -167,7 +167,7 @@ fn wirkd_process_lifecycle() {
     let estate = dir.path().to_path_buf();
 
     let mut wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -179,7 +179,7 @@ fn wirkd_process_lifecycle() {
     let pointer = wait_for_pointer(&estate);
     assert_eq!(pointer.protocol_version, 1);
 
-    let ping = Command::new(wirk_bin())
+    let ping = wirk_cli()
         .args(["wirkd", "ping", "--estate"])
         .arg(&estate)
         .output()
@@ -193,7 +193,13 @@ fn wirkd_process_lifecycle() {
 
     // -- valid claim: accepted, Run/Work complete ------------------------
     let (work1, run1, _waypoint1) = submit(&estate, "demo:write");
-    fs::write(estate.join("report.md"), b"the report").expect("write report.md");
+    // Ruling 0292: the declared artifact of an output-only Deterministic
+    // Work lives in that Work's own owned execution directory — the
+    // address its World names — not in the estate root every Work
+    // shares.
+    let owned1 = wirk_core::owned_execution_address(&estate, &WorkId(work1.clone()));
+    fs::create_dir_all(&owned1).expect("this Work's own execution directory");
+    fs::write(owned1.join("report.md"), b"the report").expect("write report.md");
     let (code, stdout) = claim(
         &estate,
         &work1,
@@ -238,6 +244,19 @@ fn wirkd_process_lifecycle() {
     // -- two Works claimed concurrently: no interleave, contiguous seq ----
     let (work4, run4, _) = submit(&estate, "demo:write");
     let (work5, run5, _) = submit(&estate, "demo:write");
+    // Each of these two Works claims `report.md` from its *own* owned
+    // execution directory (ruling 0292). While every Work's execution
+    // area was the estate root, one file there satisfied both claims at
+    // once — which is the collision this correction exists to end, so
+    // the fixture writes each Work's own bytes in each Work's own
+    // directory. The subject here is still concurrency: two claims
+    // arriving at one daemon at the same time.
+    for work in [&work4, &work5] {
+        let owned = wirk_core::owned_execution_address(&estate, &WorkId((*work).clone()));
+        fs::create_dir_all(&owned).expect("this Work's own execution directory");
+        fs::write(owned.join("report.md"), format!("the report of {work}"))
+            .expect("write report.md");
+    }
     let estate_a = estate.clone();
     let (work4a, run4a) = (work4.clone(), run4.clone());
     let handle_a = std::thread::spawn(move || {
@@ -283,7 +302,7 @@ fn wirkd_process_lifecycle() {
     }
 
     // -- stop: pointer and socket removed, child exits clean --------------
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -321,7 +340,7 @@ fn claim_names_an_artifact_whose_file_is_absent_on_disk() {
     let estate = dir.path().to_path_buf();
 
     let mut wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -332,9 +351,14 @@ fn claim_names_an_artifact_whose_file_is_absent_on_disk() {
     let pointer = wait_for_pointer(&estate);
 
     let (work, run, _waypoint) = submit(&estate, "demo:write");
-    // Deliberately no `fs::write(estate.join("report.md"), ...)` here —
-    // the claim names the file but it is absent from the worktree path.
-    assert!(!estate.join("report.md").exists());
+    // Deliberately nothing written here — the claim names the file but
+    // it is absent from the execution directory this Work's own World
+    // names (ruling 0292: its own owned address, not the estate root).
+    assert!(
+        !wirk_core::owned_execution_address(&estate, &WorkId(work.clone()))
+            .join("report.md")
+            .exists()
+    );
 
     let (code, stdout) = claim(&estate, &work, &run, &["--artifact", "report.md=report.md"]);
     assert_eq!(code, Some(3), "on-disk-missing claim stdout: {stdout}");
@@ -344,7 +368,7 @@ fn claim_names_an_artifact_whose_file_is_absent_on_disk() {
     );
     assert_eq!(status(&pointer.socket, &work), "active");
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -359,4 +383,26 @@ fn claim_names_an_artifact_whose_file_is_absent_on_disk() {
         exit_status.success(),
         "wirkd did not exit clean: {exit_status:?}"
     );
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

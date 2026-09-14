@@ -53,21 +53,22 @@ fn permissive() -> ResourcePolicy {
 /// One private host pool per check, shared between the estates that check
 /// uses.
 ///
-/// Keyed by the running test's own thread id, which is what makes it
-/// per-check: `libtest` runs each `#[test]` on its own freshly spawned
-/// thread, and a `ThreadId` is never reused for the life of the process
-/// (measured on this toolchain: 40 concurrent checks, 40 distinct ids).
-/// A check that shares one pool between several estates deliberately
-/// does so by naming `host_pool_dir` explicitly, which overrides the one
+/// `libtest` runs each `#[test]` on its own freshly spawned thread and
+/// joins it before moving on, so a `thread_local` `TempDir` gives each
+/// check its own real pool directory, stable across every call within
+/// that one test (still one path per check), and — unlike the former
+/// `std::env::temp_dir()` directory this created and never removed —
+/// actually dropped when the test's own thread exits: ordinary RAII,
+/// unwind included, the same fix ruling 0308 already applied to
+/// `run_loop.rs`'s and `contracts.rs`'s fixture estates. A check that
+/// shares one pool between several estates deliberately does so by
+/// naming `host_pool_dir` explicitly, which overrides the one
 /// `permissive()` mints here.
 fn host_pool() -> PathBuf {
-    let pool = std::env::temp_dir().join(format!(
-        "wirk-test-host-pool-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    fs::create_dir_all(&pool).unwrap();
-    pool
+    thread_local! {
+        static POOL: TempDir = TempDir::new().expect("host pool tempdir");
+    }
+    POOL.with(|dir| dir.path().to_path_buf())
 }
 
 // ---------------------------------------------------------------------
@@ -958,6 +959,72 @@ sys.stdout.buffer.flush()
         output.stdout.ends_with(format!("|{sent}").as_bytes()),
         "the child read the whole request: {}",
         String::from_utf8_lossy(&output.stdout[output.stdout.len() - 32..])
+    );
+}
+
+/// A real child that exits without reading its stdin at all: the writer
+/// thread's next `write(2)` past the kernel's pipe buffer gets `EPIPE`
+/// once the child's own copy of the read end has closed.
+///
+/// Ruling 0308: `run` used to join this thread with `let _ =
+/// writer.join()`, discarding exactly this `Err` — so a request that was
+/// only ever partly delivered still came back as `ChildEnd::Finished`
+/// with the child's real (successful) exit status, indistinguishable
+/// from a child that read the whole thing. Both real callers
+/// (`wirk-atlas/src/semantic.rs`'s and `retrieval.rs`'s backend
+/// protocols) trusted that `Finished` at face value. This is the same
+/// defect those two callers' now-removed `let write: std::io::Result<()>
+/// = Ok(());` placeholders papered over: a `write` outcome that was
+/// never actually threaded through from the writer thread at all.
+#[test]
+fn an_input_write_that_fails_is_reported_and_not_papered_over_as_success() {
+    let scratch = TempDir::new().unwrap();
+    let estate = estate();
+    let script = scratch.path().join("deaf.py");
+    fs::write(&script, "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n").unwrap();
+    let policy = ResourcePolicy {
+        job_deadline_secs: 30,
+        ..permissive()
+    };
+
+    let mut command = Command::new("python3");
+    command
+        .arg(&script)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let child = BoundedChild {
+        capabilities: jobs::capabilities(),
+        policy: &policy,
+        cancel: CancelToken::new(),
+        job_id: "discarded-writer".into(),
+        estate_root: Some(estate.path().to_path_buf()),
+        staging: None,
+        verb: "test".into(),
+        scope: "test-scope".into(),
+        requester: None,
+        registry: None,
+    };
+    // Far larger than any pipe buffer, and a child that never reads a
+    // byte of it: the write past the buffer's capacity has to see EPIPE,
+    // not merely block (which `a_blocked_input_write_is_released_when_
+    // the_job_ends` above already covers with a different, hung, child).
+    let request = vec![b'x'; 4 * 1024 * 1024];
+    let end = child.run(command, move |stdin| {
+        stdin.write_all(&request)?;
+        stdin.flush()
+    });
+
+    let ChildEnd::Failed(detail) = &end else {
+        panic!(
+            "a child whose request was never fully written must not be reported as a success, \
+             whatever its own exit status was: {end:?}"
+        );
+    };
+    assert!(
+        detail.contains("its input could not be written"),
+        "the failure must name what actually happened, not a generic one: {detail}"
     );
 }
 

@@ -82,7 +82,7 @@ fn submit(estate: &Path, repo: &str) -> (String, String, String) {
                 .success()
         );
     }
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args([
@@ -226,6 +226,7 @@ fn blocked(socket: &Path, estate: &Path, work_id: &str, run_id: &str, detail: &s
             kind: EventKind::WorktreeCreated {
                 repo: actor.repository.clone(),
                 base_sha: head,
+                identity: None,
             },
         }),
     )
@@ -319,7 +320,7 @@ impl Drop for KillOnDrop {
 
 fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
     let child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(estate)
             .stdout(Stdio::null())
@@ -389,7 +390,7 @@ fn cli_work_status_prints_needs_input() {
         "actor could not make progress: spec.md does not exist",
     );
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         // The operator's own read: ruling 0117 makes an inherited actor
         // triple mean something here, so this asks for the operator
         // rather than inheriting the runner's environment.
@@ -790,7 +791,7 @@ fn cli_work_retry_prints_old_and_new_run_id() {
         "exit 1: command failed",
     );
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "retry", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id])
@@ -832,7 +833,7 @@ fn cli_work_fail_prints_reason() {
         "exit 1: command failed",
     );
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "fail", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--reason", "giving up on this Work"])
@@ -929,7 +930,7 @@ fn cli_work_retry_succeeds_on_a_blocked_needs_input_work() {
         "waiting on pane w1:p1",
     );
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "retry", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id])
@@ -983,7 +984,7 @@ fn cli_work_fail_succeeds_on_a_blocked_needs_input_work() {
         "waiting on pane w1:p1",
     );
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "fail", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--reason", "giving up on this Work"])
@@ -1010,4 +1011,26 @@ fn cli_work_fail_succeeds_on_a_blocked_needs_input_work() {
         Reply::Err { error, .. } => panic!("status refused: {} {}", error.code, error.message),
     };
     assert_eq!(result["state"].as_str(), Some("failed"), "{result:?}");
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

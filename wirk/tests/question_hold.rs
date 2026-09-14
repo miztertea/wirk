@@ -38,7 +38,7 @@ const QUESTION: &str = "should REPORT.md cover the 2026 numbers as well?";
 /// per test binary rather than shared across binaries (R6, the same
 /// reason `run_claim_binding.rs` duplicates it).
 fn output_dir(estate: &Path, work_id: &str, run_id: &str) -> PathBuf {
-    let out = std::process::Command::new(wirk_bin())
+    let out = wirk_cli()
         .args(["output", "dir"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -482,4 +482,26 @@ fn another_runs_question_does_not_hold_this_runs_automatic_claim() {
         "this Run has no question of its own and must complete: {stdout}"
     );
     assert_eq!(stdout, "Validated");
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> std::process::Command {
+    let mut command = std::process::Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

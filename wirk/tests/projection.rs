@@ -39,10 +39,7 @@ fn atlas(estate: &Path, args: &[&str]) -> (bool, serde_json::Value, String) {
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk atlas runs");
+    let output = wirk_cli().args(&full).output().expect("wirk atlas runs");
     (
         output.status.success(),
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
@@ -223,7 +220,7 @@ fn plain_route(estate: &Path) -> PathBuf {
 /// `wirk world show` exactly as an actor types it: the injected triple
 /// in the environment, no `--work`, no `--estate`.
 fn world_show(estate: &Path, work: &str, run: &str) -> (Option<i32>, serde_json::Value, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["world", "show", "--json"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -479,7 +476,7 @@ fn the_resolve_command_world_show_prints_runs_verbatim_inside_the_pane() {
 
     // The line an actor reads, taken out of `world show`'s own text
     // rendering rather than reconstructed from the JSON.
-    let printed = Command::new(wirk_bin())
+    let printed = wirk_cli()
         .args(["world", "show"])
         .env("WIRK_ESTATE_ROOT", &estate.root)
         .env("WIRK_WORK_ID", &submitted.work_id)
@@ -500,7 +497,7 @@ fn the_resolve_command_world_show_prints_runs_verbatim_inside_the_pane() {
     );
 
     let in_pane = |args: &[&str], triple: &[(&str, &str)]| {
-        let mut command = Command::new(wirk_bin());
+        let mut command = wirk_cli();
         command.args(args).env_clear().env("PATH", "/usr/bin:/bin");
         for (name, value) in triple {
             command.env(name, value);
@@ -625,7 +622,7 @@ fn an_orienting_route_is_refused_on_the_unknown_basis_submit_arm_and_accepted_wi
 
     // The bare arm: no `--kind actor`, no `--repo-path`. Refused, before
     // anything is journaled.
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(&estate.root)
         .args(["--repo", "demo:write", "--base", "HEAD", "--route"])
@@ -655,7 +652,7 @@ fn an_orienting_route_is_refused_on_the_unknown_basis_submit_arm_and_accepted_wi
 
     // The positive control: `--kind actor --repo-path`, and no
     // `--source-basis` anywhere on the line.
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(&estate.root)
         .args([
@@ -2075,4 +2072,26 @@ fn a_bound_source_without_a_captured_generation_is_omitted_and_stays_out_of_sele
     );
 
     estate.stop();
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

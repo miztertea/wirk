@@ -1463,6 +1463,12 @@ fn dispatch(
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
+        Verb::AtlasRemove => {
+            match serde_json::from_value::<super::AtlasRemovePayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_remove(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::AtlasSemanticBuild => {
             match serde_json::from_value::<super::AtlasSemanticBuildPayload>(
                 request.payload.clone(),
@@ -1566,6 +1572,12 @@ fn dispatch(
         Verb::RunOutputs => {
             match serde_json::from_value::<super::RunOutputsPayload>(request.payload.clone()) {
                 Ok(payload) => Outcome::Reply(handle_run_outputs(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
+        Verb::RunArtifact => {
+            match serde_json::from_value::<super::RunArtifactPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_run_artifact(state, payload)),
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
@@ -1903,6 +1915,7 @@ fn handle_ping(state: &Arc<WirkdState>, payload: super::PingPayload) -> Reply {
                 "memory_pressure_avg10_max": policy.memory_pressure_avg10_max,
                 "min_available_memory_bytes": policy.min_available_memory_bytes,
                 "job_memory_max_bytes": policy.job_memory_max_bytes,
+                "artifact_max_bytes": policy.artifact_max_bytes,
                 "host_pool_capacity_authority": policy.host_pool_capacity_authority,
                 "configured_in": wirk_core::jobs::ResourcePolicy::config_path(&state.estate_root)
                     .display()
@@ -2121,14 +2134,105 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
     let output_contract = OutputContract(first_def.declared_outputs.clone());
     let branch = format!("wirk/{}", work_id.0);
 
+    // An Actor Waypoint submitted on an output-only basis executes in
+    // an owned directory, so none of its bindings is an execution
+    // checkout. The bindings are Read source grants — the alias list
+    // `wirk_atlas::admission::admit` matches memberships against — and
+    // asking which of two admitted document sources is "the checkout"
+    // has no answer rather than an ambiguous one. Deciding here, from
+    // the declared basis, is what keeps a second Read source from
+    // refusing at `resolve_execution_repo` before the basis-specific
+    // arm below is ever reached.
+    let actor_output_only = payload.kind.as_deref() == Some("actor")
+        && matches!(first_def.kind, WaypointKind::Actor)
+        && matches!(payload.source_basis, Some(SourceBasis::OutputOnly { .. }));
+    // Ruling 0283: a *Deterministic* stage on an output-only basis owns
+    // no checkout either — it executes a command, and its arm below
+    // never resolves a repository path. Its bindings are the same Read
+    // source grants an output-only Actor's are, folded onto the Work for
+    // whichever stage actually reads them. Asking `resolve_execution_repo`
+    // which of two admitted document sources is "the checkout" therefore
+    // produced an *ambiguity* refusal for a submission that needs no
+    // checkout at all: two `--repo docs-a:read --repo docs-b:read`
+    // grants, nothing to disambiguate, and the Route refused before any
+    // arm was reached. The basis decides, exactly as it already does for
+    // the Actor case just above.
+    //
+    // `None` source basis is included because the Deterministic arm
+    // below defaults to `OutputOnly` when none was given: the flag that
+    // guards the resolution has to read the same default the arm does,
+    // or the two disagree about what was submitted.
+    //
+    // Narrowed further to a submission that actually carries a Route.
+    // The ad hoc, Route-less `--kind deterministic --command <argv...>`
+    // shape synthesizes its own Deterministic first Waypoint above, so
+    // it matches `first_def.kind` exactly as a Route's own Deterministic
+    // stage does — but it has no later Actor stage to hand a source
+    // grant to, and never did. Its `--repo <name>:read` is a repository
+    // binding on a Work with no checkout, which is the incompatibility
+    // `output_only_read_binding_is_rejected_before_run_open` has always
+    // pinned. Suppressing the resolution for it would drop that refusal
+    // and open a Run for a submission that cannot be executed.
+    let deterministic_output_only = !deterministic
+        && matches!(first_def.kind, WaypointKind::Deterministic)
+        && matches!(
+            payload.source_basis,
+            None | Some(SourceBasis::OutputOnly { .. })
+        );
+    // Narrowed to the case that actually needs it: an output-only
+    // Deterministic submission holding *only* Read source grants. A
+    // Write binding still resolves an execution repository exactly as
+    // it does today, because a Write grant does name a repository this
+    // Work mutates and the Claim path reads that name; nothing about
+    // that is changed here.
+    let deterministic_output_only_sources = deterministic_output_only
+        && !payload
+            .repositories
+            .iter()
+            .any(|binding| binding.access == Access::Write);
+    let output_only_submission = actor_output_only || deterministic_output_only_sources;
+    // Ruling 0283: the whole authored Route is walked here, before any
+    // stage runs, for the one declared combination that cannot work at
+    // *any* stage of an output-only submission. An output-only basis
+    // carries forward to every later stage (`reserve_next_leaf`), and an
+    // Actor stage on that basis owns no checkout to write through, so a
+    // Write grant is uninspectable there — which is exactly what the
+    // transition refusal says. Said at submit, the Route is refused
+    // while refusing it is free. Said only at the transition, stage 1
+    // has already run and claimed, and the Work is left Active at wp-1
+    // with no open Run: nothing to claim and nothing to retry.
+    //
+    // The transition check stays where it is, as defence in depth for a
+    // Route journaled before this one existed. This is the earlier of
+    // two, not a replacement for it.
+    if deterministic_output_only
+        && payload
+            .repositories
+            .iter()
+            .any(|binding| binding.access == Access::Write)
+        && all_waypoints
+            .iter()
+            .filter_map(|id| find_definition(&waypoint_defs, id))
+            .any(|def| matches!(def.kind, WaypointKind::Actor))
+    {
+        return err_reply(
+            "IncompatibleSourceBasis",
+            "this Route reaches an Actor stage on an output-only basis, which owns no \
+             checkout to write through and whose Claim could never be checked against one: \
+             the Write binding is refused here rather than partway through the Route",
+        );
+    }
     // P3 W3 (ruling 0090): resolved once, before any World is built, so
     // every arm below (and the child-spawn identity check further down)
     // reads the same name — never a bare `repositories.first()`.
-    let execution_repo_name =
+    let execution_repo_name = if output_only_submission {
+        None
+    } else {
         match resolve_execution_repo(&payload.repositories, payload.execution_repo.as_deref()) {
             Ok(name) => name,
             Err((code, message)) => return err_reply(code, &message),
-        };
+        }
+    };
     // Populated only where a real checkout (`repo_path`) exists to
     // verify at submit time (the Deterministic-Git and immediate-Actor
     // arms below); the bare Actor arm materializes its worktree later
@@ -2150,16 +2254,54 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                     .unwrap_or_else(|| SourceBasis::OutputOnly {
                         reference: payload.base_ref.clone(),
                     });
+            // Ruling 0283: a Git *boundary* is an inspection of a
+            // checkout, and output-only execution has none — that
+            // refusal stands. A `Read` binding is not that. It is a
+            // source grant: the alias list `wirk_atlas::admission::admit`
+            // matches an admitted document source's memberships against,
+            // and the Deterministic stage simply does not consume it.
+            // Refusing it here is what made the document workflow
+            // inexpressible: the Deterministic output-only arm refused
+            // Read at submit and the Actor transition refuses Write, so
+            // a mixed `[Deterministic, Actor]` Route was admissible only
+            // with no bindings at all — and an Actor reading admitted
+            // sources after a Deterministic stage, which is the whole
+            // point of the mixed shape, could not be submitted.
+            //
+            // The grant is folded onto the Work, where the stage that
+            // does read it finds it. A Read grant confers no mutation
+            // credit anywhere (`handle_claim`'s own source check), so
+            // carrying one through a stage that does not use it adds no
+            // authority to that stage.
             if matches!(requested_basis, SourceBasis::OutputOnly { .. })
-                && (payload
-                    .repositories
-                    .iter()
-                    .any(|binding| binding.access == Access::Read)
-                    || !first_def.boundary.0.is_empty())
+                && !first_def.boundary.0.is_empty()
             {
                 return err_reply(
                     "IncompatibleSourceBasis",
-                    "output-only execution cannot satisfy repository Read or Git boundary inspection",
+                    "output-only execution cannot satisfy Git boundary inspection: it owns \
+                     no checkout for a boundary to be inspected against",
+                );
+            }
+            // The relaxation above is for a *Route*, whose later stages
+            // are what consume a source grant. The ad hoc, Route-less
+            // `--kind deterministic --command <argv...>` shape has one
+            // synthesized Waypoint and no later stage at all, so a Read
+            // binding there can never be read by anything: it is the
+            // uninspectable repository binding on a checkout-less Work
+            // that `output_only_read_binding_is_rejected_before_run_open`
+            // has pinned since before this increment. Refused here, with
+            // no Work journal opened, exactly as it was.
+            if deterministic
+                && matches!(requested_basis, SourceBasis::OutputOnly { .. })
+                && payload
+                    .repositories
+                    .iter()
+                    .any(|binding| binding.access == Access::Read)
+            {
+                return err_reply(
+                    "IncompatibleSourceBasis",
+                    "output-only execution cannot satisfy repository Read inspection: this \
+                     Work carries no Route, so no later stage can consume the grant either",
                 );
             }
             let (base_sha, source_basis, cwd) = match requested_basis {
@@ -2201,7 +2343,8 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                     // (`worktree_add`'s "path exists on disk" case) takes
                     // it over unchanged, rather than a second module
                     // reinventing worktree creation.
-                    let worktree_path = state.estate_root.join("worktrees").join(&work_id.0);
+                    let worktree_path =
+                        wirk_core::owned_execution_address(&state.estate_root, &work_id);
                     if let Err(err) = wirk_herdr::git::worktree_add(
                         Path::new(&repo_path),
                         &worktree_path,
@@ -2216,10 +2359,36 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                         worktree_path,
                     )
                 }
+                // Ruling 0292, the decisive correction. This arm used
+                // to hand the deterministic child `state.estate_root`
+                // as its `cwd`: the estate's own top level, holding
+                // `works/`, `atlas/`, `routes/` and `.wirk/`, shared by
+                // every Work in the estate. Observed live
+                // (`p5-foundation-use/USE.md` finding 1): a second
+                // Work's `collect` stage wrote `prepared.md` over the
+                // artifact of an already-validated Claim of another
+                // Work, after which one of the two Claims could always
+                // only read `ArtifactBytesChanged` — restoring either
+                // broke the other. Undeclared output landed in the same
+                // region the export guard refuses to write into, no
+                // storage class accounted for it, and `work clean`
+                // refused the Work forever.
+                //
+                // The execution area is this Work's own owned address,
+                // the same one the Git arm above materializes and
+                // `wirk run` establishes for an output-only Actor. The
+                // directory itself is *not* created here: creation is
+                // where ownership is proven and journaled, which is the
+                // executor's own step (`run_deterministic_command`'s
+                // `materialize_owned_directory`), exactly as the Actor
+                // path establishes it in `wirk run`. Reserving the
+                // address keeps the World's `cwd` a fact of the
+                // reservation, and a child is never spawned into it
+                // until that step has proven it.
                 SourceBasis::OutputOnly { reference } => (
                     reference.clone(),
                     SourceBasis::OutputOnly { reference },
-                    state.estate_root.clone(),
+                    wirk_core::owned_execution_address(&state.estate_root, &work_id),
                 ),
                 SourceBasis::Unknown => {
                     return err_reply(
@@ -2238,73 +2407,146 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
             })
         }
         WaypointKind::Actor if payload.kind.as_deref() == Some("actor") => {
-            if matches!(payload.source_basis, Some(SourceBasis::OutputOnly { .. })) {
-                return err_reply(
-                    "IncompatibleSourceBasis",
-                    "actor execution requires a Git basis",
-                );
-            }
-            let Some(repo_path) = payload.repo_path.clone() else {
-                return err_reply("BadRequest", "--repo-path is required for --kind actor");
-            };
-            // Issue 285: resolve `base_ref` to a commit SHA with git at
-            // submit time, so the World reserved here — not the
-            // worktree `wirk run` creates later — is what pins the
-            // base. An empty or unresolvable ref refuses submit rather
-            // than reserving a World whose base can never be honoured.
-            let base_sha = match resolve_git_sha(&repo_path, &payload.base_ref) {
-                Ok(sha) => sha,
-                Err(detail) => return err_reply("GitError", &detail),
-            };
-            if execution_repo_name.is_some() {
-                execution_identity = match canonical_repository_identity(&repo_path) {
-                    Ok(identity) => Some(identity),
+            // An Actor on an output-only basis reads its sources and
+            // executes in an owned directory. The two are separate
+            // contracts: the Read bindings are source grants, admitted
+            // by alias wherever this Work queries Atlas (`query_scope`,
+            // `freeze_review_targets`, evidence assembly), and the
+            // basis reference is the execution/inspection identity.
+            // Read bindings therefore flow through unchanged — refusing
+            // them would leave the Work with no admitted source at all
+            // and silently empty its frozen review targets.
+            if let Some(SourceBasis::OutputOnly { reference }) = payload.source_basis.clone() {
+                if payload.repo_path.is_some() {
+                    return err_reply(
+                        "BadRequest",
+                        "--kind actor cannot combine an output-only --source-basis with \
+                         --repo-path",
+                    );
+                }
+                if payload.execution_repo.is_some() {
+                    return err_reply(
+                        "BadRequest",
+                        "an output-only Actor has no execution checkout for --execution-repo to \
+                         name; its bindings are Read source grants",
+                    );
+                }
+                // A Write binding declares a mutation surface, and this
+                // World has none to mutate: no checkout exists, and
+                // `validate_claim` skips the worktree diff for this
+                // basis, so a write could never be inspected against
+                // the boundary it claims to respect. Refused at submit
+                // rather than accepted and left uncheckable.
+                if payload
+                    .repositories
+                    .iter()
+                    .any(|binding| binding.access == Access::Write)
+                {
+                    return err_reply(
+                        "IncompatibleSourceBasis",
+                        "an output-only Actor cannot hold a Write binding: it owns no checkout to \
+                         write through, and no Claim of its could be checked against one",
+                    );
+                }
+                if !first_def.boundary.0.is_empty() {
+                    return err_reply(
+                        "IncompatibleSourceBasis",
+                        "an output-only Actor declares no checkout boundary: it owns no worktree \
+                         for a boundary to be inspected against",
+                    );
+                }
+                World::Actor(ActorWorld {
+                    // No execution repository exists. Left empty rather
+                    // than filled with the basis reference: this field
+                    // is hashed into the World and rendered publicly,
+                    // and naming a document source here would report a
+                    // checkout this Work never had.
+                    repository: String::new(),
+                    // Empty until `wirk run` creates the owned
+                    // execution directory (`executor.rs`'s own Step 2),
+                    // exactly as the Git arm below leaves it.
+                    worktree_path: PathBuf::new(),
+                    // No Git branch exists to name; `executor.rs`
+                    // never reads it for an output-only World.
+                    branch: String::new(),
+                    source_basis: SourceBasis::OutputOnly {
+                        reference: reference.clone(),
+                    },
+                    base_sha: reference,
+                    triple,
+                    intent: first_def.intent.clone().unwrap_or_default(),
+                    output_contract,
+                    boundary: first_def.boundary.clone(),
+                    review_targets: freeze_review_targets(state, &payload.repositories, &first_def),
+                    evidence: None,
+                    contract: match reserve_worker_contract(state) {
+                        Ok(contract) => contract,
+                        Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                    },
+                })
+            } else {
+                let Some(repo_path) = payload.repo_path.clone() else {
+                    return err_reply("BadRequest", "--repo-path is required for --kind actor");
+                };
+                // Issue 285: resolve `base_ref` to a commit SHA with git at
+                // submit time, so the World reserved here — not the
+                // worktree `wirk run` creates later — is what pins the
+                // base. An empty or unresolvable ref refuses submit rather
+                // than reserving a World whose base can never be honoured.
+                let base_sha = match resolve_git_sha(&repo_path, &payload.base_ref) {
+                    Ok(sha) => sha,
                     Err(detail) => return err_reply("GitError", &detail),
                 };
+                if execution_repo_name.is_some() {
+                    execution_identity = match canonical_repository_identity(&repo_path) {
+                        Ok(identity) => Some(identity),
+                        Err(detail) => return err_reply("GitError", &detail),
+                    };
+                }
+                World::Actor(ActorWorld {
+                    repository: repo_path.clone(),
+                    // Empty until `wirk run` creates the worktree and
+                    // records the update (`handle_record`, `RecordPayload`'s
+                    // doc comment): the World is reserved before any
+                    // worktree exists.
+                    worktree_path: PathBuf::new(),
+                    branch,
+                    source_basis: SourceBasis::Git {
+                        base: base_sha.clone(),
+                    },
+                    base_sha,
+                    triple,
+                    // p2-route-files W2 (`--intent` removed, J1): the
+                    // Waypoint's own authored intent, never the submit
+                    // line's.
+                    intent: first_def.intent.clone().unwrap_or_default(),
+                    output_contract,
+                    // P2.4 W1 (build-brief.md §8 amendment 1): the World's
+                    // boundary is the Route-authored Waypoint's own globs,
+                    // not the repository path — `repo_path` stays only the
+                    // `repository` field above. `WorldHash::of` already
+                    // hashes `actor.boundary.0` (0029 D95, landed before
+                    // this item); only the value fed into it changes here.
+                    boundary: first_def.boundary.clone(),
+                    // W-B target binding: freeze the declared review
+                    // selectors here, before the review can run.
+                    review_targets: freeze_review_targets(state, &payload.repositories, &first_def),
+                    // W-C1: the reference is filled in below, once the
+                    // Work's own directory exists and the projection file
+                    // has been written into it durably. Assembling here,
+                    // before the World is built, keeps the whole of it
+                    // outside any journal guard — this Work has no journal
+                    // yet, and no other Work's is touched.
+                    evidence: None,
+                    // P4.1: the contract is reserved here, with the World,
+                    // so every attempt this reservation backs operates under
+                    // the identical bytes.
+                    contract: match reserve_worker_contract(state) {
+                        Ok(contract) => contract,
+                        Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                    },
+                })
             }
-            World::Actor(ActorWorld {
-                repository: repo_path.clone(),
-                // Empty until `wirk run` creates the worktree and
-                // records the update (`handle_record`, `RecordPayload`'s
-                // doc comment): the World is reserved before any
-                // worktree exists.
-                worktree_path: PathBuf::new(),
-                branch,
-                source_basis: SourceBasis::Git {
-                    base: base_sha.clone(),
-                },
-                base_sha,
-                triple,
-                // p2-route-files W2 (`--intent` removed, J1): the
-                // Waypoint's own authored intent, never the submit
-                // line's.
-                intent: first_def.intent.clone().unwrap_or_default(),
-                output_contract,
-                // P2.4 W1 (build-brief.md §8 amendment 1): the World's
-                // boundary is the Route-authored Waypoint's own globs,
-                // not the repository path — `repo_path` stays only the
-                // `repository` field above. `WorldHash::of` already
-                // hashes `actor.boundary.0` (0029 D95, landed before
-                // this item); only the value fed into it changes here.
-                boundary: first_def.boundary.clone(),
-                // W-B target binding: freeze the declared review
-                // selectors here, before the review can run.
-                review_targets: freeze_review_targets(state, &payload.repositories, &first_def),
-                // W-C1: the reference is filled in below, once the
-                // Work's own directory exists and the projection file
-                // has been written into it durably. Assembling here,
-                // before the World is built, keeps the whole of it
-                // outside any journal guard — this Work has no journal
-                // yet, and no other Work's is touched.
-                evidence: None,
-                // P4.1: the contract is reserved here, with the World,
-                // so every attempt this reservation backs operates under
-                // the identical bytes.
-                contract: match reserve_worker_contract(state) {
-                    Ok(contract) => contract,
-                    Err(detail) => return err_reply("ValidationUnavailable", &detail),
-                },
-            })
         }
         WaypointKind::Actor => {
             // W-C1 (BUILD.md §3.3), the refusal aimed where `Unknown` is
@@ -2964,14 +3206,87 @@ fn handle_record(
     }
 
     let kind = match payload.kind {
-        EventKind::WorktreeCreated { repo, base_sha } => {
+        EventKind::WorktreeCreated {
+            repo,
+            base_sha,
+            identity,
+        } => {
             let binding =
                 match resolve_run_binding(&events, &state.estate_root, &payload.work_id, run_id) {
                     Ok(binding) => binding,
                     Err(reason) => return err_reply("ValidationUnavailable", &reason),
                 };
+            // Ruling 0292: an output-only Deterministic Run creates an
+            // owned execution directory too, and its creation identity
+            // has to be registered in the journal for exactly the same
+            // reason an Actor's is — the marker inside the directory can
+            // be copied, and address equality says where a directory is,
+            // never that this estate made it.
+            //
+            // The Deterministic checks are the counterpart of the Actor
+            // ones just below: no repository exists, so `repo` must be
+            // empty rather than naming one; `base_sha` must be the
+            // World's own; the World's `cwd` must be this estate's own
+            // address for this Work (a World reserved anywhere else is
+            // not one this event may register a directory for); and one
+            // creation per Run.
+            let deterministic_owned = match &binding.world {
+                World::Deterministic(det)
+                    if matches!(det.source_basis, SourceBasis::OutputOnly { .. }) =>
+                {
+                    let owned =
+                        wirk_core::owned_execution_address(&state.estate_root, &payload.work_id);
+                    if !repo.is_empty()
+                        || base_sha != det.base_sha
+                        || !paths_equal(&owned, &det.cwd)
+                    {
+                        return err_reply(
+                            "InvalidTransition",
+                            "WorktreeCreated does not match this Run's output-only Deterministic \
+                             binding",
+                        );
+                    }
+                    true
+                }
+                World::Deterministic(_) => {
+                    return err_reply(
+                        "InvalidTransition",
+                        "only an Actor Run or an output-only Deterministic Run creates an \
+                         execution directory",
+                    );
+                }
+                World::Actor(_) => false,
+            };
+            if deterministic_owned {
+                if events.iter().any(|event| {
+                    event.run.as_ref() == Some(run_id)
+                        && matches!(event.kind, EventKind::WorktreeCreated { .. })
+                }) {
+                    return err_reply(
+                        "InvalidTransition",
+                        "this Run has already registered its owned execution directory",
+                    );
+                }
+                let event = new_event(
+                    &payload.work_id,
+                    Some(run_id.clone()),
+                    EventKind::WorktreeCreated {
+                        repo,
+                        base_sha,
+                        identity,
+                    },
+                );
+                return match append_event(state, &mut journal, &payload.work_id, &event) {
+                    Ok(()) => ok_reply(json!({})),
+                    Err(err) => err_reply("JournalError", &err.to_string()),
+                };
+            }
             let World::Actor(actor) = binding.world else {
-                return err_reply("InvalidTransition", "only an Actor Run creates a worktree");
+                unreachable!("every Deterministic World returned above");
+            };
+            let git_head_matches = match &actor.source_basis {
+                SourceBasis::OutputOnly { .. } => true,
+                _ => resolve_git_sha(&repo, &base_sha).as_deref() == Ok(base_sha.as_str()),
             };
             if binding.materialized
                 || events.iter().any(|event| {
@@ -2980,14 +3295,18 @@ fn handle_record(
                 })
                 || actor.repository != repo
                 || actor.base_sha != base_sha
-                || resolve_git_sha(&repo, &base_sha).as_deref() != Ok(base_sha.as_str())
+                || !git_head_matches
             {
                 return err_reply(
                     "InvalidTransition",
                     "WorktreeCreated does not match this Run's unmaterialized Actor binding",
                 );
             }
-            EventKind::WorktreeCreated { repo, base_sha }
+            EventKind::WorktreeCreated {
+                repo,
+                base_sha,
+                identity,
+            }
         }
         EventKind::WaypointReserved {
             waypoint,
@@ -3000,7 +3319,7 @@ fn handle_record(
                     "materialization has no preceding event",
                 );
             };
-            let EventKind::WorktreeCreated { repo, base_sha } = &previous.kind else {
+            let EventKind::WorktreeCreated { repo, base_sha, .. } = &previous.kind else {
                 return err_reply(
                     "InvalidTransition",
                     "Actor materialization must immediately follow WorktreeCreated",
@@ -3029,7 +3348,7 @@ fn handle_record(
                 || expected != *updated
                 || updated.worktree_path.as_os_str().is_empty()
                 || !paths_equal(
-                    &state.estate_root.join("worktrees").join(&payload.work_id.0),
+                    &wirk_core::owned_execution_address(&state.estate_root, &payload.work_id),
                     &updated.worktree_path,
                 )
                 || repo != &updated.repository
@@ -3335,6 +3654,48 @@ fn artifact_relative_to_worktree(worktree_path: &Path, artifact_path: &str) -> O
         .strip_prefix(worktree_path)
         .ok()
         .map(PathBuf::from)
+}
+
+/// The path to record on a `Worktree` receipt: worktree-relative
+/// wherever the artifact can be placed inside the Run's own checkout,
+/// and the claimed path verbatim only when it cannot be placed at all.
+///
+/// Two ways of placing it, because the lexical one alone is not enough
+/// (ruling 0283). `artifact_relative_to_worktree` normalizes and strips
+/// prefixes as text, which is exactly right for the ordinary case and
+/// answers `None` for an absolute path that is genuinely inside the
+/// checkout but reached through a different spelling of it — an estate
+/// under a symlinked root, or a temporary directory the platform
+/// resolves elsewhere (`/tmp` -> `/private/tmp`). Those receipts
+/// validated; recording them verbatim left them absolute, and an
+/// absolute receipt is one no later read can safely walk.
+///
+/// So the second way is the containment the validator itself already
+/// trusts: canonicalize the anchor and the artifact and strip the one
+/// from the other (`artifact_canonical_containment`'s own discipline,
+/// R2). Normalizing here, at the writer, is what keeps the *recorded*
+/// shape walkable rather than leaving every later reader to re-derive
+/// it — and a path that is inside neither spelling of the checkout is
+/// still recorded verbatim, unchanged, because refusing to record a
+/// validated artifact's own claimed path would lose the only evidence
+/// of where it was.
+fn receipt_relative_path(worktree_path: &Path, artifact_path: &str) -> String {
+    if let Some(relative) = artifact_relative_to_worktree(worktree_path, artifact_path) {
+        return relative.to_string_lossy().into_owned();
+    }
+    let joined = if Path::new(artifact_path).is_absolute() {
+        PathBuf::from(artifact_path)
+    } else {
+        worktree_path.join(artifact_path)
+    };
+    if let Ok(canonical_root) = std::fs::canonicalize(worktree_path)
+        && let Ok(canonical_artifact) = std::fs::canonicalize(&joined)
+        && let Ok(relative) = canonical_artifact.strip_prefix(&canonical_root)
+        && !relative.as_os_str().is_empty()
+    {
+        return relative.to_string_lossy().into_owned();
+    }
+    artifact_path.to_string()
 }
 
 /// Canonical containment after the lexical and existence checks.  A failed
@@ -3955,7 +4316,62 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             World::Actor(actor) => actor.worktree_path.clone(),
             World::Deterministic(deterministic) => deterministic.cwd.clone(),
         };
+        // Ruling 0292, the custody half. A Git-basis Run's artifact
+        // lives in a checkout that outlives the Run and is version
+        // controlled, so the receipt names the file and the digest
+        // detects a later rewrite. An *output-only* Run has no checkout:
+        // its artifact lives in the owned execution directory, which is
+        // this Work's own working area and which `wirk work clean`
+        // removes. Naming that file and nothing else meant a validated
+        // Claim's bytes were only ever as durable as a working
+        // directory — and, while the execution area was the estate root
+        // (the defect corrected above), as durable as no other Work
+        // happening to declare the same output name.
+        //
+        // So an output-only Run's validated artifact is *snapshotted*,
+        // write-once, into this Work's own `claims/<claim>/<name>` —
+        // the immutable store ruling 0145 already built and
+        // `store_claimed_bytes` already writes durably-before-referenced
+        // (R2: the existing mechanism, no second store, no archive).
+        // The bytes are read exactly once, through the same bounded
+        // no-follow reader `wirk artifact` reads a receipt with, and the
+        // digest recorded is the digest of that buffer.
+        let snapshot_custody =
+            matches!(binding.world.source_basis(), SourceBasis::OutputOnly { .. });
         for artifact in claim.artifacts.iter().filter(|a| is_worktree_artifact(a)) {
+            let relative = receipt_relative_path(&worktree_path, &artifact.path);
+            // A name that cannot address a managed output (it is not one
+            // ordinary filename component) keeps today's worktree
+            // receipt rather than being refused: the Route is
+            // legitimate, and narrowing it is not this correction's
+            // business. `work clean` still refuses such a Work by name
+            // (`ClaimEvidenceInCheckout`), which is the truthful
+            // outcome — those bytes really would become unavailable.
+            let custody =
+                snapshot_custody && wirk_core::outputs::check_output_name(&artifact.name).is_ok();
+            if custody {
+                let bytes = match read_claimed_bytes(
+                    &worktree_path,
+                    &relative,
+                    state.resource_policy.artifact_max_bytes,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err((_, detail)) => {
+                        verdict =
+                            ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
+                                "the claimed artifact {} could not be read to record its content \
+                                 identity: {detail}",
+                                artifact.name
+                            )));
+                        artifact_receipts.clear();
+                        managed_bytes.clear();
+                        break;
+                    }
+                };
+                let digest = ArtifactReceipt::digest_of_bytes(&bytes);
+                managed_bytes.push((artifact.name.clone(), bytes, digest));
+                continue;
+            }
             let resolved = worktree_path.join(&artifact.path);
             let Some(digest) = ArtifactReceipt::digest_of(&resolved) else {
                 verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
@@ -3967,9 +4383,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             };
             artifact_receipts.push(ArtifactReceipt::worktree(
                 artifact.name.clone(),
-                artifact_relative_to_worktree(&worktree_path, &artifact.path)
-                    .map(|relative| relative.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| artifact.path.clone()),
+                relative,
                 digest,
             ));
         }
@@ -4189,6 +4603,11 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 if let Err((code, message)) =
                     advance_to_next_leaf(state, &work_id, &journaled_defs, &run.waypoint)
                 {
+                    // Guard already dropped, so the recovery takes its
+                    // own (`record_transition_failure`).
+                    if transition_is_permanent(code) {
+                        return record_transition_failure(state, &work_id, code, &message);
+                    }
                     return err_reply(code, &message);
                 }
                 return reply;
@@ -4201,12 +4620,102 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 &run.waypoint,
                 None,
             ) {
+                // Ruling 0283: this Claim is already journaled and this
+                // Run is already closed. A reservation that can never
+                // succeed — the next stage's own declarations are
+                // incompatible with the basis this Work runs on — left
+                // the Work Active at the stage just claimed with no
+                // open Run: `wirk work retry` and `wirk work fail` both
+                // refuse a Work in that state, so there was nothing to
+                // claim, nothing to retry and nothing to clean. The
+                // refusal is real and stays; what changes is that it is
+                // *recorded* as this Work's terminal failure, with the
+                // reservation's own words as the cause, so the Work can
+                // be inspected and cleaned like any other failed Work.
+                //
+                // Only for a refusal that will refuse again: a journal
+                // error, an unavailable projection or an unreadable
+                // contract is transient, and failing the Work over one
+                // would destroy work that a second call would have
+                // completed.
+                if transition_is_permanent(code) {
+                    let cause = FailureCause {
+                        status: None,
+                        request_id: None,
+                        at: now_ts(),
+                        detail: Some(format!(
+                            "the next stage could not be reserved and never will be: {message}"
+                        )),
+                    };
+                    let event = new_event(&work_id, None, EventKind::WorkFailed { cause });
+                    if let Err(err) = append_event(state, &mut journal, &work_id, &event) {
+                        return err_reply("JournalError", &err.to_string());
+                    }
+                    return err_reply(
+                        code,
+                        &format!(
+                            "{message}. This Claim stands; the Work is recorded failed rather \
+                             than left with no stage to run."
+                        ),
+                    );
+                }
                 return err_reply(code, &message);
             }
         }
     }
 
     reply
+}
+
+/// Whether a reservation refusal is one a later attempt could not fix
+/// (ruling 0283).
+///
+/// `IncompatibleSourceBasis` is a statement about the Route's own
+/// declarations against the basis this Work was submitted on: nothing
+/// about it changes between attempts. Every other code a reservation
+/// can return names something that might: a journal that could not be
+/// written, an Atlas projection that could not be assembled, a worker
+/// contract that could not be read. Those keep the existing behaviour —
+/// reported to the caller, Work untouched — because failing a Work over
+/// a transient condition destroys work a retry would have finished.
+fn transition_is_permanent(code: &str) -> bool {
+    code == "IncompatibleSourceBasis"
+}
+
+/// Records a permanent transition refusal as this Work's own terminal
+/// failure, taking the journal guard itself — the orienting
+/// auto-advance path has already dropped it.
+fn record_transition_failure(
+    state: &Arc<WirkdState>,
+    work_id: &WorkId,
+    code: &'static str,
+    message: &str,
+) -> Reply {
+    let journal = match journal_for(state, work_id) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let mut journal = lock_journal(&journal);
+    let cause = FailureCause {
+        status: None,
+        request_id: None,
+        at: now_ts(),
+        detail: Some(format!(
+            "the next stage could not be reserved and never will be: {message}"
+        )),
+    };
+    let event = new_event(work_id, None, EventKind::WorkFailed { cause });
+    if let Err(err) = append_event(state, &mut journal, work_id, &event) {
+        return err_reply("JournalError", &err.to_string());
+    }
+    err_reply(
+        code,
+        &format!(
+            "{message}. This Claim stands; the Work is recorded failed rather than left with no \
+             stage to run."
+        ),
+    )
 }
 
 /// The Waypoint that follows `after_leaf` in this Work's own flattened
@@ -4407,31 +4916,141 @@ fn reserve_next_leaf(
             // `format!("wirk/{}", ...)` `handle_submit` cuts once for
             // every Waypoint (one worktree per Work, never a second).
             WaypointKind::Actor => {
-                if !matches!(prior_basis, SourceBasis::Git { .. }) {
+                // An output-only Actor stage may follow an
+                // output-only prior stage in the same Route: the
+                // same owned directory (`cwd`, already resolved above
+                // as the prior World's own `worktree_path`) is reused
+                // unchanged, exactly as one Git worktree is reused
+                // across every Waypoint of a Work today. `Unknown`
+                // stays refused: it names no recorded inspection
+                // contract for a later Actor's Claim to be checked
+                // against (the same reasoning `handle_submit`'s own
+                // bare Actor arm already gives for minting `Unknown` in
+                // the first place).
+                if matches!(prior_basis, SourceBasis::Unknown) {
                     return Err((
                         "IncompatibleSourceBasis",
-                        "an Actor stage cannot inherit an output-only or unknown source basis"
+                        "an Actor stage cannot inherit an unknown source basis".to_string(),
+                    ));
+                }
+                if matches!(prior_basis, SourceBasis::OutputOnly { .. })
+                    && !next_def.boundary.0.is_empty()
+                {
+                    return Err((
+                        "IncompatibleSourceBasis",
+                        "an output-only Actor stage cannot declare a checkout boundary; it owns \
+                         no worktree to inspect"
                             .to_string(),
                     ));
                 }
-                let (repository, branch) = match &prior_world {
-                    Some(World::Actor(actor)) => (actor.repository.clone(), actor.branch.clone()),
+                // The address this estate materializes *this Work's*
+                // execution directory at, recomputed here rather than
+                // inherited — the same expression `WorktreeTarget`,
+                // `resolve_run_binding` and `executor.rs` all derive
+                // independently.
+                let owned_address = wirk_core::owned_execution_address(&state.estate_root, work_id);
+                let output_only = matches!(prior_basis, SourceBasis::OutputOnly { .. });
+                // A mixed Deterministic→Actor Route is legitimate and
+                // stays legitimate. What is not legitimate is where the
+                // Actor stage was being *put*: a Deterministic
+                // output-only World executes at the estate root
+                // (`handle_submit`'s own output-only arm), and copying
+                // its `cwd` into an Actor World made the whole estate
+                // this Work's execution directory — hashed into the
+                // World as `repository`, reported publicly as a checkout
+                // the Work never had, treated as already materialized by
+                // `resolve_run_binding`, and then used as the root Claim
+                // validation bounds this stage's artifacts against. A
+                // source-original directory reached the same way would
+                // become an Actor's write area.
+                //
+                // So the stage is reserved, and the *execution area* is
+                // corrected: an output-only Actor owns
+                // `<estate>/worktrees/<work>` and nothing else. When the
+                // prior stage already materialized exactly that (an
+                // Actor→Actor continuation), it is reused unchanged, as
+                // one Git worktree is reused across a Work's Waypoints.
+                // Otherwise the World is reserved *unmaterialized* —
+                // empty `worktree_path`, exactly as `handle_submit`
+                // leaves a first output-only Actor — so `wirk run`
+                // materializes the owned directory through its own Step
+                // 2, with the creation identity that path establishes.
+                // Refusing the Route instead would have narrowed the
+                // workflow rather than fixed it.
+                let (repository, branch) = match (&prior_world, output_only) {
+                    // No execution repository and no branch exist for an
+                    // output-only stage, whatever its predecessor was.
+                    // Left empty for the same reason `handle_submit`
+                    // leaves them empty: these fields are hashed into the
+                    // World and rendered publicly, and a source path or a
+                    // fabricated branch name there reports a checkout
+                    // this Work never had.
+                    (_, true) => (String::new(), String::new()),
+                    (Some(World::Actor(actor)), false) => {
+                        (actor.repository.clone(), actor.branch.clone())
+                    }
                     // A deterministic Git World carries its verified
                     // checkout in `cwd`. The logical repository binding
                     // name is not a path and therefore cannot support the
                     // Actor stage's later Git validation or retry.
-                    Some(World::Deterministic(deterministic)) => (
+                    (Some(World::Deterministic(deterministic)), false) => (
                         deterministic.cwd.display().to_string(),
                         format!("wirk/{}", work_id.0),
                     ),
-                    None => (String::new(), format!("wirk/{}", work_id.0)),
+                    (None, false) => (String::new(), format!("wirk/{}", work_id.0)),
                 };
+                let worktree_path = if !output_only {
+                    cwd
+                } else if paths_equal(&owned_address, &cwd) {
+                    owned_address
+                } else {
+                    PathBuf::new()
+                };
+                // The Write refusal `handle_submit`'s output-only Actor
+                // arm makes has to hold at *every* transition into one,
+                // not only at a Work's first Waypoint. The Deterministic
+                // output-only arm permits Write bindings (it refuses
+                // Read), so a Route whose first stage is Deterministic
+                // carried a Write grant straight into an Actor stage
+                // that owns no checkout to write through and whose Claim
+                // skips the worktree diff entirely — a mutation surface
+                // nothing could ever inspect. Read the Work's own
+                // recorded bindings, the same fold `freeze_review_targets`
+                // is handed just below.
+                if output_only
+                    && fold(&events)
+                        .repositories
+                        .iter()
+                        .any(|binding| binding.access == Access::Write)
+                {
+                    return Err((
+                        "IncompatibleSourceBasis",
+                        "an output-only Actor stage cannot inherit a Write binding: it owns no \
+                         checkout to write through, and no Claim of its could be checked against \
+                         one"
+                        .to_string(),
+                    ));
+                }
                 Some(World::Actor(ActorWorld {
                     repository,
-                    worktree_path: cwd,
+                    worktree_path,
                     branch,
-                    source_basis: SourceBasis::Git {
-                        base: base_sha.clone(),
+                    // Same pattern the Deterministic arm above already
+                    // uses for `next_world`'s own `source_basis`: fresh
+                    // per variant, from this reservation's own
+                    // `base_sha`, never `prior_basis` carried forward
+                    // unchanged (W4's own reasoning above covers Git;
+                    // an output-only `base_sha` already equals the
+                    // reference and carries no separate "as of now"
+                    // concept for staleness to apply to).
+                    source_basis: match &prior_basis {
+                        SourceBasis::Git { .. } => SourceBasis::Git {
+                            base: base_sha.clone(),
+                        },
+                        SourceBasis::OutputOnly { .. } => SourceBasis::OutputOnly {
+                            reference: base_sha.clone(),
+                        },
+                        SourceBasis::Unknown => unreachable!("refused above"),
                     },
                     base_sha,
                     triple: ExecutionTriple {
@@ -4844,11 +5463,32 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
             // `repo`/`base_sha` pair the reply's own `world` already
             // carries, and withheld beside it under narrowing.
             let worktree_created = events.iter().find_map(|event| match &event.kind {
-                EventKind::WorktreeCreated { repo, base_sha }
-                    if event.run.as_ref() == Some(&run.id) =>
-                {
-                    Some(json!({"repo": repo, "base_sha": base_sha}))
+                EventKind::WorktreeCreated {
+                    repo,
+                    base_sha,
+                    identity,
+                } if event.run.as_ref() == Some(&run.id) => {
+                    Some(json!({"repo": repo, "base_sha": base_sha, "identity": identity}))
                 }
+                _ => None,
+            });
+            // Ruling 0283: the *Work's* own creation registration,
+            // whichever Run made it. `worktree_created` above is
+            // deliberately this Run's own record and stays that way —
+            // it answers "did this Run already do the first half of its
+            // materialization?", which is a per-Run question. This
+            // answers a different one: "is the directory standing at
+            // this Work's owned address the one this estate created?",
+            // which every later Run of the same Work has to be able to
+            // ask, because reattachment is exactly the case where the
+            // creating Run is not this one. Journal-held, so an actor
+            // tidying its own directory cannot remove this estate's
+            // record of what it made.
+            let owned_registration = events.iter().rev().find_map(|event| match &event.kind {
+                EventKind::WorktreeCreated {
+                    identity: Some(identity),
+                    ..
+                } => Some(json!({"identity": identity})),
                 _ => None,
             });
             Some(json!({
@@ -4858,6 +5498,7 @@ fn handle_status(state: &Arc<WirkdState>, payload: StatusPayload) -> Reply {
                 "selection": selection,
                 "prior_selection": prior_selection,
                 "worktree_created": worktree_created,
+                "owned_registration": owned_registration,
                 "orientation": orientation,
                 "worktree_present": worktree_present,
                 "runtime_pin_present": runtime_pin_present,
@@ -5119,6 +5760,7 @@ fn withhold_status_content(result: &mut Value) -> usize {
             // is narrowed with them rather than published beside a
             // hidden copy of itself.
             hide(entry, "worktree_created", &mut withheld);
+            hide(entry, "owned_registration", &mut withheld);
             // W-C3: a narrowed reader learns *that* this Run's context
             // has a history and that it is not being shown it, the same
             // answer `world` already gives. The chain is hidden in both
@@ -5457,13 +6099,34 @@ fn handle_retry_inner(
 
     let fresh_world = match &prior_world {
         World::Actor(actor) => {
-            let fresh_base_sha = if binding.materialized {
-                match resolve_git_sha(&actor.worktree_path.display().to_string(), "HEAD") {
-                    Ok(base) => base,
-                    Err(detail) => return err_reply("ValidationUnavailable", &detail),
+            // Mirrors the Deterministic arm's per-variant match just
+            // below: an output-only Actor's
+            // materialized directory carries no Git HEAD to re-read,
+            // and its `base_sha` already equals the World's
+            // `SourceBasis::OutputOnly` reference, which never goes
+            // stale the way a Git HEAD can (there is no second writer
+            // able to advance it between Runs).
+            let (fresh_base_sha, source_basis) = match &actor.source_basis {
+                SourceBasis::Git { .. } => {
+                    let base = if binding.materialized {
+                        match resolve_git_sha(&actor.worktree_path.display().to_string(), "HEAD") {
+                            Ok(base) => base,
+                            Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                        }
+                    } else {
+                        actor.base_sha.clone()
+                    };
+                    (base.clone(), SourceBasis::Git { base })
                 }
-            } else {
-                actor.base_sha.clone()
+                SourceBasis::OutputOnly { reference } => (
+                    reference.clone(),
+                    SourceBasis::OutputOnly {
+                        reference: reference.clone(),
+                    },
+                ),
+                SourceBasis::Unknown => {
+                    return err_reply("ValidationUnavailable", "source basis is unknown");
+                }
             };
             World::Actor(ActorWorld {
                 worktree_path: if binding.materialized {
@@ -5471,10 +6134,8 @@ fn handle_retry_inner(
                 } else {
                     PathBuf::new()
                 },
-                base_sha: fresh_base_sha.clone(),
-                source_basis: SourceBasis::Git {
-                    base: fresh_base_sha,
-                },
+                base_sha: fresh_base_sha,
+                source_basis,
                 triple: ExecutionTriple {
                     estate_root: state.estate_root.display().to_string(),
                     work_id: work_id.clone(),
@@ -5772,6 +6433,12 @@ fn resolve_run_binding(
             }
             match &actor.source_basis {
                 SourceBasis::Git { base } if base == &actor.base_sha => {}
+                // An output-only Actor's own recorded basis, the
+                // exact counterpart the Deterministic arm
+                // below already accepts (`SourceBasis::OutputOnly {
+                // reference } if reference == &det.base_sha`) — an
+                // Actor World is not otherwise distinguished here.
+                SourceBasis::OutputOnly { reference } if reference == &actor.base_sha => {}
                 SourceBasis::Unknown => {
                     // W-C1 (BUILD.md §3.3): refuse the *journaled
                     // combination* `Unknown` basis plus a stage
@@ -5823,7 +6490,33 @@ fn resolve_run_binding(
             legacy_basis,
         });
     };
+    let expected_path = wirk_core::owned_execution_address(estate_root, work_id);
     if !initial_actor.worktree_path.as_os_str().is_empty() {
+        // A non-empty path used to *be* the proof of materialization,
+        // which asks nothing at all about where that path points. For an
+        // output-only Actor that was the whole of the F1 escape: a World
+        // reserved with the estate root (or any other inherited
+        // directory) in this field was reported materialized, launched
+        // in, and used as the root Claim validation bounds artifacts
+        // against. An output-only Actor's execution directory is this
+        // estate's own address for this Work or it is not this Work's,
+        // so the disagreement is refused rather than resolved into a
+        // binding.
+        //
+        // The Git arm is deliberately untouched: its worktree identity
+        // is established by git's own registration
+        // (`verify_worktree_identity`, `executor.rs`'s reattachment
+        // checks) and its historical journals are not re-judged here.
+        if matches!(initial_actor.source_basis, SourceBasis::OutputOnly { .. })
+            && !paths_equal(&expected_path, &initial_actor.worktree_path)
+        {
+            return Err(format!(
+                "this Run's output-only Actor World names {} as its execution directory, which \
+                 is not this estate's own address for this Work ({})",
+                initial_actor.worktree_path.display(),
+                expected_path.display()
+            ));
+        }
         return Ok(RunBinding {
             world: resolved,
             materialized: true,
@@ -5831,7 +6524,6 @@ fn resolve_run_binding(
         });
     }
 
-    let expected_path = estate_root.join("worktrees").join(&work_id.0);
     let mut materialized: Option<World> = None;
     let launch_index = events.iter().enumerate().find_map(|(index, event)| {
         matches!(
@@ -5847,7 +6539,7 @@ fn resolve_run_binding(
         }
         let created = &events[index];
         let updated = &events[index + 1];
-        let EventKind::WorktreeCreated { repo, base_sha } = &created.kind else {
+        let EventKind::WorktreeCreated { repo, base_sha, .. } = &created.kind else {
             continue;
         };
         let EventKind::WaypointReserved {
@@ -5906,13 +6598,7 @@ fn resolve_run_binding(
 }
 
 fn paths_equal(expected: &Path, actual: &Path) -> bool {
-    match (
-        std::fs::canonicalize(expected),
-        std::fs::canonicalize(actual),
-    ) {
-        (Ok(expected), Ok(actual)) => expected == actual,
-        _ => expected == actual,
-    }
+    wirk_core::paths_equal(expected, actual)
 }
 
 fn estate_roots_equal(expected: &Path, actual: &str) -> bool {
@@ -7315,6 +8001,33 @@ struct WorktreeTarget {
     repository: PathBuf,
     worktree_path: PathBuf,
     branch: String,
+    /// Which identity check and removal mechanism apply: an output-only
+    /// Actor's directory carries no Git registration for
+    /// `verify_worktree_identity`/`worktree_remove` to consult.
+    source_basis: SourceBasis,
+    /// The address this estate would materialize this Work's execution
+    /// directory at, recomputed from the estate root and Work id rather
+    /// than taken from the journal. For an output-only Actor this is
+    /// the whole of the ownership proof: a remembered path that no
+    /// longer canonicalizes onto this address is some other directory,
+    /// whatever it is named, and is never removed.
+    owned_address: PathBuf,
+    /// The Work this directory would have to have been created for, and
+    /// every Run of it that could have created one. Checked against the
+    /// creation marker the materialization itself wrote
+    /// (`wirk_core::read_owned_marker`): address equality says where a
+    /// directory is, never that this estate made it.
+    work_id: WorkId,
+    run_ids: Vec<RunId>,
+    /// Ruling 0283: the identity of the directory this Work's own
+    /// materialization actually created, as journaled on
+    /// `WorktreeCreated`. Held outside the directory itself, so an
+    /// actor removing its own `.wirk-owned` does not remove this
+    /// estate's record of what it made — and bound to the directory
+    /// *object*, so a copied marker naming this Work does not stand in
+    /// for it. `None` for a Work materialized before the identity was
+    /// recorded, where the marker is still the only answer available.
+    created_identity: Option<wirk_core::DirectoryIdentity>,
 }
 
 fn resolve_worktree_target(
@@ -7334,13 +8047,54 @@ fn resolve_worktree_target(
             Err(_) => continue,
         };
         match binding.world {
+            // Ruling 0292: an output-only Deterministic Run's residue is
+            // an *owned execution directory* — this estate's own address
+            // for this Work, created and registered by the same
+            // materialization an output-only Actor's is, and proven the
+            // same way by `verify_worktree_identity` below. Disposing of
+            // it is the eventual cleanup the owned-workflow outcome
+            // requires, and refusing it forever (the observed behaviour:
+            // every Work carrying a Deterministic stage was
+            // undisposable) is not a safety property, it is the residue
+            // staying behind.
+            //
+            // A *Git*-basis Deterministic World is unchanged and still
+            // out of scope here (ruling 0203): its `cwd` is a checkout
+            // whose own removal is git's, and nothing in this increment
+            // asked for it.
+            World::Deterministic(det)
+                if matches!(det.source_basis, SourceBasis::OutputOnly { .. }) =>
+            {
+                return Ok(Some(WorktreeTarget {
+                    // No repository and no branch exist for an
+                    // output-only World; the Git removal path is never
+                    // reached for one (`source_basis` selects it), and
+                    // naming a path here would report a checkout this
+                    // Work never had.
+                    repository: PathBuf::new(),
+                    worktree_path: det.cwd,
+                    branch: String::new(),
+                    source_basis: det.source_basis,
+                    owned_address: wirk_core::owned_execution_address(estate_root, work_id),
+                    work_id: work_id.clone(),
+                    run_ids: run_ids.to_vec(),
+                    created_identity: events.iter().rev().find_map(|event| match &event.kind {
+                        EventKind::WorktreeCreated {
+                            identity: Some(identity),
+                            ..
+                        } => Some(*identity),
+                        _ => None,
+                    }),
+                }));
+            }
             World::Deterministic(_) => {
                 return Err((
                     "DeterministicNotSupported",
                     format!(
-                        "Run {} reserved a Deterministic World; wirk work clean covers Actor \
-                         checkouts only in this increment (ruling 0203) — Deterministic residue \
-                         is out of scope here",
+                        "Run {} reserved a Deterministic World on a Git basis; wirk work clean \
+                         covers Actor checkouts and owned output-only execution directories \
+                         (ruling 0203, ruling 0292) — a Git-basis Deterministic checkout is out \
+                         of scope here",
                         run_id.0
                     ),
                 ));
@@ -7350,6 +8104,17 @@ fn resolve_worktree_target(
                     repository: PathBuf::from(actor.repository),
                     worktree_path: actor.worktree_path,
                     branch: actor.branch,
+                    source_basis: actor.source_basis,
+                    owned_address: wirk_core::owned_execution_address(estate_root, work_id),
+                    work_id: work_id.clone(),
+                    run_ids: run_ids.to_vec(),
+                    created_identity: events.iter().rev().find_map(|event| match &event.kind {
+                        EventKind::WorktreeCreated {
+                            identity: Some(identity),
+                            ..
+                        } => Some(*identity),
+                        _ => None,
+                    }),
                 }));
             }
             World::Actor(_) => {}
@@ -7537,24 +8302,71 @@ fn pane_cwd_within(candidate: Option<&str>, worktree_path: &Path) -> bool {
     canon_candidate == canon_worktree || canon_candidate.starts_with(&canon_worktree)
 }
 
+/// What an identity check found at this Work's own execution address
+/// (ruling 0283).
+///
+/// `bool` folded two different findings into `false`: *nothing is
+/// there*, and *something is there that this estate cannot prove it
+/// made*. Both are safe — neither removes anything — but a cleanup
+/// reply that says only `worktree_removed: false` for the second is not
+/// telling the operator that a directory was found and deliberately
+/// left alone. The Git arm has always distinguished them
+/// (`PathMismatch`); this is the same distinction for the owned arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorktreeIdentity {
+    /// Proven to be this Work's own: git's registration for a checkout,
+    /// or the journaled creation identity (or the creation marker) for
+    /// an owned directory.
+    Registered,
+    /// Nothing at the address, and no administrative record naming it.
+    Absent,
+    /// A real directory stands at the address, and this estate cannot
+    /// prove it created it. Never removed; always reported, with why.
+    Unproven(String),
+}
+
+impl WorktreeIdentity {
+    fn registered(&self) -> bool {
+        matches!(self, WorktreeIdentity::Registered)
+    }
+
+    /// The word rendered in `wirk work clean`'s reply.
+    fn label(&self) -> &'static str {
+        match self {
+            WorktreeIdentity::Registered => "registered",
+            WorktreeIdentity::Absent => "absent",
+            WorktreeIdentity::Unproven(_) => "unproven",
+        }
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match self {
+            WorktreeIdentity::Unproven(detail) => Some(detail.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// Step 4 (QUALIFIED.md): the registered checkout at `target.worktree_path`
 /// is genuinely *this* Work's own — never a symlink substituted after
 /// the fact (ruling 0203: "do not follow a substituted symlink into
 /// another checkout"), and never another Work's checkout in the same
 /// repository (the qualified probe's own finding that a common Git
 /// directory cannot tell the two apart). Returns whether git still has
-/// *any* registration for this path at all: `Ok(true)` when a matching
+/// *any* registration for this path at all: `Registered` when a matching
 /// entry exists (the ordinary case, and the qualified probe's own
 /// "stale entry, directory gone" retry case — `worktree_remove` is
 /// itself idempotent over a missing directory as long as git's own
-/// record still names it); `Ok(false)` when neither the directory nor
+/// record still names it); `Absent` when neither the directory nor
 /// git's own administrative record names this path at all — already
 /// fully clean, nothing left to hand to `worktree_remove` at all (which
 /// would otherwise fail outright: git refuses `worktree remove` on a
 /// path it has no record of, `fatal: ... is not a working tree`, unlike
 /// its idempotent handling of a *registered* entry whose directory is
 /// merely gone).
-fn verify_worktree_identity(target: &WorktreeTarget) -> Result<bool, (&'static str, String)> {
+fn verify_worktree_identity(
+    target: &WorktreeTarget,
+) -> Result<WorktreeIdentity, (&'static str, String)> {
     if let Ok(metadata) = std::fs::symlink_metadata(&target.worktree_path)
         && metadata.file_type().is_symlink()
     {
@@ -7566,6 +8378,134 @@ fn verify_worktree_identity(target: &WorktreeTarget) -> Result<bool, (&'static s
                 target.worktree_path.display()
             ),
         ));
+    }
+
+    // An output-only Actor's directory has no Git worktree
+    // registration to consult, so ownership is proven against the
+    // address this estate itself would have materialized: the
+    // journalled path and the recomputed owned address must canonicalize
+    // onto the same directory (`paths_equal`, the same comparison
+    // `resolve_run_binding` already accepts a materialization by).
+    //
+    // `is_dir` alone would not establish this. A remembered path can
+    // now be a symlink into somewhere else entirely, or a directory
+    // this estate never created and does not own; both answer `is_dir`
+    // exactly as the genuine materialization does, and neither may be
+    // removed. Anything that is not a directory, or that resolves
+    // elsewhere, is reported unregistered and left alone.
+    if matches!(target.source_basis, SourceBasis::OutputOnly { .. }) {
+        if !paths_equal(&target.owned_address, &target.worktree_path) {
+            return Ok(WorktreeIdentity::Unproven(format!(
+                "the Run's recorded execution directory {} is not this estate's own address for \
+                 this Work ({}); it was not inspected further and nothing was removed",
+                target.worktree_path.display(),
+                target.owned_address.display()
+            )));
+        }
+        // Canonical comparison follows a redirect on *both* sides, so a
+        // substituted `<estate>/worktrees` agrees with itself. The
+        // container is checked directly, as `executor.rs` checks it
+        // before materializing into it.
+        if !target
+            .owned_address
+            .parent()
+            .and_then(|parent| std::fs::symlink_metadata(parent).ok())
+            .is_some_and(|meta| meta.file_type().is_dir())
+        {
+            return Ok(WorktreeIdentity::Unproven(format!(
+                "the container of {} is not a real directory of this estate, so the address \
+                 under it is not this estate's own; nothing was removed",
+                target.owned_address.display()
+            )));
+        }
+        match std::fs::symlink_metadata(&target.worktree_path) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Ok(WorktreeIdentity::Unproven(format!(
+                    "{} is not a directory; it was left exactly as it is",
+                    target.worktree_path.display()
+                )));
+            }
+            // Absent is the one finding that is genuinely clean: there
+            // is nothing at this Work's own address to prove anything
+            // about, and nothing to remove.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(WorktreeIdentity::Absent);
+            }
+            Err(err) => {
+                return Ok(WorktreeIdentity::Unproven(format!(
+                    "{} could not be inspected ({err}); nothing was removed",
+                    target.worktree_path.display()
+                )));
+            }
+        }
+        // Creation identity, which address equality plus `is_dir` is
+        // not: an unrelated real directory moved into this address
+        // answers both exactly as the genuine materialization does, and
+        // `remove_dir_all` would then take it and everything under it.
+        // The marker is written once, by the materialization itself, and
+        // names the Work and the Run that created the directory; the Run
+        // must be one this Work actually opened, so a marker copied from
+        // elsewhere does not pass either.
+        // Ruling 0283: the journaled creation identity first. It is the
+        // administrative registration git gives a checkout for free —
+        // held outside the directory, naming the directory *object*
+        // this Work's materialization created rather than the address
+        // it sits at, and therefore unaffected both by an actor tidying
+        // its own files and by a marker copied in from elsewhere.
+        //
+        // Ruling 0297: where no identity was ever recorded — every
+        // directory materialized before this field existed — nothing
+        // migrates: the marker is not read here to substitute for it,
+        // and such a directory is reported unproven and left alone,
+        // below, the same as one whose recorded and present identities
+        // cannot be told apart.
+        //
+        // *Removal* takes the strong answer only. What is about to
+        // happen is `remove_dir_all`, so the marker — which a recreation
+        // can carry, because anything can write one — is not enough
+        // here, and neither is an identity that cannot be told from a
+        // recreation. Ruling 0300 brought reattachment
+        // (`materialize_owned_directory`) to the same standard: it used
+        // to accept the weaker proof on the ground that reattaching
+        // destroys nothing, but the child launched next does not, so it
+        // refuses exactly this too now. An unproven directory is left
+        // exactly as it is and the reason says which limit was hit, so
+        // an operator can see that nothing is broken — the estate
+        // simply cannot prove this directory is its own.
+        let here = wirk_core::directory_identity(&target.worktree_path);
+        let Some(registered) = target.created_identity else {
+            return Ok(WorktreeIdentity::Unproven(format!(
+                "a directory stands at {} and this Work's journal registers no creation identity \
+                 to match it against, so this estate cannot prove it created it; it was left \
+                 exactly as it is",
+                target.worktree_path.display()
+            )));
+        };
+        let Some(present) = here else {
+            return Ok(WorktreeIdentity::Unproven(format!(
+                "{} could not be inspected as a directory of this estate, so it could not be \
+                 matched against the identity this Work registered; nothing was removed",
+                target.worktree_path.display()
+            )));
+        };
+        return Ok(match wirk_core::identity_proof(&registered, &present) {
+            wirk_core::IdentityProof::SameObject => WorktreeIdentity::Registered,
+            wirk_core::IdentityProof::DifferentObject { detail } => {
+                WorktreeIdentity::Unproven(format!(
+                    "{} is not the directory this Work created: {detail}; nothing was removed",
+                    target.worktree_path.display()
+                ))
+            }
+            wirk_core::IdentityProof::Indistinguishable { reason } => {
+                WorktreeIdentity::Unproven(format!(
+                    "{} cannot be proven to be the directory this Work created: {reason}. \
+                     Nothing was removed: an identity that cannot tell a recreation apart does \
+                     not authorize deleting what is there (ruling 0297)",
+                    target.worktree_path.display()
+                ))
+            }
+        });
     }
 
     let entries = match wirk_herdr::git::worktree_entries(&target.repository) {
@@ -7588,12 +8528,12 @@ fn verify_worktree_identity(target: &WorktreeTarget) -> Result<bool, (&'static s
             && entry.branch.as_deref() == Some(target.branch.as_str())
     });
     if matched {
-        return Ok(true);
+        return Ok(WorktreeIdentity::Registered);
     }
     if !target.worktree_path.exists() && !registered {
         // Neither the directory nor git's own administrative record
         // names this path at all: already fully clean, not a mismatch.
-        return Ok(false);
+        return Ok(WorktreeIdentity::Absent);
     }
     Err((
         "PathMismatch",
@@ -7701,7 +8641,7 @@ fn clean_work(
 
     let target = resolve_worktree_target(&events, &state.estate_root, work_id, &run_ids)?;
 
-    let mut worktree_registered = false;
+    let mut worktree_identity = WorktreeIdentity::Absent;
     if let Some(target) = &target {
         for run_id in &run_ids {
             let Some(run) = find_run(&events, run_id) else {
@@ -7709,9 +8649,17 @@ fn clean_work(
             };
             check_run_ownership(run_id, &run, &target.worktree_path)?;
         }
-        worktree_registered = verify_worktree_identity(target)?;
+        worktree_identity = verify_worktree_identity(target)?;
 
-        if worktree_registered && target.worktree_path.is_dir() {
+        if worktree_identity.registered()
+            && target.worktree_path.is_dir()
+            && !matches!(target.source_basis, SourceBasis::OutputOnly { .. })
+        {
+            // The ignored/uncommitted-content guards below are Git
+            // status checks, meaningless for an output-only Actor's
+            // directory. It holds only that Run's own working state;
+            // the admitted sources it read are originals living outside
+            // this owned area, which this verb never reaches.
             let ignored = wirk_herdr::git::ignored_paths(&target.worktree_path).map_err(|err| {
                 (
                     "IgnoredContent",
@@ -7760,18 +8708,40 @@ fn clean_work(
     let mut worktree_removed = false;
     let mut runtime_pins_removed: Vec<RunId> = Vec::new();
 
-    if worktree_registered && let Some(target) = &target {
+    if worktree_identity.registered()
+        && let Some(target) = &target
+    {
         if !dry_run {
-            match wirk_herdr::git::worktree_remove(&target.repository, &target.worktree_path) {
-                Ok(()) => worktree_removed = true,
-                Err(err) => {
-                    return Err((
-                        "UncommittedWork",
-                        format!(
-                            "git refused to remove the worktree (uncommitted or untracked \
-                             changes preserved, nothing removed): {err}"
-                        ),
-                    ));
+            if matches!(target.source_basis, SourceBasis::OutputOnly { .. }) {
+                // An owned directory, not a Git checkout, and already
+                // proven to be this estate's own address for this Work
+                // by `verify_worktree_identity`. A directory already
+                // gone is not a failure: removal is idempotent the same
+                // way `git worktree remove`'s reuse paths are.
+                match std::fs::remove_dir_all(&target.worktree_path) {
+                    Ok(()) => worktree_removed = true,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        worktree_removed = true;
+                    }
+                    Err(err) => {
+                        return Err((
+                            "RemovalFailed",
+                            format!("could not remove the owned execution directory: {err}"),
+                        ));
+                    }
+                }
+            } else {
+                match wirk_herdr::git::worktree_remove(&target.repository, &target.worktree_path) {
+                    Ok(()) => worktree_removed = true,
+                    Err(err) => {
+                        return Err((
+                            "UncommittedWork",
+                            format!(
+                                "git refused to remove the worktree (uncommitted or untracked \
+                                 changes preserved, nothing removed): {err}"
+                            ),
+                        ));
+                    }
                 }
             }
         } else {
@@ -7831,6 +8801,12 @@ fn clean_work(
             "dry_run": true,
             "runs": run_ids.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
             "worktree_removed": worktree_removed,
+            // Ruling 0283: `worktree_removed: false` alone cannot tell
+            // "there was nothing there" from "a directory was found and
+            // deliberately left alone because this estate cannot prove
+            // it made it". Both are reported here, with the reason.
+            "worktree_state": worktree_identity.label(),
+            "worktree_detail": worktree_identity.detail(),
             "runtime_pins_removed": runtime_pins_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
             "outputs_staging_removed": outputs_staging_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
             "outputs_staging_requested": outputs_staging,
@@ -7879,6 +8855,8 @@ fn clean_work(
         "dry_run": false,
         "runs": run_ids.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
         "worktree_removed": worktree_removed,
+        "worktree_state": worktree_identity.label(),
+        "worktree_detail": worktree_identity.detail(),
         "runtime_pins_removed": runtime_pins_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
         "outputs_staging_removed": outputs_staging_removed.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
         "outputs_staging_requested": outputs_staging,
@@ -8039,14 +9017,20 @@ fn derive_retention(
             super::inventory::Retention::retain(
                 &mut retention.generations,
                 &generation.0,
-                format!("published generation of source {}", membership.alias),
+                super::inventory::RetentionHolder::Publication {
+                    membership: membership.id.0.clone(),
+                    alias: membership.alias.clone(),
+                },
             );
         }
         if let Some(edition) = atlas.selected_semantic(membership) {
             super::inventory::Retention::retain(
                 &mut retention.editions,
                 &edition.0,
-                format!("selected semantic edition of source {}", membership.alias),
+                super::inventory::RetentionHolder::Selection {
+                    membership: membership.id.0.clone(),
+                    alias: membership.alias.clone(),
+                },
             );
         }
     }
@@ -8056,7 +9040,7 @@ fn derive_retention(
     super::inventory::Retention::retain(
         &mut retention.contracts,
         &wirk_herdr::worker_contract::digest(),
-        "this build's own worker contract".to_string(),
+        super::inventory::RetentionHolder::OwnContract,
     );
 
     let works_dir = state.estate_root.join("works");
@@ -8131,14 +9115,18 @@ fn derive_retention(
             super::inventory::Retention::retain(
                 &mut retention.generations,
                 generation,
-                format!("a delivered World of work {} (not terminal)", work.id),
+                super::inventory::RetentionHolder::Work {
+                    work: work.id.clone(),
+                },
             );
         }
         for digest in &work.contract_digests {
             super::inventory::Retention::retain(
                 &mut retention.contracts,
                 digest,
-                format!("work {} is not terminal and reserves it", work.id),
+                super::inventory::RetentionHolder::Reservation {
+                    work: work.id.clone(),
+                },
             );
         }
     }
@@ -8166,7 +9154,9 @@ fn derive_retention(
                         super::inventory::Retention::retain(
                             &mut retention.generations,
                             generation,
-                            format!("unsettled finding {}", row.finding.id.0),
+                            super::inventory::RetentionHolder::Finding {
+                                finding: row.finding.id.0.clone(),
+                            },
                         );
                     }
                 }
@@ -8532,6 +9522,11 @@ fn membership_json(membership: &wirk_atlas::Membership) -> Value {
         "source": membership.source.0,
         "locator": membership.locator,
         "requested_ref": membership.requested_ref,
+        // Which acquisition policy this source was explicitly
+        // admitted under — disclosed here for the same reason every
+        // other admission fact already is: a caller should never have
+        // to guess what kind of thing an alias names.
+        "acquisition_policy": membership.policy,
     })
 }
 
@@ -8576,6 +9571,13 @@ fn generation_json(generation: &wirk_atlas::SourceGeneration) -> Value {
 /// only, never a query's side effect (BUILD-BRIEF.md: "Query and exact
 /// resolution cannot create, refresh, fetch, embed or repair stores").
 fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePayload) -> Reply {
+    // Ruling 0251 F4's own rule, applied to this verb: resolve the
+    // named Work against this daemon's own journals before anything
+    // runs, so an unknown or stale identity is refused rather than
+    // quietly widened to an administrative job.
+    if let Err(reply) = resolve_query_scope(state, &payload.work) {
+        return reply;
+    }
     // B3: admission first, atlas second.
     let admission = match admit_expensive(state, "atlas acquire", &payload.source) {
         Ok(admission) => admission,
@@ -8586,13 +9588,38 @@ fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePay
         .atlas
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let membership =
-        match atlas.register_git(&payload.source, &payload.repository, &payload.revision) {
-            Ok(membership) => membership,
-            Err(err) => return err_reply("AtlasError", &err.to_string()),
-        };
+    let _requester = atlas
+        .jobs()
+        .bind_requester(payload.work.as_ref().map(|work| work.0.clone()));
+    // The caller's explicit, one-time choice of acquisition policy for
+    // a source registered for the first time. Never inferred from
+    // `repository`'s own shape; an unknown spelling is refused rather
+    // than silently defaulted, the same rule every other
+    // misspelled-flag path in this product already follows.
+    let membership = match payload.kind.as_deref() {
+        None | Some("git") => {
+            atlas.register_git(&payload.source, &payload.repository, &payload.revision)
+        }
+        Some("document-tree") => {
+            atlas.register_document_tree(&payload.source, &payload.repository, &payload.revision)
+        }
+        Some(other) => {
+            return err_reply(
+                "InvalidRequest",
+                &format!("unknown source kind {other:?}; expected \"git\" or \"document-tree\""),
+            );
+        }
+    };
+    let membership = match membership {
+        Ok(membership) => membership,
+        Err(err) => return err_reply("AtlasError", &err.to_string()),
+    };
+    // `acquire` is always told a revision: it is required for a Git
+    // source and the caller-side default for a document collection is
+    // the sentinel this policy's own current state is named by, so
+    // there is nothing to resolve from the membership here.
     with_admission_notes(
-        acquire_reply(&mut atlas, &membership, &payload.revision),
+        acquire_reply(&mut atlas, &membership, &payload.revision, false),
         notes,
     )
 }
@@ -8602,6 +9629,13 @@ fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePay
 /// creates a registration, only `acquire` does); stages a candidate
 /// generation without publishing it.
 fn handle_atlas_refresh(state: &Arc<WirkdState>, payload: super::AtlasRefreshPayload) -> Reply {
+    // Ruling 0251 F4's own rule, applied to this verb: resolve the
+    // named Work against this daemon's own journals before anything
+    // runs, so an unknown or stale identity is refused rather than
+    // quietly widened to an administrative job.
+    if let Err(reply) = resolve_query_scope(state, &payload.work) {
+        return reply;
+    }
     let admission = match admit_expensive(state, "atlas refresh", &payload.source) {
         Ok(admission) => admission,
         Err(refusal) => return refusal,
@@ -8611,6 +9645,9 @@ fn handle_atlas_refresh(state: &Arc<WirkdState>, payload: super::AtlasRefreshPay
         .atlas
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    let _requester = atlas
+        .jobs()
+        .bind_requester(payload.work.as_ref().map(|work| work.0.clone()));
     let Some(membership) = atlas
         .memberships()
         .find(|membership| membership.alias == payload.source)
@@ -8621,18 +9658,75 @@ fn handle_atlas_refresh(state: &Arc<WirkdState>, payload: super::AtlasRefreshPay
             &format!("no registered source named {}", payload.source),
         );
     };
+    // An omitted revision means the membership's own policy default:
+    // the current observation for a document collection, and the
+    // registered `requested_ref` for a Git source, which is the ref
+    // that source was admitted to track. Resolved here because
+    // `refresh` never re-registers and so is never told a kind; the
+    // membership is the only thing that knows.
+    let revision = payload.revision.clone().unwrap_or_else(|| {
+        if membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY {
+            wirk_atlas::DOCUMENT_TREE_CURRENT_OBSERVATION.to_string()
+        } else {
+            membership.requested_ref.clone()
+        }
+    });
     with_admission_notes(
-        acquire_reply(&mut atlas, &membership, &payload.revision),
+        acquire_reply(&mut atlas, &membership, &revision, true),
         notes,
     )
 }
 
+/// A stopped job is not a failed one.
+///
+/// `AtlasError::Cancelled` means an operator cancelled this job, or it
+/// reached a checkpoint after its deadline. Nothing about the estate or
+/// the collection is wrong, and the same verb run again will do the
+/// same thing, so it gets its own code rather than being reported to a
+/// caller as `AtlasError` beside a malformed catalog.
+fn atlas_err_reply(err: &wirk_atlas::AtlasError) -> Reply {
+    match err {
+        wirk_atlas::AtlasError::Cancelled(detail) => err_reply("JobStopped", detail),
+        other => err_reply("AtlasError", &other.to_string()),
+    }
+}
+
+/// Dispatches on `membership.policy` — set once, at registration, by
+/// `register_git`/`register_document_tree` — so `acquire` and `refresh`
+/// (which never re-registers) both reach the correct `AtlasStore`
+/// method for an already-established source without either verb
+/// needing to be told the kind again. `is_refresh` picks the verb label
+/// a running document job is registered under, so `atlas cancel --list`
+/// names the command an operator actually ran rather than always
+/// reporting `atlas acquire`.
 fn acquire_reply(
     atlas: &mut wirk_atlas::AtlasStore,
     membership: &wirk_atlas::Membership,
     revision: &str,
+    is_refresh: bool,
 ) -> Reply {
-    match atlas.acquire(membership, revision, wirk_atlas::ExtractorPolicy::default()) {
+    let outcome = match (
+        membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY,
+        is_refresh,
+    ) {
+        (true, false) => atlas.acquire_document_tree(
+            membership,
+            revision,
+            wirk_atlas::ExtractorPolicy::default(),
+        ),
+        (true, true) => atlas.refresh_document_tree(
+            membership,
+            revision,
+            wirk_atlas::ExtractorPolicy::default(),
+        ),
+        (false, false) => {
+            atlas.acquire(membership, revision, wirk_atlas::ExtractorPolicy::default())
+        }
+        (false, true) => {
+            atlas.refresh(membership, revision, wirk_atlas::ExtractorPolicy::default())
+        }
+    };
+    match outcome {
         Ok(wirk_atlas::AcquireOutcome::Staged(generation)) => ok_reply(json!({
             "membership": membership_json(membership),
             "outcome": "staged",
@@ -8643,7 +9737,7 @@ fn acquire_reply(
             "outcome": "unavailable",
             "detail": detail,
         })),
-        Err(err) => err_reply("AtlasError", &err.to_string()),
+        Err(err) => atlas_err_reply(&err),
     }
 }
 
@@ -8652,7 +9746,227 @@ fn acquire_reply(
 /// operation from `acquire`/`refresh` (BUILD-BRIEF.md: "An immutable
 /// staged generation is unreadable to queries until a separate catalog
 /// publication names it").
+///
+/// **Two different costs behind one verb, and they are admitted
+/// differently.** Publishing a Git generation compares cheap structural
+/// identity — `git ls-tree` against the recorded tree — and is what
+/// this verb has always been: a catalog edit, not a job. A local
+/// document collection has no equivalent free listing, so validating
+/// that the staged generation still describes what is on disk means
+/// walking and re-reading the collection, bounded by the estate's
+/// document capture limits but genuinely acquisition-priced.
+///
+/// Dropping that revalidation is not an option: it is what stops a
+/// generation being published over inputs that have since changed. So
+/// the cost is admitted rather than hidden — a document publish takes
+/// the same expensive slot `acquire` and `refresh` take, under the same
+/// estate and host bounds and with the same visible refusal when the
+/// estate is busy. A Git publish keeps its existing semantics untouched
+/// and takes no slot.
+///
+/// The revalidation also runs as a **registered, cancellable job**
+/// (`AtlasStore::publish`'s document arm), so `atlas cancel --source`
+/// reaches it and the estate's job deadline bounds it. Both are
+/// cooperative: the walk and the extraction stop at their next
+/// checkpoint, which is per examined entry, and a read already blocked
+/// in the kernel is not interrupted — the non-blocking open bounds the
+/// open of a non-directory and the per-file byte bound stops a read
+/// from growing without limit, but neither bounds *time*: an
+/// `openat`/`fstatat`/`read` that blocks on a stalled locator (a hung
+/// NFS or FUSE mount) is not reached by either mechanism, and holds the
+/// atlas mutex past both the deadline and a cancellation until it
+/// returns or the process is killed from outside. A stopped publish
+/// advances no catalog, so the previously published generation stays
+/// exactly where it was.
 fn handle_atlas_publish(state: &Arc<WirkdState>, payload: super::AtlasPublishPayload) -> Reply {
+    // Ruling 0251 F4's own rule, applied to this verb: resolve the
+    // named Work against this daemon's own journals before anything
+    // runs, so an unknown or stale identity is refused rather than
+    // quietly widened to an administrative job.
+    if let Err(reply) = resolve_query_scope(state, &payload.work) {
+        return reply;
+    }
+    // The membership's kind decides the cost class, so it is read before
+    // admission — under its own short-lived lock, released before an
+    // admission that may wait or refuse.
+    let membership = {
+        let atlas = state
+            .atlas
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match atlas
+            .memberships()
+            .find(|membership| membership.alias == payload.source)
+            .cloned()
+        {
+            Some(membership) => membership,
+            None => {
+                return err_reply(
+                    "UnknownSource",
+                    &format!("no registered source named {}", payload.source),
+                );
+            }
+        }
+    };
+
+    let mut notes = Value::Array(vec![]);
+    let _admission = if membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY {
+        let admission = match admit_expensive(state, "atlas publish", &payload.source) {
+            Ok(admission) => admission,
+            Err(refusal) => return refusal,
+        };
+        notes = admission_notes(&admission);
+        Some(admission)
+    } else {
+        None
+    };
+
+    let mut atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    // Re-read under the lock actually held for the publish: between the
+    // read above and this one the source could have been removed, and
+    // publishing against a membership that is no longer registered must
+    // refuse rather than proceed on a stale copy.
+    let Some(membership) = atlas
+        .memberships()
+        .find(|candidate| candidate.alias == payload.source)
+        .cloned()
+    else {
+        return err_reply(
+            "UnknownSource",
+            &format!("no registered source named {}", payload.source),
+        );
+    };
+    let _requester = atlas
+        .jobs()
+        .bind_requester(payload.work.as_ref().map(|work| work.0.clone()));
+    let generation = wirk_atlas::GenerationId(payload.generation.clone());
+    match atlas.publish(&membership, &generation) {
+        Ok(()) => ok_reply(json!({
+            "membership": membership_json(&membership),
+            "generation": payload.generation,
+            "publication_revision": atlas.publication_revision(),
+            "admission_notes": notes,
+        })),
+        Err(err) => atlas_err_reply(&err),
+    }
+}
+
+/// Which of this source's own retained generations and editions are
+/// held by something other than this membership's own catalog entry.
+///
+/// **Both halves of this matter and they pull in opposite directions.**
+///
+/// A source's own publication retains its own published generation —
+/// that is what `derive_retention` records for every membership,
+/// including this one. Counting it would make removal impossible for
+/// any source that has ever published, because the thing holding the
+/// evidence would be the very catalog entry the removal releases. So
+/// this membership's own publication and selection are excluded, by
+/// identity rather than by matching the sentence they render as.
+///
+/// Everything else is not excluded, and that includes retained
+/// generations this source published *in the past*. A non-terminal Work
+/// whose delivered World pins an earlier generation, or an unsettled
+/// finding recorded against one, is retained under that generation's
+/// own id — not under the currently published one. Dropping the
+/// membership would make `AtlasStore::check_membership` refuse every
+/// coordinate in the source, invalidating live evidence whose bytes are
+/// still sitting untouched on disk. So every retained generation and
+/// edition is attributed to its source, not just the current pair.
+///
+/// **An identity that cannot be read is not evidence of safety.** A
+/// retained generation or edition whose record will not load could be
+/// this source's, and nothing here can show that it is not. That is
+/// returned as a hole, and the caller refuses on it, exactly as an
+/// incomplete retention set already refuses a cleanup.
+fn foreign_holders_of_source(
+    atlas: &wirk_atlas::AtlasStore,
+    membership: &wirk_atlas::Membership,
+    retention: &super::inventory::Retention,
+) -> Result<Vec<String>, Vec<String>> {
+    let mut retained_by: Vec<String> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+
+    for (id, holders) in &retention.generations {
+        let generation = match atlas.generation(&wirk_atlas::GenerationId(id.clone())) {
+            Ok(generation) => generation,
+            Err(err) => {
+                unreadable.push(format!(
+                    "retained generation {id} could not be read ({err}), so whether it belongs \
+                     to this source is unknown"
+                ));
+                continue;
+            }
+        };
+        if generation.source != membership.source || generation.locator != membership.locator {
+            continue;
+        }
+        for holder in holders {
+            if holder.is_own_catalog_entry_of(&membership.id.0) {
+                continue;
+            }
+            retained_by.push(holder.describe());
+        }
+    }
+
+    for (id, holders) in &retention.editions {
+        let edition = match atlas.read_edition(&wirk_atlas::EditionId(id.clone())) {
+            Ok(edition) => edition,
+            Err(err) => {
+                unreadable.push(format!(
+                    "retained semantic edition {id} could not be read ({err}), so whether it \
+                     belongs to this source is unknown"
+                ));
+                continue;
+            }
+        };
+        if edition.membership != membership.id {
+            continue;
+        }
+        for holder in holders {
+            if holder.is_own_catalog_entry_of(&membership.id.0) {
+                continue;
+            }
+            retained_by.push(holder.describe());
+        }
+    }
+
+    if !unreadable.is_empty() {
+        return Err(unreadable);
+    }
+    retained_by.sort();
+    retained_by.dedup();
+    Ok(retained_by)
+}
+
+/// `wirk atlas remove`: unregisters a source's own catalog membership —
+/// never a query's side effect, and never the source's own original
+/// files (`wirk_atlas::AtlasStore::remove_source`'s own doc). No
+/// `admit_expensive` here, matching `handle_atlas_publish` for a Git
+/// source: this is a catalog edit, not a job that spawns a bounded
+/// child.
+///
+/// **Protects active evidence before invalidating membership.**
+/// `resolve_exact` refuses once a membership is gone from the catalog
+/// (`AtlasStore::check_membership`), whether or not the generation's own
+/// bytes remain on disk — so dropping the membership underneath a
+/// non-terminal Work's delivered World, or an unsettled finding, would
+/// break real evidence even though no byte was deleted. This is exactly
+/// the retention `wirk estate clean` already derives and refuses
+/// against; `wirk-atlas` itself cannot compute it, because Work journals
+/// and the findings index are `wirkd`-level state, so the check runs
+/// here, before the store is asked to do anything, rather than inside
+/// `AtlasStore::remove_source`.
+///
+/// What it does *not* do is delete bytes. Membership is released here
+/// and the generation and edition files become unreferenced; reclaiming
+/// them stays with `wirk estate clean`, the estate's one cleanup owner,
+/// which re-derives retention against every remaining source before it
+/// removes anything.
+fn handle_atlas_remove(state: &Arc<WirkdState>, payload: super::AtlasRemovePayload) -> Reply {
     let mut atlas = state
         .atlas
         .lock()
@@ -8667,12 +9981,54 @@ fn handle_atlas_publish(state: &Arc<WirkdState>, payload: super::AtlasPublishPay
             &format!("no registered source named {}", payload.source),
         );
     };
-    let generation = wirk_atlas::GenerationId(payload.generation.clone());
-    match atlas.publish(&membership, &generation) {
-        Ok(()) => ok_reply(json!({
-            "membership": membership_json(&membership),
-            "generation": payload.generation,
+
+    let retention = derive_retention(state, &atlas);
+    if !retention.complete() {
+        return err_reply_with_notes(
+            "RetentionIncomplete",
+            "part of what this estate records could not be read, so it cannot be shown \
+             that nothing still needs this source's evidence. Nothing was removed",
+            &wirk_core::storage::tell_unreadable(
+                &retention.unreadable,
+                wirk_core::storage::Disclosure::Administrative,
+            ),
+        );
+    }
+    let retained_by = match foreign_holders_of_source(&atlas, &membership, &retention) {
+        Ok(retained_by) => retained_by,
+        Err(unreadable) => {
+            return err_reply_with_notes(
+                "RetentionIncomplete",
+                "part of this estate's own atlas records could not be read, so it cannot \
+                 be shown which of them belong to this source. Nothing was removed",
+                &unreadable,
+            );
+        }
+    };
+    if !retained_by.is_empty() {
+        return err_reply_with_notes(
+            "SourceRetained",
+            &format!(
+                "source {} still has evidence this estate's own records require; remove it \
+                 once that evidence is settled or terminal. Nothing was removed",
+                payload.source
+            ),
+            &retained_by,
+        );
+    }
+
+    match atlas.remove_source(&membership) {
+        Ok(outcome) => ok_reply(json!({
+            "outcome": "removed",
+            "source": payload.source,
             "publication_revision": atlas.publication_revision(),
+            "released_generation": outcome.released_generation.map(|g| g.0),
+            "released_edition": outcome.released_edition.map(|e| e.0),
+            "reclaim": "this source's own generation and edition bytes, if any, are now \
+                unreferenced by this estate's catalog and not yet removed; reclaim them with \
+                `wirk estate clean --class atlas-generations --all-unreferenced` (and \
+                --class atlas-editions), which re-derives retention against every remaining \
+                source before removing anything",
         })),
         Err(err) => err_reply("AtlasError", &err.to_string()),
     }
@@ -10365,6 +11721,112 @@ fn continuation_decision(
     }
 }
 
+/// What a Work's own delivered World was captured at: the Run, the
+/// projection reference, its publication revision and its generation
+/// vector. Read from the journal **before** the atlas lock is taken —
+/// the order `resolve_query_scope` already establishes for this verb,
+/// and the reason this is two functions rather than one.
+struct CapturedBasis {
+    run: RunId,
+    projection: wirk_core::ProjectionId,
+    revision: u64,
+    publication_revision: u64,
+    generations: Vec<(String, String)>,
+}
+
+fn captured_basis_of(state: &Arc<WirkdState>, work_id: &WorkId) -> Option<CapturedBasis> {
+    let journal = journal_for(state, work_id).ok().flatten()?;
+    let events = {
+        let journal = lock_journal(&journal);
+        journal.replay().ok()?
+    };
+    let run_id = all_run_ids(&events).pop()?;
+    let run = find_run(&events, &run_id)?;
+    let binding = resolve_run_binding(&events, &state.estate_root, work_id, &run_id).ok()?;
+    let reference = projection_chain(&binding, &run).pop()?;
+    let file =
+        wirk_core::ProjectionFile::read_referenced(&state.estate_root, work_id, &reference).ok()?;
+    Some(CapturedBasis {
+        run: run_id,
+        projection: reference.projection.clone(),
+        revision: reference.revision,
+        publication_revision: file.content.publication_revision(),
+        generations: file.content.generations().to_vec(),
+    })
+}
+
+/// Ruling 0292 (`p5-foundation-use/USE.md` finding 4): whether this
+/// current search read the estate at the same source basis the calling
+/// Work's own delivered World was captured at.
+///
+/// Both vectors are in hand at that moment and nothing said so. In the
+/// observed Run, `world show` reported the World pinned at publication
+/// revision 8 while `atlas search` in the same pane answered at revision
+/// 9 over a new generation, with no word that the two differed. Nothing
+/// was mislabelled — the search really is current, and current discovery
+/// is legitimate and stays legitimate — but an actor mixing the two
+/// surfaces had no way to see that it was mixing them.
+///
+/// So the divergence is *disclosed*, never resolved: the World is not
+/// refreshed, the search is not pinned back, and neither basis is
+/// rewritten. `None` when the Work names no delivered World to compare
+/// against, which is an absence of comparison and not a finding about
+/// either side.
+///
+/// The disclosure itself: the captured basis read above against the
+/// basis this answer actually read at.
+fn captured_basis_disclosure(captured: &CapturedBasis, answer: &wirk_atlas::SearchAnswer) -> Value {
+    let captured_revision = captured.publication_revision;
+    let run = captured.run.0.clone();
+    let projection = captured.projection.0.clone();
+    let revision = captured.revision;
+    let captured: BTreeMap<&str, &str> = captured
+        .generations
+        .iter()
+        .map(|(membership, generation)| (membership.as_str(), generation.as_str()))
+        .collect();
+    // Only the memberships this answer actually read are compared: a
+    // membership the World captured and this query never touched is not
+    // a divergence in what was just returned.
+    let mut differing = Vec::new();
+    for (membership, generation) in &answer.generations {
+        match captured.get(membership.0.as_str()) {
+            Some(captured_generation) if *captured_generation == generation.0.as_str() => {}
+            Some(captured_generation) => differing.push(json!({
+                "membership": membership.0,
+                "captured": captured_generation,
+                "current": generation.0,
+            })),
+            // Not in the captured vector at all: this source was not
+            // part of the World's own basis. Reported as such rather
+            // than as a changed generation, which it is not.
+            None => differing.push(json!({
+                "membership": membership.0,
+                "captured": Value::Null,
+                "current": generation.0,
+            })),
+        }
+    }
+    let diverges = !differing.is_empty() || captured_revision != answer.publication_revision;
+    json!({
+        "run": run,
+        "projection": projection,
+        "revision": revision,
+        "captured_publication_revision": captured_revision,
+        "current_publication_revision": answer.publication_revision,
+        "state": if diverges { "diverges" } else { "matches" },
+        "differing_generations": differing,
+        "detail": if diverges {
+            "these hits were read at the estate's current publication, which is not the basis \
+             this Run's delivered World was captured at; the World is not refreshed by this \
+             search and these results are not part of it"
+        } else {
+            "this search read the same publication revision and generations this Run's delivered \
+             World was captured at"
+        },
+    })
+}
+
 fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPayload) -> Reply {
     let scope = match resolve_query_scope(state, &payload.work) {
         Ok(scope) => scope,
@@ -10535,6 +11997,14 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
             (Some(pinned), decoded.offset)
         }
     };
+    // Ruling 0292: the calling Work's own captured World basis, read
+    // from its journal **here**, before the atlas lock below — the same
+    // order `resolve_query_scope` already takes, and never a journal
+    // lock acquired underneath the atlas one.
+    let captured_basis = payload
+        .work
+        .as_ref()
+        .and_then(|work| captured_basis_of(state, work));
     // A search is a cheap read: it must not queue invisibly behind an
     // expensive build. Note this bounds waiting for the *catalog*; the
     // semantic query child it may then spawn is bounded separately, by
@@ -10611,6 +12081,9 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
                     .map(|application| application.producer_pin.basis.label().to_owned()),
             };
             ok_reply(json!({
+                "captured_basis": captured_basis
+                    .as_ref()
+                    .map(|captured| captured_basis_disclosure(captured, &answer)),
                 "publication_revision": answer.publication_revision,
                 "generations": answer.generations.iter().map(|(membership, generation)| json!({
                     "membership": membership.0,
@@ -10695,25 +12168,47 @@ fn handle_atlas_resolve(state: &Arc<WirkdState>, payload: super::AtlasResolvePay
         );
     };
     match atlas.resolve_exact(&membership, &coordinate) {
-        Ok(outcome) => ok_reply(resolve_outcome_json(outcome, &membership.locator)),
+        Ok(outcome) => {
+            let total_bytes = resource_total_bytes(&atlas, &membership, &coordinate);
+            ok_reply(resolve_outcome_json(outcome, total_bytes))
+        }
         Err(err) => err_reply("AtlasError", &err.to_string()),
     }
 }
 
-/// The full committed blob's own byte length (P3 W3 correction, ruling
-/// 0093, W3-CORRECTION.md item 4; VERDICT.md L3: "no evidence budget is
-/// disclosed on either search or resolve"): `resolve`'s own answer
-/// already names an exact `byte_start`/`byte_end` span the caller
-/// chose; this discloses how large the object it was cut from actually
-/// is, so a caller can tell a deliberately narrow span from the whole
-/// object. Read directly from Git (`cat-file -s`), never from the
-/// bounded extracted unit — the same real-object source `resolve_exact`
-/// itself already re-verified the span against.
-fn blob_total_bytes(locator: &str, object_id: &str) -> Option<u64> {
+/// The full resource's own byte length, so a caller can tell a
+/// deliberately narrow span from the whole object.
+///
+/// `resolve`'s answer already names the exact `byte_start`/`byte_end`
+/// span the caller asked for; this discloses how large the thing it was
+/// cut from actually is.
+///
+/// **Read from whichever source actually holds the resource.** For a
+/// Git source that is `git cat-file -s` against the object store — the
+/// same real object `resolve_exact` re-verified the span against. For a
+/// local document collection there is no object store and no
+/// repository to run `git` in: spawning one there produced a failed
+/// process and a `null` length, so a document resolve silently lost the
+/// budget disclosure a Git resolve got. The length is already recorded
+/// on the generation's own `ResourceRecord`, read and verified at
+/// acquisition, so it is taken from there.
+fn resource_total_bytes(
+    atlas: &wirk_atlas::AtlasStore,
+    membership: &wirk_atlas::Membership,
+    coordinate: &wirk_atlas::ExactCoordinate,
+) -> Option<u64> {
+    if membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY {
+        let generation = atlas.generation(&coordinate.generation).ok()?;
+        return generation
+            .resources
+            .iter()
+            .find(|resource| resource.path == coordinate.path)
+            .and_then(|resource| resource.byte_len);
+    }
     let output = Command::new("git")
         .arg("-C")
-        .arg(locator)
-        .args(["cat-file", "-s", object_id])
+        .arg(&membership.locator)
+        .args(["cat-file", "-s", &coordinate.object_id])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -10722,7 +12217,7 @@ fn blob_total_bytes(locator: &str, object_id: &str) -> Option<u64> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
-fn resolve_outcome_json(outcome: wirk_atlas::ResolveOutcome, locator: &str) -> Value {
+fn resolve_outcome_json(outcome: wirk_atlas::ResolveOutcome, total_bytes: Option<u64>) -> Value {
     match outcome {
         wirk_atlas::ResolveOutcome::Resolved(evidence) => json!({
             "outcome": "resolved",
@@ -10734,7 +12229,7 @@ fn resolve_outcome_json(outcome: wirk_atlas::ResolveOutcome, locator: &str) -> V
             "bytes_hex": hex_encode(&evidence.bytes),
             "budget": {
                 "returned_bytes": evidence.bytes.len(),
-                "total_bytes": blob_total_bytes(locator, &evidence.coordinate.object_id),
+                "total_bytes": total_bytes,
             },
         }),
         wirk_atlas::ResolveOutcome::Absent => json!({"outcome": "absent"}),
@@ -18288,6 +19783,88 @@ mod tests {
     use super::*;
     use std::process::Stdio;
 
+    /// Ruling 0283: a validated artifact claimed by absolute path, in an
+    /// estate reached through a symlink, is inside the Run's own
+    /// checkout — canonically — and its receipt has to be walkable
+    /// afterwards. The lexical strip alone answers `None` for it, and
+    /// recording the claimed path verbatim left an absolute receipt no
+    /// later read can safely follow.
+    #[test]
+    fn an_absolute_artifact_path_inside_the_checkout_is_recorded_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("out")).unwrap();
+        std::fs::write(real.join("out").join("draft.md"), b"# Draft\n").unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let canonical_real = std::fs::canonicalize(&real).unwrap();
+
+        // The World names the checkout through the link; the executor's
+        // own declared-output shape is the absolute canonical path.
+        let claimed = canonical_real.join("out").join("draft.md");
+        assert_eq!(
+            receipt_relative_path(&linked, &claimed.display().to_string()),
+            "out/draft.md",
+            "an absolute path canonically inside the checkout records relative"
+        );
+        // The ordinary case is untouched.
+        assert_eq!(
+            receipt_relative_path(&linked, "out/draft.md"),
+            "out/draft.md"
+        );
+        // Outside both spellings: recorded verbatim, because refusing to
+        // record it would lose the only evidence of where it was.
+        let outside = dir.path().join("elsewhere.md");
+        std::fs::write(&outside, b"x").unwrap();
+        assert_eq!(
+            receipt_relative_path(&linked, &outside.display().to_string()),
+            outside.display().to_string()
+        );
+    }
+
+    /// The read side of the same shape: a receipt already recorded
+    /// absolute (every one written before the writer normalized) still
+    /// resolves, through the anchored no-follow walk rather than through
+    /// a `Path::join` that would discard the anchor.
+    #[test]
+    fn an_absolute_receipt_is_read_inside_its_own_anchor_and_nowhere_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("out")).unwrap();
+        std::fs::write(real.join("out").join("draft.md"), b"# Draft\n").unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let canonical_real = std::fs::canonicalize(&real).unwrap();
+
+        let recorded = canonical_real
+            .join("out")
+            .join("draft.md")
+            .display()
+            .to_string();
+        let bytes = read_claimed_bytes(&linked, &recorded, 4096).expect("the artifact resolves");
+        assert_eq!(bytes, b"# Draft\n");
+
+        // Absolute and outside the anchor: unresolved, never joined.
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, b"not ours\n").unwrap();
+        let (code, _) = read_claimed_bytes(&linked, &outside.display().to_string(), 4096)
+            .expect_err("an absolute path outside the anchor does not resolve");
+        assert_eq!(code, "ArtifactUnresolved");
+
+        // A symlink standing where the artifact should be is refused
+        // rather than followed, absolute recorded path or not: the final
+        // component is carried across untouched and the walk refuses it.
+        std::os::unix::fs::symlink(&outside, real.join("out").join("link.md")).unwrap();
+        let through_link = canonical_real
+            .join("out")
+            .join("link.md")
+            .display()
+            .to_string();
+        let (code, _) = read_claimed_bytes(&linked, &through_link, 4096)
+            .expect_err("a symlinked artifact is not followed");
+        assert_eq!(code, "ArtifactUnresolved");
+    }
+
     /// The journal lock discipline's own detector, watched failing
     /// (`CLAUDE.md`: a test is deterministic and has been watched fail,
     /// or it is not a test). `no_journal_guard_held` is what makes the
@@ -19531,6 +21108,7 @@ mod tests {
                 &EventKind::WorktreeCreated {
                     repo: "r".to_string(),
                     base_sha: "s".to_string(),
+                    identity: None,
                 },
             )
             .is_ok(),
@@ -22868,6 +24446,15 @@ fn open_no_follow(
     let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     if directory {
         flags |= libc::O_DIRECTORY;
+    } else {
+        // `O_NOFOLLOW` refuses a symlink; it says nothing about a FIFO
+        // or a device, and opening either of those blocks — a daemon
+        // thread parked indefinitely on an entry some other process
+        // chose. `O_NONBLOCK` makes the open itself return instead, and
+        // the `fstat` every caller already performs then refuses the
+        // non-regular file before a single byte is read. On a regular
+        // file the flag does nothing at all.
+        flags |= libc::O_NONBLOCK;
     }
     // SAFETY: `name` is NUL-terminated and outlives the call, `parent`
     // is a live borrowed descriptor, and the result is either -1 or a
@@ -22985,6 +24572,203 @@ fn read_staged_output(
     }
 }
 
+/// The components of a recorded receipt path, when it is a plain
+/// relative walk this daemon can perform inside the area that owns it.
+///
+/// `None` for anything else: an absolute path, an empty path, a `.` or
+/// `..` component, or a component carrying a NUL. A receipt may record
+/// the claimed path verbatim, absolute included
+/// (`ArtifactReceipt::path`'s own doc), and `Path::join` with an
+/// absolute argument silently discards the base it was supposed to be
+/// contained by — so this refuses rather than joins.
+fn receipt_components(relative: &str) -> Option<Vec<String>> {
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_str()?;
+                if part.is_empty() || part.contains('\0') {
+                    return None;
+                }
+                components.push(part.to_string());
+            }
+            _ => return None,
+        }
+    }
+    (!components.is_empty()).then_some(components)
+}
+
+/// The bytes of one claimed artifact, read inside `anchor` through the
+/// same no-follow component walk `read_staged_output` uses, bounded by
+/// this estate's own configured artifact size.
+///
+/// Both stores go through this. The `WorkOutputs` arm previously proved
+/// containment and regular-fileness through `outputs::resolve_stored`
+/// and then read the resolved path again with `std::fs::read`, and the
+/// `Worktree` arm proved nothing at all: it joined the recorded path
+/// onto the Run's worktree — discarding the worktree entirely when that
+/// path was absolute — and read it unbounded. Re-hashing afterwards
+/// bounds what content can be *disclosed*; it does not bound what is
+/// read, does not stop a FIFO or a device from parking a daemon thread,
+/// and does not stop the reply naming a path outside the owned area for
+/// the caller to read and export.
+///
+/// So: one anchor, one component at a time with `O_NOFOLLOW`
+/// (`open_no_follow`, R2 — no ancestor left in any lookup for a rename
+/// to retarget), `fstat` on the descriptor that survives, an explicit
+/// size refusal against `ResourcePolicy::artifact_max_bytes`, and a read
+/// bounded by that same number. Check and read address the same open
+/// file object.
+fn read_claimed_bytes(
+    anchor: &Path,
+    relative: &str,
+    cap: u64,
+) -> Result<Vec<u8>, (&'static str, String)> {
+    let unresolved = || {
+        (
+            "ArtifactUnresolved",
+            "the recorded path no longer addresses a file inside the area that owns it".to_string(),
+        )
+    };
+    let Ok(root) = std::fs::canonicalize(anchor) else {
+        return Err((
+            "ArtifactUnresolved",
+            "the area that owns this artifact could not be inspected".to_string(),
+        ));
+    };
+    // Ruling 0283: a receipt written before the writer normalized
+    // (`receipt_relative_path`) may hold an absolute path that is
+    // genuinely inside this anchor — the shape `ArtifactReceipt::path`
+    // itself documents, and one a validated Claim really does carry
+    // where the estate is reached through a symlink. Those artifacts
+    // are still retrievable, and refusing them outright would make a
+    // Claim that genuinely validated permanently unreadable.
+    //
+    // What is *not* done is joining it: `Path::join` with an absolute
+    // argument discards the anchor entirely. The absolute path is
+    // placed inside the canonical anchor first, and only the remainder
+    // is walked — one component at a time, no-follow, exactly as a
+    // relative receipt is walked. A path that canonicalizes outside the
+    // anchor, or that cannot be canonicalized at all, stays unresolved.
+    let placed;
+    let relative = if Path::new(relative).is_absolute() {
+        // The *parent* is canonicalized, never the artifact itself:
+        // canonicalizing the last component would resolve a symlink
+        // standing where the artifact should be and quietly read its
+        // target. The final component is carried across untouched, so
+        // the walk below refuses it the same way it refuses one in a
+        // relative receipt.
+        let recorded = Path::new(relative);
+        match recorded
+            .parent()
+            .zip(recorded.file_name())
+            .and_then(|(parent, name)| {
+                let canonical = std::fs::canonicalize(parent).ok()?;
+                let rest = canonical.strip_prefix(&root).ok()?.join(name);
+                Some(rest.to_string_lossy().into_owned())
+            })
+            .filter(|rest| !rest.is_empty())
+        {
+            Some(rest) => {
+                placed = rest;
+                placed.as_str()
+            }
+            None => return Err(unresolved()),
+        }
+    } else {
+        relative
+    };
+    let Some(components) = receipt_components(relative) else {
+        return Err(unresolved());
+    };
+    let Ok(root_dir) = std::fs::File::open(&root) else {
+        return Err((
+            "ArtifactUnresolved",
+            "the area that owns this artifact could not be opened".to_string(),
+        ));
+    };
+    let mut dir: OwnedFd = root_dir.into();
+    let (name, directories) = components.split_last().expect("non-empty, checked above");
+    for component in directories {
+        match open_no_follow(dir.as_fd(), component, true) {
+            Ok(next) => dir = next,
+            Err(err) => {
+                return Err(match staged_open_failure(&err) {
+                    StagedRead::Absent => (
+                        "ArtifactAbsent",
+                        "the claimed bytes are no longer at that address".to_string(),
+                    ),
+                    _ => unresolved(),
+                });
+            }
+        }
+    }
+    let opened = match open_no_follow(dir.as_fd(), name, false) {
+        Ok(fd) => fd,
+        Err(err) => {
+            return Err(match staged_open_failure(&err) {
+                StagedRead::Absent => (
+                    "ArtifactAbsent",
+                    "the claimed bytes are no longer at that address".to_string(),
+                ),
+                _ => unresolved(),
+            });
+        }
+    };
+    let mut file = std::fs::File::from(opened);
+    let Ok(meta) = file.metadata() else {
+        return Err((
+            "ArtifactAbsent",
+            "the claimed bytes could not be inspected".to_string(),
+        ));
+    };
+    if !meta.file_type().is_file() {
+        return Err(unresolved());
+    }
+    if meta.len() > cap {
+        return Err((
+            "ArtifactTooLarge",
+            format!(
+                "the claimed artifact is {} bytes, above this estate's artifact_max_bytes of \
+                 {cap}; nothing was read (raise it in .wirk/resources.json)",
+                meta.len()
+            ),
+        ));
+    }
+    let mut bytes = Vec::new();
+    // Bounded even though `fstat` already agreed: a file can grow
+    // between the two, and a truncated answer reported under a Claim's
+    // digest would be a different artifact. One byte over the cap is
+    // read deliberately, so growth is *detected* rather than silently
+    // cut at the boundary.
+    match io::Read::read_to_end(
+        &mut io::Read::take(&mut file, cap.saturating_add(1)),
+        &mut bytes,
+    ) {
+        Ok(_) => {}
+        Err(err) => {
+            return Err((
+                "ArtifactAbsent",
+                format!("the claimed bytes could not be read: {err}"),
+            ));
+        }
+    }
+    if bytes.len() as u64 > cap {
+        return Err((
+            "ArtifactTooLarge",
+            format!(
+                "the claimed artifact grew past this estate's artifact_max_bytes of {cap} while \
+                 it was being read; nothing is reported"
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Removes the `.tmp-` files a crash between a projection's temp write
 /// and its rename can leave. See the call site's own note for why
 /// nothing else in `projections/` is ever removed.
@@ -23002,6 +24786,189 @@ fn sweep_projection_temporaries(state: &Arc<WirkdState>) {
             }
         }
     }
+}
+
+/// Resolves one artifact a validated `Done` Claim of this caller's own
+/// Work was checked against, and reports where its recorded bytes are.
+///
+/// This is the operation a later stage needs in order to *revise* an
+/// earlier stage's output. The orientation projection already binds a
+/// prior stage's artifacts, but it delivers a bounded one-line summary
+/// of each (`bounded_summary`, 320 bytes) — enough to know the artifact
+/// exists and what it opens with, never enough to revise it. Nothing
+/// else in the public surface addressed a claimed artifact's bytes at
+/// all, so this is the missing read, not a second artifact store: the
+/// bytes stay exactly where `store_claimed_bytes` put them, and this
+/// only resolves and vouches for them.
+///
+/// Three facts are established before an address is reported, and the
+/// reply distinguishes them so a caller never has to guess which failed:
+///
+/// * the named Claim is a Claim **of this Work**, recorded `Validated`
+///   with kind `Done` — a refused Claim, a Question, and a Claim of a
+///   neighbouring Work are each `NotFound` here;
+/// * the Claim carries a receipt for `name`, and that receipt records a
+///   digest (a pre-correction receipt that recorded a name and nothing
+///   else can vouch for no bytes);
+/// * the recorded path still resolves inside this Work's own outputs
+///   area, and the bytes there still hash to the digest the Claim was
+///   validated against.
+///
+/// The last of those is re-checked on every call deliberately. A
+/// validated Claim says the bytes were right when it was filed; it is
+/// not a standing guarantee that they are still retrievable, and a
+/// caller about to revise them needs the current answer.
+fn handle_run_artifact(state: &Arc<WirkdState>, payload: super::RunArtifactPayload) -> Reply {
+    let work_id = payload.triple.work_id.clone();
+    let run_id = payload.triple.run_id.clone();
+    if !estate_roots_equal(&state.estate_root, &payload.triple.estate_root) {
+        return err_reply(
+            "TripleMismatch",
+            "the triple's estate root does not identify this daemon's estate",
+        );
+    }
+    if wirk_core::outputs::check_output_name(&payload.name).is_err() {
+        return err_reply("BadRequest", "that is not a declarable managed output name");
+    }
+    let journal = match journal_for(state, &work_id) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let events = {
+        let journal = lock_journal(&journal);
+        match journal.replay() {
+            Ok(events) => events,
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        }
+    };
+    if events.is_empty() {
+        return err_reply("NotFound", "no such work");
+    }
+    let Some(run) = find_run(&events, &run_id) else {
+        return err_reply(
+            "TripleMismatch",
+            "the run id does not match any Run opened for this Work",
+        );
+    };
+    // Reading an artifact is an act of *this* Run's execution authority,
+    // and a historical Run id is not that. `find_run` alone accepts any
+    // Run ever opened, including one a retry superseded — so a stale
+    // pane, restarted with an old triple in its environment, kept
+    // reading a current Claim's bytes as though it were still the actor
+    // in charge. This is the same currency check the record path
+    // (`handle_record`) and the child-receipt path already make: the
+    // caller must be the current, unsuperseded Run of its own Waypoint.
+    //
+    // It bounds the *caller*, never the Claim: an earlier leaf's
+    // validated Claim is exactly what a later stage is here to read, and
+    // that scope (any leaf of this Work) is unchanged —
+    // `bind_prior_stage_artifacts` already spans it.
+    let current_for_waypoint = latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0);
+    if current_for_waypoint.as_ref() != Some(&run_id) {
+        return err_reply(
+            "InvalidTransition",
+            &match &current_for_waypoint {
+                Some(current) => format!(
+                    "Run {} has been superseded by Run {} on Waypoint {}; a superseded Run does \
+                     not read this Work's claimed artifacts",
+                    run_id.0, current.0, run.waypoint.0
+                ),
+                None => format!(
+                    "Run {} is not the current Run of Waypoint {}",
+                    run_id.0, run.waypoint.0
+                ),
+            },
+        );
+    }
+    // The Claim must be this Work's own, Validated, and `Done`. Every
+    // other recorded outcome is deliberately indistinguishable from an
+    // unknown id here: none of them vouches for bytes.
+    let found = events.iter().rev().find_map(|event| match &event.kind {
+        EventKind::ClaimRecorded {
+            claim,
+            claim_kind: ClaimKind::Done,
+            verdict: ClaimVerdict::Validated,
+            artifacts,
+            ..
+        } if claim == &payload.claim && event.work == work_id => {
+            Some((event.run.clone(), artifacts.clone()))
+        }
+        _ => None,
+    });
+    let Some((claimed_by, artifacts)) = found else {
+        return err_reply(
+            "NotFound",
+            "this Work records no validated Done Claim with that id",
+        );
+    };
+    let Some(receipt) = artifacts
+        .iter()
+        .find(|receipt| receipt.name == payload.name)
+    else {
+        return err_reply(
+            "NotFound",
+            "that Claim was not validated against an artifact of that name",
+        );
+    };
+    if receipt.digest.is_empty() {
+        return err_reply(
+            "ArtifactUnrecorded",
+            "that receipt records a name and no digest, so it can vouch for no bytes",
+        );
+    }
+    // The area that owns this receipt, never guessed from the string —
+    // the same dispatch `work status` and the orientation assembly
+    // already make over `ArtifactStore`. Both arms now yield an
+    // *anchor* and a *relative walk*, because that is what a no-follow
+    // read needs; neither arm joins a recorded path onto a root and
+    // hopes.
+    let anchored = match receipt.store {
+        wirk_core::ArtifactStore::WorkOutputs => {
+            // `resolve_stored` stays the shape gate: a managed receipt is
+            // exactly `claims/<id>/<name>`, each component under its own
+            // rule, and anything else resolves to nothing here rather
+            // than being walked.
+            wirk_core::outputs::resolve_stored(&state.estate_root, &work_id, &receipt.path).and(
+                wirk_core::outputs::outputs_dir(&state.estate_root, &work_id),
+            )
+        }
+        wirk_core::ArtifactStore::Worktree => claimed_by
+            .as_ref()
+            .and_then(|run| worktree_path_for_run(&events, run)),
+    };
+    let Some(anchor) = anchored else {
+        return err_reply(
+            "ArtifactUnresolved",
+            "the recorded path no longer addresses a file inside the area that owns it",
+        );
+    };
+    let bytes = match read_claimed_bytes(
+        &anchor,
+        &receipt.path,
+        state.resource_policy.artifact_max_bytes,
+    ) {
+        Ok(bytes) => bytes,
+        Err((code, detail)) => return err_reply(code, &detail),
+    };
+    // The digest of the buffer that was actually read, not of a second
+    // lookup of the same path.
+    if wirk_core::ArtifactReceipt::digest_of_bytes(&bytes) != receipt.digest {
+        return err_reply(
+            "ArtifactBytesChanged",
+            "what is at that address no longer hashes to the digest this Claim was validated \
+             against",
+        );
+    }
+    ok_reply(json!({
+        "work": work_id.0,
+        "claim": payload.claim.0,
+        "name": receipt.name,
+        "store": receipt.store.label(),
+        "digest": receipt.digest,
+        "bytes": bytes.len(),
+        "path": anchor.join(&receipt.path).display().to_string(),
+    }))
 }
 
 /// `wirk output` (ruling 0145): where this Run's actor writes its

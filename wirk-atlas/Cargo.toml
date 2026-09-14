@@ -11,6 +11,11 @@ sha2 = "0.11.0"
 thiserror = "2.0.20"
 ulid = "3.0.0"
 libc = "0.2.189"
+# Descriptor-relative directory enumeration (`fs::Dir::read_from`), the
+# one facility this crate's own `openat`/`fstatat` walk lacks a POSIX
+# equivalent for. Pinned exact: raised deliberately, never silently.
+# Already in this workspace's lock at this version.
+rustix = { version = "=1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

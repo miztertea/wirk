@@ -64,7 +64,7 @@ impl Drop for KillOnDrop {
 /// waypoint <id>` stdout line. No `--intent`: removed from `wirk work
 /// submit` (p2-route-files W2, J1).
 fn submit_deterministic(estate: &Path, command: &[&str]) -> (String, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args([
@@ -107,7 +107,7 @@ fn submit_deterministic(estate: &Path, command: &[&str]) -> (String, String) {
 /// Runs `wirk run-deterministic --estate <estate> --work <work_id>
 /// --executor <executor>`, returning its exit code and stdout.
 fn run_deterministic(estate: &Path, work_id: &str, executor: &str) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["run-deterministic", "--estate"])
         .arg(estate)
         .args(["--work", work_id, "--executor", executor])
@@ -155,7 +155,7 @@ fn run_deterministic_child_completes_and_fails() {
     let estate = dir.path().to_path_buf();
 
     let mut wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -210,7 +210,7 @@ fn run_deterministic_child_completes_and_fails() {
     );
 
     // -- stop: pointer and socket removed, child exits clean ----------------
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -255,7 +255,7 @@ fn a_deterministic_child_inherits_its_callers_cargo_target_dir_and_pins_no_host_
     let cache = dir.path().join("this-callers-own-cache");
 
     let mut wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -296,7 +296,7 @@ fn a_deterministic_child_inherits_its_callers_cargo_target_dir_and_pins_no_host_
     };
 
     // And the caller's own configuration reaches the child, natively.
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["run-deterministic", "--estate"])
         .arg(&estate)
         .args(["--work", &work, "--executor", "child"])
@@ -316,7 +316,7 @@ fn a_deterministic_child_inherits_its_callers_cargo_target_dir_and_pins_no_host_
         "the child must see the cache its caller configured, not one compiled into the product"
     );
 
-    let _ = Command::new(wirk_bin())
+    let _ = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output();
@@ -336,7 +336,7 @@ fn run_deterministic_child_blocks_past_a_real_delay_with_no_deadline() {
     let estate = dir.path().to_path_buf();
 
     let mut wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -364,7 +364,7 @@ fn run_deterministic_child_blocks_past_a_real_delay_with_no_deadline() {
     );
     assert_eq!(status_state(&pointer.socket, &work), "completed");
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -386,7 +386,7 @@ fn run_deterministic_child_blocks_past_a_real_delay_with_no_deadline() {
 #[test]
 fn submit_command_rejects_unfenced_flag_after_command() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(dir.path())
         .args(["--route", "smoke", "--kind", "deterministic", "--command"])
@@ -406,4 +406,26 @@ fn submit_command_rejects_unfenced_flag_after_command() {
         "stdout: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

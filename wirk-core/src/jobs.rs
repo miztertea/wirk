@@ -861,6 +861,88 @@ pub struct ResourcePolicy {
     /// because a limit silently attached to nothing is worse than no
     /// limit at all.
     pub storage_soft_limits: BTreeMap<String, u64>,
+    /// Largest single document a local document-collection capture will
+    /// read into memory, in bytes.
+    ///
+    /// The workload is a directory of arbitrary local files chosen by
+    /// whoever admitted it, not a curated object store, so nothing is
+    /// read unbounded merely to decide it is not text. The default is
+    /// sized to the workload rather than to any particular machine: it
+    /// is far above the largest ordinary prose, Markdown or source
+    /// document, and far below a size at which one file would dominate
+    /// a capture's resident memory. A file over it is reported
+    /// `Unsupported` by name, never skipped in silence.
+    pub document_max_file_bytes: u64,
+    /// Ceiling on the sum of every file one document-collection capture
+    /// holds in memory at once, in bytes.
+    ///
+    /// A capture needs each file's bytes twice — once to fold the
+    /// manifest identity, once to extract retrieval units — and holds
+    /// them between those two uses, so a collection of individually
+    /// small files still has an aggregate cost. The default bounds one
+    /// capture's resident bytes to a size an ordinary workstation or
+    /// small container can hold beside the rest of the process. Exceeded
+    /// is a visible refusal of the whole capture, never a partial
+    /// generation reported as complete.
+    ///
+    /// **What it bounds transitively, and what it does not account
+    /// for.** It bounds one capture's read bytes directly, and with them
+    /// one later *hydration* of that generation: reading a generation's
+    /// bytes back — for a lexical search, a path lookup, an edition
+    /// build or a ranking pass — holds at most the bytes that capture
+    /// was allowed to read, and a hydration is scoped to one generation
+    /// at a time, so this ceiling is the peak either way. That is the
+    /// same relationship a Git source has to its own object reads; it is
+    /// not a second bound and does not need one.
+    ///
+    /// What it does **not** count is extraction output. Retrieval units
+    /// are produced from those bytes and live alongside them until the
+    /// generation is staged, so a capture's true peak is this ceiling
+    /// plus whatever the extraction edition derived from it —
+    /// proportional to the input rather than free, and uncharged here.
+    /// Stated rather than fixed: an operator sizing this field should
+    /// know the real peak sits somewhat above the number they wrote.
+    pub document_max_total_bytes: u64,
+    /// How deep a document-collection walk may recurse.
+    ///
+    /// Bounds stack growth and cycles introduced by mounts rather than
+    /// symlinks (which the walk refuses outright). The default is far
+    /// past any hand-built document hierarchy and well short of a depth
+    /// at which recursion itself becomes the risk.
+    pub document_max_entries_depth: usize,
+    /// How many directory entries one document-collection walk may
+    /// examine, counting every name it reads — files, directories,
+    /// symlinks, special files and names that vanish before they can be
+    /// inspected alike.
+    ///
+    /// This is the allocation bound as well as the work bound: it is
+    /// tested while the directory is being streamed, so a single
+    /// enormously wide directory is refused partway through rather than
+    /// listed in full first. The default admits document collections far
+    /// larger than any this is expected to serve while refusing a walk
+    /// that has clearly been pointed at something other than a document
+    /// collection.
+    pub document_max_entries: usize,
+    /// The largest single claimed artifact this daemon will read into
+    /// memory to serve `wirk artifact` (`handle_run_artifact`), in
+    /// bytes. Default 64 MiB.
+    ///
+    /// This is a *bound on one read*, not a policy about what may be
+    /// claimed: a Claim validates whatever bytes it validates, and this
+    /// never changes that. It exists because serving an artifact means
+    /// the daemon reads it whole in order to re-hash it, and an
+    /// unbounded read of a file another process chose the size of is a
+    /// resource decision the operator should own rather than a constant
+    /// compiled into the product. Exceeding it is an *explicit
+    /// refusal* naming the size and this setting — never a truncated
+    /// answer, which would be a different artifact reported under the
+    /// Claim's digest.
+    ///
+    /// A summary cap is not this number and must not be reused as one:
+    /// `ASSEMBLY_SUMMARY_BYTES` (320) bounds a one-line *description* of
+    /// an artifact in an orientation projection, which is a different
+    /// job from delivering the artifact.
+    pub artifact_max_bytes: u64,
     /// Whether this estate's `max_host_expensive` may *set* the shared
     /// host pool's agreed capacity, rather than merely be bound by it.
     ///
@@ -885,9 +967,14 @@ impl Default for ResourcePolicy {
             memory_pressure_avg10_max: 60.0,
             min_available_memory_bytes: 512 * 1024 * 1024,
             job_memory_max_bytes: None,
+            artifact_max_bytes: 64 * 1024 * 1024,
             host_pool_dir: None,
             host_pool_capacity_authority: false,
             storage_soft_limits: BTreeMap::new(),
+            document_max_file_bytes: 8 * 1024 * 1024,
+            document_max_total_bytes: 128 * 1024 * 1024,
+            document_max_entries_depth: 128,
+            document_max_entries: 200_000,
         }
     }
 }
@@ -907,9 +994,14 @@ struct ConfiguredPolicy {
     memory_pressure_avg10_max: Option<f64>,
     min_available_memory_bytes: Option<u64>,
     job_memory_max_bytes: Option<u64>,
+    artifact_max_bytes: Option<u64>,
     host_pool_dir: Option<String>,
     host_pool_capacity_authority: Option<bool>,
     storage_soft_limits: Option<BTreeMap<String, u64>>,
+    document_max_file_bytes: Option<u64>,
+    document_max_total_bytes: Option<u64>,
+    document_max_entries_depth: Option<usize>,
+    document_max_entries: Option<usize>,
 }
 
 impl ResourcePolicy {
@@ -942,6 +1034,7 @@ impl ResourcePolicy {
                 );
             }
         };
+        let defaults = Self::default();
         let mut policy = Self::default();
         let mut complaints = Vec::new();
         macro_rules! overlay {
@@ -960,7 +1053,12 @@ impl ResourcePolicy {
         overlay!(job_deadline_secs);
         overlay!(memory_pressure_avg10_max);
         overlay!(min_available_memory_bytes);
+        overlay!(artifact_max_bytes);
         overlay!(host_pool_capacity_authority);
+        overlay!(document_max_file_bytes);
+        overlay!(document_max_total_bytes);
+        overlay!(document_max_entries_depth);
+        overlay!(document_max_entries);
         if let Some(bytes) = configured.job_memory_max_bytes {
             policy.job_memory_max_bytes = (bytes > 0).then_some(bytes);
         }
@@ -985,6 +1083,52 @@ impl ResourcePolicy {
             }
             policy.storage_soft_limits = known;
         }
+        // A document bound of 0 would refuse every collection, including
+        // an empty one, which is a configuration that can express nothing
+        // an operator wants. Named and ignored, exactly as a 0 concurrency
+        // value is, rather than applied into an estate that then cannot
+        // admit a document source at all.
+        // The restored value is read from `Self::default()` itself, not
+        // restated here: a default raised in one place must not leave a
+        // zero-value complaint quietly restoring the old number.
+        for (label, value, default) in [
+            (
+                "document_max_file_bytes",
+                &mut policy.document_max_file_bytes,
+                defaults.document_max_file_bytes,
+            ),
+            (
+                "document_max_total_bytes",
+                &mut policy.document_max_total_bytes,
+                defaults.document_max_total_bytes,
+            ),
+        ] {
+            if *value == 0 {
+                complaints.push(format!(
+                    "{label} 0 would read nothing; using the built-in default {default}"
+                ));
+                *value = default;
+            }
+        }
+        for (label, value, default) in [
+            (
+                "document_max_entries_depth",
+                &mut policy.document_max_entries_depth,
+                defaults.document_max_entries_depth,
+            ),
+            (
+                "document_max_entries",
+                &mut policy.document_max_entries,
+                defaults.document_max_entries,
+            ),
+        ] {
+            if *value == 0 {
+                complaints.push(format!(
+                    "{label} 0 would walk nothing; using the built-in default {default}"
+                ));
+                *value = default;
+            }
+        }
         for (label, value) in [
             ("max_expensive", &mut policy.max_expensive),
             ("max_host_expensive", &mut policy.max_host_expensive),
@@ -994,6 +1138,16 @@ impl ResourcePolicy {
                 complaints.push(format!("{label} 0 would admit nothing; using 1"));
                 *value = 1;
             }
+        }
+        if policy.artifact_max_bytes == 0 {
+            // Same rule as the concurrency values above: a bound of zero
+            // refuses every artifact, which is not a limit an operator
+            // can have meant by writing a number. Reported, not applied
+            // in silence.
+            complaints.push(
+                "artifact_max_bytes 0 would refuse every artifact; using the default".to_string(),
+            );
+            policy.artifact_max_bytes = Self::default().artifact_max_bytes;
         }
         let note = (!complaints.is_empty())
             .then(|| format!("{}: {}", path.display(), complaints.join("; ")));
@@ -2490,6 +2644,175 @@ impl JobRegistry {
 }
 
 // ---------------------------------------------------------------------
+// The in-process job
+// ---------------------------------------------------------------------
+
+/// Why an in-process job must stop, and how long it had been running.
+///
+/// Reported as the deliberate act it was — an operator's cancellation or
+/// a passed deadline — never as a failure of the work itself.
+#[derive(Debug, Clone)]
+pub struct JobStopped {
+    pub reason: String,
+    pub elapsed: Duration,
+}
+
+impl std::fmt::Display for JobStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} after {:.1}s",
+            self.reason,
+            self.elapsed.as_secs_f64()
+        )
+    }
+}
+
+/// The stop condition of one job, as the work itself can see it.
+///
+/// **What this is honestly able to do.** A [`BoundedChild`] runs in
+/// another process, so its watchdog can end it from outside at any
+/// instant, including while it is blocked. Work running on this
+/// process's own thread has no such outside lever: nothing here
+/// interrupts a syscall that is already blocked in the kernel. What it
+/// does is make the work *cooperative* — the work calls [`Self::check`]
+/// at points it chooses, and stops there. So the guarantee is bounded by
+/// the spacing of those checkpoints, not by the deadline alone, and the
+/// deadline is a deadline on *reaching the next checkpoint*, not a
+/// promise to return within it.
+///
+/// That distinction is the reason this type exists separately rather
+/// than being folded into the child: an operator reading `atlas cancel`
+/// must not be told that in-process work was killed when what actually
+/// happened is that it was asked to stop at its next checkpoint.
+#[derive(Debug, Clone)]
+pub struct JobStop {
+    cancel: CancelToken,
+    started: Instant,
+    /// `None` never expires, which is what a caller running outside any
+    /// job gets.
+    deadline: Option<Duration>,
+}
+
+impl JobStop {
+    /// A stop condition that never fires: for work not running under a
+    /// registered job at all, so a caller that has no job still has one
+    /// code path rather than an `Option` threaded through every frame.
+    pub fn unbounded() -> Self {
+        Self {
+            cancel: CancelToken::new(),
+            started: Instant::now(),
+            deadline: None,
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// Stop here if this job has been cancelled or has run past its
+    /// deadline. Cheap enough to call in a walk's inner loop: an atomic
+    /// load and a monotonic clock read.
+    pub fn check(&self) -> Result<(), JobStopped> {
+        let elapsed = self.started.elapsed();
+        if self.cancel.is_cancelled() {
+            return Err(JobStopped {
+                reason: self
+                    .cancel
+                    .reason()
+                    .unwrap_or_else(|| "was cancelled".to_string()),
+                elapsed,
+            });
+        }
+        if let Some(deadline) = self.deadline
+            && elapsed >= deadline
+        {
+            return Err(JobStopped {
+                reason: format!(
+                    "reached a checkpoint after its {}s deadline had passed",
+                    deadline.as_secs()
+                ),
+                elapsed,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One expensive job that runs on this process's own thread, announced
+/// in the registry for exactly as long as it runs.
+///
+/// The counterpart to [`BoundedChild`] for work that is not a child
+/// process. Both exist because both are addressable by `atlas cancel`;
+/// what differs is only how the stop is delivered, which [`JobStop`]
+/// documents. Registration happens on construction and deregistration
+/// on `Drop`, so the entry is released on **every** return path —
+/// success, refusal, early `?` and panic alike — and "still in the
+/// registry" stays a truthful answer to "is it still running?".
+#[derive(Debug)]
+pub struct InProcessJob {
+    registry: Option<JobRegistry>,
+    job_id: String,
+    stop: JobStop,
+}
+
+impl InProcessJob {
+    /// Announce a job of `verb` over `scope` for `requester`, bounded by
+    /// `deadline_secs`.
+    ///
+    /// `registry: None` runs unregistered — for tests that drive the
+    /// token directly, matching [`BoundedChild`]'s own option.
+    pub fn register(
+        registry: Option<JobRegistry>,
+        verb: &str,
+        scope: &str,
+        requester: Option<String>,
+        deadline_secs: u64,
+    ) -> Self {
+        let job_id = new_job_id();
+        let cancel = CancelToken::new();
+        if let Some(registry) = &registry {
+            registry.register(ActiveJob {
+                job_id: job_id.clone(),
+                verb: verb.to_string(),
+                scope: scope.to_string(),
+                requester,
+                started_unix_millis: now_unix_millis(),
+                cancel: cancel.clone(),
+            });
+        }
+        Self {
+            registry,
+            job_id,
+            stop: JobStop {
+                cancel,
+                started: Instant::now(),
+                deadline: Some(Duration::from_secs(deadline_secs)),
+            },
+        }
+    }
+
+    pub fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    /// The stop condition to hand to the work itself. Cloned freely; a
+    /// clone does not extend the registration, which belongs to this
+    /// value's lifetime alone.
+    pub fn stop(&self) -> JobStop {
+        self.stop.clone()
+    }
+}
+
+impl Drop for InProcessJob {
+    fn drop(&mut self) {
+        if let Some(registry) = &self.registry {
+            registry.deregister(&self.job_id);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // The bounded child
 // ---------------------------------------------------------------------
 
@@ -2497,8 +2820,11 @@ impl JobRegistry {
 #[derive(Debug)]
 pub enum ChildEnd {
     /// It ran to completion. Both pipes were drained to EOF, so this is
-    /// the whole output and not a prefix of it. An output that could not
-    /// be read to its end is [`ChildEnd::Failed`], never this.
+    /// the whole output and not a prefix of it, and the caller's `write`
+    /// closure returned `Ok`, so the input side is whole too — a request
+    /// that was only partly written is [`ChildEnd::Failed`], never this.
+    /// An output that could not be read to its end is likewise
+    /// [`ChildEnd::Failed`].
     Finished(std::process::Output),
     /// A deadline or an explicit cancel ended it. The group and the job
     /// cgroup were killed; this is not a backend failure and must not be
@@ -2922,7 +3248,20 @@ impl BoundedChild<'_> {
         ended.store(true, Ordering::SeqCst);
         finished.store(true, Ordering::SeqCst);
         let _ = watchdog.join();
-        let _ = writer.join();
+        // The writer's own `Err` — a short write, a refusal from
+        // `BoundedStdin` because the job ended before it finished, or any
+        // other I/O failure — used to be discarded here (`let _ =
+        // writer.join()`), so a request that was never fully delivered
+        // could still reach `ChildEnd::Finished` and be read as a
+        // complete answer to an incomplete question. A caller cannot see
+        // that from `std::process::Output` alone: a backend that reads a
+        // truncated request and still exits 0 with *some* reply looks
+        // identical to one that read the whole thing.
+        let write_failure = match writer.join() {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("the input writer thread panicked".to_string()),
+        };
         let elapsed = started.elapsed();
 
         // Every exit path, success included.
@@ -2933,8 +3272,10 @@ impl BoundedChild<'_> {
         let cancelled = reason.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(reason) = cancelled {
             // A job the watchdog ended is a cancellation, whatever the
-            // drain saw on its way out: the classification the callers
-            // depend on is unchanged.
+            // drain or the writer saw on their way out: the
+            // classification the callers depend on is unchanged, and
+            // takes priority over a write failure that a cancellation
+            // would itself have caused.
             return ChildEnd::Cancelled { reason, elapsed };
         }
         let (stdout, stderr) = match drained {
@@ -2943,6 +3284,9 @@ impl BoundedChild<'_> {
                 return ChildEnd::Failed(format!("its output could not be read: {error}"));
             }
         };
+        if let Some(error) = write_failure {
+            return ChildEnd::Failed(format!("its input could not be written: {error}"));
+        }
         match status {
             Ok(status) => ChildEnd::Finished(std::process::Output {
                 status,
@@ -2991,6 +3335,136 @@ impl BoundedChild<'_> {
         if let Some(registry) = &self.registry {
             registry.deregister(&self.job_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod in_process_tests {
+    use super::*;
+
+    /// The registration an operator's cancellation has to find, and the
+    /// release that makes "still listed" mean "still running".
+    #[test]
+    fn an_in_process_job_is_listed_while_it_runs_and_gone_when_it_returns() {
+        let registry = JobRegistry::new();
+        {
+            let job = InProcessJob::register(
+                Some(registry.clone()),
+                "atlas acquire",
+                "clientdocs",
+                Some("work-1".to_string()),
+                3600,
+            );
+            let listed = registry.list();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].verb, "atlas acquire");
+            assert_eq!(listed[0].scope, "clientdocs");
+            assert_eq!(listed[0].requester.as_deref(), Some("work-1"));
+            assert_eq!(listed[0].job_id, job.job_id());
+            assert!(registry.is_active(job.job_id()));
+        }
+        assert!(
+            registry.list().is_empty(),
+            "the entry is released on the return path, not left behind to answer \"still \
+             running\" about a job that has finished"
+        );
+    }
+
+    /// Cancelling by the scope an operator actually names reaches the
+    /// work, and the work sees it at its next checkpoint.
+    #[test]
+    fn cancelling_by_scope_stops_the_work_at_its_next_checkpoint() {
+        let registry = JobRegistry::new();
+        let job = InProcessJob::register(
+            Some(registry.clone()),
+            "atlas publish",
+            "clientdocs",
+            None,
+            3600,
+        );
+        let stop = job.stop();
+        assert!(stop.check().is_ok(), "nothing has asked it to stop yet");
+
+        let acknowledged = registry.cancel(
+            &JobSelector::Scope("clientdocs".to_string()),
+            "was cancelled by an operator",
+        );
+        assert_eq!(acknowledged.len(), 1);
+        assert_eq!(acknowledged[0].job_id, job.job_id());
+
+        let stopped = stop.check().expect_err("the work stops at its checkpoint");
+        assert!(
+            stopped.reason.contains("cancelled by an operator"),
+            "and it stops for the reason the operator gave: {stopped}"
+        );
+    }
+
+    /// A cancellation reaches exactly the source it names. The defect
+    /// this rules out is a token shared across jobs, where cancelling
+    /// one would poison the estate's next legitimate job too.
+    #[test]
+    fn cancelling_one_source_leaves_another_running_and_a_later_job_unaffected() {
+        let registry = JobRegistry::new();
+        let theirs = InProcessJob::register(
+            Some(registry.clone()),
+            "atlas acquire",
+            "otherdocs",
+            None,
+            3600,
+        );
+        let ours = InProcessJob::register(
+            Some(registry.clone()),
+            "atlas acquire",
+            "clientdocs",
+            None,
+            3600,
+        );
+        registry.cancel(&JobSelector::Scope("clientdocs".to_string()), "stop");
+        assert!(ours.stop().check().is_err());
+        assert!(
+            theirs.stop().check().is_ok(),
+            "a cancellation scoped to one source does not reach another"
+        );
+
+        drop(ours);
+        let later = InProcessJob::register(
+            Some(registry.clone()),
+            "atlas acquire",
+            "clientdocs",
+            None,
+            3600,
+        );
+        assert!(
+            later.stop().check().is_ok(),
+            "and the next job on the same source starts uncancelled: the token belongs to the \
+             job, not to the estate"
+        );
+    }
+
+    /// The deadline half, with no elapsed time to wait for: a zero
+    /// deadline has already passed at the first checkpoint, which is the
+    /// same meaning it has for a bounded child.
+    #[test]
+    fn a_passed_deadline_stops_the_work_and_says_so_as_a_deadline() {
+        let job = InProcessJob::register(None, "atlas acquire", "clientdocs", None, 0);
+        let stopped = job
+            .stop()
+            .check()
+            .expect_err("a deadline of zero has passed by the first checkpoint");
+        assert!(
+            stopped.reason.contains("deadline"),
+            "reported as the deadline it is, not as a cancellation or a backend failure: \
+             {stopped}"
+        );
+    }
+
+    /// Work running outside any job is bounded by its own limits alone
+    /// and never stops here.
+    #[test]
+    fn unbounded_work_never_stops() {
+        let stop = JobStop::unbounded();
+        assert!(stop.check().is_ok());
+        assert!(stop.check().is_ok());
     }
 }
 

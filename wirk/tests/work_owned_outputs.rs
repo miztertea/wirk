@@ -39,7 +39,7 @@ use serde_json::Value;
 /// `wirk output --json`, run exactly as an actor runs it: the injected
 /// triple in the environment and no argument naming a Work or a path.
 fn output_json(estate: &Path, work_id: &str, run_id: &str) -> Value {
-    let out = Command::new(wirk_bin())
+    let out = wirk_cli()
         .args(["output", "list", "--json"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -57,7 +57,7 @@ fn output_json(estate: &Path, work_id: &str, run_id: &str) -> Value {
 
 /// `wirk output dir` — the one line a shell substitutes.
 fn output_dir(estate: &Path, work_id: &str, run_id: &str) -> PathBuf {
-    let out = Command::new(wirk_bin())
+    let out = wirk_cli()
         .args(["output", "dir"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -1026,7 +1026,7 @@ fn a_later_stage_binds_a_prior_stages_managed_output_at_its_digest() {
         Some("outputs-two-stage/change")
     );
 
-    let world = Command::new(wirk_bin())
+    let world = wirk_cli()
         .args(["world", "show", "--json"])
         .env("WIRK_ESTATE_ROOT", &estate)
         .env("WIRK_WORK_ID", &submitted.work_id)
@@ -1252,4 +1252,26 @@ fn an_artifact_past_the_progress_observation_budget_still_claims_and_validates()
     );
 
     stop_wirkd(&estate, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

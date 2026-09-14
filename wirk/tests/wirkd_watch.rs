@@ -183,7 +183,7 @@ fn a_watcher_sees_events_before_and_after_it_dials() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let mut wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -243,7 +243,7 @@ fn a_watcher_sees_events_before_and_after_it_dials() {
         "a late watcher must see the already-appended live event too"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -259,7 +259,7 @@ fn a_second_works_appends_are_not_delivered_to_the_first_works_watcher() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let mut wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -292,7 +292,7 @@ fn a_second_works_appends_are_not_delivered_to_the_first_works_watcher() {
         }
     }
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -307,7 +307,7 @@ fn wirkd_stopping_ends_the_watch_stream_for_the_client() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -321,7 +321,7 @@ fn wirkd_stopping_ends_the_watch_stream_for_the_client() {
     let (rx, handle) = spawn_watch(&pointer.socket, &work_id);
     let _ = recv_event(&rx, "the WorkSubmitted event submit already journaled");
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -365,7 +365,7 @@ fn watch_of_unsubmitted_work_creates_no_journal_and_is_refused() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -404,7 +404,7 @@ fn watch_of_unsubmitted_work_creates_no_journal_and_is_refused() {
         "the daemon must still accept ordinary work after refusing an unknown watch"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -425,7 +425,7 @@ fn watch_of_path_like_work_id_is_refused_not_panicked() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -459,7 +459,7 @@ fn watch_of_path_like_work_id_is_refused_not_panicked() {
     let (work_id, _run_id) = submit(&estate, &pointer.socket, "post-panic liveness check");
     assert!(estate.join("works").join(&work_id.0).exists());
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -480,7 +480,7 @@ fn live_streamed_event_id_matches_the_persisted_event() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -531,7 +531,7 @@ fn live_streamed_event_id_matches_the_persisted_event() {
         "the streamed EventId must equal the journal's own persisted id"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -547,7 +547,7 @@ fn live_streamed_event_id_matches_the_persisted_event() {
 /// applied here to the actual CLI binary rather than
 /// `wirkd::client::watch`'s iterator.
 fn spawn_cli_watch(estate: &Path) -> (std::process::Child, mpsc::Receiver<String>) {
-    let mut child = Command::new(wirk_bin())
+    let mut child = wirk_cli()
         // The operator's own stream (ruling 0117), not the runner's
         // inherited actor context.
         .env_remove("WIRK_ESTATE_ROOT")
@@ -593,7 +593,7 @@ fn cli_watch_of_unknown_work_exits_nonzero_and_labels_the_refusal() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -603,7 +603,7 @@ fn cli_watch_of_unknown_work_exits_nonzero_and_labels_the_refusal() {
     );
     let _pointer = wait_for_pointer(&estate);
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .env_remove("WIRK_ESTATE_ROOT")
         .env_remove("WIRK_WORK_ID")
         .env_remove("WIRK_RUN_ID")
@@ -630,7 +630,7 @@ fn cli_watch_of_unknown_work_exits_nonzero_and_labels_the_refusal() {
         "a valid daemon refusal must never be labeled malformed, got stdout: {stdout}"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -658,7 +658,7 @@ fn cli_watch_multi_work_keeps_streaming_after_a_sibling_refusal_and_exits_nonzer
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let wirkd_child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -721,7 +721,7 @@ fn cli_watch_multi_work_keeps_streaming_after_a_sibling_refusal_and_exits_nonzer
     // Ending wirkd ends work_a's own stream too (EOF); the whole CLI
     // process then exits on its own — no kill, no timeout on the
     // stream itself, only this test's own bound on waiting for it.
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -735,4 +735,26 @@ fn cli_watch_multi_work_keeps_streaming_after_a_sibling_refusal_and_exits_nonzer
     );
 
     drop(wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

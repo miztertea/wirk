@@ -166,7 +166,7 @@ fn submit_actor_named(
     );
     route_fixture::write_route(estate, name, &route_json);
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route", name, "--kind", "actor", "--repo-path"])
@@ -276,7 +276,7 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -289,7 +289,7 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
     let (work_id, run_id, _waypoint) = submit_actor(&estate, &repo, "write report.md, then claim");
 
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["run", "--estate"])
             .arg(&estate)
             .args(["--work", &work_id, "--session", session.name()])
@@ -341,6 +341,7 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
         EventKind::WorktreeCreated {
             repo,
             base_sha: sha,
+            ..
         } => Some((repo.clone(), sha.clone())),
         _ => None,
     });
@@ -418,7 +419,7 @@ fn wirk_run_drives_one_actor_run_to_claimed() {
 
     // Teardown: stop wirkd, then let `guard`'s Drop reap both children;
     // `LiveHerdrSession`'s own `Drop` tears down the session.
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -486,7 +487,7 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -500,7 +501,7 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
         submit_actor(&estate, &repo, "sit still; do not write anything yet");
 
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["run", "--estate"])
             .arg(&estate)
             .args(["--work", &work_id, "--session", session.name()])
@@ -611,7 +612,7 @@ fn wirk_run_survives_a_quiet_pane_past_the_subscription_timeout() {
         "expected no bogus RunFailed, found {bogus_run_failed:?}"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -680,7 +681,7 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -693,7 +694,7 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
     let (work_id, run_id, _waypoint) =
         submit_actor(&estate, &repo, "reply with the word ready and stop");
 
-    let mut run_child = Command::new(wirk_bin())
+    let mut run_child = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session.name()])
@@ -833,7 +834,7 @@ fn wirk_run_prompts_an_idle_unclaimed_pane_again_then_claims() {
         "expected no RunFailed, found {run_failed:?}"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -896,7 +897,7 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -914,7 +915,7 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
          prompted again, reply with the single word waiting and stop.",
     );
 
-    let mut run_child = Command::new(wirk_bin())
+    let mut run_child = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session.name()])
@@ -1035,7 +1036,7 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
     // P4.7 completion (ruling 0250), C2 qualified against the real
     // daemon rather than a fake: the *public* answer an operator gets
     // names what was observed, not a verdict on the actor.
-    let status = Command::new(wirk_bin())
+    let status = wirk_cli()
         // An operator's own invocation, not an actor's: the injected
         // triple is removed so an outer Run's `WIRK_ESTATE_ROOT` in the
         // test runner's own environment cannot scope this read (the
@@ -1080,7 +1081,7 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
     // Work — the property a fabricated `RunFailed` would have
     // foreclosed. Filed through the real CLI with the injected triple,
     // exactly as an actor files it.
-    let staging = Command::new(wirk_bin())
+    let staging = wirk_cli()
         .args(["output", "dir"])
         .env("WIRK_ESTATE_ROOT", &estate)
         .env("WIRK_WORK_ID", &work_id)
@@ -1098,7 +1099,7 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
         b"the actor was working after all\n",
     )
     .expect("the actor writes its declared output after the observation");
-    let late_claim = Command::new(wirk_bin())
+    let late_claim = wirk_cli()
         .args(["claim", "--output", "report.md"])
         .env("WIRK_ESTATE_ROOT", &estate)
         .env("WIRK_WORK_ID", &work_id)
@@ -1117,7 +1118,7 @@ fn wirk_run_stuck_after_the_first_continuation_exits_4() {
         "Validated"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -1166,7 +1167,7 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -1187,7 +1188,7 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
     // First attempt: the same "stuck after the first continuation"
     // shape as the test above -- `wirk run` exits 4, the Work is
     // `NeedsInput`.
-    let run1_status = Command::new(wirk_bin())
+    let run1_status = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session1.name()])
@@ -1224,7 +1225,7 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
     // NoObservableProgress}` (which already put the Work in
     // `NeedsInput`, P4.7 ruling 0243) *before* it ever reaches this new
     // `RunOpened`.
-    let retry = Command::new(wirk_bin())
+    let retry = wirk_cli()
         .args(["work", "retry", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id])
@@ -1259,7 +1260,7 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
         return;
     };
 
-    let mut run2_child = Command::new(wirk_bin())
+    let mut run2_child = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session2.name()])
@@ -1353,7 +1354,7 @@ fn wirk_run_retries_a_stuck_run_and_reaches_claimed() {
          first (stuck) attempt's: {events:?}"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -1401,7 +1402,7 @@ fn wirk_run_retry_reuses_the_worktree_and_branch() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -1420,7 +1421,7 @@ fn wirk_run_retry_reuses_the_worktree_and_branch() {
     );
 
     // First attempt: stuck, `NeedsInput`, exactly as the sibling test.
-    let run1_status = Command::new(wirk_bin())
+    let run1_status = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session1.name()])
@@ -1452,7 +1453,7 @@ fn wirk_run_retry_reuses_the_worktree_and_branch() {
     );
 
     // No manual cleanup here — this is the whole point of the fix.
-    let retry = Command::new(wirk_bin())
+    let retry = wirk_cli()
         .args(["work", "retry", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id])
@@ -1484,7 +1485,7 @@ fn wirk_run_retry_reuses_the_worktree_and_branch() {
         return;
     };
 
-    let mut run2_child = Command::new(wirk_bin())
+    let mut run2_child = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session2.name()])
@@ -1585,7 +1586,7 @@ fn wirk_run_retry_reuses_the_worktree_and_branch() {
         "expected exactly one {branch} branch for the Work, got {branch_lines:?}"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -1652,7 +1653,7 @@ fn wirk_run_drives_two_works_at_once_with_no_cross_contamination() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -1858,7 +1859,7 @@ fn wirk_run_drives_two_works_at_once_with_no_cross_contamination() {
         "expected Work B ClaimRecorded{{Done, Validated}}"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -1916,7 +1917,7 @@ fn wirk_run_reinvocation_with_a_conflicting_actor_model_is_refused_and_first_lau
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -1937,7 +1938,7 @@ fn wirk_run_reinvocation_with_a_conflicting_actor_model_is_refused_and_first_lau
     // First invocation: an explicit, real `--actor-model` this Run has
     // never had before — nothing to conflict with yet.
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["run", "--estate"])
             .arg(&estate)
             .args(["--work", &work_id, "--session", session.name()])
@@ -1994,7 +1995,7 @@ fn wirk_run_reinvocation_with_a_conflicting_actor_model_is_refused_and_first_lau
     // `--actor-model` — refused before Herdr or the journal are ever
     // touched again, the first invocation's own drive loop (still
     // running, unaffected) never interrupted.
-    let second = Command::new(wirk_bin())
+    let second = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session.name()])
@@ -2117,7 +2118,7 @@ fn submit_actor_with_selection(
         r#"{{"id":{name:?},"waypoints":[{{"id":"{name}/wp-1","kind":"Actor","intent":"idle","declared_outputs":[{{"name":"report.md","required":true}}],"boundary":["**"],"selection":{selection_json}}}]}}"#
     );
     route_fixture::write_route(estate, name, &route_json);
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route", name, "--kind", "actor", "--repo-path"])
@@ -2192,7 +2193,7 @@ fn wirkd_admits_one_launch_request_per_run_and_binds_it_before_the_launch() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -2210,7 +2211,7 @@ fn wirkd_admits_one_launch_request_per_run_and_binds_it_before_the_launch() {
     );
 
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["run", "--estate"])
             .arg(&estate)
             .args(["--work", &work_id, "--session", session.name()])
@@ -2346,7 +2347,7 @@ fn a_selection_whose_raw_args_restate_its_model_is_refused_before_any_effect() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -2363,7 +2364,7 @@ fn a_selection_whose_raw_args_restate_its_model_is_refused_before_any_effect() {
         r#"{"harness":"claude","model":"model-A","args":["--model","raw-B"]}"#,
     );
 
-    let out = Command::new(wirk_bin())
+    let out = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session.name()])
@@ -2461,7 +2462,7 @@ fn wirk_run_resumes_the_same_run_after_a_resolved_block() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -2478,7 +2479,7 @@ fn wirk_run_resumes_the_same_run_after_a_resolved_block() {
     );
 
     // ---- attempt 1: held on the pane, exit 4 -----------------------
-    let first = Command::new(wirk_bin())
+    let first = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session.name()])
@@ -2530,7 +2531,7 @@ fn wirk_run_resumes_the_same_run_after_a_resolved_block() {
     }
 
     // ---- attempt 2: the same Run resumes ---------------------------
-    let second = Command::new(wirk_bin())
+    let second = wirk_cli()
         .args(["run", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--session", session.name()])
@@ -2625,7 +2626,7 @@ fn wirk_run_resuming_a_still_blocked_run_stays_needs_input() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -2642,7 +2643,7 @@ fn wirk_run_resuming_a_still_blocked_run_stays_needs_input() {
     );
 
     for attempt in 1..=2 {
-        let status = Command::new(wirk_bin())
+        let status = wirk_cli()
             .args(["run", "--estate"])
             .arg(&estate)
             .args(["--work", &work_id, "--session", session.name()])
@@ -2703,7 +2704,7 @@ fn run_once(
     session: &live_herdr::LiveHerdrSession,
     path_env: &str,
 ) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["run", "--estate"])
         .arg(estate)
         .args(["--work", work_id, "--session", session.name()])
@@ -2790,7 +2791,7 @@ fn wirk_run_resuming_an_unanswered_question_never_prompts_the_pane() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -2909,7 +2910,7 @@ fn wirk_run_resuming_a_question_filed_after_a_resolved_block_never_prompts() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -3011,4 +3012,26 @@ fn wirk_run_resuming_a_question_filed_after_a_resolved_block_never_prompts() {
         .filter(|event| matches!(event.kind, EventKind::RunOpened { .. }))
         .count();
     assert_eq!(opened, 1, "no resume opened a second Run");
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

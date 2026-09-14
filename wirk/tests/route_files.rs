@@ -80,7 +80,7 @@ impl Drop for KillOnDrop {
 
 fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
     let child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(estate)
             .stdout(Stdio::null())
@@ -93,7 +93,7 @@ fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
 }
 
 fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(estate)
         .output()
@@ -116,7 +116,7 @@ fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
 /// `--intent`: an Actor Waypoint's intent is authored in the Route file
 /// (p2-route-files W2, J1).
 fn submit_route(estate: &Path, route_path: &Path, repo: &str) -> std::process::Output {
-    Command::new(wirk_bin())
+    wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route"])
@@ -157,7 +157,7 @@ fn init_repo(repo: &Path) {
 }
 
 fn submit_actor_route(estate: &Path, route_path: &Path, repo: &Path) -> std::process::Output {
-    Command::new(wirk_bin())
+    wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route"])
@@ -190,7 +190,7 @@ fn parse_submit_stdout(stdout: &str) -> (String, String, String) {
 }
 
 fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -247,6 +247,7 @@ fn materialize_actor(
             kind: EventKind::WorktreeCreated {
                 repo: actor.repository.clone(),
                 base_sha: head,
+                identity: None,
             },
         }),
     )
@@ -363,7 +364,7 @@ fn route_file_bare_name_with_no_file_is_refused_no_journal() {
         .map(|entries| entries.filter_map(|e| e.ok()).collect())
         .unwrap_or_default();
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(&estate)
         .args(["--route", "proving", "--kind", "actor"])
@@ -678,7 +679,7 @@ fn route_file_with_retries_field_is_refused_as_unknown_field() {
 #[test]
 fn submit_with_intent_flag_is_usage_exit() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(dir.path())
         .args(["--route", "smoke", "--intent", "still passed"])
@@ -702,7 +703,7 @@ fn submit_with_intent_flag_is_usage_exit() {
 #[test]
 fn submit_without_route_or_command_is_usage_exit() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(dir.path())
         .args(["--repo", "demo:write", "--base", "main"])
@@ -748,7 +749,7 @@ fn hand_edited_reversed_route_advances_in_the_journaled_file_order() {
 
     // The file's first entry (`.../wp-2`) writes `report.md`; complete
     // it for real.
-    let run_det = Command::new(wirk_bin())
+    let run_det = wirk_cli()
         .args(["run-deterministic", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--executor", "child"])
@@ -770,7 +771,7 @@ fn hand_edited_reversed_route_advances_in_the_journaled_file_order() {
 
     // The file's second entry (`.../wp-1`) counts `report.md`'s lines
     // into `summary.md`; complete it too.
-    let run_det = Command::new(wirk_bin())
+    let run_det = wirk_cli()
         .args(["run-deterministic", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--executor", "child"])
@@ -788,8 +789,34 @@ fn hand_edited_reversed_route_advances_in_the_journaled_file_order() {
         Some("completed"),
         "both entries done, in the file's own order: {result}"
     );
-    let summary = fs::read_to_string(estate.join("summary.md")).expect("summary.md written");
+    // Both entries of this output-only Route execute in the one owned
+    // execution directory this Work holds (ruling 0292) — which is also
+    // how the second entry can count the first entry's own `report.md`.
+    let owned = wirk_core::owned_execution_address(&estate, &WorkId(work_id.clone()));
+    let summary = fs::read_to_string(owned.join("summary.md")).expect("summary.md written");
     assert_eq!(summary.trim(), "1", "wc -l of the one-line report.md");
 
     stop_wirkd(&estate, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

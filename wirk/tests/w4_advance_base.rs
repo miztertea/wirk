@@ -58,7 +58,7 @@ impl Drop for KillOnDrop {
 
 fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
     let child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(estate)
             .stdout(Stdio::null())
@@ -71,7 +71,7 @@ fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
 }
 
 fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(estate)
         .output()
@@ -171,7 +171,7 @@ fn parse_submit_stdout(stdout: &str) -> (String, String, String) {
 }
 
 fn submit_actor(estate: &Path, route_path: &Path, repo: &Path, base_sha: &str) -> (String, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route"])
@@ -192,7 +192,7 @@ fn submit_actor(estate: &Path, route_path: &Path, repo: &Path, base_sha: &str) -
 }
 
 fn submit_deterministic(estate: &Path, base: &str, command: &[&str]) -> (String, String, String) {
-    let mut cmd = Command::new(wirk_bin());
+    let mut cmd = wirk_cli();
     cmd.args(["work", "submit", "--estate"])
         .arg(estate)
         .args([
@@ -295,6 +295,7 @@ fn create_worktree_for_run(
         EventKind::WorktreeCreated {
             repo: actor.repository.clone(),
             base_sha: head,
+            identity: None,
         },
     );
     let mut updated_actor = actor;
@@ -325,7 +326,7 @@ fn claim(
         args.push("--artifact".to_string());
         args.push(format!("{name}={path}"));
     }
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&args)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -513,7 +514,7 @@ fn deterministic_waypoint_after_a_committing_actor_validates() {
     }
 
     // verify's own command writes only its own declared output.
-    let run_det = Command::new(wirk_bin())
+    let run_det = wirk_cli()
         .args(["run-deterministic", "--estate"])
         .arg(estate)
         .args(["--work", &work_id, "--executor", "child"])
@@ -728,4 +729,26 @@ fn deterministic_retry_carries_the_branch_tip_as_base() {
     }
 
     stop_wirkd(repo, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

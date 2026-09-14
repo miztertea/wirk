@@ -33,7 +33,7 @@ use harness::*;
 /// Wirk pane inherits one, and under ruling 0117 it would decide the
 /// default scope of the very verbs under test.
 fn cli() -> Command {
-    let mut command = Command::new(wirk_bin());
+    let mut command = wirk_cli();
     command
         .env_remove("WIRK_ESTATE_ROOT")
         .env_remove("WIRK_WORK_ID")
@@ -1079,7 +1079,7 @@ fn a_live_job_refuses_the_cleanup_and_a_later_one_succeeds() {
 
 /// `wirk output dir` for one Run, as the actor itself asks for it.
 fn output_dir(estate: &Path, work_id: &str, run_id: &str) -> PathBuf {
-    let out = Command::new(wirk_bin())
+    let out = wirk_cli()
         .arg("output")
         .arg("dir")
         .env("WIRK_ESTATE_ROOT", estate)
@@ -1452,4 +1452,244 @@ fn a_work_scoped_storage_read_withholds_identities_from_its_diagnostics_too() {
     }
 
     stop_wirkd(&fixture.estate, wirkd);
+}
+
+// ---- local document sources ----------------------------------------------
+
+/// A document collection admitted as its own source is owned, inventoried
+/// and reclaimable exactly like a Git one — and reclaiming it never
+/// reaches the originals.
+///
+/// The estate's own bytes for a document source are the same two things
+/// they are for any source: a generation manifest and its resource list.
+/// The documents themselves stay where their owner put them. This walks
+/// the whole lifecycle through the public verbs: admit, publish, see the
+/// generation held by its own publication, unregister, see it become
+/// reclaimable, reclaim it, and confirm every original file is still
+/// there, byte for byte.
+#[test]
+fn a_document_source_is_owned_inventoried_and_reclaimable_without_touching_originals() {
+    let (fixture, wirkd) = fixture();
+
+    let docs = fixture.estate.parent().expect("parent").join("docs");
+    fs::create_dir_all(&docs).expect("docs dir");
+    fs::write(docs.join("guide.md"), "# Guide\n\nA sentence.\n").expect("write guide");
+    fs::write(docs.join("notes.md"), "# Notes\n\nAnother sentence.\n").expect("write notes");
+    let before: Vec<(PathBuf, String)> = ["guide.md", "notes.md"]
+        .iter()
+        .map(|name| {
+            let path = docs.join(name);
+            let body = fs::read_to_string(&path).expect("read original");
+            (path, body)
+        })
+        .collect();
+
+    let acquired = json(&[
+        "atlas",
+        "acquire",
+        "--estate",
+        fixture.estate_arg(),
+        "--source",
+        "docs",
+        "--repository",
+        docs.to_str().unwrap(),
+        "--kind",
+        "document-tree",
+        "--json",
+    ]);
+    let generation = acquired["generation"]["generation"]
+        .as_str()
+        .expect("generation id")
+        .to_string();
+    let published = json(&[
+        "atlas",
+        "publish",
+        "--estate",
+        fixture.estate_arg(),
+        "--source",
+        "docs",
+        "--generation",
+        &generation,
+        "--json",
+    ]);
+    assert!(
+        published["publication_revision"].is_u64(),
+        "publish must report the catalog revision it advanced to: {published}"
+    );
+
+    // Held by its own publication, so not removable yet.
+    let report = fixture.storage_admin();
+    let item = fixture.class(&report, "atlas-generations")["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["id"] == generation.as_str())
+        .unwrap_or_else(|| panic!("the document generation is inventoried: {report}"))
+        .clone();
+    assert_eq!(
+        item["removable"], false,
+        "a published generation is retained by its own publication: {item}"
+    );
+
+    // The source's locator is *named* in the inventory and never
+    // measured: the originals are not this estate's to account for.
+    let named = report["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .any(|entry| entry["locator"] == docs.to_str().unwrap());
+    assert!(
+        named,
+        "the document source's locator is disclosed: {report}"
+    );
+
+    // Unregister, then reclaim through the one cleanup owner.
+    let removed = json(&[
+        "atlas",
+        "remove",
+        "--estate",
+        fixture.estate_arg(),
+        "--source",
+        "docs",
+        "--json",
+    ]);
+    assert_eq!(removed["outcome"], "removed", "{removed}");
+
+    let report = fixture.storage_admin();
+    let item = fixture.class(&report, "atlas-generations")["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["id"] == generation.as_str())
+        .unwrap_or_else(|| panic!("still inventoried before reclaim: {report}"))
+        .clone();
+    assert_eq!(
+        item["removable"], true,
+        "once unregistered, nothing retains it: {item}"
+    );
+
+    let cleaned = json(&[
+        "estate",
+        "clean",
+        "--estate",
+        fixture.estate_arg(),
+        "--admin",
+        "--class",
+        "atlas-generations",
+        "--all-unreferenced",
+        "--json",
+    ]);
+    assert!(
+        cleaned["removed"]
+            .as_array()
+            .expect("removed")
+            .iter()
+            .any(|entry| entry["id"] == generation.as_str()),
+        "the unreferenced document generation is reclaimed: {cleaned}"
+    );
+
+    // The decisive half: the user's own documents are exactly as they
+    // were. Nothing in this lifecycle ever had the right to touch them.
+    for (path, body) in before {
+        assert_eq!(
+            fs::read_to_string(&path).expect("original still readable"),
+            body,
+            "reclaiming estate-owned bytes must never reach {}",
+            path.display()
+        );
+    }
+
+    stop_wirkd(&fixture.estate, wirkd);
+}
+
+/// D5's operator recourse, through the real configuration surface.
+///
+/// The default document bounds refuse a collection this wide. An estate
+/// that raises `document_max_entries` in its own `.wirk/resources.json`
+/// admits exactly the same collection. Nothing about the capture changes
+/// except whether it was allowed to happen — which is the difference
+/// between a bound and a wall.
+#[test]
+fn a_configured_document_bound_admits_a_collection_the_default_refuses() {
+    fn collection(root: &Path) -> PathBuf {
+        let docs = root.join("wide-docs");
+        fs::create_dir_all(&docs).expect("docs dir");
+        for n in 0..24 {
+            fs::write(docs.join(format!("d{n}.md")), "# x\n").expect("write");
+        }
+        docs
+    }
+
+    // Tight: the estate's own policy refuses it, by name, with the
+    // setting an operator would change.
+    let mut tight = serde_json::Map::new();
+    tight.insert("document_max_entries".to_string(), serde_json::json!(4));
+    let (fixture, wirkd) = fixture_with(tight);
+    let docs = collection(fixture.estate.parent().expect("parent"));
+    let (ok, stdout, stderr) = run(&[
+        "atlas",
+        "acquire",
+        "--estate",
+        fixture.estate_arg(),
+        "--source",
+        "wide",
+        "--repository",
+        docs.to_str().unwrap(),
+        "--kind",
+        "document-tree",
+        "--json",
+    ]);
+    let said = format!("{stdout}{stderr}");
+    assert!(!ok, "the tight bound must refuse this collection: {said}");
+    assert!(
+        said.contains("document_max_entries"),
+        "the refusal must name the setting an operator can raise: {said}"
+    );
+    stop_wirkd(&fixture.estate, wirkd);
+
+    // Raised: the same collection, admitted.
+    let mut raised = serde_json::Map::new();
+    raised.insert("document_max_entries".to_string(), serde_json::json!(5_000));
+    let (fixture, wirkd) = fixture_with(raised);
+    let docs = collection(fixture.estate.parent().expect("parent"));
+    let acquired = json(&[
+        "atlas",
+        "acquire",
+        "--estate",
+        fixture.estate_arg(),
+        "--source",
+        "wide",
+        "--repository",
+        docs.to_str().unwrap(),
+        "--kind",
+        "document-tree",
+        "--json",
+    ]);
+    assert_eq!(
+        acquired["generation"]["coverage"]["total"], 24,
+        "a raised bound admits the whole collection: {acquired}"
+    );
+    stop_wirkd(&fixture.estate, wirkd);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

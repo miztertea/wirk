@@ -110,10 +110,11 @@ fn main() -> ExitCode {
         Some("finding") => finding::finding_command(&args[2..]),
         Some("world") => world_command(&args[2..]),
         Some("output") => output_command(&args[2..]),
+        Some("artifact") => artifact_command(&args[2..]),
         Some("estate") => estate::estate_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json] | wirk estate storage|clean --estate <root> ..."
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path> | --kind actor --source-basis output-only] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|remove|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json] | wirk artifact read|export --claim <id> --name <name> [--to <path>] | wirk estate storage|clean --estate <root> ..."
             );
             ExitCode::FAILURE
         }
@@ -516,6 +517,502 @@ fn output_command(rest: &[String]) -> ExitCode {
 
 fn output_usage() -> ExitCode {
     eprintln!("usage: wirk output [list [--json] | dir]");
+    ExitCode::from(1)
+}
+
+// ---- wirk artifact -------------------------------------------------
+
+/// `wirk artifact read --claim <id> --name <name>`: the bytes a
+/// validated Claim of this Work was checked against, written to stdout.
+///
+/// `wirk artifact export --claim <id> --name <name> --to <path>`: the
+/// same bytes, written to a destination the caller names.
+///
+/// Both go through the same triple-only door `wirk output` uses: the
+/// Work is this Run's own bound Work, never a named one. The daemon
+/// re-verifies the bytes against the digest the Claim was validated
+/// against before reporting an address, and `export` verifies again
+/// after writing, so a destination that does not byte-match the Claim
+/// is reported as a failure rather than left in place as if it did.
+///
+/// Ownership of the destination is the caller's, and is never inferred:
+/// `--to` is required for `export` — this verb never picks a
+/// destination — and an existing file is refused rather than
+/// overwritten unless `--force` says otherwise.
+fn artifact_command(rest: &[String]) -> ExitCode {
+    let mode = match rest.first().map(String::as_str) {
+        Some("read") => "read",
+        Some("export") => "export",
+        _ => return artifact_usage(),
+    };
+    let mut claim: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut destination: Option<String> = None;
+    let mut force = false;
+    let mut index = 1usize;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--claim" if index + 1 < rest.len() => {
+                claim = Some(rest[index + 1].clone());
+                index += 2;
+            }
+            "--name" if index + 1 < rest.len() => {
+                name = Some(rest[index + 1].clone());
+                index += 2;
+            }
+            "--to" if index + 1 < rest.len() => {
+                destination = Some(rest[index + 1].clone());
+                index += 2;
+            }
+            "--force" => {
+                force = true;
+                index += 1;
+            }
+            _ => return artifact_usage(),
+        }
+    }
+    let (Some(claim), Some(name)) = (claim, name) else {
+        return artifact_usage();
+    };
+    if mode == "export" && destination.is_none() {
+        eprintln!("wirk artifact: export needs --to <path>: this verb never picks a destination");
+        return ExitCode::from(1);
+    }
+    if mode == "read" && (destination.is_some() || force) {
+        // `--force` was accepted and silently ignored here. A flag that
+        // does nothing is a promise the verb does not keep: `read`
+        // writes nothing, so there is nothing for it to force.
+        return artifact_usage();
+    }
+
+    let triple = match world_triple() {
+        Ok(triple) => triple,
+        Err(missing) => {
+            for name in &missing {
+                eprintln!("wirk artifact: missing {name}");
+            }
+            return ExitCode::from(1);
+        }
+    };
+    let estate_root = triple["WIRK_ESTATE_ROOT"].clone();
+    let pointer = match wirkd::client::locate(Path::new(&estate_root)) {
+        Ok(pointer) => pointer,
+        Err(err) => {
+            eprintln!("wirk artifact: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let payload = wirkd::RunArtifactPayload {
+        triple: ExecutionTriple {
+            estate_root,
+            work_id: WorkId(triple["WIRK_WORK_ID"].clone()),
+            run_id: RunId(triple["WIRK_RUN_ID"].clone()),
+        },
+        claim: ClaimId(claim),
+        name,
+    };
+    // The triple is read again after this call (the managed-storage
+    // guard below), and `Request::run_artifact` takes the payload by
+    // value: bound here, before the move, rather than read from a
+    // payload that no longer exists.
+    let caller = payload.triple.clone();
+    let result = match wirkd::client::call(&pointer.socket, &Request::run_artifact(payload)) {
+        Ok(Reply::Ok { result, .. }) => result,
+        Ok(Reply::Err { error, .. }) => {
+            eprintln!("wirk artifact: {} {}", error.code, error.message);
+            return ExitCode::from(3);
+        }
+        Err(err) => {
+            eprintln!("wirk artifact: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let source = Path::new(result["path"].as_str().unwrap_or(""));
+    let digest = result["digest"].as_str().unwrap_or("").to_string();
+    let reported_len = result["bytes"].as_u64().unwrap_or(0);
+    // **One read, and the digest is of that read.** The previous shape
+    // hashed the path with `digest_of` and then called `std::fs::read`
+    // on it again: two lookups, two buffers, and the success line
+    // printed the Claim's digest for bytes nothing had verified. The
+    // daemon has already verified its own read and returned an address,
+    // so custody has to be re-established on *this* side — on the exact
+    // buffer that is about to be written to stdout or to a file.
+    let bytes = match read_regular_no_follow(source, reported_len.saturating_add(1)) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("wirk artifact: the claimed bytes could not be read: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    if wirk_core::ArtifactReceipt::digest_of_bytes(&bytes) != digest {
+        eprintln!(
+            "wirk artifact: the claimed bytes are no longer readable at the digest this Claim \
+             was validated against; nothing was written"
+        );
+        return ExitCode::from(3);
+    }
+
+    if mode == "read" {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        if let Err(err) = out.write_all(&bytes).and_then(|()| out.flush()) {
+            eprintln!("wirk artifact: {err}");
+            return ExitCode::from(2);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let destination = PathBuf::from(destination.expect("export requires --to, checked above"));
+    // An export is for getting claimed bytes *out*. It is never a way to
+    // write into the area that holds them: a destination resolving onto
+    // the artifact's own stored path would let `--force` rewrite the
+    // very bytes a Claim was validated against, through a verb whose
+    // whole promise is that it only reads them.
+    //
+    // Ruling 0283: the area protected is this *estate's* managed
+    // storage, not only this Work's own subtree of it. A caller holding
+    // a valid triple for its own Work could name another Work's
+    // `outputs/claims/<claim>/<name>` or its `journal.ndjson` and, with
+    // `--force`, overwrite bytes a validated Claim was checked against
+    // or the Trail itself. `--to` is real destination authority, but it
+    // is authority over where this caller's *own* output goes; it is not
+    // a waiver of the boundary around every other Work's record.
+    //
+    // The one destination inside that area this workflow genuinely
+    // needs is the caller's own Run staging directory: an Actor stage
+    // exporting a prior stage's claimed artifact in order to revise it
+    // writes exactly there, and that is where `wirk output dir` sends
+    // it. Excluded by name, from the same helper that derives it
+    // (`outputs::staging_dir`), rather than by a prefix match invented
+    // here. `<estate>/worktrees/<work>` is not in the protected area at
+    // all: a Git stage's checkout is an ordinary working tree, and
+    // exporting into it is the normal way to bring an artifact into the
+    // work.
+    let estate = PathBuf::from(&caller.estate_root);
+    let works_root = estate.join("works");
+    let own_staging = wirk_core::outputs::staging_dir(&estate, &caller.work_id, &caller.run_id);
+    if let Some(reason) =
+        managed_storage_conflict(&works_root, own_staging.as_deref(), source, &destination)
+    {
+        eprintln!("wirk artifact: {reason}");
+        return ExitCode::from(1);
+    }
+    let opened = if force {
+        // `--force` respects an explicit destination; it does not
+        // respect whatever happens to be standing at it. A non-regular
+        // entry is refused before anything is truncated.
+        //
+        // What `O_NOFOLLOW` on this open gives, precisely (ruling 0283):
+        // the *final component* is not a symlink at the moment it is
+        // opened. It does not bind an ancestor — a directory on the way
+        // to the destination replaced by a symlink is still followed —
+        // and it does not bind file identity: a regular file swapped
+        // for another regular file, or for a hard link to one, between
+        // the inspection and the open is still opened. So the checks
+        // that matter are made on the descriptor itself, below, and the
+        // file is opened *without* `O_TRUNC` so nothing is destroyed
+        // before they run.
+        match std::fs::symlink_metadata(&destination) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) => {
+                eprintln!(
+                    "wirk artifact: {} is not a regular file; --force replaces a file, it does \
+                     not write through whatever is standing at the destination",
+                    destination.display()
+                );
+                return ExitCode::from(1);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!("wirk artifact: {} {err}", destination.display());
+                return ExitCode::from(2);
+            }
+        }
+        open_destination(&destination, true)
+    } else {
+        // Atomic no-clobber. `exists()` follows links, so a dangling
+        // symlink at `--to` answered `false`, the write landed at the
+        // link's target, and the read-back followed the same link and
+        // reported success — the export silently went somewhere the
+        // caller never named. `create_new` is one syscall and refuses
+        // *any* existing entry, symlink included.
+        open_destination(&destination, false)
+    };
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!(
+                "wirk artifact: {} already exists; nothing was written (--force to replace it)",
+                destination.display()
+            );
+            return ExitCode::from(1);
+        }
+        Err(err) => {
+            eprintln!(
+                "wirk artifact: could not write {}: {err}",
+                destination.display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    // The destination that was actually opened, judged as the open file
+    // object rather than as the path that named it (ruling 0283). This
+    // is where an ancestor swapped for a symlink, or a hard link into
+    // managed storage, is caught — the canonical check above ran
+    // against a path, and a path can stop describing this file the
+    // instant after it is inspected. Nothing has been truncated yet.
+    if let Some(reason) = opened_destination_conflict(
+        &file,
+        &works_root,
+        own_staging.as_deref(),
+        &destination,
+        force,
+    ) {
+        eprintln!("wirk artifact: {reason}");
+        if !force {
+            // The no-clobber open creates the entry before this check
+            // can run, so an entry this call made may be standing there
+            // — empty, never written to, and said plainly rather than
+            // left for the caller to discover.
+            eprintln!(
+                "wirk artifact: an empty file this call created may remain at {}; none of the \
+                 claimed bytes were written to it",
+                destination.display()
+            );
+        }
+        return ExitCode::from(1);
+    }
+    if force && let Err(err) = file.set_len(0) {
+        eprintln!(
+            "wirk artifact: could not replace {}: {err}",
+            destination.display()
+        );
+        return ExitCode::from(2);
+    }
+    {
+        use std::io::Write;
+        if let Err(err) = file.write_all(&bytes).and_then(|()| file.flush()) {
+            eprintln!(
+                "wirk artifact: could not write {}: {err}",
+                destination.display()
+            );
+            return ExitCode::from(2);
+        }
+    }
+    drop(file);
+    // Byte-match confirmed at the destination, not assumed from a
+    // successful write: a short write, a full filesystem, or a
+    // destination that is not what it looked like all surface here.
+    match read_regular_no_follow(&destination, bytes.len() as u64 + 1) {
+        Ok(written) if written == bytes => {
+            println!(
+                "exported {} ({} bytes, {digest}) to {}",
+                result["name"].as_str().unwrap_or("?"),
+                bytes.len(),
+                destination.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!(
+                "wirk artifact: {} does not byte-match the Claim it was exported from",
+                destination.display()
+            );
+            ExitCode::from(3)
+        }
+        Err(err) => {
+            eprintln!(
+                "wirk artifact: {} could not be read back to confirm it: {err}",
+                destination.display()
+            );
+            ExitCode::from(3)
+        }
+    }
+}
+
+/// Reads at most `cap` bytes of `path` as a regular file, following no
+/// symlink at the final component and never blocking on a FIFO or a
+/// device.
+///
+/// `std::fs::read` does a fresh path lookup that follows links and
+/// happily opens anything the kernel will open — including an entry that
+/// replaced a regular file between an inspection and the read. Here the
+/// open *is* the inspection: `O_NOFOLLOW` refuses a symlink, `O_NONBLOCK`
+/// makes the open of a FIFO or device return instead of parking this
+/// process, and `fstat` on the descriptor that survives refuses anything
+/// that is not a regular file before a byte is read. One file object,
+/// checked and read.
+fn read_regular_no_follow(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, cap), &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Opens an export destination: atomically created when it must not
+/// already exist, and otherwise replaced without following a symlink
+/// that appeared since it was inspected.
+fn open_destination(destination: &Path, replace: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if replace {
+        // Deliberately *not* `truncate(true)`: the destination's
+        // identity is checked on this descriptor before anything is
+        // destroyed (ruling 0283), and the caller truncates afterwards.
+        options
+            .create(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    } else {
+        options.create_new(true);
+    }
+    let file = options.open(destination)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", destination.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Why this destination may not be written, when it addresses the
+/// artifact's own managed storage rather than somewhere outside it.
+///
+/// Compared after canonicalization, and the *parent* is compared too, so
+/// a destination naming a file that does not exist yet inside the
+/// managed area is caught as well as one that does. A destination that
+/// cannot be canonicalized at all is not thereby a conflict: it is
+/// simply somewhere this check cannot place, and the open below decides
+/// it.
+fn managed_storage_conflict(
+    works_root: &Path,
+    own_staging: Option<&Path>,
+    source: &Path,
+    destination: &Path,
+) -> Option<String> {
+    if let Ok(canonical_source) = std::fs::canonicalize(source)
+        && std::fs::canonicalize(destination).is_ok_and(|actual| actual == canonical_source)
+    {
+        return Some(format!(
+            "{} is the artifact's own stored path; an export reads managed storage, it never \
+             writes into it",
+            destination.display()
+        ));
+    }
+    let managed = std::fs::canonicalize(works_root).ok()?;
+    let destination_area = std::fs::canonicalize(destination.parent()?).ok()?;
+    if !destination_area.starts_with(&managed) {
+        return None;
+    }
+    if own_staging
+        .and_then(|staging| std::fs::canonicalize(staging).ok())
+        .is_some_and(|staging| destination_area.starts_with(&staging))
+    {
+        // This Run's own staging directory — where this caller's
+        // outputs are supposed to be written, and the destination a
+        // revision stage exports a prior artifact into.
+        return None;
+    }
+    Some(format!(
+        "{} is inside this estate's managed Work storage ({}), which holds every Work's \
+         journal, projections and validated Claim bytes; an export writes outside the area it \
+         reads from. This Run's own output directory is the exception, and `wirk output dir` \
+         prints it",
+        destination.display(),
+        managed.display()
+    ))
+}
+
+/// Why the destination that was *opened* may not be written, judged on
+/// the open file object rather than on the path that named it.
+///
+/// The canonical path check runs before the open and can be made stale
+/// by anything that happens in between; this runs after it, on a
+/// descriptor that can no longer be retargeted. Two things it can
+/// establish that the path check cannot:
+///
+/// * **Where this file actually is.** `/proc/self/fd/<n>` is the
+///   kernel's own answer for the open file, fully resolved — so an
+///   ancestor directory swapped for a symlink after the path check
+///   shows up here as the real location, inside managed storage.
+/// * **Whether it is the only name for these bytes.** A hard link in an
+///   unprotected directory pointing at a Claim's stored file has its
+///   own harmless-looking path and the protected file's contents.
+///   `st_nlink > 1` under `--force` means this file has other names
+///   that cannot be enumerated from here, so replacing its contents
+///   might replace theirs; it is refused rather than guessed at.
+///
+/// `None` where nothing is proven wrong, including where `/proc` cannot
+/// be read: that failure is disclosed on stderr rather than converted
+/// into a refusal or into a silent claim of safety.
+fn opened_destination_conflict(
+    file: &std::fs::File,
+    works_root: &Path,
+    own_staging: Option<&Path>,
+    destination: &Path,
+    force: bool,
+) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+    if force
+        && let Ok(meta) = file.metadata()
+        && meta.nlink() > 1
+    {
+        return Some(format!(
+            "{} has {} names on this filesystem, so replacing its contents would replace them \
+             all — and this verb cannot tell whether one of them is managed storage; nothing \
+             was written (remove the other names, or export to a fresh path)",
+            destination.display(),
+            meta.nlink()
+        ));
+    }
+    match std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())) {
+        Ok(actual) => {
+            let managed = std::fs::canonicalize(works_root).ok()?;
+            if !actual.starts_with(&managed) {
+                return None;
+            }
+            if own_staging
+                .and_then(|staging| std::fs::canonicalize(staging).ok())
+                .is_some_and(|staging| actual.starts_with(&staging))
+            {
+                return None;
+            }
+            Some(format!(
+                "the destination {} resolved to {}, inside this estate's managed Work storage \
+                 ({}); nothing was written",
+                destination.display(),
+                actual.display(),
+                managed.display()
+            ))
+        }
+        Err(err) => {
+            eprintln!(
+                "wirk artifact: note: the opened destination could not be re-checked against \
+                 managed storage ({err}); the path check before the open is all that stands \
+                 behind this write"
+            );
+            None
+        }
+    }
+}
+
+fn artifact_usage() -> ExitCode {
+    eprintln!(
+        "usage: wirk artifact read --claim <id> --name <name> | wirk artifact export --claim \
+         <id> --name <name> --to <path> [--force]"
+    );
     ExitCode::from(1)
 }
 
@@ -2952,7 +3449,7 @@ fn work_obligations_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path>] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json] | wirk work clean --estate <root> --work <id> [--dry-run] [--outputs-staging] [--json]"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path> | --kind actor --source-basis output-only] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json] | wirk work clean --estate <root> --work <id> [--dry-run] [--outputs-staging] [--json]"
     );
     ExitCode::from(1)
 }
@@ -3106,6 +3603,82 @@ fn run_deterministic_command(args: &[String]) -> ExitCode {
         }
     };
 
+    // Ruling 0292: an output-only Deterministic World executes in this
+    // Work's *own* owned directory, and this is where that directory is
+    // established — creation is where ownership is proven and
+    // registered, the same step `wirk run` performs for an output-only
+    // Actor (`executor.rs`), through the same
+    // `wirk_core::materialize_owned_directory`.
+    //
+    // Nothing is spawned until it holds. The address the reservation
+    // carries is checked against the address this estate would
+    // materialize for this Work, so a World reserved anywhere else — a
+    // historical one submitted before this correction, or a hand-built
+    // one — is refused here rather than run in a directory that is not
+    // this Work's. A Git-basis Deterministic World is untouched: its
+    // `cwd` is a real git worktree, established and registered by git
+    // itself at submit.
+    if let World::Deterministic(det) = &world
+        && matches!(det.source_basis, wirk_core::SourceBasis::OutputOnly { .. })
+    {
+        let owned = wirk_core::owned_execution_address(&estate_root, &work_id);
+        if !wirk_core::paths_equal(&owned, &det.cwd) {
+            eprintln!(
+                "wirk run-deterministic: this Run's output-only World names {} as its execution \
+                 directory, which is not this estate's own address for this Work ({}); \
+                 nothing was created or executed",
+                det.cwd.display(),
+                owned.display()
+            );
+            return ExitCode::from(2);
+        }
+        let registered = registered_owned_identity(&status, &run.id);
+        match wirk_core::materialize_owned_directory(&owned, &work_id, &run.id, registered) {
+            Ok(wirk_core::OwnedMaterialization::Created) => {
+                // Durable before it is relied on: the identity of the
+                // directory object this materialization actually
+                // created, journaled outside the directory so a later
+                // attempt (a retry, a reattachment, `wirk work clean`)
+                // can tell it from whatever is standing at the address
+                // then (ruling 0283). A creation this estate cannot
+                // register is refused rather than executed in.
+                let identity = wirk_core::directory_identity(&owned);
+                if let Err(detail) = record_owned_creation(
+                    &estate,
+                    &work_id,
+                    &run.id,
+                    det.base_sha.clone(),
+                    identity,
+                ) {
+                    eprintln!(
+                        "wirk run-deterministic: could not register this Run's creation of {}: \
+                         {detail}",
+                        owned.display()
+                    );
+                    return ExitCode::from(2);
+                }
+                println!("owned execution directory {}", owned.display());
+            }
+            Ok(wirk_core::OwnedMaterialization::ReattachedByIdentity(identity)) => {
+                println!(
+                    "owned execution directory {} is the directory this Work created \
+                     (registered identity {}:{}) and is reattached, not re-created",
+                    owned.display(),
+                    identity.dev,
+                    identity.ino
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "wirk run-deterministic: {} is not this Run's owned execution directory: \
+                     {err}",
+                    owned.display()
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     println!("Running {}", run.id.0);
 
     let outcome = if executor_kind == "child" {
@@ -3195,6 +3768,53 @@ fn reserved_deterministic(status: &serde_json::Value) -> Result<(Run, World), St
         launch_attempt: None,
     };
     Ok((run, world))
+}
+
+/// The creation identity this Work already registered for its owned
+/// execution directory, read out of the same `status` reply this
+/// command already holds — `runs[].owned_registration.identity`, the
+/// Work-scoped registration `executor.rs` reads for the Actor path
+/// (ruling 0283). `None` when nothing was ever registered, which is the
+/// case a first materialization is.
+fn registered_owned_identity(
+    status: &serde_json::Value,
+    run_id: &RunId,
+) -> Option<wirk_core::DirectoryIdentity> {
+    let entry = status["runs"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["run"]["id"].as_str() == Some(run_id.0.as_str()))?;
+    serde_json::from_value(entry["owned_registration"]["identity"].clone()).ok()
+}
+
+/// Journals this Run's creation of its owned execution directory. The
+/// same `WorktreeCreated` record the Actor path writes, with the fields
+/// an output-only World carries: no repository, this World's own
+/// `base_sha`, and the identity of the directory object just created.
+fn record_owned_creation(
+    estate: &str,
+    work_id: &WorkId,
+    run_id: &RunId,
+    base_sha: String,
+    identity: Option<wirk_core::DirectoryIdentity>,
+) -> Result<(), String> {
+    let pointer = wirkd::client::locate(Path::new(estate)).map_err(|err| err.to_string())?;
+    match wirkd::client::call(
+        &pointer.socket,
+        &Request::record(wirkd::RecordPayload {
+            work_id: work_id.clone(),
+            run: Some(run_id.clone()),
+            kind: EventKind::WorktreeCreated {
+                repo: String::new(),
+                base_sha,
+                identity,
+            },
+        }),
+    ) {
+        Ok(Reply::Ok { .. }) => Ok(()),
+        Ok(Reply::Err { error, .. }) => Err(format!("{}: {}", error.code, error.message)),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 /// Launches `world` through `executor`, then blocks once on the

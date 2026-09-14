@@ -12,9 +12,9 @@ use std::process::ExitCode;
 
 use crate::wirkd::{
     AtlasAcquirePayload, AtlasCancelPayload, AtlasFindingsPayload, AtlasPublishPayload,
-    AtlasRefreshPayload, AtlasRelatePayload, AtlasResolvePayload, AtlasSearchPayload,
-    AtlasSemanticBuildPayload, AtlasSemanticSelectPayload, AtlasStatusPayload, CancelTarget, Reply,
-    Request,
+    AtlasRefreshPayload, AtlasRelatePayload, AtlasRemovePayload, AtlasResolvePayload,
+    AtlasSearchPayload, AtlasSemanticBuildPayload, AtlasSemanticSelectPayload, AtlasStatusPayload,
+    CancelTarget, Reply, Request,
 };
 use crate::{ActorContext, actor_context, flag_value, warn_if_index_incomplete, wirkd_client_call};
 use wirk_core::WorkId;
@@ -24,6 +24,7 @@ pub fn atlas_command(rest: &[String]) -> ExitCode {
         Some("acquire") => acquire_command(&rest[1..]),
         Some("refresh") => refresh_command(&rest[1..]),
         Some("publish") => publish_command(&rest[1..]),
+        Some("remove") => remove_command(&rest[1..]),
         Some("status") => status_command(&rest[1..]),
         // P4.5 B2 correction: the operator's reachable cancellation
         // path. Before it, `cancel_jobs` had no caller and nothing but
@@ -43,9 +44,22 @@ pub fn atlas_command(rest: &[String]) -> ExitCode {
 
 fn atlas_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk atlas acquire --estate <root> --source <name> --repository <path> --revision <ref> [--json] \
-         | wirk atlas refresh --estate <root> --source <name> --revision <ref> [--json] \
-         | wirk atlas publish --estate <root> --source <name> --generation <id> [--json] \
+        "usage: wirk atlas acquire --estate <root> --source <name> --repository <path> --revision <ref> [--kind git|document-tree] [--requesting-work <id> | --admin] [--json] \
+         (--repository names a Git repository/subdirectory/worktree under --kind git, the default; \
+          a plain local directory under --kind document-tree. --revision names the Git ref to \
+          acquire under --kind git, required; under --kind document-tree it can only mean the \
+          tree's current state, so it is optional there, defaults to \"current\", and any other \
+          value is refused by name — a document tree has no other revision to honour) \
+         | wirk atlas refresh --estate <root> --source <name> [--revision <ref>] [--requesting-work <id> | --admin] [--json] \
+         (--revision is optional: omitted, the source's own registered acquisition policy \
+          supplies it — the ref a Git source was admitted to track, or a document tree's \
+          current state; --requesting-work/--admin on any of these three resolve the Work the \
+          job belongs to the same way `atlas semantic build` does — the actor's own Work inside \
+          a context, or an explicit administrative job — so `atlas cancel` scoped to that Work \
+          can reach it — a document collection's walk, its extraction and a publish's \
+          revalidation all run as registered, cancellable jobs) \
+         | wirk atlas publish --estate <root> --source <name> --generation <id> [--requesting-work <id> | --admin] [--json] \
+         | wirk atlas remove --estate <root> --source <name> [--json] \
          | wirk atlas status --estate <root> [--source <name>] [--work <id>] [--json] \
          | wirk atlas cancel --estate <root> (--list | --job <id> | --source <name> | --all) [--reason <text>] [--wait <secs>] [--requesting-work <id> | --admin] [--json] \
          | wirk atlas resolve [--estate <root>] [--work <id>] --coordinate <encoded> [--json] \
@@ -152,17 +166,60 @@ fn acquire_command(rest: &[String]) -> ExitCode {
             ("--source", true),
             ("--repository", true),
             ("--revision", true),
+            ("--kind", true),
+            ("--requesting-work", true),
+            ("--admin", false),
         ],
     ) {
         return code;
     }
-    let (Some(estate), Some(source), Some(repository), Some(revision)) = (
+    let (Some(estate), Some(source), Some(repository)) = (
         flag_value(rest, "--estate"),
         flag_value(rest, "--source"),
         flag_value(rest, "--repository"),
-        flag_value(rest, "--revision"),
     ) else {
         return atlas_usage();
+    };
+    // Same resolution as every other scoped job-starting verb
+    // (`semantic_build_command`): the actor's own Work inside a context,
+    // `--admin` for an administrative job, and the operator's shell
+    // unchanged. Without this a job registers with no requester and its
+    // own actor cannot reach it through `atlas cancel`.
+    let scope = match crate::resolve_scope(
+        "wirk atlas acquire",
+        &estate,
+        flag_value(rest, "--requesting-work"),
+        rest.iter().any(|arg| arg == "--admin"),
+    ) {
+        Ok(scope) => scope,
+        Err(refusal) => {
+            eprintln!("wirk atlas acquire: {refusal}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = &scope.note {
+        eprintln!("wirk atlas acquire: {note}");
+    }
+    // The explicit, one-time choice of acquisition policy for a source
+    // registered for the first time — `git`
+    // (unchanged default) or `document-tree` for a local non-Git
+    // document collection. Never inferred from `--repository`'s own
+    // shape.
+    let kind = flag_value(rest, "--kind");
+    // A document-tree source has no revision beside
+    // its own current state, so `--revision` is optional under `--kind
+    // document-tree` and defaults to the sentinel the daemon actually
+    // checks for (`wirk_atlas::DOCUMENT_TREE_CURRENT_OBSERVATION`) —
+    // never silently defaulted to a made-up Git-shaped value. Any other
+    // value the caller does supply travels unchanged and is refused, by
+    // name, on the daemon side (`AtlasStore::register_document_tree`/
+    // `acquire_document_tree`), which is the one place that can express
+    // what this policy actually observed. Git's `--revision` stays
+    // required exactly as before.
+    let revision = match (flag_value(rest, "--revision"), kind.as_deref()) {
+        (Some(value), _) => value,
+        (None, Some("document-tree")) => wirk_atlas::DOCUMENT_TREE_CURRENT_OBSERVATION.to_string(),
+        (None, _) => return atlas_usage(),
     };
     let json = is_json(rest);
     call_expecting_outcome(
@@ -171,14 +228,59 @@ fn acquire_command(rest: &[String]) -> ExitCode {
             source,
             repository,
             revision,
+            kind,
+            // Who this job belongs to, so `atlas cancel --source` run
+            // by the same Work can reach it. `None` is an administrative
+            // job.
+            work: scope.requesting,
         }),
         &["staged"],
         |result| {
             print_result(json, result, |result| {
                 println!(
-                    "outcome {} generation {}",
+                    "outcome {} generation {} acquisition_policy {}",
                     result["outcome"].as_str().unwrap_or("?"),
-                    result["generation"]["generation"].as_str().unwrap_or("-")
+                    result["generation"]["generation"].as_str().unwrap_or("-"),
+                    result["membership"]["acquisition_policy"]
+                        .as_str()
+                        .unwrap_or("?")
+                );
+            });
+        },
+    )
+}
+
+/// `wirk atlas remove`: unregisters a source's own catalog membership. Refused, by name,
+/// while this estate's own records still need this source's published
+/// generation or selected semantic edition (a non-terminal Work's
+/// delivered World, or an unsettled finding) — see
+/// `wirk_atlas::AtlasStore::remove_source`'s own doc for why that check
+/// happens here, not inside `wirk-atlas`. Never removes the source's
+/// own original files. Once removed, this source's own generation/
+/// edition bytes on disk are unreferenced but not yet reclaimed: `wirk
+/// estate clean --class atlas-generations|atlas-editions
+/// --all-unreferenced` does that, re-deriving retention against every
+/// other source first.
+fn remove_command(rest: &[String]) -> ExitCode {
+    if let Err(code) = check_flags("remove", rest, &[ESTATE, JSON, ("--source", true)]) {
+        return code;
+    }
+    let (Some(estate), Some(source)) = (flag_value(rest, "--estate"), flag_value(rest, "--source"))
+    else {
+        return atlas_usage();
+    };
+    let json = is_json(rest);
+    call_expecting_outcome(
+        &estate,
+        &Request::atlas_remove(AtlasRemovePayload { source }),
+        &["removed"],
+        |result| {
+            print_result(json, result, |result| {
+                println!(
+                    "outcome {} released_generation {} released_edition {}",
+                    result["outcome"].as_str().unwrap_or("?"),
+                    result["released_generation"].as_str().unwrap_or("-"),
+                    result["released_edition"].as_str().unwrap_or("-"),
                 );
             });
         },
@@ -189,21 +291,55 @@ fn refresh_command(rest: &[String]) -> ExitCode {
     if let Err(code) = check_flags(
         "refresh",
         rest,
-        &[ESTATE, JSON, ("--source", true), ("--revision", true)],
+        &[
+            ESTATE,
+            JSON,
+            ("--source", true),
+            ("--revision", true),
+            ("--requesting-work", true),
+            ("--admin", false),
+        ],
     ) {
         return code;
     }
-    let (Some(estate), Some(source), Some(revision)) = (
-        flag_value(rest, "--estate"),
-        flag_value(rest, "--source"),
-        flag_value(rest, "--revision"),
-    ) else {
+    // `--revision` is optional: a source registered as a document
+    // collection has exactly one observable state, and a Git source
+    // already records the ref it was admitted to track. Omitted, the
+    // daemon applies the membership's own policy default rather than
+    // making the caller spell one.
+    let (Some(estate), Some(source)) = (flag_value(rest, "--estate"), flag_value(rest, "--source"))
+    else {
         return atlas_usage();
     };
+    // Same resolution as every other scoped job-starting verb
+    // (`semantic_build_command`): the actor's own Work inside a context,
+    // `--admin` for an administrative job, and the operator's shell
+    // unchanged. Without this a job registers with no requester and its
+    // own actor cannot reach it through `atlas cancel`.
+    let scope = match crate::resolve_scope(
+        "wirk atlas refresh",
+        &estate,
+        flag_value(rest, "--requesting-work"),
+        rest.iter().any(|arg| arg == "--admin"),
+    ) {
+        Ok(scope) => scope,
+        Err(refusal) => {
+            eprintln!("wirk atlas refresh: {refusal}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = &scope.note {
+        eprintln!("wirk atlas refresh: {note}");
+    }
+    let revision = flag_value(rest, "--revision");
     let json = is_json(rest);
     call_expecting_outcome(
         &estate,
-        &Request::atlas_refresh(AtlasRefreshPayload { source, revision }),
+        &Request::atlas_refresh(AtlasRefreshPayload {
+            source,
+            revision,
+            work: scope.requesting,
+        }),
         &["staged"],
         |result| {
             print_result(json, result, |result| {
@@ -221,7 +357,14 @@ fn publish_command(rest: &[String]) -> ExitCode {
     if let Err(code) = check_flags(
         "publish",
         rest,
-        &[ESTATE, JSON, ("--source", true), ("--generation", true)],
+        &[
+            ESTATE,
+            JSON,
+            ("--source", true),
+            ("--generation", true),
+            ("--requesting-work", true),
+            ("--admin", false),
+        ],
     ) {
         return code;
     }
@@ -232,10 +375,35 @@ fn publish_command(rest: &[String]) -> ExitCode {
     ) else {
         return atlas_usage();
     };
+    // Same resolution as every other scoped job-starting verb
+    // (`semantic_build_command`): the actor's own Work inside a context,
+    // `--admin` for an administrative job, and the operator's shell
+    // unchanged. Without this a document publish's revalidation job
+    // registers with no requester and its own actor cannot reach it
+    // through `atlas cancel`.
+    let scope = match crate::resolve_scope(
+        "wirk atlas publish",
+        &estate,
+        flag_value(rest, "--requesting-work"),
+        rest.iter().any(|arg| arg == "--admin"),
+    ) {
+        Ok(scope) => scope,
+        Err(refusal) => {
+            eprintln!("wirk atlas publish: {refusal}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = &scope.note {
+        eprintln!("wirk atlas publish: {note}");
+    }
     let json = is_json(rest);
     wirkd_client_call(
         &estate,
-        &Request::atlas_publish(AtlasPublishPayload { source, generation }),
+        &Request::atlas_publish(AtlasPublishPayload {
+            source,
+            generation,
+            work: scope.requesting,
+        }),
         |result| {
             print_result(json, result, |result| {
                 println!(
@@ -633,6 +801,38 @@ fn search_command(rest: &[String]) -> ExitCode {
                 // both come from one place, so they cannot drift.
                 if let Some(reason) = result["semantic"]["reason"].as_str() {
                     println!("  semantic reason {reason}");
+                }
+                // Ruling 0292 (`p5-foundation-use/USE.md` finding 4):
+                // this search reads the estate's *current* publication.
+                // When the calling Work's own delivered World was
+                // captured at a different one, both vectors are in hand
+                // and the difference is said here rather than left for
+                // an actor to notice by reading two surfaces. It is a
+                // disclosure and nothing else: the World is not
+                // refreshed, the search is not pinned back, and current
+                // discovery stays available.
+                if result["captured_basis"]["state"].as_str() == Some("diverges") {
+                    let basis = &result["captured_basis"];
+                    println!(
+                        "  captured basis diverges: this Run's World was captured at publication \
+                         revision {}, these hits were read at {}",
+                        basis["captured_publication_revision"].as_u64().unwrap_or(0),
+                        basis["current_publication_revision"].as_u64().unwrap_or(0),
+                    );
+                    for entry in basis["differing_generations"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        println!(
+                            "    {} captured {} current {}",
+                            entry["membership"].as_str().unwrap_or("?"),
+                            entry["captured"]
+                                .as_str()
+                                .unwrap_or("not in the captured vector"),
+                            entry["current"].as_str().unwrap_or("?"),
+                        );
+                    }
                 }
                 // A ranking that actually happened names what did it.
                 if let Some(application) = result["ranking"]["application"].as_object() {
@@ -1125,6 +1325,31 @@ fn resolve_command(rest: &[String]) -> ExitCode {
                     result["line_start"].as_u64().unwrap_or(0),
                     result["line_end"].as_u64().unwrap_or(0)
                 );
+                // Ruling 0292 (`p5-foundation-use/USE.md` finding 3): an
+                // unresolvable coordinate printed `outcome unavailable
+                // ?:0-0` and dropped the one thing that says *why* —
+                // which `--json` was carrying all along, from the same
+                // field. The plain surface is the one an actor reads, so
+                // the reason prints here too. Nothing is re-derived: it
+                // is the `detail` this reply already carries, so the two
+                // surfaces cannot drift.
+                if let Some(detail) = result["detail"].as_str() {
+                    println!("  reason {detail}");
+                }
+                // Said once, where a reader meets the limit: what the
+                // World retains is the captured generation manifest and
+                // the delivered excerpt, never the source bytes. A
+                // coordinate that no longer resolves is not evidence of
+                // loss by this estate (ruling 0270) — the original
+                // changed or went away, and a validated Claim's own
+                // artifact bytes are the thing that is retained.
+                if result["outcome"].as_str() == Some("unavailable") {
+                    println!(
+                        "  retention a delivered World retains this coordinate's identity and \
+                         its delivered excerpt, not the source bytes; full bytes are retained \
+                         only by a validated Claim's own artifact"
+                    );
+                }
             });
         },
     )

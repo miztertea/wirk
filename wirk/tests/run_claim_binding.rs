@@ -29,7 +29,7 @@ use harness::*;
 /// `output_dir` lives in `work_owned_outputs.rs`, a different test
 /// binary; duplicated here rather than shared across binaries (R6).
 fn output_dir(estate: &Path, work_id: &str, run_id: &str) -> std::path::PathBuf {
-    let out = std::process::Command::new(wirk_bin())
+    let out = wirk_cli()
         .args(["output", "dir"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -338,4 +338,26 @@ fn a_same_waypoint_superseded_runs_out_of_boundary_does_not_reclaim_the_retried_
     );
 
     stop_wirkd(&estate, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> std::process::Command {
+    let mut command = std::process::Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

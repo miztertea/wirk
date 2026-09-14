@@ -132,17 +132,28 @@ fn pane_info(pane_id: &str, agent_status: AgentStatus, revision: u64) -> PaneInf
     }
 }
 
-/// A real, writable estate root for this binary's fixtures, created
-/// once and shared. P3 execution-recovery correction item 1: an actor
-/// launch pins this Run's own `wirk` under `<estate_root>/.wirk/
-/// runtime/` and *refuses* the launch when it cannot, so the former
-/// `/estate` placeholder (never writable, the pin's failure formerly
-/// swallowed) no longer stands in for a real estate.
-fn fixture_estate_root() -> &'static std::path::Path {
-    static ESTATE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    ESTATE
-        .get_or_init(|| tempfile::tempdir().expect("fixture estate tempdir"))
-        .path()
+/// A real, writable estate root for this binary's fixtures. P3
+/// execution-recovery correction item 1: an actor launch pins this
+/// Run's own `wirk` under `<estate_root>/.wirk/runtime/` and *refuses*
+/// the launch when it cannot, so the former `/estate` placeholder
+/// (never writable, the pin's failure formerly swallowed) no longer
+/// stands in for a real estate.
+///
+/// Ruling 0308: a `static OnceLock<TempDir>` here never ran its
+/// destructor — statics are never dropped at process exit — so every
+/// run of this test binary leaked a whole estate into RAM-backed
+/// `/tmp`, the same defect `run_loop.rs`'s `fixture_estate_root` had
+/// under ruling 0306. This binary's `#[test]`s likewise run under the
+/// ordinary libtest harness, one fresh OS thread per test; a
+/// `thread_local` ties the `TempDir`'s ownership to that thread, so it
+/// is dropped — ordinary RAII, unwind included — when the test's own
+/// thread exits.
+fn fixture_estate_root() -> std::path::PathBuf {
+    thread_local! {
+        static ESTATE: tempfile::TempDir =
+            tempfile::tempdir().expect("fixture estate tempdir");
+    }
+    ESTATE.with(|dir| dir.path().to_path_buf())
 }
 
 /// The selection flags in a claude `agent.start` argv, with the Claim

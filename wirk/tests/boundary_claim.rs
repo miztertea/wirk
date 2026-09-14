@@ -81,7 +81,7 @@ impl Drop for KillOnDrop {
 
 fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
     let child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(estate)
             .stdout(Stdio::null())
@@ -94,7 +94,7 @@ fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
 }
 
 fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(estate)
         .output()
@@ -193,7 +193,7 @@ fn submit_actor_with_repo(
     base_sha: &str,
     repo_spec: &str,
 ) -> (String, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route"])
@@ -218,7 +218,7 @@ fn submit_actor_with_repo(
 /// `ActorWorld`'s declared outputs are staged here (ruling 0212), never
 /// written straight into the checkout.
 fn output_dir(estate: &Path, work_id: &str, run_id: &str) -> PathBuf {
-    let out = Command::new(wirk_bin())
+    let out = wirk_cli()
         .args(["output", "dir"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -239,7 +239,7 @@ fn output_dir(estate: &Path, work_id: &str, run_id: &str) -> PathBuf {
 /// check names `wirk work status` showing `needs_input` with the
 /// paths, so this reads it the way an operator would.
 fn work_status_cli(estate: &Path, work_id: &str) -> String {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         // The operator's own read: ruling 0117 makes an inherited actor
         // triple mean something here, so this asks for the operator
         // rather than inheriting the runner's environment.
@@ -329,6 +329,7 @@ fn create_worktree_for_run(
         EventKind::WorktreeCreated {
             repo: actor.repository.clone(),
             base_sha: head,
+            identity: None,
         },
     );
     let mut updated_actor = actor;
@@ -359,7 +360,7 @@ fn claim(
         args.push("--artifact".to_string());
         args.push(format!("{name}={path}"));
     }
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&args)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -1256,7 +1257,7 @@ fn claim_question(
         args.extend(["--artifact".to_string(), format!("{name}={path}")]);
     }
     args.extend(["--question".to_string(), question.to_string()]);
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(args)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -1657,4 +1658,26 @@ fn claim_validated_on_read_binding_when_declared_artifact_is_unchanged() {
     assert_eq!(stdout, "Validated");
 
     stop_wirkd(estate, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

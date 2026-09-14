@@ -1,0 +1,24 @@
+{
+  "id": "output-only-actor-revise-oriented",
+  "waypoints": [
+    {
+      "id": "output-only-actor-revise-oriented/wp-1",
+      "kind": "Actor",
+      "intent": "read admitted document evidence and claim a cited draft",
+      "declared_outputs": [
+        {"name": "draft.md", "required": true}
+      ],
+      "boundary": []
+    },
+    {
+      "id": "output-only-actor-revise-oriented/wp-2",
+      "kind": "Actor",
+      "intent": "read the prior validated draft and claim a revision",
+      "declared_outputs": [
+        {"name": "revision.md", "required": true}
+      ],
+      "boundary": [],
+      "orient": {"question": "What did the prior stage draft, and what does it cite?", "sources": ["docs-a"]}
+    }
+  ]
+}

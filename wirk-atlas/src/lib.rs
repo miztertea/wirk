@@ -3,10 +3,12 @@
 //! publish, and resolve immutable generations.
 
 mod admission;
+mod doctree;
 mod domain;
 mod extract;
 mod findings;
 mod git;
+mod hydrate;
 mod query;
 mod relationship;
 mod retrieval;
@@ -14,6 +16,23 @@ mod semantic;
 mod store;
 
 pub use admission::{AdmissionSummary, AdmittedSource, QueryScope};
+/// The document-tree acquisition policy label, for a caller (`wirkd`)
+/// deciding which `AtlasStore` method a registered source's
+/// `Membership::policy` calls for.
+pub use doctree::ACQUISITION_POLICY as DOCUMENT_TREE_POLICY;
+/// The only `--revision`/`requested_ref` spelling a document-tree
+/// source honours. Such a source observes its own current state and
+/// nothing else, so a caller defaults to this rather than inventing or
+/// requiring a Git-shaped ref a document collection could mean nothing
+/// by.
+pub use doctree::CURRENT_OBSERVATION as DOCUMENT_TREE_CURRENT_OBSERVATION;
+/// The named window between classifying a document-collection entry and
+/// opening it, for a verifier arming [`BARRIER_RELEASE_SOCKET`]'s gate
+/// at the one real instant a replacement can happen. Exported for the
+/// same reason the gate itself is: the window has to be nameable from
+/// outside the crate that holds it, or the only way to test the race is
+/// to sleep and hope.
+pub use doctree::OPEN_WINDOW as DOCTREE_OPEN_WINDOW;
 pub use domain::*;
 pub use extract::ExtractorPolicy;
 pub use findings::{
@@ -53,5 +72,6 @@ pub use semantic::{
     VECTOR_FORMAT, VECTORS_FILE, VectorManifest,
 };
 pub use store::{
-    AcquireOutcome, AtlasLayout, AtlasStore, BARRIER_RELEASE_SOCKET, atlas_layout, checkpoint,
+    AcquireOutcome, AtlasLayout, AtlasStore, BARRIER_RELEASE_SOCKET, RemovalOutcome, atlas_layout,
+    checkpoint,
 };

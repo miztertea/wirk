@@ -108,10 +108,7 @@ fn atlas(estate: &Path, args: &[&str]) -> (bool, Value, String) {
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk atlas runs");
+    let output = wirk_cli().args(&full).output().expect("wirk atlas runs");
     (
         output.status.success(),
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap_or(Value::Null),
@@ -266,7 +263,7 @@ fn two_stage_route(estate: &Path, name: &str, budget: &str) -> PathBuf {
 /// `wirk world show` exactly as an actor types it: the injected triple in
 /// the environment and no arguments at all.
 fn world_show(estate: &Path, work: &str, run: &str) -> Value {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["world", "show", "--json"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -286,7 +283,7 @@ fn world_show(estate: &Path, work: &str, run: &str) -> Value {
 /// The plain-text rendering, which is what a human and a fresh actor
 /// actually read.
 fn world_show_text(estate: &Path, work: &str, run: &str) -> String {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["world", "show"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -299,7 +296,7 @@ fn world_show_text(estate: &Path, work: &str, run: &str) -> String {
 /// A command run with nothing in the environment but the injected triple
 /// — the way the line a projection prints is actually typed.
 fn in_pane(estate: &Path, work: &str, run: &str, args: &[&str]) -> (Option<i32>, String, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(args)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -666,7 +663,7 @@ fn two_reservations_of_one_work_deliver_different_stage_context_an_actor_can_fol
     // rule `wirk atlas resolve` runs on, and it is not a widening:
     // outside any actor context the verb still refuses, and a half
     // triple is refused rather than read as "no context".
-    let bare = Command::new(wirk_bin())
+    let bare = wirk_cli()
         .args(["atlas", "search", "--query", "boundary", "--json"])
         .env_remove("WIRK_ESTATE_ROOT")
         .env_remove("WIRK_WORK_ID")
@@ -678,7 +675,7 @@ fn two_reservations_of_one_work_deliver_different_stage_context_an_actor_can_fol
         Some(0),
         "outside an actor context nothing changes: {bare:?}"
     );
-    let half = Command::new(wirk_bin())
+    let half = wirk_cli()
         .args(["atlas", "search", "--query", "boundary", "--json"])
         .env("WIRK_ESTATE_ROOT", &estate.root)
         .env_remove("WIRK_WORK_ID")
@@ -2617,7 +2614,7 @@ fn oversize_source_text() -> String {
 }
 
 fn expand_world(estate: &Path, work: &str, run: &str, question: &str, reason: &str) -> Value {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args([
             "world",
             "expand",
@@ -2873,4 +2870,263 @@ fn a_world_over_declared_exclusions_and_unsupported_families_stays_complete() {
     );
 
     estate.stop();
+}
+
+// ---- document sources under a live World ---------------------------------
+
+/// Removal must not drop a source's membership while a non-terminal Work
+/// still has a delivered World pinning one of its generations — and the
+/// generation it pins does not have to be the currently published one.
+///
+/// **Why the older generation is the whole point.** Retention records a
+/// pinned generation under *its own* id. Once the source publishes again,
+/// the currently published id and the pinned id are two different
+/// strings, so a removal check that looks only at what is published today
+/// sees nothing holding the source and proceeds. Nothing is deleted by
+/// that — but `AtlasStore::check_membership` then refuses every
+/// coordinate in the source, so the Work's evidence becomes unresolvable
+/// while its bytes sit untouched on disk. That is the failure this pins.
+///
+/// It also pins the other half, which pulls the opposite way: the
+/// source's *own* publication retains its own generation too, and
+/// counting that would make removal impossible for any source that has
+/// ever published. The second half of this test removes a published
+/// document source that nothing else holds, and it must succeed.
+#[test]
+fn removing_a_document_source_is_refused_while_a_live_world_pins_an_older_generation() {
+    let mut estate = Estate::new();
+
+    let docs = estate.root.parent().unwrap().join("client-docs");
+    fs::create_dir_all(&docs).expect("docs dir");
+    fs::write(
+        docs.join("handbook.md"),
+        "# Handbook\n\nThe escalation path is named zephyrprotocol.\n",
+    )
+    .expect("write handbook");
+
+    // Generation A, published.
+    let (ok, acquired, err) = atlas(
+        &estate.root,
+        &[
+            "acquire",
+            "--source",
+            "clientdocs",
+            "--repository",
+            docs.to_str().unwrap(),
+            "--kind",
+            "document-tree",
+        ],
+    );
+    assert!(ok, "acquire document source: {err}");
+    let generation_a = acquired["generation"]["generation"]
+        .as_str()
+        .expect("generation id")
+        .to_string();
+    let (ok, _, err) = atlas(
+        &estate.root,
+        &[
+            "publish",
+            "--source",
+            "clientdocs",
+            "--generation",
+            &generation_a,
+        ],
+    );
+    assert!(ok, "publish generation A: {err}");
+
+    // A coordinate into generation A, produced by the verb that produces
+    // coordinates rather than handed in from outside.
+    let (ok, found, err) = atlas(
+        &estate.root,
+        &[
+            "search",
+            "--query",
+            "zephyrprotocol",
+            "--source",
+            "clientdocs",
+        ],
+    );
+    assert!(ok, "search over a document source: {err}");
+    let coordinate = found["hits"][0]["coordinate"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a document source must produce hits: {found}"))
+        .to_string();
+
+    // A real Work whose delivered World pins generation A, and which is
+    // not terminal: it can still run, expand and write.
+    let route = one_stage_route_with(
+        &estate.root,
+        "clientdocsstage",
+        "What is the escalation path?",
+        r#"["clientdocs"]"#,
+        "",
+    );
+    // `clientdocs` is bound explicitly, not merely named in the Route's
+    // `orient.sources`. That filter narrows what an assembly reaches; it
+    // grants no authority of its own, so a source named there and not
+    // bound here is reported `inadmissible` and the World pins no
+    // generation for it. The Write binding still resolves the execution
+    // checkout unambiguously, so adding a Read grant beside it changes
+    // nothing about which repository this Work mutates.
+    let submitted = submit_kind(
+        &estate.root,
+        route.to_str().unwrap(),
+        &estate.repo,
+        &["demo:write", "clientdocs:read"],
+        None,
+        Some("actor"),
+    )
+    .expect("submit");
+    let projection =
+        world_show(&estate.root, &submitted.work_id, &submitted.run_id)["projection"].clone();
+    assert_eq!(
+        captured_generation(&projection),
+        generation_a,
+        "the delivered World must pin the generation that was published when it was assembled: \
+         {projection}"
+    );
+
+    // The collection moves on, and the source publishes again. `refresh`
+    // is asked with no `--revision` at all: a document collection has one
+    // observable state and its membership already says so.
+    fs::write(
+        docs.join("handbook.md"),
+        "# Handbook\n\nThe escalation path is named zephyrprotocol, revised.\n",
+    )
+    .expect("edit handbook");
+    let (ok, refreshed, err) = atlas(&estate.root, &["refresh", "--source", "clientdocs"]);
+    assert!(ok, "refresh with no --revision: {err}");
+    let generation_b = refreshed["generation"]["generation"]
+        .as_str()
+        .expect("generation id")
+        .to_string();
+    assert_ne!(
+        generation_a, generation_b,
+        "an edited collection must capture as a different generation"
+    );
+    let (ok, _, err) = atlas(
+        &estate.root,
+        &[
+            "publish",
+            "--source",
+            "clientdocs",
+            "--generation",
+            &generation_b,
+        ],
+    );
+    assert!(ok, "publish generation B: {err}");
+
+    // The decisive refusal. Nothing published today holds generation A;
+    // the live Work does.
+    let (ok, refusal, err) = atlas(&estate.root, &["remove", "--source", "clientdocs"]);
+    assert!(
+        !ok,
+        "removal must refuse while a non-terminal Work pins an older generation: {refusal} {err}"
+    );
+    let said = format!("{refusal}{err}");
+    assert!(
+        said.contains(&submitted.work_id),
+        "the refusal must name the Work that still needs it: {said}"
+    );
+
+    // What that refusal preserves is the *record*: the membership,
+    // generation A, and the coordinate into it all survive the arrival
+    // of B. It does not preserve the bytes, and as built it cannot — a
+    // document tree has no object store behind it the way a Git source
+    // does. `resolve` goes back to the original file and checks it
+    // against the content hash the capture recorded, so once this test
+    // edits `handbook.md` into generation B, that check fails for the
+    // pinned coordinate.
+    //
+    // What a caller gets then is the honest answer: `unavailable`,
+    // naming the file and the reason, and never stale bytes served under
+    // generation A's identity. That is the property worth pinning here.
+    // Retaining captured bytes so a pinned generation stays *readable*
+    // after its originals move is real work that has not been built, and
+    // no assertion here should imply otherwise.
+    let (ok, resolved, err) = atlas(&estate.root, &["resolve", "--coordinate", &coordinate]);
+    assert!(
+        !ok,
+        "an unresolvable coordinate must not exit 0 (ruling 0093): {resolved} / {err}"
+    );
+    assert_eq!(
+        resolved["outcome"].as_str(),
+        Some("unavailable"),
+        "the pinned coordinate must disclose unavailable, never stale bytes: {resolved}"
+    );
+    assert!(
+        resolved["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("handbook.md")
+                && detail.contains("content hash")),
+        "the disclosure must name the file and why it could not be served: {resolved}"
+    );
+
+    // The other half: a published document source nothing else holds is
+    // removable. Its own publication is not a reason to refuse itself.
+    let solo = estate.root.parent().unwrap().join("solo-docs");
+    fs::create_dir_all(&solo).expect("solo dir");
+    fs::write(solo.join("note.md"), "# Note\n\nNothing depends on this.\n").expect("write note");
+    let (ok, acquired, err) = atlas(
+        &estate.root,
+        &[
+            "acquire",
+            "--source",
+            "solodocs",
+            "--repository",
+            solo.to_str().unwrap(),
+            "--kind",
+            "document-tree",
+        ],
+    );
+    assert!(ok, "acquire solo source: {err}");
+    let solo_generation = acquired["generation"]["generation"]
+        .as_str()
+        .expect("generation id")
+        .to_string();
+    let (ok, _, err) = atlas(
+        &estate.root,
+        &[
+            "publish",
+            "--source",
+            "solodocs",
+            "--generation",
+            &solo_generation,
+        ],
+    );
+    assert!(ok, "publish solo generation: {err}");
+    let (ok, removed, err) = atlas(&estate.root, &["remove", "--source", "solodocs"]);
+    assert!(
+        ok,
+        "a published source nothing else holds must be removable: {removed} {err}"
+    );
+    assert_eq!(removed["outcome"].as_str(), Some("removed"));
+
+    // Originals, as always, untouched by any of it.
+    assert!(solo.join("note.md").exists());
+    assert!(docs.join("handbook.md").exists());
+
+    estate.stop();
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

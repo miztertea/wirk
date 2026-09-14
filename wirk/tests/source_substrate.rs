@@ -80,7 +80,7 @@ fn ensure_isolated_host_pool(estate: &Path) {
 fn start_wirkd(estate: &Path) -> KillOnDrop {
     ensure_isolated_host_pool(estate);
     let child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(estate)
             .stdout(Stdio::null())
@@ -93,7 +93,7 @@ fn start_wirkd(estate: &Path) -> KillOnDrop {
 }
 
 fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(estate)
         .output()
@@ -146,10 +146,7 @@ fn atlas(estate: &Path, args: &[&str]) -> (bool, serde_json::Value, String) {
     let estate = estate.to_str().expect("estate path is utf-8");
     full.push(estate);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk atlas runs");
+    let output = wirk_cli().args(&full).output().expect("wirk atlas runs");
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let value = serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
@@ -189,10 +186,7 @@ fn submit_work_with_run(
     args.push(repo_path);
     args.push("--route");
     args.push("smoke");
-    let output = Command::new(wirk_bin())
-        .args(&args)
-        .output()
-        .expect("work submit runs");
+    let output = wirk_cli().args(&args).output().expect("work submit runs");
     assert!(
         output.status.success(),
         "work submit failed: {}",
@@ -231,7 +225,7 @@ fn claim_report(estate: &Path, work_id: &str, run_id: &str) {
 /// order: assert during the work, write the report that includes the
 /// assertion's outcome, then Claim the finished report once.
 fn claim_report_existing(estate: &Path, work_id: &str, run_id: &str) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -1905,4 +1899,26 @@ fn an_unknown_atlas_flag_is_a_typed_failure_not_a_silent_drop() {
     assert_eq!(value["hits"].as_array().unwrap().len(), 1);
 
     stop_wirkd(&estate, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

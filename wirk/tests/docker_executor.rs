@@ -346,14 +346,20 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         name: "report.md".to_string(),
         required: true,
     }]);
-    // `cwd` is the estate root itself — matching what a real `wirk
-    // run-deterministic` actually hands the executor (`main.rs`'s
-    // `reserved_deterministic` reads the World wirkd journaled at
-    // submit, whose `cwd` is `state.estate_root`, `server.rs::
-    // handle_submit`); an ad-hoc, unrelated tempdir here would make
-    // the container's real write land outside the Run's own journaled
-    // worktree, which the boundary guard (W6) correctly refuses.
-    let world = deterministic_world(vec!["sh", "-c", "echo hi > report.md"], &estate, artifacts);
+    // `cwd` is what a real `wirk run-deterministic` actually hands the
+    // executor (`main.rs`'s `reserved_deterministic` reads the World
+    // wirkd journaled at submit); an ad-hoc, unrelated tempdir here
+    // would make the container's real write land outside the Run's own
+    // journaled execution directory, which the boundary guard (W6)
+    // correctly refuses.
+    // Ruling 0292: that directory is this Work's own owned execution
+    // directory, the address `handle_submit` reserves and `wirk
+    // run-deterministic` establishes before it launches anything. This
+    // gated live check drives the executor directly, below that step,
+    // so it creates the same address itself.
+    let owned = wirk_core::owned_execution_address(&estate, &WorkId(work_id.clone()));
+    std::fs::create_dir_all(&owned).expect("this Work's own execution directory");
+    let world = deterministic_world(vec!["sh", "-c", "echo hi > report.md"], &owned, artifacts);
     executor.launch(&run, &world).expect("launch");
     let container_name = executor
         .container_name(&run.id)
@@ -395,7 +401,7 @@ fn d5_9_docker_live_round_trip_completes_by_claim() {
         "the real wirkd's journal never recorded ClaimRecorded{{Validated}}"
     );
     assert!(
-        estate.join("report.md").exists(),
+        owned.join("report.md").exists(),
         "the container's write through the /work bind mount must land on the host cwd"
     );
 
@@ -884,7 +890,14 @@ fn d5_13_docker_live_wirkd_restart_reattaches_a_running_container_to_claimed() {
         name: "report.md".to_string(),
         required: true,
     }]);
-    let world = deterministic_world(vec!["sh", "-c", REAL_WORKLOAD], &estate, artifacts);
+    // Ruling 0292: that directory is this Work's own owned execution
+    // directory, the address `handle_submit` reserves and `wirk
+    // run-deterministic` establishes before it launches anything. This
+    // gated live check drives the executor directly, below that step,
+    // so it creates the same address itself.
+    let owned = wirk_core::owned_execution_address(&estate, &WorkId(work_id.clone()));
+    std::fs::create_dir_all(&owned).expect("this Work's own execution directory");
+    let world = deterministic_world(vec!["sh", "-c", REAL_WORKLOAD], &owned, artifacts);
     executor.launch(&run, &world).expect("launch");
     let container_name = executor
         .container_name(&run.id)
@@ -960,8 +973,8 @@ fn d5_13_docker_live_wirkd_restart_reattaches_a_running_container_to_claimed() {
         "exactly one validated ClaimRecorded, no duplicate from a racing second filer: {events:?}"
     );
     assert!(
-        estate.join("report.md").exists(),
-        "the container's declared artifact must exist on the host estate root"
+        owned.join("report.md").exists(),
+        "the container's declared artifact must exist in this Work's own execution directory"
     );
 
     assert!(
@@ -1012,7 +1025,11 @@ fn d5_14_docker_live_wirkd_restart_journals_run_vanished_for_a_removed_container
         name: "report.md".to_string(),
         required: true,
     }]);
-    let world = deterministic_world(vec!["sh", "-c", REAL_WORKLOAD], &estate, artifacts);
+    // Ruling 0292: this Work's own owned execution directory, which a
+    // real `wirk run-deterministic` establishes before launching.
+    let owned = wirk_core::owned_execution_address(&estate, &WorkId(work_id.clone()));
+    std::fs::create_dir_all(&owned).expect("this Work's own execution directory");
+    let world = deterministic_world(vec!["sh", "-c", REAL_WORKLOAD], &owned, artifacts);
     executor.launch(&run, &world).expect("launch");
     let container_name = executor
         .container_name(&run.id)

@@ -40,6 +40,30 @@ pub struct Membership {
     pub source: SourceId,
     pub locator: String,
     pub requested_ref: String,
+    /// Which acquisition policy this source was **explicitly** admitted
+    /// under — `crate::git::ACQUISITION_POLICY` for a Git repository,
+    /// subdirectory or worktree, `crate::doctree::ACQUISITION_POLICY`
+    /// for a local non-Git document collection.
+    ///
+    /// Decided once, at registration (`AtlasStore::register_git`/
+    /// `register_document_tree`), and reused by every later `refresh` of
+    /// the same alias. What kind of thing someone pointed wirk at is
+    /// their choice, made exactly once and never re-inferred from the
+    /// path — in particular never from the presence or absence of a
+    /// `.git` entry, which says where a directory happens to sit and
+    /// nothing about how its owner meant it to be read.
+    ///
+    /// `#[serde(default)]` to the Git label: a catalog written before
+    /// this field existed named only Git sources, so an old membership
+    /// keeps meaning exactly what it always meant.
+    #[serde(default = "Membership::default_policy")]
+    pub policy: String,
+}
+
+impl Membership {
+    fn default_policy() -> String {
+        crate::git::ACQUISITION_POLICY.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,8 +165,17 @@ pub enum ResolveOutcome {
 
 #[derive(Debug, Error)]
 pub enum AtlasError {
-    #[error("Git object unavailable: {0}")]
-    GitUnavailable(String),
+    /// The bytes a coordinate or resource names could not be read from
+    /// the source that holds them.
+    ///
+    /// Deliberately source-neutral: a Git source reaches it when the
+    /// object store no longer holds the object, and a local document
+    /// collection reaches it when the file has changed, vanished, or is
+    /// no longer an ordinary readable file. It is a disclosure, not a
+    /// failure — the caller reports the resource unavailable rather
+    /// than returning different bytes under the same coordinate.
+    #[error("source bytes unavailable: {0}")]
+    SourceBytesUnavailable(String),
     #[error("inconsistent or out-of-scope coordinate: {0}")]
     InvalidCoordinate(String),
     /// The request names something this product cannot run as asked — a
@@ -173,6 +206,16 @@ pub enum AtlasError {
     /// "abandoned" is now true by enforcement rather than by distance.
     #[error("atlas store is already owned by a live holder: {0}")]
     StoreInUse(String),
+    /// An operator cancelled this job, or it reached a checkpoint after
+    /// its deadline had passed.
+    ///
+    /// Its own variant because it is neither a failure of the work nor a
+    /// bad request: nothing about the estate or the collection is wrong,
+    /// and the same verb run again will do the same thing. Whatever was
+    /// already published stays published — a cancelled acquisition
+    /// stages nothing and a cancelled publish advances nothing.
+    #[error("job stopped: {0}")]
+    Cancelled(String),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON: {0}")]

@@ -1,0 +1,14 @@
+{
+  "id": "output-only-actor",
+  "waypoints": [
+    {
+      "id": "output-only-actor/wp-1",
+      "kind": "Actor",
+      "intent": "read admitted document evidence and claim a cited draft",
+      "declared_outputs": [
+        {"name": "draft.md", "required": true}
+      ],
+      "boundary": []
+    }
+  ]
+}

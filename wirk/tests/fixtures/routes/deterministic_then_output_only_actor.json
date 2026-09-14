@@ -1,0 +1,21 @@
+{
+  "id": "deterministic-then-output-only-actor",
+  "waypoints": [
+    {
+      "id": "deterministic-then-output-only-actor/wp-1",
+      "kind": "Deterministic",
+      "command": ["true"],
+      "declared_outputs": [],
+      "boundary": []
+    },
+    {
+      "id": "deterministic-then-output-only-actor/wp-2",
+      "kind": "Actor",
+      "intent": "read the prepared evidence and claim a cited draft",
+      "declared_outputs": [
+        {"name": "draft.md", "required": true}
+      ],
+      "boundary": []
+    }
+  ]
+}

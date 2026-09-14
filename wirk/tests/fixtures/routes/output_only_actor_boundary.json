@@ -1,0 +1,14 @@
+{
+  "id": "output-only-actor-boundary",
+  "waypoints": [
+    {
+      "id": "output-only-actor-boundary/wp-1",
+      "kind": "Actor",
+      "intent": "declares a checkout boundary an output-only World cannot honour",
+      "declared_outputs": [
+        {"name": "draft.md", "required": true}
+      ],
+      "boundary": ["**"]
+    }
+  ]
+}

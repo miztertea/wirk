@@ -801,29 +801,34 @@ pub(crate) fn rank(
                 admitted.edition.vectors.rows as usize * stride
             )));
         }
-        // One `git cat-file --batch-command` session reads every unique
-        // object this edition's rows address, instead of one `git`
-        // process spawn per unique object (the per-row lazy fetch this
-        // replaced). Same bytes, same per-object error surfaced the same
-        // way; only how many processes are started to get them changes.
-        let mut unique_oids: Vec<String> = Vec::new();
+        // One batched read fetches every unique resource this edition's
+        // rows address, through whichever source policy holds the bytes
+        // — one `git cat-file --batch-command` session for a Git
+        // source, one bounded file read per distinct content identity
+        // for a document collection. Deduplicated by identity, because
+        // one resource backs every row cut out of it.
+        let mut wanted: Vec<(Vec<u8>, String)> = Vec::new();
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for row in &admitted.rows {
             if seen.insert(row.object_id.as_str()) {
-                unique_oids.push(row.object_id.clone());
+                wanted.push((row.path.clone(), row.object_id.clone()));
             }
         }
-        let cache: BTreeMap<String, Vec<u8>> =
-            match crate::git::blobs(Path::new(&admitted.locator), &unique_oids) {
-                Ok(cache) => cache,
-                Err(AtlasError::GitUnavailable(detail)) => {
-                    return Ok(Err(format!(
-                        "the committed bytes edition {} ranks over are unavailable: {detail}",
-                        admitted.edition.id.0
-                    )));
-                }
-                Err(error) => return Err(error),
-            };
+        let cache: BTreeMap<String, Vec<u8>> = match crate::hydrate::blobs(
+            &admitted.edition.acquisition_policy,
+            Path::new(&admitted.locator),
+            &wanted,
+            &crate::doctree::CaptureLimits::from_policy(&jobs.policy),
+        ) {
+            Ok(cache) => cache,
+            Err(AtlasError::SourceBytesUnavailable(detail)) => {
+                return Ok(Err(format!(
+                    "the recorded bytes edition {} ranks over are unavailable: {detail}",
+                    admitted.edition.id.0
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         for row in &admitted.rows {
             // Borrowed, not cloned: one blob backs every row that
             // addresses a range inside it, and cloning it per row copied
@@ -834,8 +839,8 @@ pub(crate) fn rank(
                 // process never received would put an invented diagnosis
                 // in an answer whose whole job is to say what it read.
                 return Ok(Err(format!(
-                    "the committed bytes edition {} ranks over are unavailable: object {} was not \
-                     returned by the batched read of {}",
+                    "the recorded bytes edition {} ranks over are unavailable: resource {} was \
+                     not returned by the batched read of {}",
                     admitted.edition.id.0, row.object_id, admitted.locator
                 )));
             };
@@ -851,7 +856,7 @@ pub(crate) fn rank(
             let text_digest = digest_bytes(text.as_bytes());
             if text_digest != row.ranking_text_digest() {
                 return Ok(Err(format!(
-                    "edition {} row {} no longer re-derives to the text it recorded; the committed \
+                    "edition {} row {} no longer re-derives to the text it recorded; the source \
                      bytes behind it are not the bytes it was built from",
                     admitted.edition.id.0, row.row
                 )));
@@ -1126,7 +1131,6 @@ fn run_query_backend(
                 ));
             }
         };
-    let write: std::io::Result<()> = Ok(());
     if !finished.status.success() {
         return Err(format!(
             "query backend {} exited {} : {}",
@@ -1137,12 +1141,6 @@ fn run_query_backend(
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "by signal".into()),
             String::from_utf8_lossy(&finished.stderr).trim()
-        ));
-    }
-    if let Err(error) = write {
-        return Err(format!(
-            "query backend {} did not consume the view: {error}",
-            config.backend.display()
         ));
     }
     let stdout = String::from_utf8_lossy(&finished.stdout);

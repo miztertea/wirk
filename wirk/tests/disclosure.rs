@@ -45,10 +45,7 @@ fn atlas(estate: &Path, args: &[&str]) -> (bool, serde_json::Value, String) {
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk atlas runs");
+    let output = wirk_cli(&[]).args(&full).output().expect("wirk atlas runs");
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let value = serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
@@ -64,7 +61,7 @@ fn raise_cli(
     let mut full = vec!["finding", "raise"];
     full.extend_from_slice(args);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli(&[])
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -86,7 +83,7 @@ fn applied_cli(
     let mut full = vec!["finding", "applied"];
     full.extend_from_slice(args);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli(&[])
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -106,7 +103,7 @@ fn finding_cli(estate: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value,
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli(&[])
         .args(&full)
         .output()
         .expect("wirk finding runs");
@@ -4688,7 +4685,7 @@ fn the_cli_refuses_an_obligations_answer_that_never_named_its_scope() {
         if json {
             args.push("--json");
         }
-        let output = Command::new(wirk_bin())
+        let output = wirk_cli(&[])
             .args(&args)
             .output()
             .expect("wirk work obligations runs");
@@ -4711,7 +4708,7 @@ fn the_cli_refuses_an_obligations_answer_that_never_named_its_scope() {
 
     // The administrative read of the identical reply is unchanged: it
     // asked for the whole answer and gets it, from either daemon.
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli(&[])
         .args([
             "work",
             "obligations",
@@ -4792,7 +4789,7 @@ fn obligations_cli(estate: &Path, args: &[&str]) -> (Option<i32>, serde_json::Va
     full.push(estate_str);
     full.extend_from_slice(args);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli(&[])
         .args(&full)
         .output()
         .expect("wirk work obligations runs");

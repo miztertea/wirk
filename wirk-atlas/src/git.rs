@@ -2,6 +2,13 @@ use crate::{AtlasError, CoverageDisposition, ExtractorPolicy, GenerationId, Reso
 use std::path::Path;
 use std::process::Command;
 
+/// The acquisition policy label a Git generation records in
+/// `SourceGeneration::acquisition_policy`. Named here, beside the code
+/// that actually shells to `git`, rather than as a bare string literal
+/// repeated at each call site (`store.rs`'s dispatch, `extract.rs`'s
+/// `generation_id`) — parallel to `doctree::ACQUISITION_POLICY`.
+pub(crate) const ACQUISITION_POLICY: &str = "git-tree-policy/v1";
+
 fn git(repo: &Path, args: &[String]) -> Result<Vec<u8>, AtlasError> {
     let output = Command::new("git")
         .env("GIT_NO_LAZY_FETCH", "1")
@@ -12,7 +19,7 @@ fn git(repo: &Path, args: &[String]) -> Result<Vec<u8>, AtlasError> {
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(AtlasError::GitUnavailable(
+        Err(AtlasError::SourceBytesUnavailable(
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ))
     }
@@ -20,7 +27,7 @@ fn git(repo: &Path, args: &[String]) -> Result<Vec<u8>, AtlasError> {
 fn text(repo: &Path, args: &[String]) -> Result<String, AtlasError> {
     String::from_utf8(git(repo, args)?)
         .map(|s| s.trim().to_owned())
-        .map_err(|_| AtlasError::GitUnavailable("non UTF-8 Git object identifier".into()))
+        .map_err(|_| AtlasError::SourceBytesUnavailable("non UTF-8 Git object identifier".into()))
 }
 pub(crate) fn commit_and_tree(
     repo: &Path,
@@ -35,7 +42,7 @@ pub(crate) fn commit_and_tree(
         ],
     )?;
     if commit.len() != 40 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(AtlasError::GitUnavailable(
+        return Err(AtlasError::SourceBytesUnavailable(
             "Git did not return a full SHA-1 commit".into(),
         ));
     }
@@ -68,15 +75,17 @@ pub(crate) fn resources(
     let mut records = Vec::new();
     for entry in raw.split(|b| *b == 0).filter(|x| !x.is_empty()) {
         let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
-            return Err(AtlasError::GitUnavailable(
+            return Err(AtlasError::SourceBytesUnavailable(
                 "invalid NUL-framed ls-tree record".into(),
             ));
         };
         let meta = std::str::from_utf8(&entry[..tab])
-            .map_err(|_| AtlasError::GitUnavailable("invalid Git metadata".into()))?;
+            .map_err(|_| AtlasError::SourceBytesUnavailable("invalid Git metadata".into()))?;
         let fields: Vec<_> = meta.split_whitespace().collect();
         if fields.len() != 4 {
-            return Err(AtlasError::GitUnavailable("invalid Git tree fields".into()));
+            return Err(AtlasError::SourceBytesUnavailable(
+                "invalid Git tree fields".into(),
+            ));
         }
         let path = entry[tab + 1..].to_vec();
         let mode = fields[0].to_owned();
@@ -117,7 +126,7 @@ pub(crate) fn resources(
                     Ok(units) => (CoverageDisposition::Indexed, None, units),
                     Err(detail) => (CoverageDisposition::Error, Some(detail.into()), vec![]),
                 },
-                Err(AtlasError::GitUnavailable(detail)) => {
+                Err(AtlasError::SourceBytesUnavailable(detail)) => {
                     (CoverageDisposition::Unavailable, Some(detail), vec![])
                 }
                 Err(error) => return Err(error),
@@ -145,7 +154,7 @@ pub(crate) fn blob(repo: &Path, oid: &str) -> Result<Vec<u8>, AtlasError> {
 /// one process spawn per object. Reads exactly the objects named by
 /// `oids`, in order, and returns exactly what `blob` would have returned
 /// for each: on a missing or otherwise unreadable object this fails with
-/// the same `AtlasError::GitUnavailable` shape a lone `blob(repo, oid)`
+/// the same `AtlasError::SourceBytesUnavailable` shape a lone `blob(repo, oid)`
 /// call for that object would have produced, so a caller that already
 /// tolerates that error does not need to change how it reacts.
 pub(crate) fn blobs(
@@ -225,7 +234,7 @@ pub(crate) fn blobs_with_program(
         let mut header = String::new();
         match reader.read_line(&mut header) {
             Ok(0) => {
-                read_error = Some(AtlasError::GitUnavailable(format!(
+                read_error = Some(AtlasError::SourceBytesUnavailable(format!(
                     "git cat-file --batch-command closed its output before object {oid}"
                 )));
                 break;
@@ -248,19 +257,19 @@ pub(crate) fn blobs_with_program(
         let mut fields = header.split_whitespace();
         let (Some(got), Some(_kind), Some(size)) = (fields.next(), fields.next(), fields.next())
         else {
-            read_error = Some(AtlasError::GitUnavailable(format!(
+            read_error = Some(AtlasError::SourceBytesUnavailable(format!(
                 "malformed git cat-file --batch-command header for {oid}: {header:?}"
             )));
             break;
         };
         let Ok(size) = size.parse::<usize>() else {
-            read_error = Some(AtlasError::GitUnavailable(format!(
+            read_error = Some(AtlasError::SourceBytesUnavailable(format!(
                 "non-numeric object size from git cat-file --batch-command for {oid}"
             )));
             break;
         };
         if got != oid {
-            read_error = Some(AtlasError::GitUnavailable(format!(
+            read_error = Some(AtlasError::SourceBytesUnavailable(format!(
                 "git cat-file --batch-command answered object {got} for requested {oid}"
             )));
             break;
@@ -297,12 +306,12 @@ pub(crate) fn blobs_with_program(
         // Git repository, permissions) also looks like from here -- git
         // exits nonzero before writing any object header at all. Prefer
         // the process's own account when it has one, the same
-        // `AtlasError::GitUnavailable(stderr)` a lone `blob(repo, oid)`
+        // `AtlasError::SourceBytesUnavailable(stderr)` a lone `blob(repo, oid)`
         // call against that repo would already have produced, so a
         // caller that tolerates "this source is unavailable" continues
         // to see that, not a new, narrower failure shape.
         if !status.success() {
-            return Err(AtlasError::GitUnavailable(if detail.is_empty() {
+            return Err(AtlasError::SourceBytesUnavailable(if detail.is_empty() {
                 format!("{error}")
             } else {
                 detail
@@ -311,7 +320,7 @@ pub(crate) fn blobs_with_program(
         return Err(error);
     }
     if !status.success() {
-        return Err(AtlasError::GitUnavailable(detail));
+        return Err(AtlasError::SourceBytesUnavailable(detail));
     }
     // The child answered every object and exited cleanly; a write that
     // failed on the way in could only have shortened that answer, and it
@@ -334,7 +343,7 @@ pub(crate) fn blob_at_path(
         .filter(|entry| !entry.is_empty())
     {
         let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
-            return Err(AtlasError::GitUnavailable(
+            return Err(AtlasError::SourceBytesUnavailable(
                 "invalid NUL-framed ls-tree record".into(),
             ));
         };
@@ -342,7 +351,7 @@ pub(crate) fn blob_at_path(
             continue;
         }
         let meta = std::str::from_utf8(&entry[..tab])
-            .map_err(|_| AtlasError::GitUnavailable("invalid Git metadata".into()))?;
+            .map_err(|_| AtlasError::SourceBytesUnavailable("invalid Git metadata".into()))?;
         let fields: Vec<_> = meta.split_whitespace().collect();
         if fields.len() != 3 || fields[1] != "blob" {
             return Ok(None);
@@ -366,15 +375,17 @@ pub(crate) fn tree_entries(
         .filter(|entry| !entry.is_empty())
     {
         let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
-            return Err(AtlasError::GitUnavailable(
+            return Err(AtlasError::SourceBytesUnavailable(
                 "invalid NUL-framed ls-tree record".into(),
             ));
         };
         let meta = std::str::from_utf8(&entry[..tab])
-            .map_err(|_| AtlasError::GitUnavailable("invalid Git metadata".into()))?;
+            .map_err(|_| AtlasError::SourceBytesUnavailable("invalid Git metadata".into()))?;
         let fields: Vec<_> = meta.split_whitespace().collect();
         if fields.len() != 3 {
-            return Err(AtlasError::GitUnavailable("invalid Git tree fields".into()));
+            return Err(AtlasError::SourceBytesUnavailable(
+                "invalid Git tree fields".into(),
+            ));
         }
         entries.push((
             entry[tab + 1..].to_vec(),
@@ -447,7 +458,7 @@ mod batched_read_tests {
 
     /// The same shape on the failure side: a child that fails *and* is
     /// talkative about it must still be waited for, and what it said must
-    /// still reach the caller as `GitUnavailable`, bounded rather than
+    /// still reach the caller as `SourceBytesUnavailable`, bounded rather than
     /// unbounded.
     #[test]
     fn a_talkative_failing_child_reports_its_own_account_bounded() {
@@ -461,7 +472,7 @@ mod batched_read_tests {
             .recv_timeout(Duration::from_secs(30))
             .expect("the batched read did not return on a failing, talkative child");
         match outcome {
-            Err(AtlasError::GitUnavailable(detail)) => {
+            Err(AtlasError::SourceBytesUnavailable(detail)) => {
                 assert!(
                     detail.len() <= BATCH_STDERR_KEPT,
                     "kept {} bytes of a child's stderr; the bound is {BATCH_STDERR_KEPT}",
@@ -472,7 +483,7 @@ mod batched_read_tests {
                     "the child's own account is reported"
                 );
             }
-            other => panic!("expected GitUnavailable, got {other:?}"),
+            other => panic!("expected SourceBytesUnavailable, got {other:?}"),
         }
     }
 

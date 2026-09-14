@@ -94,7 +94,7 @@ fn wait_for_pointer_live(estate: &Path) -> wirkd::WirkdPointer {
 /// `report.md` by name regardless of `--command` — the caller's own
 /// command decides whether the later Claim honors that.
 fn submit_deterministic(estate: &Path, base: &str, command: &[&str]) -> (String, String, String) {
-    let mut cmd = Command::new(wirk_bin());
+    let mut cmd = wirk_cli();
     cmd.args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--kind", "deterministic", "--base", base])
@@ -199,7 +199,7 @@ fn d5_1_true_completes_by_claim() {
     let estate = estate_dir.path().to_path_buf();
 
     let mut guard = KillWirkdOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -233,19 +233,28 @@ fn d5_1_true_completes_by_claim() {
         contract_delivery: None,
         claim_hook: None,
     };
-    // P2.4 W1: `cwd` must be the *journaled* World's own `cwd`
-    // (`estate`, `handle_submit`'s ad hoc deterministic arm — real
+    // P2.4 W1: `cwd` must be the *journaled* World's own `cwd` (real
     // usage, `run_deterministic_command`, always launches with the
     // World it read back from wirkd, never a World it built itself), so
-    // `handle_claim`'s boundary/escape checks — which now read the
-    // journaled World's `worktree_path`, not this local one — see the
-    // artifact land where it says it did. A separate tempdir here
-    // (worked before those checks existed, since the artifact path was
-    // already absolute and `Path::join` on an absolute argument
+    // `handle_claim`'s boundary/escape checks — which read the
+    // journaled World's own execution directory, not this local one —
+    // see the artifact land where it says it did. A separate tempdir
+    // here (worked before those checks existed, since the artifact path
+    // was already absolute and `Path::join` on an absolute argument
     // silently discards the base) is not a real executor's shape.
+    //
+    // Ruling 0292: that directory is this Work's own owned execution
+    // directory, not the estate root that every Work in the estate
+    // shares. `run_deterministic_command` establishes it (proving and
+    // journaling ownership) before it launches anything; this test
+    // drives `ChildExecutor` directly, below that step, so it creates
+    // the same address itself rather than asserting a directory into
+    // existence that the real caller would have made.
+    let owned = wirk_core::owned_execution_address(&estate, &WorkId(work_id.clone()));
+    std::fs::create_dir_all(&owned).expect("this Work's own execution directory");
     let world = deterministic_world(
         vec!["sh", "-c", "echo hi > report.md"],
-        &estate,
+        &owned,
         OutputContract(vec![wirk_core::ArtifactSpec {
             name: "report.md".to_string(),
             required: true,
@@ -290,7 +299,7 @@ fn d5_1_true_completes_by_claim() {
     );
 
     // Teardown: stop wirkd, then let `guard`'s Drop reap it.
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -451,7 +460,7 @@ fn d5_6b_a_claim_wirkd_refuses_surfaces_as_claim_filing_error() {
     let cwd = tempfile::tempdir().expect("cwd tempdir");
 
     let mut guard = KillWirkdOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -501,7 +510,7 @@ fn d5_6b_a_claim_wirkd_refuses_surfaces_as_claim_filing_error() {
         other => panic!("expected Err(ClaimFiling(..)), got {other:?}"),
     }
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -675,4 +684,26 @@ mod death_signal {
             thread::sleep(Duration::from_secs(60));
         }
     }
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

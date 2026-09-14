@@ -553,6 +553,19 @@ impl ExtractorPolicy {
     pub(crate) fn id(&self) -> &str {
         self.edition.id()
     }
+    /// The inverse of `id`/edition construction: reconstructs the exact
+    /// `ExtractorPolicy` an already-staged generation's own
+    /// `extractor_set` names, so a caller re-verifying that generation
+    /// (`AtlasStore::publish_verify_doctree`) can re-run
+    /// `doctree::capture`/`doctree::finish` under the identical edition
+    /// rather than today's default — a `v2`/`v3` generation staged before the
+    /// vocabulary widened must re-verify exactly as it was staged.
+    /// `None` for an `extractor_set` naming no known edition, the same
+    /// refusal `ExtractorEdition::from_id`'s existing callers already
+    /// give.
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        ExtractorEdition::from_id(id).map(|edition| Self { edition })
+    }
     pub(crate) fn supports(&self, path: &[u8]) -> bool {
         self.family(path).is_some()
     }
@@ -645,11 +658,17 @@ impl ExtractorPolicy {
         }
         Ok(units)
     }
+    /// `acquisition_policy` is folded into the identity as an explicit
+    /// parameter, so a generation binds the policy it was acquired
+    /// under and can never collide with, or be mistaken for, a
+    /// generation of the same source, revision, content and extractor
+    /// acquired under a different one.
     pub(crate) fn generation_id(
         source: &str,
         revision: &str,
         content: &str,
         extractor: &str,
+        acquisition_policy: &str,
     ) -> String {
         let mut h = Sha256::new();
         for part in [
@@ -658,7 +677,7 @@ impl ExtractorPolicy {
             revision.as_bytes(),
             content.as_bytes(),
             extractor.as_bytes(),
-            b"git-tree-policy/v1",
+            acquisition_policy.as_bytes(),
         ] {
             h.update((part.len() as u64).to_be_bytes());
             h.update(part);

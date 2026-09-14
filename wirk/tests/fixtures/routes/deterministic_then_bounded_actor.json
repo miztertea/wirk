@@ -1,0 +1,21 @@
+{
+  "id": "deterministic-then-bounded-actor",
+  "waypoints": [
+    {
+      "id": "deterministic-then-bounded-actor/wp-1",
+      "kind": "Deterministic",
+      "command": ["true"],
+      "declared_outputs": [],
+      "boundary": []
+    },
+    {
+      "id": "deterministic-then-bounded-actor/wp-2",
+      "kind": "Actor",
+      "intent": "a stage declaring a checkout boundary an output-only basis owns no checkout for",
+      "declared_outputs": [
+        {"name": "draft.md", "required": true}
+      ],
+      "boundary": ["docs/**"]
+    }
+  ]
+}

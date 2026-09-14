@@ -10,9 +10,9 @@
 use std::path::PathBuf;
 use wirk_core::{
     Access, ActorWorld, ArtifactSpec, Boundary, Claim, ClaimId, ClaimKind, ClaimVerdict,
-    DeterministicWorld, Event, EventId, EventKind, ExecutionTriple, FailureCause, OutputContract,
-    RepositoryBinding, ReviewTarget, RouteId, Run, RunId, RunState, SourceBasis, Timestamp,
-    WaypointId, WorkId, WorkState, WorkerContractRef, World, WorldHash,
+    DeterministicWorld, DirectoryIdentity, Event, EventId, EventKind, ExecutionTriple,
+    FailureCause, OutputContract, RepositoryBinding, ReviewTarget, RouteId, Run, RunId, RunState,
+    SourceBasis, Timestamp, WaypointId, WorkId, WorkState, WorkerContractRef, World, WorldHash,
 };
 
 fn triple(run_id: &str) -> ExecutionTriple {
@@ -570,12 +570,33 @@ fn d9_6_worktree_created_carries_the_exact_base_sha() {
         EventKind::WorktreeCreated {
             repo: "wirk".to_string(),
             base_sha: exact_sha.to_string(),
+            identity: Some(DirectoryIdentity {
+                dev: 66_305,
+                ino: 123_456,
+                created: Some(1_700_000_000_000_000_000),
+            }),
         },
     );
     match &created.kind {
-        EventKind::WorktreeCreated { repo, base_sha } => {
+        EventKind::WorktreeCreated {
+            repo,
+            base_sha,
+            identity,
+        } => {
             assert_eq!(repo, "wirk");
             assert_eq!(base_sha, exact_sha);
+            // 0283: the created directory's own object identity rides
+            // the same event, exact in every component — including the
+            // creation time ruling 0297 added, which is what tells a
+            // recreated directory on a reused inode from the original.
+            assert_eq!(
+                *identity,
+                Some(DirectoryIdentity {
+                    dev: 66_305,
+                    ino: 123_456,
+                    created: Some(1_700_000_000_000_000_000),
+                })
+            );
         }
         other => panic!("expected WorktreeCreated, got {other:?}"),
     }

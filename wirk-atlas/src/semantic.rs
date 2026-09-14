@@ -2571,7 +2571,6 @@ fn run_backend_v2(
             return Err(format!("backend {} {detail}", program.display()));
         }
     };
-    let write: std::io::Result<()> = Ok(());
     if !finished.status.success() {
         return Err(format!(
             "backend {} exited {} : {}",
@@ -2582,12 +2581,6 @@ fn run_backend_v2(
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "by signal".into()),
             String::from_utf8_lossy(&finished.stderr).trim()
-        ));
-    }
-    if let Err(error) = write {
-        return Err(format!(
-            "backend {} did not consume the request: {error}",
-            program.display()
         ));
     }
     let stdout = String::from_utf8_lossy(&finished.stdout);
@@ -3303,10 +3296,11 @@ impl crate::AtlasStore {
         Ok(SemanticBuildOutcome::Staged(Box::new(edition)))
     }
 
-    /// Every indexed resource of `generation`, in one deterministic order,
-    /// with the exact committed bytes behind each. A resource whose blob
-    /// cannot be read is a refusal for the whole build: a partial edition
-    /// that silently omitted content would be exactly the "publish only a
+    /// Every indexed resource of `generation`, in one deterministic
+    /// order, with the exact recorded bytes behind each, read through
+    /// whichever source policy holds them. A resource whose bytes cannot
+    /// be read is a refusal for the whole build: a partial edition that
+    /// silently omitted content would be exactly the "publish only a
     /// fully verified edition" failure.
     #[allow(clippy::type_complexity)]
     fn collect_inputs(
@@ -3329,14 +3323,20 @@ impl crate::AtlasStore {
             };
             let bytes = match blob_cache.get(&object_id) {
                 Some(bytes) => bytes.clone(),
-                None => match crate::git::blob(Path::new(&membership.locator), &object_id) {
+                None => match crate::hydrate::blob(
+                    &generation.acquisition_policy,
+                    Path::new(&membership.locator),
+                    &resource.path,
+                    &object_id,
+                    &self.capture_limits(),
+                ) {
                     Ok(bytes) => {
                         blob_cache.insert(object_id.clone(), bytes.clone());
                         bytes
                     }
-                    Err(AtlasError::GitUnavailable(detail)) => {
+                    Err(AtlasError::SourceBytesUnavailable(detail)) => {
                         return Ok(Err(format!(
-                            "committed bytes for {} are unavailable: {detail}",
+                            "the recorded bytes for {} are unavailable: {detail}",
                             String::from_utf8_lossy(&resource.path)
                         )));
                     }
@@ -3525,12 +3525,22 @@ impl crate::AtlasStore {
             };
             let bytes = match blob_cache.get(&row.object_id) {
                 Some(bytes) => bytes.clone(),
-                None => match crate::git::blob(Path::new(&membership.locator), &row.object_id) {
+                // The edition records the policy its own generation was
+                // acquired under, so verification reads the rows back
+                // from the source that actually holds them rather than
+                // assuming the generation was a Git one.
+                None => match crate::hydrate::blob(
+                    &edition.acquisition_policy,
+                    Path::new(&membership.locator),
+                    &row.path,
+                    &row.object_id,
+                    &self.capture_limits(),
+                ) {
                     Ok(bytes) => {
                         blob_cache.insert(row.object_id.clone(), bytes.clone());
                         bytes
                     }
-                    Err(AtlasError::GitUnavailable(detail)) => {
+                    Err(AtlasError::SourceBytesUnavailable(detail)) => {
                         return Ok(SemanticVerification::Unavailable(detail));
                     }
                     Err(error) => return Err(error),

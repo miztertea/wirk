@@ -169,7 +169,7 @@ fn ensure_isolated_host_pool(estate: &Path) {
 
 pub fn start_wirkd_with_env(estate: &Path, env: &[(&str, &str)]) -> (KillOnDrop, WirkdPointer) {
     ensure_isolated_host_pool(estate);
-    let mut command = Command::new(wirk_bin());
+    let mut command = wirk_cli();
     command
         .args(["wirkd", "start", "--estate"])
         .arg(estate)
@@ -185,7 +185,7 @@ pub fn start_wirkd_with_env(estate: &Path, env: &[(&str, &str)]) -> (KillOnDrop,
 }
 
 pub fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(estate)
         .output()
@@ -300,7 +300,7 @@ pub fn submit_kind(
     parent: Option<ParentRef>,
     kind: Option<&str>,
 ) -> Result<Submitted, String> {
-    let mut cmd = Command::new(wirk_bin());
+    let mut cmd = wirk_cli();
     cmd.args(["work", "submit", "--estate"]).arg(estate);
     if let Some(kind) = kind {
         cmd.args(["--kind", kind]);
@@ -371,7 +371,7 @@ pub fn submit_kind(
 }
 
 pub fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -413,7 +413,7 @@ pub fn state_of(socket: &Path, work_id: &str) -> String {
 }
 
 pub fn retry_cli(estate: &Path, work_id: &str) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "retry", "--estate"])
         .arg(estate)
         .args(["--work", work_id])
@@ -434,7 +434,7 @@ pub fn retry_cli(estate: &Path, work_id: &str) -> (Option<i32>, String) {
 /// Run rather than letting the CLI resolve the Work's own current one,
 /// which is what reopening an *already-closed* nested stage needs.
 pub fn retry_run_cli(estate: &Path, work_id: &str, run_id: &str) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "retry", "--estate"])
         .arg(estate)
         .args(["--work", work_id, "--run", run_id])
@@ -459,10 +459,7 @@ pub fn cancel_cli(estate: &Path, work_id: &str, cascade: bool) -> (Option<i32>, 
     if cascade {
         args.push("--cascade");
     }
-    let output = Command::new(wirk_bin())
-        .args(&args)
-        .output()
-        .expect("work cancel runs");
+    let output = wirk_cli().args(&args).output().expect("work cancel runs");
     (
         output.status.code(),
         format!(
@@ -552,6 +549,7 @@ pub fn materialize_actor(
             kind: EventKind::WorktreeCreated {
                 repo: actor.repository.clone(),
                 base_sha: head,
+                identity: None,
             },
         }),
     )
@@ -575,4 +573,26 @@ pub fn materialize_actor(
     .expect("record WaypointReserved");
     assert!(matches!(reserved, Reply::Ok { .. }), "{reserved:?}");
     worktree
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+pub fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

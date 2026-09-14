@@ -153,10 +153,7 @@ fn atlas(estate: &Path, args: &[&str]) -> (bool, Value, String) {
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk atlas runs");
+    let output = wirk_cli().args(&full).output().expect("wirk atlas runs");
     (
         output.status.success(),
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap_or(Value::Null),
@@ -296,7 +293,7 @@ fn two_source_route(estate: &Path, name: &str) -> PathBuf {
 fn world_show_args(estate: &Path, work: &str, run: &str, args: &[&str]) -> (Option<i32>, Value) {
     let mut full = vec!["world", "show", "--json"];
     full.extend_from_slice(args);
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -316,7 +313,7 @@ fn world_show(estate: &Path, work: &str, run: &str) -> Value {
 }
 
 fn world_show_text(estate: &Path, work: &str, run: &str) -> String {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["world", "show"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -329,7 +326,7 @@ fn world_show_text(estate: &Path, work: &str, run: &str) -> String {
 fn expand(estate: &Path, work: &str, run: &str, args: &[&str]) -> (Option<i32>, Value, String) {
     let mut full = vec!["world", "expand", "--json"];
     full.extend_from_slice(args);
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -350,7 +347,7 @@ fn expand_ok(estate: &Path, work: &str, run: &str, args: &[&str]) -> Value {
 }
 
 fn resolve(estate: &Path, work: &str, run: &str, coordinate: &str) -> (Option<i32>, Value, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["atlas", "resolve", "--coordinate", coordinate, "--json"])
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -1229,7 +1226,7 @@ fn concurrent_expansions_chain_or_conflict_and_never_lose_one() {
         .to_string();
 
     let spawn = |question: &str| {
-        Command::new(wirk_bin())
+        wirk_cli()
             .args([
                 "world",
                 "expand",
@@ -1364,6 +1361,7 @@ fn materialization_preserves_the_delivered_projection_and_refuses_a_replacement(
             kind: EventKind::WorktreeCreated {
                 repo: actor.repository.clone(),
                 base_sha: head,
+                identity: None,
             },
         }),
     )
@@ -2369,4 +2367,26 @@ fn the_same_handle_across_a_readability_change_leaves_two_truthful_statements() 
 
     fs::write(&manifest, &saved).expect("restore the generation manifest");
     estate.stop();
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

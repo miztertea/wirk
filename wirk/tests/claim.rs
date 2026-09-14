@@ -29,7 +29,7 @@ fn claim_with_no_wirkd_running_is_a_transport_error() {
     // No `.wirk/wirkd.json` under this estate root — wirkd was never
     // started here, so `client::locate` fails and `claim` exits 2
     // (transport error), never printing a verdict.
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env("WIRK_ESTATE_ROOT", dir.path())
         .env("WIRK_WORK_ID", "work-1")
@@ -57,7 +57,7 @@ fn claim_with_no_wirkd_running_is_a_transport_error() {
 
 #[test]
 fn claim_fails_and_names_each_missing_variable() {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env_remove("WIRK_ESTATE_ROOT")
         .env_remove("WIRK_WORK_ID")
@@ -83,7 +83,7 @@ fn claim_fails_and_names_each_missing_variable() {
 
 #[test]
 fn claim_treats_blank_variable_as_missing() {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env("WIRK_ESTATE_ROOT", "")
         .env("WIRK_WORK_ID", "work-1")
@@ -120,7 +120,7 @@ fn claim_treats_blank_variable_as_missing() {
 /// to be running.
 #[test]
 fn claim_refuses_a_name_claimed_as_both_artifact_and_output() {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args([
             "claim",
             "--artifact",
@@ -152,4 +152,26 @@ fn claim_refuses_a_name_claimed_as_both_artifact_and_output() {
             && stderr.contains("--output"),
         "expected the conflicting-name usage error naming both flags, got: {stderr}"
     );
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

@@ -961,23 +961,24 @@ fn lexical_hits(
     coverage: &mut AnswerCoverage,
 ) -> Result<(Vec<EvidenceHit>, usize), AtlasError> {
     let mut candidates: Vec<Candidate> = Vec::new();
-    let _ = store;
+    let limits = store.capture_limits();
     for (source, generation) in resolved {
         let generation_identity = HitGenerationIdentity {
             revision: generation.revision.clone(),
             content: generation.content.clone(),
             extractor_set: generation.extractor_set.clone(),
         };
-        // One `git cat-file --batch-command` session per (source,
-        // generation) pair reads every indexed, family-matched object
-        // this generation's resources address, instead of one `git`
-        // process spawn per unique object -- this is the scan that runs
-        // on every lexical search, over every indexed resource in scope,
-        // so it is the hottest of the two batched sites. Same bytes,
-        // same per-object tolerance (a missing object still degrades
-        // `coverage.source_unavailable` and is skipped, never a hard
-        // failure); only how many processes read them changes.
-        let mut wanted_oids: Vec<String> = Vec::new();
+        // One batched read per (source, generation) pair fetches every
+        // indexed, family-matched resource this generation addresses,
+        // through whichever source policy actually holds the bytes —
+        // one `git cat-file --batch-command` session for a Git source,
+        // one bounded file read per distinct content identity for a
+        // document collection. This is the scan that runs on every
+        // lexical search over every indexed resource in scope, so it is
+        // the hottest hydration site in the crate. A resource that
+        // cannot be read still degrades `coverage.source_unavailable`
+        // and is skipped, never a hard failure.
+        let mut wanted: Vec<(Vec<u8>, String)> = Vec::new();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for resource in &generation.resources {
             if resource.disposition != CoverageDisposition::Indexed {
@@ -991,18 +992,22 @@ fn lexical_hits(
             }
             let object_id = resource.object_id.clone().unwrap_or_default();
             if seen.insert(object_id.clone()) {
-                wanted_oids.push(object_id);
+                wanted.push((resource.path.clone(), object_id));
             }
         }
-        let blob_cache =
-            match crate::git::blobs(Path::new(&source.membership.locator), &wanted_oids) {
-                Ok(blob_cache) => blob_cache,
-                Err(AtlasError::GitUnavailable(_)) => {
-                    coverage.source_unavailable = true;
-                    BTreeMap::new()
-                }
-                Err(error) => return Err(error),
-            };
+        let blob_cache = match crate::hydrate::blobs(
+            &generation.acquisition_policy,
+            Path::new(&source.membership.locator),
+            &wanted,
+            &limits,
+        ) {
+            Ok(blob_cache) => blob_cache,
+            Err(AtlasError::SourceBytesUnavailable(_)) => {
+                coverage.source_unavailable = true;
+                BTreeMap::new()
+            }
+            Err(error) => return Err(error),
+        };
         for resource in &generation.resources {
             if resource.disposition != CoverageDisposition::Indexed {
                 continue;
@@ -1258,9 +1263,15 @@ pub fn resolve_path(
         CoverageDisposition::Indexed => {}
     }
     let object_id = record.object_id.clone().unwrap_or_default();
-    let bytes = match crate::git::blob(Path::new(&source.membership.locator), &object_id) {
+    let bytes = match crate::hydrate::blob(
+        &generation.acquisition_policy,
+        Path::new(&source.membership.locator),
+        &record.path,
+        &object_id,
+        &store.capture_limits(),
+    ) {
         Ok(bytes) => bytes,
-        Err(AtlasError::GitUnavailable(detail)) => {
+        Err(AtlasError::SourceBytesUnavailable(detail)) => {
             return Ok(PathLookupOutcome::Unavailable(detail));
         }
         Err(error) => return Err(error),

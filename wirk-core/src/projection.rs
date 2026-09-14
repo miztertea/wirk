@@ -1235,6 +1235,19 @@ impl DeliveredContent {
         }
     }
 
+    /// The Atlas publication revision this projection was captured at,
+    /// whatever format wrote it. The companion of `generations`: the
+    /// pair is the whole of a delivered World's source basis, and
+    /// disclosing that a *current* read used a different one (ruling
+    /// 0292) needs both halves.
+    pub fn publication_revision(&self) -> u64 {
+        match self {
+            Self::V3(content) => content.publication_revision,
+            Self::V2(content) => content.publication_revision,
+            Self::V1(content) => content.publication_revision,
+        }
+    }
+
     pub fn waypoint(&self) -> &WaypointId {
         match self {
             Self::V3(content) => &content.waypoint,

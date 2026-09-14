@@ -106,10 +106,7 @@ fn atlas(estate: &Path, args: &[&str]) -> (bool, serde_json::Value, String) {
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk atlas runs");
+    let output = wirk_cli().args(&full).output().expect("wirk atlas runs");
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let value = serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
@@ -127,7 +124,7 @@ fn raise_cli(
     let mut full = vec!["finding", "raise"];
     full.extend_from_slice(args);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -152,7 +149,7 @@ fn applied_cli(
     let mut full = vec!["finding", "applied"];
     full.extend_from_slice(args);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -172,10 +169,7 @@ fn finding_cli(estate: &Path, args: &[&str]) -> (Option<i32>, serde_json::Value,
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.push("--json");
-    let output = Command::new(wirk_bin())
-        .args(&full)
-        .output()
-        .expect("wirk finding runs");
+    let output = wirk_cli().args(&full).output().expect("wirk finding runs");
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let value = serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
@@ -577,7 +571,7 @@ fn deterministic_verified_proves_the_named_obligation_and_refuses_every_nearby_s
         raise(&["--claim", "x", "--obligation", "no-edition"]).1
     );
     let _ = refusal;
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args([
             "finding",
             "raise",
@@ -5053,7 +5047,7 @@ fn raise_bind_finding(estate: &Path, work_id: &str, run_id: &str, coordinate: &s
 fn applied_refusal(estate: &Path, work: &str, run: &str, args: &[&str]) -> String {
     let mut full = vec!["finding", "applied"];
     full.extend_from_slice(args);
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -5768,7 +5762,7 @@ fn wait_within(mut child: std::process::Child, secs: u64, what: &str) -> Option<
 fn spawn_applied(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> std::process::Child {
     let mut full = vec!["finding", "applied"];
     full.extend_from_slice(args);
-    Command::new(wirk_bin())
+    wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -5792,7 +5786,7 @@ fn spawn_applied_capturing(
 ) -> std::process::Child {
     let mut full = vec!["finding", "applied"];
     full.extend_from_slice(args);
-    Command::new(wirk_bin())
+    wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -6455,7 +6449,7 @@ fn the_retired_claim_flag_is_refused_with_its_migration_rather_than_downgraded()
     let estate = dir.path().join("estate");
     fs::create_dir_all(&estate).unwrap();
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args([
             "finding",
             "applied",
@@ -6496,7 +6490,7 @@ fn the_retired_claim_flag_is_refused_with_its_migration_rather_than_downgraded()
     // The convention it deliberately does not change: an unrelated
     // unknown flag is still tolerated, exactly as everywhere else in
     // this binary. This one reaches the daemon and fails there instead.
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args([
             "finding",
             "applied",
@@ -6546,7 +6540,7 @@ fn obligations_cli(estate: &Path, args: &[&str]) -> (Option<i32>, serde_json::Va
     full.push(estate_str);
     full.extend_from_slice(args);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .output()
         .expect("wirk work obligations runs");
@@ -6941,7 +6935,7 @@ fn work_obligations_not_ready_reason_matches_finding_settle_pending_reason() {
     // The human renderer prints the reason beside the `not-ready` state,
     // the same pattern the adjacent `basis unavailable` line already
     // uses for `entry["basis"]["reason"]`.
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args([
             "work",
             "obligations",
@@ -7065,7 +7059,7 @@ fn obligations_human(estate: &Path, args: &[&str]) -> (Option<i32>, String, Stri
     let estate_str = estate.to_str().unwrap();
     full.push(estate_str);
     full.extend_from_slice(args);
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .output()
         .expect("wirk work obligations runs");
@@ -8119,7 +8113,7 @@ fn raise_raw(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Opti
     let mut full = vec!["finding", "raise"];
     full.extend_from_slice(args);
     full.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -8676,7 +8670,7 @@ fn spawn_raise(estate: &Path, work: &str, run: &str, args: &[&str]) -> std::proc
     let mut full = vec!["finding", "raise"];
     full.extend_from_slice(args);
     full.push("--json");
-    Command::new(wirk_bin())
+    wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -8693,7 +8687,7 @@ fn spawn_raise(estate: &Path, work: &str, run: &str, args: &[&str]) -> std::proc
 fn raise_text(estate: &Path, work: &str, run: &str, args: &[&str]) -> (Option<i32>, String) {
     let mut full = vec!["finding", "raise"];
     full.extend_from_slice(args);
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&full)
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work)
@@ -8760,7 +8754,7 @@ fn join_or_report_hung(children: &mut [std::process::Child], seconds: u64) -> Ve
 /// Runs one read-only CLI call with its own wall clock, so a wedged
 /// daemon is reported rather than hanging the test.
 fn answers_within(label: &str, seconds: u64, args: &[&str]) -> bool {
-    let mut child = Command::new(wirk_bin())
+    let mut child = wirk_cli()
         .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -9631,7 +9625,7 @@ fn a_managed_receipt_never_attests_a_source_coordinate_that_collides_with_its_pa
 
     // ---- wp-1: a real managed-output Claim -------------------------
     let staging = {
-        let out = Command::new(wirk_bin())
+        let out = wirk_cli()
             .args(["output", "dir"])
             .env("WIRK_ESTATE_ROOT", &estate)
             .env("WIRK_WORK_ID", &work.work_id)
@@ -10119,4 +10113,26 @@ fn the_readiness_reason_ladder_is_walked_end_to_end_and_both_verbs_agree() {
     );
 
     stop_wirkd(&estate, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

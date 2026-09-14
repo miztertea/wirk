@@ -117,6 +117,10 @@ pub enum Verb {
     /// P3 W3: atomically advances a registered source's published
     /// generation to an already-staged one.
     AtlasPublish,
+    /// Removes a registered source's own catalog
+    /// membership and staged generations from this estate — never its
+    /// original files.
+    AtlasRemove,
     /// P3 W4 A: builds one immutable semantic edition over an
     /// already-staged generation with an explicitly configured backend
     /// and model, and stages it. No query ever triggers this.
@@ -193,6 +197,19 @@ pub enum Verb {
     /// answer for the caller's own bound Run. The daemon derives the
     /// storage; the caller never supplies a path.
     RunOutputs,
+    /// `wirk artifact read`/`wirk artifact export`: resolves one
+    /// artifact a *validated* Claim of this same Work was checked
+    /// against, and reports the address its recorded bytes are still
+    /// at. The same triple-only door as `RunOutputs` — the Work is the
+    /// caller's own bound Work, never a named one — so a later stage
+    /// can consume an earlier stage's claimed bytes without any
+    /// surface on which one Work reaches into another's outputs.
+    ///
+    /// Distinct from the orientation projection, which delivers a
+    /// bounded *summary* of a prior stage's artifact (320 bytes, and
+    /// one line): a revision needs the bytes the Claim was validated
+    /// against, and that is what this resolves.
+    RunArtifact,
     /// `wirk world expand` (W-C3): the actor of the current Run adds a
     /// revision to the context it was delivered. Same triple-only door
     /// as `WorldShow` — nothing on this surface names a Work, a Run or a
@@ -373,6 +390,13 @@ impl Request {
         }
     }
 
+    pub fn atlas_remove(payload: AtlasRemovePayload) -> Self {
+        Request {
+            verb: Verb::AtlasRemove,
+            payload: serde_json::to_value(payload).expect("AtlasRemovePayload always serializes"),
+        }
+    }
+
     pub fn atlas_semantic_build(payload: AtlasSemanticBuildPayload) -> Self {
         Request {
             verb: Verb::AtlasSemanticBuild,
@@ -499,6 +523,15 @@ impl Request {
         Request {
             verb: Verb::RunOutputs,
             payload: serde_json::to_value(payload).expect("RunOutputsPayload always serializes"),
+        }
+    }
+
+    /// `wirk artifact`'s request: the injected triple, plus the Claim
+    /// and output name the caller is asking for.
+    pub fn run_artifact(payload: RunArtifactPayload) -> Self {
+        Request {
+            verb: Verb::RunArtifact,
+            payload: serde_json::to_value(payload).expect("RunArtifactPayload always serializes"),
         }
     }
 
@@ -849,11 +882,44 @@ pub struct EstateCleanPayload {
 /// exact-generation acquisition at `revision`. An existing `source`
 /// resolves through its membership and refuses a conflicting
 /// `repository` (`wirk_atlas::AtlasStore::register_git`'s own check).
+///
+/// `kind` is the caller's **explicit** choice of acquisition policy for
+/// a source registered for the first time — `"git"` (the default, so a
+/// caller that names no kind keeps meaning exactly what it always
+/// meant) or `"document-tree"` for a local non-Git document collection
+/// (`wirk_atlas::AtlasStore::register_document_tree`). Never inferred
+/// from `repository`'s own shape, and in particular never from the
+/// presence or absence of a `.git` entry: where a directory sits says
+/// nothing about how its owner meant it to be read. Refused outright,
+/// by name, when `source` already
+/// exists under a *different* policy: an established source's kind was
+/// already decided at its own first registration
+/// (`AtlasStore::register`'s own policy-mismatch check) and is never
+/// silently re-decided by a later call. One consequence worth knowing:
+/// a plain `wirk atlas acquire` with no `--kind` against an
+/// already-registered document-tree source fails, because omitting
+/// `--kind` means `"git"`, not "whatever this source already is".
+///
+/// `revision` is the Git ref to acquire under `"git"`, required there.
+/// Under `"document-tree"` it can only name that policy's own current
+/// state (`wirk_atlas::DOCUMENT_TREE_CURRENT_OBSERVATION`) — any other
+/// value is refused rather than silently recorded as if it had been
+/// honoured.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtlasAcquirePayload {
     pub source: String,
     pub repository: String,
     pub revision: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The Work this job is run for, bound onto the running job as its
+    /// requester so `atlas cancel` can be scoped to whoever asked for
+    /// it. Job origin, not a grant: it changes nothing about what this
+    /// verb may reach, and the daemon validates that the Work exists
+    /// rather than trusting what the client says about it. Absent is an
+    /// administrative job, cancellable only administratively.
+    #[serde(default)]
+    pub work: Option<WorkId>,
 }
 
 /// `atlas refresh`'s payload: reuses `source`'s existing registration
@@ -862,7 +928,26 @@ pub struct AtlasAcquirePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtlasRefreshPayload {
     pub source: String,
-    pub revision: String,
+    /// The revision to observe, or `None` to let the source's own
+    /// registered acquisition policy say what its current state is.
+    ///
+    /// `acquire` has always been able to default this, because it knows
+    /// the kind of source being registered. `refresh` never re-registers
+    /// and so was never told a kind — which left a document collection,
+    /// whose only observable state is its current one, having to be
+    /// refreshed by naming a literal string that is not a revision.
+    /// Absent means "whatever this source's policy already means by
+    /// current", resolved by the daemon from the membership itself.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// The Work this job is run for, bound onto the running job as its
+    /// requester so `atlas cancel` can be scoped to whoever asked for
+    /// it. Job origin, not a grant: it changes nothing about what this
+    /// verb may reach, and the daemon validates that the Work exists
+    /// rather than trusting what the client says about it. Absent is an
+    /// administrative job, cancellable only administratively.
+    #[serde(default)]
+    pub work: Option<WorkId>,
 }
 
 /// `atlas publish`'s payload: atomically advances `source`'s published
@@ -872,6 +957,29 @@ pub struct AtlasRefreshPayload {
 pub struct AtlasPublishPayload {
     pub source: String,
     pub generation: String,
+    /// The Work this job is run for, bound onto the running job as its
+    /// requester so `atlas cancel` can be scoped to whoever asked for
+    /// it. Job origin, not a grant: it changes nothing about what this
+    /// verb may reach, and the daemon validates that the Work exists
+    /// rather than trusting what the client says about it. Absent is an
+    /// administrative job, cancellable only administratively.
+    #[serde(default)]
+    pub work: Option<WorkId>,
+}
+
+/// `atlas remove`'s payload: the registered source to unregister from
+/// this estate's own catalog.
+/// Refused while this estate's own records still need this source's
+/// published generation or selected edition
+/// (`handle_atlas_remove`'s own retention check, mirroring `wirk
+/// estate clean`'s). Never touches the source's original files, and
+/// never itself removes this estate's generation or edition bytes
+/// either; see
+/// `wirk_atlas::AtlasStore::remove_source`'s own doc for why, and
+/// `wirk estate clean` for how they are eventually reclaimed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasRemovePayload {
+    pub source: String,
 }
 
 /// `atlas semantic build`'s payload (P3 W4 A). Backend and model are
@@ -1410,6 +1518,17 @@ pub struct WorldShowPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunOutputsPayload {
     pub triple: wirk_core::ExecutionTriple,
+}
+
+/// `wirk artifact`'s payload: the injected execution triple, and which
+/// artifact of which Claim. The Work comes from the triple for exactly
+/// `RunOutputsPayload`'s reason; `claim` names a Claim of that same
+/// Work, and `name` a declared output that Claim was validated against.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunArtifactPayload {
+    pub triple: wirk_core::ExecutionTriple,
+    pub claim: wirk_core::ClaimId,
+    pub name: String,
 }
 
 /// `world expand`'s request (W-C3): the injected triple, plus what the

@@ -83,7 +83,7 @@ impl Drop for KillOnDrop {
 
 fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
     let child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(estate)
             .stdout(Stdio::null())
@@ -96,7 +96,7 @@ fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
 }
 
 fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(estate)
         .output()
@@ -152,7 +152,7 @@ fn submit_route(
     repo: &Path,
     explicit_actor: bool,
 ) -> (String, String, String) {
-    let mut command = Command::new(wirk_bin());
+    let mut command = wirk_cli();
     command
         .args(["work", "submit", "--estate"])
         .arg(estate)
@@ -218,6 +218,7 @@ fn materialize_actor(
             kind: EventKind::WorktreeCreated {
                 repo: actor.repository.clone(),
                 base_sha: head,
+                identity: None,
             },
         }),
     )
@@ -244,7 +245,7 @@ fn materialize_actor(
 }
 
 fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -380,7 +381,7 @@ fn deterministic_then_actor_auto_advance_reserves_a_world_for_the_actor() {
     );
     assert_eq!(waypoint1, "deterministic-then-actor/wp-1");
 
-    let run_det = Command::new(wirk_bin())
+    let run_det = wirk_cli()
         .args(["run-deterministic", "--estate"])
         .arg(&estate)
         .args(["--work", &work_id, "--executor", "child"])
@@ -438,4 +439,26 @@ fn deterministic_then_actor_auto_advance_reserves_a_world_for_the_actor() {
     assert_eq!(actor.output_contract.0[0].name, "verdict.md");
 
     stop_wirkd(&estate, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

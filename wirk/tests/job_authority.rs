@@ -34,7 +34,7 @@ mod wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use harness::*;
@@ -47,7 +47,7 @@ use harness::*;
 /// the default scope of the very verbs under test. Leaving them in
 /// would make these results depend on who ran the suite.
 fn cli() -> Command {
-    let mut command = Command::new(wirk_bin());
+    let mut command = wirk_cli();
     command
         .env_remove("WIRK_ESTATE_ROOT")
         .env_remove("WIRK_WORK_ID")
@@ -78,11 +78,15 @@ fn blocking_backend(dir: &Path) -> PathBuf {
     fs::write(&written, "#!/bin/sh\nexec sleep 600\n").expect("write backend");
     // `install(1)`, not `fs::set_permissions`: writing a file here and
     // then executing that same file leaves this process holding its
-    // writable descriptor for the length of the write, and a fork by any
-    // other check in this binary during that window inherits it — the
-    // kernel then refuses to execute the script with `ETXTBSY` until
-    // that child execs. The copy `install` makes was never open for
-    // writing in this process, so there is nothing to inherit.
+    // writable descriptor for the length of the write. These checks run
+    // in parallel and the product's own job spawns install a `pre_exec`
+    // hook, which takes Rust off `posix_spawn` and onto fork + exec:
+    // another check's fork inside that window inherits the writable
+    // descriptor, and the kernel then refuses to execute the script with
+    // `ETXTBSY` until that child reaches its own `exec` (the same
+    // mechanism `wirk-atlas/tests/semantic_retrieval.rs`'s `installed`
+    // documents). The copy `install` makes was never open for writing in
+    // this process, so there is nothing to inherit.
     let path = dir.join("blocking-backend.sh.run");
     let status = Command::new("install")
         .args(["-m", "0755"])
@@ -781,6 +785,223 @@ fn an_administrative_job_is_invisible_and_untouchable_to_every_bound_caller() {
     stop_wirkd(&fx.estate, wirkd);
 }
 
+// ---------------------------------------------------------------------
+// 0284: the client-side identity resolution `semantic_build_command`
+// already had, reused by `acquire`/`refresh`/`publish` — the same
+// requester scoping proven above for a semantic build, now proven for
+// the document-tree jobs those three verbs themselves register.
+// ---------------------------------------------------------------------
+
+/// **The gap, exactly as 0284 found it.** Before this correction,
+/// `acquire`/`refresh`/`publish` took a bare `--work` that defaulted to
+/// administrative when omitted, with no actor-context fallback and no
+/// `--admin` opt-in — unlike `semantic_build_command`, which already
+/// resolved identity through `resolve_scope`. An actor that ran the
+/// obvious `wirk atlas acquire` inside its own pane registered a job
+/// with `requester = None`, and its own `atlas cancel --source` came
+/// back `no_match`: the actor could not stop the capture it started.
+///
+/// A real document capture is held at its own entry-classified window
+/// (`wirk-atlas/tests/document_tree.rs`'s own barrier technique, also
+/// used by `document_tree_wire.rs`), so a scoped `atlas cancel` is
+/// exercised against a job genuinely running, not merely admitted.
+#[test]
+fn an_actor_can_cancel_its_own_document_job_and_a_stranger_cannot_see_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    let pool = dir.path().join("host-pool");
+    fs::create_dir_all(estate.join(".wirk")).unwrap();
+    fs::write(
+        estate.join(".wirk").join("resources.json"),
+        format!(
+            "{{\"host_pool_dir\": {:?}, \"max_host_expensive\": 2}}\n",
+            pool.to_str().expect("pool path")
+        ),
+    )
+    .unwrap();
+    route_fixture::install_route_fixture(&estate, "smoke");
+
+    let docs = dir.path().join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    // Exactly one entry reaches the window, so the one thread the
+    // barrier arms is parked on this capture and nothing else.
+    fs::write(docs.join("brief.md"), "# brief\n\nHello.\n").unwrap();
+
+    let barrier = dir.path().join("barrier");
+    fs::create_dir_all(&barrier).unwrap();
+    let listener =
+        std::os::unix::net::UnixListener::bind(barrier.join(wirk_atlas::BARRIER_RELEASE_SOCKET))
+            .unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let barrier_env = format!("{}={}", wirk_atlas::DOCTREE_OPEN_WINDOW, barrier.display());
+    let (wirkd, _pointer) =
+        harness::start_wirkd_with_env(&estate, &[("WIRK_ATLAS_BARRIER", &barrier_env)]);
+    // Armed before the capture is spawned (finding D): the worker can
+    // reach OPEN_WINDOW as soon as it starts.
+    fs::write(barrier.join("arm"), b"").unwrap();
+
+    let owner_repo = dir.path().join("owner-repo");
+    init_repo(&owner_repo);
+    let stranger_repo = dir.path().join("stranger-repo");
+    init_repo(&stranger_repo);
+    let owner = submit(&estate, "smoke", &owner_repo, &["docs:read"], None).expect("submit owner");
+    let stranger =
+        submit(&estate, "smoke", &stranger_repo, &["docs:read"], None).expect("submit stranger");
+
+    let mut acquiring = cli()
+        .args(["atlas", "acquire", "--estate"])
+        .arg(&estate)
+        .args(["--source", "docs", "--repository"])
+        .arg(&docs)
+        .args(["--kind", "document-tree", "--requesting-work"])
+        .arg(&owner.work_id)
+        .arg("--json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn atlas acquire");
+
+    // The gate has no notion of elapsed time; every bound below is this
+    // controller's own, and an exhausted one reports a state that was
+    // never observed rather than a verdict.
+    let supervision = Duration::from_secs(60);
+    let deadline = Instant::now() + supervision;
+    let parked = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("accept on the release socket failed: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the capture never reached the entry-classified window"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    // A stranger bound to the same source alias cannot enumerate it —
+    // finding A's compounding defect was that nothing exercised --work
+    // on these three verbs at all.
+    let stranger_listing = json(&[
+        "atlas",
+        "cancel",
+        "--estate",
+        estate.to_str().unwrap(),
+        "--requesting-work",
+        &stranger.work_id,
+        "--list",
+        "--json",
+    ]);
+    assert_eq!(
+        stranger_listing["running"].as_array().expect("array").len(),
+        0,
+        "a stranger enumerated another Work's document job: {stranger_listing}"
+    );
+
+    // The owner sees its own job, addressed by the source alias an
+    // operator would actually name, and the verb it was actually run as
+    // (finding C).
+    let owner_listing = json(&[
+        "atlas",
+        "cancel",
+        "--estate",
+        estate.to_str().unwrap(),
+        "--requesting-work",
+        &owner.work_id,
+        "--list",
+        "--json",
+    ]);
+    let running = owner_listing["running"].as_array().expect("array");
+    assert_eq!(
+        running.len(),
+        1,
+        "the owner cannot see its own document job: {owner_listing}"
+    );
+    assert_eq!(running[0]["scope"], "docs");
+    assert_eq!(running[0]["verb"], "atlas acquire");
+
+    // And can stop it — the reachability finding A exists to deliver.
+    let cancelled = json(&[
+        "atlas",
+        "cancel",
+        "--estate",
+        estate.to_str().unwrap(),
+        "--requesting-work",
+        &owner.work_id,
+        "--source",
+        "docs",
+        "--json",
+    ]);
+    assert_eq!(cancelled["outcome"], "signalled", "{cancelled}");
+
+    drop(parked);
+
+    // Bounded, because the failure being ruled out is a capture that
+    // never returns.
+    let deadline = Instant::now() + supervision;
+    let stderr = loop {
+        if let Some(status) = acquiring.try_wait().unwrap() {
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(acquiring.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+            assert!(
+                !status.success(),
+                "a cancelled acquisition reported success"
+            );
+            break stderr;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cancelled capture was never observed to finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        stderr.contains("JobStopped"),
+        "expected a stopped-job refusal, got: {stderr}"
+    );
+
+    // An unknown requester is refused NotFound, never widened to the
+    // administrative default.
+    let (ok, _stdout, stderr) = run(&[
+        "atlas",
+        "acquire",
+        "--estate",
+        estate.to_str().unwrap(),
+        "--source",
+        "docs2",
+        "--repository",
+        docs.to_str().unwrap(),
+        "--kind",
+        "document-tree",
+        "--requesting-work",
+        "work-that-was-never-submitted",
+        "--json",
+    ]);
+    assert!(!ok, "an unknown Work's acquire was served");
+    assert!(stderr.contains("NotFound"), "{stderr}");
+
+    // Legitimate administrative use is preserved: an operator's own
+    // shell reaches the source with no flag named, exactly as before.
+    let (ok, admin_refresh, err) = run(&[
+        "atlas",
+        "refresh",
+        "--estate",
+        estate.to_str().unwrap(),
+        "--source",
+        "docs2",
+        "--admin",
+        "--json",
+    ]);
+    // `docs2` was never acquired (its own acquire above was refused
+    // NotFound before it registered anything), so this is expected to
+    // fail on `UnknownSource` — proof the administrative surface still
+    // reaches the daemon rather than being refused by identity.
+    assert!(!ok, "{admin_refresh}");
+    assert!(err.contains("UnknownSource"), "{err}");
+
+    stop_wirkd(&estate, wirkd);
+}
+
 /// The requester check must not move cancellation behind the mutex it
 /// exists to reach past. A build holds the atlas for its whole run; a
 /// cheap read waits and then answers `AtlasBusy`, while the scoped
@@ -813,4 +1034,26 @@ fn a_requester_check_keeps_cancellation_reachable_while_the_atlas_is_held() {
 
     fx.drain(build);
     stop_wirkd(&fx.estate, wirkd);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

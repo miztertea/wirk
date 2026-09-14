@@ -12,8 +12,11 @@
 //! explicit `--herdr-socket` override (this wave's own test, and the
 //! tried step's escape hatch); create the worktree with `wirk_herdr::
 //! git::worktree_add` from the World's `repository`/`branch`/
-//! `base_sha`, journal `WorktreeCreated` with the SHA `worktree_add`
-//! read back, and update the World's `worktree_path` — both through
+//! `base_sha` — or, for a `SourceBasis::OutputOnly` World (an Actor
+//! with no Git checkout at all), materialize a plain owned directory
+//! at the same path instead — journal
+//! `WorktreeCreated` with the identity the materialization actually
+//! produced, and update the World's `worktree_path` — both through
 //! wirkd's `record` verb, never by opening the journal file directly
 //! (item 3's single-write-path discipline); then drive `wirk_herdr::
 //! run_loop::RunLoop` with a `WirkdApi` built over the same wirkd
@@ -27,7 +30,9 @@ use std::process::ExitCode;
 
 use serde::Deserialize;
 
-use wirk_core::{EventKind, Run, RunId, RunState, WorkId, WorkState, World, WorldHash};
+use wirk_core::{
+    EventKind, Run, RunId, RunState, SourceBasis, WorkId, WorkState, World, WorldHash,
+};
 use wirk_herdr::SocketClient;
 use wirk_herdr::run_loop::{Outcome, RecordOutcome, RunLoop, RunStatusEntry, WirkdApi, WorkStatus};
 
@@ -130,15 +135,32 @@ struct StatusRunEntry {
     /// case. Same `#[serde(default)]` tolerance as the fields above.
     #[serde(default)]
     worktree_created: Option<WorktreeCreatedFact>,
+    /// Ruling 0283: this *Work's* own creation registration, whichever
+    /// Run wrote it (`handle_status`). Read only by the output-only
+    /// reattachment arm below, where the creating Run is by definition
+    /// not this one. `None` on a journal written before the identity
+    /// was recorded, and on a Work that never materialized.
+    #[serde(default)]
+    owned_registration: Option<OwnedRegistration>,
 }
 
 /// Wire shape of `StatusRunEntry.worktree_created` (ruling 0160): the
 /// `repo`/`base_sha` pair this Run's own `WorktreeCreated` was admitted
-/// with, exactly as `handle_status` serializes them (`server.rs`).
+/// with, exactly as `handle_status` serializes them (`server.rs`), plus
+/// the created directory's own identity (ruling 0283) where the record
+/// carries one.
 #[derive(Debug, Deserialize)]
 struct WorktreeCreatedFact {
     repo: String,
     base_sha: String,
+    #[serde(default)]
+    identity: Option<wirk_core::DirectoryIdentity>,
+}
+
+/// Wire shape of `StatusRunEntry.owned_registration` (ruling 0283).
+#[derive(Debug, Deserialize)]
+struct OwnedRegistration {
+    identity: wirk_core::DirectoryIdentity,
 }
 
 /// Wire shape of `StatusRunEntry.prior_selection` (ruling 0159): the
@@ -207,6 +229,7 @@ struct OpenRun {
     authored: Option<wirk_core::AuthoredSelection>,
     prior: Option<PriorLaunch>,
     worktree_created: Option<WorktreeCreatedFact>,
+    owned_registration: Option<OwnedRegistration>,
 }
 
 fn fetch_open_run(socket: &Path, work_id: &WorkId) -> Result<OpenRun, ExecutorError> {
@@ -252,6 +275,7 @@ fn fetch_open_run(socket: &Path, work_id: &WorkId) -> Result<OpenRun, ExecutorEr
         authored: entry.selection,
         prior: prior_selection,
         worktree_created: entry.worktree_created,
+        owned_registration: entry.owned_registration,
     })
 }
 
@@ -430,6 +454,7 @@ pub fn run_command(rest: &[String]) -> ExitCode {
         authored: authored_selection,
         prior: prior_selection,
         worktree_created,
+        owned_registration,
     } = match fetch_open_run(&pointer.socket, &work_id) {
         Ok(quad) => quad,
         Err(err) => {
@@ -549,7 +574,7 @@ pub fn run_command(rest: &[String]) -> ExitCode {
     // declared an estimate: a worktree shares nothing with the source's
     // object store and may be larger or smaller than the tree it checks
     // out. Herdr is untouched — no agent and no pane is counted here.
-    let worktree_path = estate_path.join("worktrees").join(&work_id.0);
+    let worktree_path = wirk_core::owned_execution_address(&estate_path, &work_id);
     let (policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(&estate_path);
     if let Some(note) = policy_note {
         eprintln!("wirk run: {note}");
@@ -577,16 +602,112 @@ pub fn run_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let head = match wirk_herdr::git::worktree_add(
-        Path::new(&actor.repository),
-        &worktree_path,
-        &actor.branch,
-        &actor.base_sha,
-    ) {
-        Ok(head) => head,
-        Err(err) => {
-            eprintln!("wirk run: {err}");
-            return ExitCode::from(2);
+    // An output-only Actor World owns no Git checkout. Its admitted
+    // sources are Read grants resolved through the Work's own bindings,
+    // and `actor.repository`/`actor.branch` are empty because no
+    // repository and no branch exist to name. This materializes a plain
+    // owned directory at the estate's own address for this Work instead
+    // of calling `git worktree add`.
+    let is_output_only = matches!(actor.source_basis, SourceBasis::OutputOnly { .. });
+    let head = if is_output_only {
+        // `create_dir_all` is idempotent on reattach the same way `git
+        // worktree add` already is for the Git arm below. `base_sha`
+        // already equals this World's `SourceBasis::OutputOnly`
+        // reference (set at submit), so it stands in for a resolved
+        // `head` unchanged rather than inventing a second identity.
+        // Three separate things have to hold before an actor is
+        // launched into this directory, and the earlier version of this
+        // block established none of them on its own: the route to the
+        // address is this estate's own, the entry at the address is a
+        // real directory, and this estate created it. All three now live
+        // in `wirk_core::materialize_owned_directory`, which is also
+        // what the Deterministic output-only path calls before its child
+        // runs — one implementation of ownership, not two (ruling 0292).
+        match wirk_core::materialize_owned_directory(
+            &worktree_path,
+            &work_id,
+            &run.id,
+            owned_registration.as_ref().map(|r| r.identity),
+        ) {
+            Ok(wirk_core::OwnedMaterialization::Created) => {}
+            Ok(wirk_core::OwnedMaterialization::ReattachedByIdentity(registered)) => {
+                println!(
+                    "owned execution directory {} is the directory this Work created \
+                     (registered identity {}:{}) and is reattached, not re-created",
+                    worktree_path.display(),
+                    registered.dev,
+                    registered.ino
+                );
+            }
+            Err(wirk_core::OwnedMaterializationError::Unproven { reason }) => {
+                // Ruling 0300: a marker naming this Work is not enough
+                // on its own — the identity comparison itself must
+                // prove the directory, or nothing is launched into it.
+                eprintln!(
+                    "wirk run: {} is not proven to be the directory this Work created: {reason}; \
+                     nothing was executed in it and it was not touched",
+                    worktree_path.display()
+                );
+                return ExitCode::from(2);
+            }
+            Err(err @ wirk_core::OwnedMaterializationError::IdentityMismatch { .. }) => {
+                // Named with the address, which the shared error does
+                // not carry: this is the substitution case (ruling 0297
+                // included: a directory recreated here on the same
+                // reused inode number), and the operator needs to know
+                // *which* directory it is about.
+                eprintln!(
+                    "wirk run: {} is not the directory this Work created: {err}",
+                    worktree_path.display()
+                );
+                return ExitCode::from(2);
+            }
+            Err(wirk_core::OwnedMaterializationError::ForeignMarker(marked_work)) => {
+                eprintln!(
+                    "wirk run: {} was created by work {marked_work}, not {}; nothing was \
+                     executed in it and it was not touched",
+                    worktree_path.display(),
+                    work_id.0
+                );
+                return ExitCode::from(2);
+            }
+            Err(wirk_core::OwnedMaterializationError::Unregistered) => {
+                eprintln!(
+                    "wirk run: {} exists but carries no record of this estate having created \
+                     it, so it is not this Run's owned execution directory; nothing was \
+                     executed in it and it was not touched",
+                    worktree_path.display()
+                );
+                return ExitCode::from(2);
+            }
+            Err(wirk_core::OwnedMaterializationError::MarkerUnwritable(err)) => {
+                // The directory exists but cannot be proven ours later.
+                // Refuse now rather than leave an unattributable
+                // directory at this estate's own address.
+                eprintln!(
+                    "wirk run: could not record this Run's ownership of {}: {err}",
+                    worktree_path.display()
+                );
+                return ExitCode::from(2);
+            }
+            Err(err) => {
+                eprintln!("wirk run: {err}");
+                return ExitCode::from(2);
+            }
+        }
+        actor.base_sha.clone()
+    } else {
+        match wirk_herdr::git::worktree_add(
+            Path::new(&actor.repository),
+            &worktree_path,
+            &actor.branch,
+            &actor.base_sha,
+        ) {
+            Ok(head) => head,
+            Err(err) => {
+                eprintln!("wirk run: {err}");
+                return ExitCode::from(2);
+            }
         }
     };
     println!("worktree {}", worktree_path.display());
@@ -627,6 +748,31 @@ pub fn run_command(rest: &[String]) -> ExitCode {
         // different repository or a different base sha than the
         // checkout this invocation just materialized is refused rather
         // than resumed onto.
+        // Ruling 0283: the identity this Run recorded when it created
+        // the directory, checked against what is at the address now.
+        // The repo/base_sha pair below says *what* was materialized;
+        // this says *which directory object* it was materialized into,
+        // which is the half an unrelated directory moved onto the
+        // address satisfies for free.
+        let created_identity = wirk_core::directory_identity(&worktree_path);
+        if let Some(created) = &worktree_created
+            && let Some(recorded) = created.identity
+            && Some(recorded) != created_identity
+        {
+            eprintln!(
+                "wirk run: this Run journaled its materialization of {path} as directory {}:{}, \
+                 and that address now holds {}; an interrupted materialization is only resumed \
+                 onto the directory it actually created",
+                recorded.dev,
+                recorded.ino,
+                match created_identity {
+                    Some(present) => format!("{}:{}", present.dev, present.ino),
+                    None => "no directory this estate can inspect".to_string(),
+                },
+                path = worktree_path.display()
+            );
+            return ExitCode::from(2);
+        }
         match &worktree_created {
             Some(created) if created.repo == actor.repository && created.base_sha == head => {
                 println!(
@@ -657,6 +803,14 @@ pub fn run_command(rest: &[String]) -> ExitCode {
                     EventKind::WorktreeCreated {
                         repo: actor.repository.clone(),
                         base_sha: head.clone(),
+                        // The object this materialization produced, read
+                        // from the directory itself rather than assumed
+                        // from the address it was asked for (ruling
+                        // 0283). `None` only where the directory cannot
+                        // be inspected at all, which is recorded as the
+                        // absence of a registration rather than as a
+                        // guess.
+                        identity: created_identity,
                     },
                 ) {
                     eprintln!("wirk run: {err}");
@@ -687,6 +841,17 @@ pub fn run_command(rest: &[String]) -> ExitCode {
     } else if actor.worktree_path != worktree_path {
         eprintln!("wirk run: the existing Run binding does not match the reusable checkout");
         return ExitCode::from(2);
+    } else if is_output_only {
+        // The recorded path matched this estate's own address for this
+        // Work above, and the entry there was proven to be a real
+        // directory (not a substituted symlink) at materialization.
+        // That pair is the whole of an owned directory's identity:
+        // there is no Git branch or ancestor to check beyond it.
+        println!(
+            "reattaching to this Run's owned execution directory at {} (output-only basis: \
+             ownership is the estate's own address for this Work, not a Git identity)",
+            worktree_path.display()
+        );
     } else {
         // P3 execution-recovery item 2, with root's own correction: an
         // actor that has committed on its own branch in this Run's own

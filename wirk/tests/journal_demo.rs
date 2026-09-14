@@ -26,7 +26,7 @@ fn replay_after_full_run_reports_completed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let dir_path = dir.path();
 
-    let first = Command::new(wirk_bin())
+    let first = wirk_cli()
         .args(["journal", "demo"])
         .arg(dir_path)
         .output()
@@ -44,7 +44,7 @@ fn replay_after_full_run_reports_completed() {
         "expected 6 appended-event lines, got:\n{first_stdout}"
     );
 
-    let second = Command::new(wirk_bin())
+    let second = wirk_cli()
         .args(["journal", "demo"])
         .arg(dir_path)
         .output()
@@ -76,7 +76,7 @@ fn pause_after_then_kill_leaves_a_partial_journal() {
     let dir_path = dir.path();
     let journal_path = dir_path.join("journal.ndjson");
 
-    let mut child = Command::new(wirk_bin())
+    let mut child = wirk_cli()
         .args(["journal", "demo"])
         .arg(dir_path)
         .args(["--pause-after", "3"])
@@ -109,7 +109,7 @@ fn pause_after_then_kill_leaves_a_partial_journal() {
     // (`wait_for_continue`'s own open(2), which blocks until a writer
     // connects) — it never got the signal to append the rest, which the
     // replay below confirms directly (`events 3`, not `events 6`).
-    let replay = Command::new(wirk_bin())
+    let replay = wirk_cli()
         .args(["journal", "demo"])
         .arg(dir_path)
         .output()
@@ -134,7 +134,7 @@ fn pause_after_then_kill_leaves_a_partial_journal() {
 /// (BRIEF outcome).
 #[test]
 fn bad_args_print_usage_and_exit_one() {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["journal", "nonsense"])
         .output()
         .expect("bad-args invocation runs");
@@ -159,7 +159,7 @@ fn malformed_journal_exits_two() {
     writeln!(file, "not json").expect("write malformed line");
     drop(file);
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["journal", "demo"])
         .arg(dir_path)
         .output()
@@ -171,4 +171,26 @@ fn malformed_journal_exits_two() {
         "expected the JournalError's own message, got: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

@@ -125,7 +125,7 @@ fn submit_actor_named_with_outputs(
     );
     route_fixture::write_route(estate, name, &route_json);
 
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route", name, "--kind", "actor", "--repo-path"])
@@ -198,7 +198,7 @@ fn run_clean(estate: &Path, work_id: &str, dry_run: bool) -> (bool, serde_json::
         args.push("--dry-run");
     }
     args.push("--json");
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(&args)
         .output()
         .expect("wirk work clean runs");
@@ -214,7 +214,7 @@ fn run_clean(estate: &Path, work_id: &str, dry_run: bool) -> (bool, serde_json::
 /// public status surface actually discloses, not only what `wirk work
 /// clean` itself just returned.
 fn wirkd_status(estate: &Path, work_id: &str) -> serde_json::Value {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["wirkd", "status", "--estate"])
         .arg(estate)
         .args(["--work", work_id, "--admin", "--json"])
@@ -228,7 +228,7 @@ fn wirkd_status(estate: &Path, work_id: &str) -> serde_json::Value {
 /// human-facing surface (ruling 0224): what a person actually sees
 /// running `wirk wirkd status --work <id> --admin`, unparsed.
 fn wirkd_status_text(estate: &Path, work_id: &str) -> String {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["wirkd", "status", "--estate"])
         .arg(estate)
         .args(["--work", work_id, "--admin"])
@@ -293,7 +293,7 @@ fn spawn_run(
     path_env: &str,
     work_id: &str,
 ) -> std::process::Child {
-    let child = Command::new(wirk_bin())
+    let child = wirk_cli()
         .args(["run", "--estate"])
         .arg(estate)
         .args(["--work", work_id, "--session", session.name()])
@@ -357,7 +357,7 @@ fn wirk_work_clean_removes_a_claimed_committed_checkout_preserving_the_branch() 
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -505,7 +505,7 @@ fn wirk_work_clean_removes_a_claimed_committed_checkout_preserving_the_branch() 
     assert_eq!(result["worktree_removed"], serde_json::json!(false));
     assert_eq!(result["runtime_pins_removed"], serde_json::json!([]));
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -523,7 +523,7 @@ fn wirk_work_clean_refuses_a_nonterminal_work() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -555,7 +555,7 @@ fn wirk_work_clean_refuses_a_nonterminal_work() {
         "a refused clean must not journal anything"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -602,7 +602,7 @@ fn wirk_work_clean_refuses_a_live_registered_agent_and_a_plain_shell() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -765,7 +765,7 @@ fn wirk_work_clean_refuses_a_live_registered_agent_and_a_plain_shell() {
     );
     assert_eq!(result["worktree_removed"], serde_json::json!(true));
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -805,7 +805,7 @@ fn wirk_work_clean_refuses_ignored_content_and_refuses_uncommitted_content() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -884,7 +884,7 @@ fn wirk_work_clean_refuses_ignored_content_and_refuses_uncommitted_content() {
     );
     assert_eq!(result["worktree_removed"], serde_json::json!(true));
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -929,7 +929,7 @@ fn wirk_work_clean_refuses_a_symlink_substituted_into_another_works_checkout() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -1006,7 +1006,7 @@ fn wirk_work_clean_refuses_a_symlink_substituted_into_another_works_checkout() {
     assert!(ok, "B's own clean must succeed normally: {stderr}");
     assert_eq!(result["worktree_removed"], serde_json::json!(true));
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -1050,7 +1050,7 @@ fn wirk_work_clean_refuses_checkout_backed_claim_evidence() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -1087,7 +1087,7 @@ fn wirk_work_clean_refuses_checkout_backed_claim_evidence() {
         "a refused clean must not touch the worktree"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
@@ -1137,7 +1137,7 @@ fn wirk_work_clean_reconciles_a_real_partial_removal_on_retry() {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -1404,10 +1404,32 @@ fn wirk_work_clean_reconciles_a_real_partial_removal_on_retry() {
          wording, got:\n{text}"
     );
 
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
         .output()
         .expect("wirkd stop runs");
     assert!(stop.status.success());
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

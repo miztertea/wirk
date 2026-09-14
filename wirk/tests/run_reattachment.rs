@@ -87,7 +87,7 @@ fn rev_parse(dir: &Path, rev: &str) -> String {
 fn submit_actor(estate: &Path, repo: &Path) -> String {
     let route_json = r#"{"id":"reattach","waypoints":[{"id":"reattach/wp-1","kind":"Actor","intent":"commit progress on this Run's own branch","declared_outputs":[{"name":"report.md","required":true}],"boundary":["**"]}]}"#;
     route_fixture::write_route(estate, "reattach", route_json);
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["work", "submit", "--estate"])
         .arg(estate)
         .args(["--route", "reattach", "--kind", "actor", "--repo-path"])
@@ -131,7 +131,7 @@ impl Drop for KillOnDrop {
 /// it stops the invocation immediately after the reattachment decision
 /// it exists to observe. Returns (stdout, stderr).
 fn wirk_run(estate: &Path, work_id: &str) -> (String, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .args(["run", "--estate"])
         .arg(estate)
         .args(["--work", work_id, "--session", "no-such-session"])
@@ -188,7 +188,7 @@ fn materialize() -> Materialized {
 
     let mut guard = KillOnDrop(Vec::new());
     guard.0.push(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .stdout(Stdio::null())
@@ -221,7 +221,7 @@ fn materialize() -> Materialized {
 }
 
 fn stop_wirkd(estate: &Path) {
-    let _ = Command::new(wirk_bin())
+    let _ = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(estate)
         .output();
@@ -300,7 +300,7 @@ fn a_canceled_work_is_not_reattached_to_its_leftover_open_run() {
     git(&m.worktree, &["commit", "-q", "-m", "before the cancel"]);
     let progressed = rev_parse(&m.worktree, "HEAD");
 
-    let cancel = Command::new(wirk_bin())
+    let cancel = wirk_cli()
         .args(["work", "cancel", "--estate"])
         .arg(&m.estate)
         .args(["--work", &m.work_id, "--reason", "the owner stopped this"])
@@ -570,7 +570,7 @@ fn the_records_guard_names_supersession_and_settlement_apart() {
 
     // (2) Superseded: a retry has opened a newer Run for this Waypoint.
     // A different fact, a different sentence, and still `InvalidTransition`.
-    let retry = Command::new(wirk_bin())
+    let retry = wirk_cli()
         .args(["work", "retry", "--estate"])
         .arg(&m.estate)
         .args(["--work", &m.work_id])
@@ -670,7 +670,7 @@ fn after_a_retry_nothing_is_ever_recorded_against_the_superseded_run() {
         "recording the Run's own failure must be admitted: {failed:?}"
     );
 
-    let retry = Command::new(wirk_bin())
+    let retry = wirk_cli()
         .args(["work", "retry", "--estate"])
         .arg(&m.estate)
         .args(["--work", &m.work_id])
@@ -788,4 +788,26 @@ fn a_real_reservation_binds_the_worker_contract_and_writes_its_bytes_durably() {
     }
 
     stop_wirkd(&m.estate);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }

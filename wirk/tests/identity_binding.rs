@@ -50,7 +50,7 @@ fn wait_for_pointer(estate: &Path) -> WirkdPointer {
 
 fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
     let child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(estate)
             .stdout(Stdio::null())
@@ -63,7 +63,7 @@ fn start_wirkd(estate: &Path) -> (KillOnDrop, WirkdPointer) {
 }
 
 fn stop_wirkd(estate: &Path, mut child: KillOnDrop) {
-    let stop = Command::new(wirk_bin())
+    let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(estate)
         .output()
@@ -155,7 +155,7 @@ fn parse_submit(output: &std::process::Output) -> (String, String, String) {
 
 fn submit_actor(estate: &Path, route: &Path, repo: &Path, sha: &str) -> (String, String, String) {
     parse_submit(
-        &Command::new(wirk_bin())
+        &wirk_cli()
             .args(["work", "submit", "--estate"])
             .arg(estate)
             .args(["--route"])
@@ -171,7 +171,7 @@ fn submit_actor(estate: &Path, route: &Path, repo: &Path, sha: &str) -> (String,
 
 fn submit_deterministic(estate: &Path) -> (String, String, String) {
     parse_submit(
-        &Command::new(wirk_bin())
+        &wirk_cli()
             .args(["work", "submit", "--estate"])
             .arg(estate)
             .args([
@@ -195,7 +195,7 @@ fn submit_deterministic_with(
     repository: &str,
     extra: &[&str],
 ) -> std::process::Output {
-    let mut command = Command::new(wirk_bin());
+    let mut command = wirk_cli();
     command
         .args(["work", "submit", "--estate"])
         .arg(estate)
@@ -367,6 +367,7 @@ fn materialize_legacy_actor(
             EventKind::WorktreeCreated {
                 repo: actor.repository.clone(),
                 base_sha: actor.base_sha.clone(),
+                identity: None,
             },
         ),
         Reply::Ok { .. }
@@ -660,7 +661,13 @@ fn record_refuses_unknown_mismatched_duplicate_and_terminal_run_transitions() {
     assert!(matches!(mismatched, Reply::Err { .. }));
     assert_eq!(journal_len(&estate, &work), initial);
 
-    fs::write(estate.join("report.md"), "done\n").expect("write report");
+    // Ruling 0292: an output-only Deterministic World executes in this
+    // Work's *own* owned execution directory, so that is where its
+    // declared artifact lives and where `handle_claim` validates it —
+    // never the estate root, which every Work in the estate shares.
+    let owned = wirk_core::owned_execution_address(&estate, &WorkId(work.clone()));
+    fs::create_dir_all(&owned).expect("this Work's own execution directory");
+    fs::write(owned.join("report.md"), "done\n").expect("write report");
     let done = wirkd::client::call(
         &pointer.socket,
         &Request::claim(ClaimPayload {
@@ -977,6 +984,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
                 EventKind::WorktreeCreated {
                     repo: repo.display().to_string(),
                     base_sha: sha,
+                    identity: None,
                 },
             ),
             raw_event(
@@ -1182,7 +1190,7 @@ fn question_before_actor_materialization_refuses_before_touching_daemon_cwd() {
     .expect("sentinel symlink");
 
     let child = KillOnDrop(
-        Command::new(wirk_bin())
+        wirk_cli()
             .args(["wirkd", "start", "--estate"])
             .arg(&estate)
             .current_dir(&daemon_cwd)
@@ -1259,7 +1267,7 @@ fn submit_multi_repo_actor(
     repo_flags: &[&str],
     execution_repo_name: &str,
 ) -> (String, String, String) {
-    let mut cmd = Command::new(wirk_bin());
+    let mut cmd = wirk_cli();
     cmd.args(["work", "submit", "--estate"]).arg(estate);
     for flag in repo_flags {
         cmd.args(["--repo", flag]);
@@ -1273,7 +1281,7 @@ fn submit_multi_repo_actor(
 }
 
 fn claim(estate: &Path, work_id: &str, run_id: &str, args: &[&str]) -> (Option<i32>, String) {
-    let output = Command::new(wirk_bin())
+    let output = wirk_cli()
         .arg("claim")
         .env("WIRK_ESTATE_ROOT", estate)
         .env("WIRK_WORK_ID", work_id)
@@ -1341,4 +1349,26 @@ fn both_repository_binding_orders_refuse_identically_on_the_read_execution_repo(
     }
 
     stop_wirkd(&estate, wirkd_child);
+}
+
+/// The `wirk` CLI with the *test runner's own* actor triple removed from
+/// the child's environment.
+///
+/// `resolve_scope` reads `WIRK_ESTATE_ROOT`/`WIRK_WORK_ID`/`WIRK_RUN_ID`
+/// to decide whether a call is an actor's own or an operator's, and a
+/// test process inherits whatever its runner had. This suite is run from
+/// inside a real actor pane often enough that an inherited triple makes
+/// a fixture's administrative call against its own temp estate refuse as
+/// a cross-estate read — so the fixture has to say which it is rather
+/// than depend on who started it.
+///
+/// Sites that mean to act *as* an actor set the three back explicitly on
+/// the returned command; a later `env` overrides this removal.
+fn wirk_cli() -> Command {
+    let mut command = Command::new(wirk_bin());
+    command
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID");
+    command
 }
