@@ -170,7 +170,16 @@ fn commit_all(repo: &Path, message: &str) {
         .expect("git add runs");
     assert!(status.success());
     let status = Command::new("git")
-        .args(["commit", "-q", "-m", message])
+        .args([
+            "-c",
+            "user.name=job-authority-test",
+            "-c",
+            "user.email=job-authority@example.test",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ])
         .current_dir(repo)
         .status()
         .expect("git commit runs");

@@ -136,7 +136,19 @@ fn fixture_with(extra: serde_json::Map<String, serde_json::Value>) -> (Fixture, 
 }
 
 fn commit_all(repo: &Path, message: &str) {
-    for args in [vec!["add", "-A"], vec!["commit", "-q", "-m", message]] {
+    for args in [
+        vec!["add", "-A"],
+        vec![
+            "-c",
+            "user.name=estate-storage-test",
+            "-c",
+            "user.email=estate-storage@example.test",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    ] {
         let status = Command::new("git")
             .args(&args)
             .current_dir(repo)
