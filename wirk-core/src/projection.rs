@@ -1561,3 +1561,379 @@ impl ProjectionFile {
         Ok(file)
     }
 }
+
+/// Who a rendered projection is being written for.
+///
+/// The categories, their order, the content and every disclosure are the
+/// same under both: a style decides only whether the machine coordinates
+/// an operator pastes into another command are printed beside the
+/// content or left to the command that prints them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportStyle {
+    /// A person at a terminal running `wirk world show`, who may copy a
+    /// coordinate straight into `wirk atlas resolve`.
+    Console,
+    /// A stage's own initial briefing, where the exact coordinates would
+    /// be hundreds of opaque characters per item and the same command
+    /// still prints them on demand.
+    Briefing,
+}
+
+// ---- shared projection rendering ----------------------------------------
+//
+// One text renderer for a delivered projection's body, read from the
+// wire-shaped `serde_json::Value` both callers already produce: wirkd's
+// own `world show` reply is `serde_json::to_value(&file.content)`
+// (`handle_world_show`), and a stage composing its own first prompt from
+// `ProjectionFile::read_referenced` reaches the identical shape with the
+// same one call. Operating on `Value` rather than the typed
+// `DeliveredContent`/`ProjectionContent` is deliberate: it is what makes
+// this the *one* renderer rather than two that must be kept in step —
+// `wirk world show` and a composed prompt read this exact function, not
+// two ports of the same logic maintained in two crates. No new
+// projection schema; this only prints what the categories, budget,
+// coverage and omissions already carry.
+///
+/// `current` answers "is the Run this projection was delivered to the
+/// one `wirk world expand`/`wirk atlas resolve` would actually act on
+/// right now" — true for an actor rendering its own live World, and
+/// wirkd's own `current` flag for the CLI's `wirk world show`. It gates
+/// only the two lines that name a follow-up command, never the content
+/// itself.
+pub fn render_projection_report(
+    projection: &serde_json::Value,
+    receipt: Option<&serde_json::Value>,
+    current: bool,
+    style: ReportStyle,
+) -> String {
+    let mut out = String::new();
+    macro_rules! line {
+        ($($arg:tt)*) => {{
+            out.push_str(&format!($($arg)*));
+            out.push('\n');
+        }};
+    }
+    let string = |value: &serde_json::Value, key: &str| -> String {
+        value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    line!("question {}", string(projection, "question"));
+    line!(
+        "policy {} route_edition {} revision {}",
+        string(projection, "compilation_policy"),
+        string(projection, "route_edition"),
+        projection
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    );
+    if let Some(expansion) = projection.get("expansion") {
+        line!(
+            "expands revision's observation {} (basis {})",
+            string(expansion, "parent_observation"),
+            string(expansion, "basis")
+        );
+        if let Some(request) = expansion.get("request") {
+            line!(
+                "      asked [{}] {}",
+                if request
+                    .get("authored_question")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "authored question"
+                } else {
+                    "this stage's own question, carried over"
+                },
+                string(request, "question")
+            );
+            if let Some(handle) = request.get("reference").and_then(|v| v.as_str()) {
+                line!("      inside delivered handle {handle}");
+            }
+            if let Some(reason) = request.get("reason").and_then(|v| v.as_str()) {
+                line!("      because {reason}");
+            }
+        }
+        let count = |key: &str| -> u64 {
+            expansion
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        line!(
+            "      added {} item(s); {} candidate(s) were already bound here at the same \
+             coordinate",
+            count("delivered"),
+            count("already_bound")
+        );
+    }
+    if let Some(coverage) = projection.get("coverage") {
+        line!("coverage {coverage}");
+    }
+    if let Some(generations) = projection.get("generations").and_then(|v| v.as_array()) {
+        line!(
+            "generations {} at publication revision {}",
+            generations.len(),
+            projection
+                .get("publication_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+    }
+    for (label, key) in [("bound", "bound"), ("referenced", "referenced")] {
+        let Some(items) = projection.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for item in items {
+            line!(
+                "{label} [{}] {}",
+                item.get("lifetime")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("working"),
+                string(item, "reason")
+            );
+            match item.get("identity").and_then(|value| value.get("kind")) {
+                Some(kind) if kind == "artifact_digest" => line!(
+                    "      claim {} digest {}",
+                    string(&item["identity"], "claim"),
+                    string(&item["identity"], "digest")
+                ),
+                _ => match style {
+                    ReportStyle::Console => line!(
+                        "      resolve with: wirk atlas resolve --coordinate {}",
+                        string(item, "coordinate")
+                    ),
+                    // A coordinate is a hex-encoded `ExactCoordinate`:
+                    // hundreds of opaque characters per item, and two of
+                    // them where an item also carries `shown`. They are
+                    // an input to `wirk atlas resolve`, not something a
+                    // reader gets anything from, so a briefing names the
+                    // generation and object this item was read at — the
+                    // identity it actually needs to cite — and leaves the
+                    // machine coordinate to `wirk world show`, which
+                    // prints it for this same revision.
+                    ReportStyle::Briefing => line!(
+                        "      read at generation {} object {}",
+                        string(&item["identity"], "generation"),
+                        string(&item["identity"], "object_id")
+                    ),
+                },
+            }
+            // The selected content itself. `summary` is the bounded,
+            // newline-flattened presentation string the assembler chose
+            // for this item — the material the stage was oriented with.
+            // Without it every line above is metadata about evidence the
+            // reader still has to go and fetch.
+            let summary = string(item, "summary");
+            if !summary.is_empty() {
+                line!("      selected text: {summary}");
+            }
+            if let Some(terms) = item["shown"]["matched_terms"].as_array() {
+                let named = terms
+                    .iter()
+                    .filter_map(|term| term.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                line!(
+                    "      shown: lines {}-{} of that resource, around {}{}",
+                    item["shown"]["line_start"].as_u64().unwrap_or(0),
+                    item["shown"]["line_end"].as_u64().unwrap_or(0),
+                    if named.is_empty() {
+                        "the match".to_string()
+                    } else {
+                        named
+                    },
+                    if item["shown"]["whole_match_shown"].as_bool().unwrap_or(true) {
+                        ""
+                    } else {
+                        "; the match itself is wider than the summary budget and is cut"
+                    }
+                );
+                if let Some(coordinate) = item["shown"]["coordinate"].as_str()
+                    && style == ReportStyle::Console
+                {
+                    line!("      shown coordinate {coordinate}");
+                }
+            }
+        }
+    }
+    if let Some(items) = projection.get("reachable").and_then(|v| v.as_array()) {
+        for item in items {
+            line!(
+                "reachable {} — {} indexed {} resource(s) in source {}",
+                string(item, "handle"),
+                item.get("resources")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                string(item, "family"),
+                string(item, "source")
+            );
+            line!("      discover with: {}", string(item, "fetch"));
+            if current {
+                line!(
+                    "      bind it into this context with: wirk world expand --reference {}",
+                    string(item, "handle")
+                );
+            }
+        }
+    }
+    if let Some(retrieval) = projection.get("retrieval") {
+        line!(
+            "retrieval mode {} semantic {} candidates {} shown {}",
+            string(retrieval, "mode"),
+            string(retrieval, "semantic"),
+            retrieval
+                .get("total_candidates")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            retrieval
+                .get("returned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        );
+        if let Some(reason) = retrieval.get("semantic_reason").and_then(|v| v.as_str()) {
+            line!("      semantic reason {reason}");
+        }
+        if let Some(degraded) = retrieval.get("degraded").and_then(|v| v.as_array())
+            && !degraded.is_empty()
+        {
+            line!(
+                "      degraded {}",
+                serde_json::Value::Array(degraded.clone())
+            );
+        }
+        if let Some(capacity) = retrieval.get("capacity") {
+            line!(
+                "      capacity {} of {} ({}, policy {}) reached {} exhausted {}",
+                capacity
+                    .get("capacity")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                capacity
+                    .get("max")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                string(capacity, "source"),
+                string(capacity, "policy"),
+                capacity
+                    .get("reached")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                capacity
+                    .get("resultset_exhausted")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            );
+        }
+    }
+    if let Some(note) = projection.get("findings_index") {
+        line!(
+            "findings index {} (complete {})",
+            string(note, "state"),
+            note.get("complete")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        );
+    }
+    if let Some(items) = projection.get("consulted").and_then(|v| v.as_array()) {
+        for item in items {
+            line!(
+                "consulted [{}] {} — {}",
+                string(item, "origin"),
+                string(item, "id"),
+                string(item, "claim")
+            );
+            line!(
+                "      status {} generations {} — {}",
+                item.get("status")
+                    .map(|status| string(status, "state"))
+                    .unwrap_or_default(),
+                string(item, "generation_relation"),
+                string(item, "reason")
+            );
+            let count = |key: &str| -> u64 {
+                item.get(key)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            };
+            if count("evidence_withheld") > 0 || count("evidence_not_delivered") > 0 {
+                line!(
+                    "      {} recorded evidence entr(ies) withheld from this requester, {} not \
+                     delivered here",
+                    count("evidence_withheld"),
+                    count("evidence_not_delivered")
+                );
+            }
+            for evidence in item
+                .get("evidence")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                line!(
+                    "      resolve its evidence with: wirk atlas resolve --coordinate {}",
+                    string(evidence, "coordinate")
+                );
+            }
+            for contradiction in item
+                .get("contradictions")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                line!("      contradicts {}", string(contradiction, "text"));
+            }
+        }
+    }
+    for (label, key) in [("assumption", "assumptions"), ("unknown", "unknowns")] {
+        let Some(items) = projection.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for item in items {
+            line!(
+                "{label} [{}] {}",
+                item.get("attributed_to")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                string(item, "text")
+            );
+        }
+    }
+    if let Some(items) = projection.get("omitted").and_then(|v| v.as_array()) {
+        for item in items {
+            line!("omitted {item}");
+        }
+    }
+    line!(
+        "truncated {}",
+        projection
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    );
+    if !string(projection, "next_action").is_empty() {
+        line!("next {}", string(projection, "next_action"));
+    }
+    if let Some(receipt) = receipt {
+        line!(
+            "observed {} over {}ms in {} lap(s), observation {}",
+            receipt
+                .get("observed_at")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            receipt
+                .get("observation_window_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            receipt
+                .get("laps")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            string(receipt, "observation")
+        );
+    }
+    out
+}

@@ -4363,7 +4363,14 @@ fn prompt_with_hook(claim_hook: Option<wirk_core::ClaimHookDelivery>) -> String 
     let World::Actor(actor) = actor_world(&run, dir.path()) else {
         unreachable!("actor_world builds an Actor World")
     };
-    wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, claim_hook.as_ref())
+    wirk_herdr::run_loop::compose_first_prompt(
+        &actor,
+        &run.kind,
+        None,
+        None,
+        claim_hook.as_ref(),
+        true,
+    )
 }
 
 #[test]
@@ -4444,7 +4451,8 @@ fn the_first_prompt_names_this_runs_actual_output_destination() {
         wirk_core::outputs::staging_dir(estate.path(), &actor.triple.work_id, &actor.triple.run_id)
             .expect("well-formed work/run ids stage a directory");
 
-    let text = wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, None);
+    let text =
+        wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, None, true);
 
     assert!(
         text.contains("report.md"),
@@ -4458,5 +4466,484 @@ fn the_first_prompt_names_this_runs_actual_output_destination() {
     assert!(
         !expected_staging.exists(),
         "this test's own premise: nothing has created the staging directory yet"
+    );
+}
+
+// ---- the reserved World arrives with the initial assignment ------------
+//
+// What these pin is that an orienting stage's *selected content* reaches
+// its own first harness input: the excerpts the assembler already chose,
+// with attribution and coverage, inside a bounded packet — not a list of
+// coordinates the stage has to spend a tool call resolving before it can
+// start. An ordinary continuation nudge repeats none of it.
+
+/// The one byte length `bounded_summary` caps an assembled summary at.
+/// Not imported — it is `wirk`'s own assembler constant, and this crate
+/// only needs a realistic worst case to render.
+const ASSEMBLY_SUMMARY_BYTES: usize = 320;
+
+fn projection_reference_for(
+    file: &wirk_core::ProjectionFile,
+    revision: u64,
+) -> wirk_core::EvidenceProjectionRef {
+    wirk_core::EvidenceProjectionRef {
+        observation: file.receipt.observation.clone(),
+        projection: file.content.projection_id(),
+        revision,
+        format: file.content.format().to_string(),
+        receipt: file.receipt.digest(),
+    }
+}
+
+/// A coordinate shaped the way a real one is: `encode_coordinate` hex-
+/// encodes a serialized `ExactCoordinate`, so every real coordinate is
+/// several hundred opaque characters. A short readable placeholder here
+/// would make the size this delivery actually costs untestable.
+fn realistic_coordinate(seed: u8) -> String {
+    let coordinate = serde_json::json!({
+        "estate": {"root": "/home/operator/estates/product"},
+        "membership": format!("membership-{seed:02}"),
+        "source": "product",
+        "generation": format!("generation-{seed:02}"),
+        "path": "wirk-core/src/projection.rs",
+        "object_id": format!("{seed:02}").repeat(20),
+        "byte_start": 0,
+        "byte_end": 4096,
+        "line_start": 1,
+        "line_end": 120,
+    });
+    serde_json::to_vec(&coordinate)
+        .expect("fixture coordinate serializes")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// A summary at exactly the assembler's own cap: the largest single
+/// piece of content one delivered item can carry.
+fn full_budget_summary(seed: u8) -> String {
+    let text = format!(
+        "pub fn render_projection_report(projection: &Value, receipt: Option<&Value>, current: \
+         bool, style: ReportStyle) -> String {{ // item {seed} "
+    );
+    text.repeat(8)
+        .chars()
+        .take(ASSEMBLY_SUMMARY_BYTES)
+        .collect()
+}
+
+fn evidence_item(seed: u8, summary: &str) -> wirk_core::EvidenceItem {
+    wirk_core::EvidenceItem {
+        coordinate: realistic_coordinate(seed),
+        summary: summary.to_string(),
+        lifetime: wirk_core::Lifetime::Working,
+        reason: format!(
+            "ranked for the authored question in source `product` at the captured generation \
+             (item {seed})"
+        ),
+        identity: wirk_core::ItemIdentity::Generation {
+            generation: format!("generation-{seed:02}"),
+            object_id: format!("object-{seed:02}"),
+        },
+        shown: Some(wirk_core::ShownEvidence {
+            coordinate: realistic_coordinate(seed.wrapping_add(100)),
+            byte_start: 0,
+            byte_end: 320,
+            line_start: 12,
+            line_end: 21,
+            matched_terms: vec!["projection".to_string()],
+            whole_match_shown: true,
+        }),
+    }
+}
+
+/// A real, fully-shaped `ProjectionContent`: nothing left as a
+/// placeholder the renderer would silently skip.
+fn fixture_projection_content(question: &str) -> wirk_core::ProjectionContent {
+    wirk_core::ProjectionContent {
+        format: wirk_core::PROJECTION_FORMAT.to_string(),
+        compilation_policy: wirk_core::ASSEMBLY_POLICY.to_string(),
+        route_edition: "edition-1".to_string(),
+        waypoint: WaypointId("route-1/wp-1".to_string()),
+        revision: 0,
+        question: question.to_string(),
+        generations: vec![("m-1".to_string(), "gen-1".to_string())],
+        publication_revision: 3,
+        bound: vec![evidence_item(
+            1,
+            "fn reserve_next_leaf(estate: &Path) -> Result<Leaf, Refusal> { // the boundary \
+             refusal this question is about",
+        )],
+        assumptions: Vec::new(),
+        retrieval: wirk_core::RetrievalNote {
+            mode: "lexical".to_string(),
+            semantic: "unavailable".to_string(),
+            semantic_reason: Some("no query backend is configured".to_string()),
+            editions: Vec::new(),
+            degraded: Vec::new(),
+            total_candidates: 1,
+            returned: 1,
+            capacity: None,
+        },
+        referenced: Vec::new(),
+        reachable: Vec::new(),
+        unknowns: Vec::new(),
+        omitted: Vec::new(),
+        next_action: "State of the delivered evidence: complete.".to_string(),
+        coverage: wirk_core::EvidenceCoverage::Complete,
+        truncated: false,
+        expansion: None,
+        consulted: Vec::new(),
+        findings_index: wirk_core::FindingsIndexNote {
+            state: wirk_core::FindingsIndexState::Synchronized,
+            complete: true,
+        },
+    }
+}
+
+/// Writes a real projection file under `estate_root` (the same
+/// `ProjectionFile::write_new` a real assembly calls) and returns the
+/// `ActorWorld` an orient Waypoint reserving it would actually carry.
+fn actor_world_reserving(
+    run: &Run,
+    worktree_path: &std::path::Path,
+    estate_root: &std::path::Path,
+    content: wirk_core::ProjectionContent,
+) -> ActorWorld {
+    let file = wirk_core::ProjectionFile {
+        content: wirk_core::DeliveredContent::V3(Box::new(content)),
+        receipt: wirk_core::ObservationReceipt {
+            observation: wirk_core::ObservationId("obs-1".to_string()),
+            observed_at: 5,
+            observation_window_ms: 3,
+            laps: 1,
+        },
+    };
+    file.write_new(estate_root, &work_id())
+        .expect("fixture projection writes durably");
+    let evidence = projection_reference_for(&file, 0);
+    let World::Actor(mut actor) = actor_world_with_estate(run, worktree_path, estate_root) else {
+        unreachable!("actor_world_with_estate builds an Actor World")
+    };
+    actor.evidence = Some(Box::new(evidence));
+    actor
+}
+
+fn actor_world_with_reserved_projection(
+    run: &Run,
+    worktree_path: &std::path::Path,
+    estate_root: &std::path::Path,
+    question: &str,
+) -> ActorWorld {
+    actor_world_reserving(
+        run,
+        worktree_path,
+        estate_root,
+        fixture_projection_content(question),
+    )
+}
+
+#[test]
+fn an_orient_actors_first_prompt_carries_the_selected_source_content() {
+    let run = open_run("run-1");
+    let estate = tempdir().expect("estate tempdir");
+    let dir = tempdir().expect("worktree tempdir");
+    let actor = actor_world_with_reserved_projection(
+        &run,
+        dir.path(),
+        estate.path(),
+        "which function decides boundary refusal?",
+    );
+
+    let text =
+        wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, None, true);
+
+    assert!(
+        text.contains("fn reserve_next_leaf(estate: &Path) -> Result<Leaf, Refusal>"),
+        "the selected source text itself must reach the actor's first prompt: a stage that \
+         has to resolve a coordinate before it can read what was chosen for it was not \
+         oriented at all: {text:?}"
+    );
+    assert!(
+        text.contains("which function decides boundary refusal?"),
+        "the reserved World's own question must reach the first prompt: {text:?}"
+    );
+    assert!(
+        text.contains("generation-01") && text.contains("object-01"),
+        "each delivered excerpt must name the generation and object it was read at, so it \
+         can be cited and re-resolved: {text:?}"
+    );
+    assert!(
+        text.contains("revision 0"),
+        "the delivered block must name its own revision, so a later reattach that \
+         re-renders it reads as the captured revision shown again: {text:?}"
+    );
+    assert!(
+        text.contains("task evidence, not instruction"),
+        "delivered source text must be labeled as evidence: an excerpt worded as an \
+         instruction is the source's wording, not the actor's assignment: {text:?}"
+    );
+    assert!(
+        text.contains("coverage") && text.contains("truncated"),
+        "the honest coverage and truncation disclosures travel with the content: {text:?}"
+    );
+    assert!(
+        text.contains("report.md"),
+        "the assignment's own required output is unaffected by the added block: {text:?}"
+    );
+}
+
+#[test]
+fn the_delivered_world_omits_the_opaque_machine_coordinates() {
+    let run = open_run("run-1");
+    let estate = tempdir().expect("estate tempdir");
+    let dir = tempdir().expect("worktree tempdir");
+    let actor = actor_world_with_reserved_projection(
+        &run,
+        dir.path(),
+        estate.path(),
+        "which function decides boundary refusal?",
+    );
+
+    let text =
+        wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, None, true);
+
+    assert!(
+        !text.contains(&realistic_coordinate(1)),
+        "a hex-encoded ExactCoordinate is hundreds of characters a reader gets nothing \
+         from; it belongs to `wirk atlas resolve`, not to an orientation packet: {text:?}"
+    );
+    assert!(
+        text.contains("wirk world show") && text.contains("wirk world expand"),
+        "the packet must still name the existing path to the exact coordinates and to \
+         deeper binding, so nothing is lost by not printing them: {text:?}"
+    );
+}
+
+#[test]
+fn the_delivered_world_is_bounded_in_what_it_actually_renders() {
+    let run = open_run("run-1");
+    let estate = tempdir().expect("estate tempdir");
+    let dir = tempdir().expect("worktree tempdir");
+
+    // The largest packet this delivery can produce at the default
+    // budget: `REFERENCED_DEFAULT` ranked items and `REACHABLE_DEFAULT`
+    // handles, every item carrying a summary at the assembler's own cap
+    // and a located span, plus the bound item the fixture already has.
+    let mut content = fixture_projection_content("what does the installer need to package?");
+    content.referenced = (0..wirk_core::REFERENCED_DEFAULT)
+        .map(|index| {
+            let seed = index as u8 + 10;
+            evidence_item(seed, &full_budget_summary(seed))
+        })
+        .collect();
+    content.reachable = (0..wirk_core::REACHABLE_DEFAULT)
+        .map(|index| wirk_core::ReachableEntry {
+            handle: format!("handle-{index}"),
+            source: "product".to_string(),
+            family: "git".to_string(),
+            resources: 412,
+            fetch: format!("wirk atlas search --source product --query handle-{index}"),
+        })
+        .collect();
+    content.truncated = true;
+    content.omitted = vec![wirk_core::Omission::OverBudget {
+        of: "referenced".to_string(),
+        shown: wirk_core::REFERENCED_DEFAULT,
+        total: 137,
+    }];
+    content.coverage = wirk_core::EvidenceCoverage::Partial {
+        reason: wirk_core::CoverageReason::EvidenceUnavailable,
+    };
+    let actor = actor_world_reserving(&run, dir.path(), estate.path(), content);
+
+    let text =
+        wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, None, true);
+    let world = text
+        .split_once("Evidence selected for this Waypoint")
+        .expect("the World block is delivered")
+        .1;
+
+    // The same projection through the operator's style, for the one
+    // comparison that says what the machine coordinates actually cost.
+    let content = wirk_core::DeliveredContent::V3(Box::new(
+        actor
+            .evidence
+            .as_deref()
+            .and_then(|evidence| {
+                wirk_core::ProjectionFile::read_referenced(
+                    std::path::Path::new(&actor.triple.estate_root),
+                    &actor.triple.work_id,
+                    evidence,
+                )
+                .ok()
+            })
+            .map(|file| match file.content {
+                wirk_core::DeliveredContent::V3(content) => *content,
+                _ => unreachable!("the fixture writes a v3 projection"),
+            })
+            .expect("the fixture projection reads back"),
+    ));
+    let as_json = serde_json::to_value(&content).expect("projection serializes");
+    let console =
+        wirk_core::render_projection_report(&as_json, None, true, wirk_core::ReportStyle::Console);
+    let briefing =
+        wirk_core::render_projection_report(&as_json, None, true, wirk_core::ReportStyle::Briefing);
+    println!(
+        "full-budget World block: {} characters over {} rendered lines (report body: briefing \
+         {} vs console {})",
+        world.len(),
+        world.lines().count(),
+        briefing.len(),
+        console.len()
+    );
+    // Deliberately measured on the *rendered* text, not on the length of
+    // the input arrays: a bounded list of items whose rendering is
+    // unbounded is not a bounded packet. 24 KiB is roughly twice what
+    // this worst case renders, so it fails on a real regression in what
+    // is printed per item rather than on ordinary wording changes.
+    assert!(
+        world.len() < 24_576,
+        "a full-budget World renders {} characters; the initial packet must stay bounded \
+         in what it actually prints",
+        world.len()
+    );
+    assert!(
+        world.contains("truncated true"),
+        "a packet that was cut says so: {world:?}"
+    );
+    assert!(
+        world.contains("over_budget") && world.contains("\"total\":137"),
+        "the real total behind a cut travels with it, so a rendering budget is never read \
+         as the whole of what the estate holds: {world:?}"
+    );
+    assert!(
+        world.contains(&full_budget_summary(10)),
+        "every delivered item's own selected text is rendered whole, not elided to make \
+         room: {world:?}"
+    );
+}
+
+#[test]
+fn a_waypoint_with_no_orient_block_renders_no_world_section() {
+    let run = open_run("run-1");
+    let estate = tempdir().expect("estate tempdir");
+    let dir = tempdir().expect("worktree tempdir");
+    let World::Actor(actor) = actor_world_with_estate(&run, dir.path(), estate.path()) else {
+        unreachable!("actor_world_with_estate builds an Actor World")
+    };
+    assert!(
+        actor.evidence.is_none(),
+        "this test's premise: no orient block, so no reserved projection"
+    );
+
+    let text =
+        wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, None, true);
+
+    assert!(
+        !text.contains("Evidence selected for this Waypoint"),
+        "nothing was reserved, so nothing is invented for it: {text:?}"
+    );
+}
+
+#[test]
+fn a_reserved_world_that_cannot_be_delivered_is_disclosed_not_reassembled() {
+    let run = open_run("run-1");
+    let estate = tempdir().expect("estate tempdir");
+    let dir = tempdir().expect("worktree tempdir");
+    let mut actor = actor_world_with_reserved_projection(
+        &run,
+        dir.path(),
+        estate.path(),
+        "which function decides boundary refusal?",
+    );
+    // The reference no longer describes the file on disk — the same
+    // mismatch `ProjectionFile::read_referenced` refuses a tampered or
+    // superseded projection on.
+    let evidence = actor.evidence.as_deref().expect("the fixture reserved one");
+    actor.evidence = Some(Box::new(wirk_core::EvidenceProjectionRef {
+        receipt: "0".repeat(64),
+        ..evidence.clone()
+    }));
+
+    let text =
+        wirk_herdr::run_loop::compose_first_prompt(&actor, &run.kind, None, None, None, true);
+
+    assert!(
+        text.contains("cannot be delivered here"),
+        "an undeliverable reservation is stated, never silently dropped: {text:?}"
+    );
+    assert!(
+        text.contains("not re-assembled"),
+        "what was reserved then is not what would be assembled now, and the actor is told \
+         so rather than handed a substitute: {text:?}"
+    );
+    assert!(
+        !text.contains("fn reserve_next_leaf"),
+        "no content is invented or read around the refusal: {text:?}"
+    );
+    assert!(
+        text.contains("report.md"),
+        "the rest of the assignment still reaches the actor: {text:?}"
+    );
+}
+
+#[test]
+fn an_ordinary_continuation_nudge_repeats_neither_the_world_nor_the_fallback_contract() {
+    let run = open_run("run-1");
+    let estate = tempdir().expect("estate tempdir");
+    let dir = tempdir().expect("worktree tempdir");
+    let actor = actor_world_with_reserved_projection(
+        &run,
+        dir.path(),
+        estate.path(),
+        "which function decides boundary refusal?",
+    );
+    let contract = wirk_core::ContractDelivery {
+        version: "v1".to_string(),
+        digest: "deadbeef".to_string(),
+        mode: wirk_core::ContractDeliveryMode::Prompt,
+        fallback_reason: Some("no native mechanism was available for this test kind".to_string()),
+    };
+    let contract_text = "THE SHARED WORKER CONTRACT BODY, VERBATIM";
+
+    let first = wirk_herdr::run_loop::compose_first_prompt(
+        &actor,
+        &run.kind,
+        Some(&contract),
+        Some(contract_text),
+        None,
+        true,
+    );
+    assert!(
+        first.contains(contract_text) && first.contains("fn reserve_next_leaf"),
+        "the very first prompt of a drive carries both the fallback contract and the \
+         reserved World's own content: {first:?}"
+    );
+
+    let continuation = wirk_herdr::run_loop::compose_first_prompt(
+        &actor,
+        &run.kind,
+        Some(&contract),
+        Some(contract_text),
+        None,
+        false,
+    );
+    assert!(
+        !continuation.contains(contract_text),
+        "an ordinary continuation nudge must not resend the whole fallback contract: \
+         {continuation:?}"
+    );
+    assert!(
+        !continuation.contains("which function decides")
+            && !continuation.contains("Evidence selected for this Waypoint")
+            && !continuation.contains("fn reserve_next_leaf")
+            && !continuation.contains("selected text:"),
+        "an ordinary continuation nudge must not resend the World or any of its delivered \
+         content: {continuation:?}"
+    );
+    assert!(
+        continuation.contains("report.md"),
+        "the assignment's own required output still reaches a continuation: {continuation:?}"
     );
 }

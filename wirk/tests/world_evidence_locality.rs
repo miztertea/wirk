@@ -598,6 +598,33 @@ fn the_plain_world_surface_names_the_lines_it_showed() {
     estate.stop();
 }
 
+/// The plain surface must carry the *content* the assembler selected,
+/// not only a citation for it: the JSON's own `summary` for a delivered
+/// item is what a reader of `wirk world show` sees for that item.
+#[test]
+fn the_plain_world_surface_prints_the_content_it_selected() {
+    let mut estate = Estate::new();
+    let work = submit_oriented(&estate, "world-selected-text");
+    let json = world_show(&estate.root, &work.work_id, &work.run_id);
+    let summary = json["projection"]["bound"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item["summary"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("this fixture binds at least one item: {json}"));
+    assert!(
+        !summary.is_empty(),
+        "this test's premise: the assembler chose some content for that item"
+    );
+
+    let text = world_show_text(&estate.root, &work.work_id, &work.run_id);
+    assert!(
+        text.contains(&format!("selected text: {summary}")),
+        "the plain rendering must print the selected content itself: {text}"
+    );
+    estate.stop();
+}
+
 /// The `wirk` CLI with the *test runner's own* actor triple removed from
 /// the child's environment.
 ///
