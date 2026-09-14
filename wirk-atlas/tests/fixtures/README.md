@@ -1,8 +1,16 @@
 # Test fixtures
 
-Small, real files the integration tests need and that no read-only
-reference corpus on an ordinary checkout already provides. Each one is
-here because a test's claim is only as real as the bytes it runs on.
+Small, real files the integration tests need, committed here so a normal
+test run needs only this checkout and its declared dependencies — never
+an ancestor-workspace reference corpus, a runtime download, or a skip.
+Each one is here because a test's claim is only as real as the bytes it
+runs on.
+
+## `anydoc_corpus/`
+
+The subset of formats `document_formats.rs` actually reads, copied from
+the estate's read-only reference checkout with provenance recorded in
+its own `MANIFEST.md`.
 
 ## `legacy-excel-97.xls`
 

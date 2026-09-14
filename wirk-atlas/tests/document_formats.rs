@@ -4,12 +4,13 @@
 //! `acquire_document_tree` / `publish` / `search` / `resolve_exact`, the
 //! same calls `wirkd` makes, not a standalone converter demo.
 //!
-//! Fixtures: the existing ~541 KB `anydoc_corpus` under
-//! `refs/sergeant-rs/tests/fixtures/anydoc_corpus/` (hand-authored,
-//! source-known — see that corpus's own `MANIFEST.md`) plus a handful of
-//! small source-known additions this file builds itself, for the two
-//! precision-gap scenarios the corpus does not already cover: a
-//! non-A1 spreadsheet origin and text repeated across two sheets.
+//! Fixtures: this crate's own committed `tests/fixtures/anydoc_corpus/`
+//! (hand-authored, source-known, copied from the estate's read-only
+//! reference checkout with its provenance recorded — see that
+//! directory's own `MANIFEST.md`) plus a handful of small source-known
+//! additions this file builds itself, for the two precision-gap
+//! scenarios the corpus does not already cover: a non-A1 spreadsheet
+//! origin and text repeated across two sheets.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,29 +21,17 @@ use wirk_atlas::{
 };
 use wirk_core::{Access, RepositoryBinding};
 
-/// The estate's read-only reference corpus (ruling 0026-style: evidence,
-/// never copied into the product tree). This worktree lives under
-/// `<estate>/.wirk/p3-runtime/worktrees/<work-id>/wirk-atlas`, at a
-/// depth from the estate root that varies with which runtime coordinates
-/// it — so this walks upward looking for the one thing that identifies
-/// the estate root (`refs/sergeant-rs`) rather than hardcoding a fixed
-/// number of `..`s or an absolute host path.
+/// This crate's own committed fixture subset (`tests/fixtures/README.md`,
+/// `tests/fixtures/anydoc_corpus/MANIFEST.md`): a normal test suite must
+/// run from the product checkout and its declared dependencies alone, so
+/// these bytes are copied in rather than located by walking up toward a
+/// workspace-only reference checkout that a product-only checkout — CI's
+/// own, or any other clone of this repository — does not have.
 fn corpus_root() -> PathBuf {
-    let suffix = Path::new("refs/sergeant-rs/tests/fixtures/anydoc_corpus");
-    let mut dir = Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
-    loop {
-        let candidate = dir.join(suffix);
-        if candidate.join("MANIFEST.md").exists() {
-            return candidate;
-        }
-        if !dir.pop() {
-            panic!(
-                "could not find {suffix:?} above {}; this test needs the wirk-workspace estate's \
-                 own refs/sergeant-rs checkout",
-                env!("CARGO_MANIFEST_DIR")
-            );
-        }
-    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("anydoc_corpus")
 }
 
 fn staged(outcome: AcquireOutcome) -> SourceGeneration {
