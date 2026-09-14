@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 use wirk_atlas::{
-    AcquireOutcome, AtlasStore, EditionId, ExtractorPolicy, Membership, SemanticBuildConfig,
-    SemanticBuildOutcome, SemanticEdition, SemanticVerification,
+    AcquireOutcome, AtlasStore, EditionId, ExtractorPolicy, MappingRow, Membership,
+    SemanticBuildConfig, SemanticBuildOutcome, SemanticEdition, SemanticVerification,
 };
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -45,6 +45,33 @@ fn fixture_repo() -> TempDir {
     git(repo.path(), &["config", "user.name", "A"]);
     fs::write(repo.path().join("code.rs"), "fn one() {}\nfn two() {}\n").unwrap();
     fs::write(repo.path().join("readme.md"), "# heading\nbody text\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    repo
+}
+
+/// The bytes both twins below are committed with: a real, small CSV table,
+/// so the `.csv` twin renders a genuine Markdown table and the `.md` twin
+/// passes the same bytes through unchanged.
+const TWIN_BYTES: &str = "site,phase,lead\nHarbour,Build,Nia\n";
+
+/// A repository holding a document and an ordinary note under one
+/// generation — the shape an estate of reports and the notes about them
+/// actually has — with the two committed byte-identical so they share one
+/// object id.
+///
+/// Both halves matter. The mixed generation carries two unitizers, because
+/// the `.csv` twin's units index converted Markdown and the `.md` twin's
+/// index the file itself; and the shared object id is what makes a cache
+/// keyed by object id alone hand one twin the other's hydrated bytes.
+fn mixed_fixture_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    fs::write(repo.path().join("code.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+    fs::write(repo.path().join("twin.csv"), TWIN_BYTES).unwrap();
+    fs::write(repo.path().join("twin.md"), TWIN_BYTES).unwrap();
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-qm", "fixture"]);
     repo
@@ -280,7 +307,10 @@ fn estate() -> Estate {
 }
 
 fn estate_with_backend(flavour: &str) -> Estate {
-    let repo = fixture_repo();
+    estate_with_repo(fixture_repo(), flavour)
+}
+
+fn estate_with_repo(repo: TempDir, flavour: &str) -> Estate {
     let home = TempDir::new().unwrap();
     let root = home.path().join("estate");
     fs::create_dir_all(&root).unwrap();
@@ -392,6 +422,156 @@ fn edition_path(estate: &Estate, id: &EditionId, file: &str) -> PathBuf {
 }
 
 // ---- lifecycle -----------------------------------------------------------
+
+/// One generation holding both a document and an ordinary note builds one
+/// edition over both, each embedded from its own reading, and that edition
+/// selects.
+///
+/// Three separate things have to hold, and each was watched failing on its
+/// own before this was accepted:
+///
+/// 1. The build is not refused. A generation carrying two unitizers is
+///    ordinary once documents are admitted — a `.csv` is cut as converted
+///    Markdown, a `.md` as itself — and refusing it left semantic
+///    retrieval unreachable for exactly the collections documents were
+///    admitted for.
+/// 2. Each resource is embedded from *its own* hydrated bytes. The twins
+///    here are committed byte-identical, so they share one object id; a
+///    build that caches hydrated bytes by object id alone embeds the
+///    second twin from the first twin's rendering.
+/// 3. The edition says both unitizers, rather than naming one and being
+///    wrong about half its own rows, and it selects — which is to say its
+///    coordinates re-verify against the same per-resource readings.
+#[test]
+fn a0_a_mixed_document_and_text_generation_builds_and_selects_one_edition() {
+    let mut estate = estate_with_repo(mixed_fixture_repo(), "honest");
+    let edition = staged({
+        let m = estate.model.clone();
+        build(&mut estate, &m)
+    });
+
+    // (3) The identity says exactly what was cut, both of them, sorted.
+    assert_eq!(edition.identity, wirk_atlas::IDENTITY_V6);
+    assert_eq!(
+        edition.chunker.unitizers,
+        vec![
+            "anydoc-0.2.4-markdown+utf8-multiline-chunks-65536/v1".to_owned(),
+            "utf8-multiline-chunks-65536/v1".to_owned(),
+        ],
+        "a mixed generation's edition must name every unitizer it was cut by"
+    );
+
+    // (2) Both twins are in the mapping, under one object id, each with
+    // its own reading: the CSV twin as a rendered Markdown table, the
+    // Markdown twin as the raw comma-separated bytes it actually holds.
+    let rows: Vec<MappingRow> = fs::read(edition_path(&estate, &edition.id, "mapping.ndjson"))
+        .unwrap()
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let text_of = |path: &[u8]| -> String {
+        let row = rows
+            .iter()
+            .find(|row| row.path == path)
+            .unwrap_or_else(|| panic!("no mapping row for {}", String::from_utf8_lossy(path)));
+        let bytes = blob_of(&estate, &row.path, &row.object_id);
+        let slice = &bytes[row.byte_start as usize..row.byte_end as usize];
+        // The row has to describe *this* resource's own reading, not
+        // merely address a range that happens to exist: a build that
+        // embedded the other twin's rendering records that rendering's
+        // digest here.
+        assert_eq!(
+            sha256(slice),
+            row.content_digest,
+            "the row recorded for {} does not digest to that resource's own bytes",
+            String::from_utf8_lossy(path)
+        );
+        String::from_utf8(slice.to_vec()).unwrap()
+    };
+    let csv = text_of(b"twin.csv");
+    let markdown = text_of(b"twin.md");
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.path == b"twin.csv")
+            .unwrap()
+            .object_id,
+        rows.iter()
+            .find(|row| row.path == b"twin.md")
+            .unwrap()
+            .object_id,
+        "the fixture must commit both twins as one object for this to mean anything"
+    );
+    assert!(
+        csv.contains('|') && csv.contains("Harbour"),
+        "the CSV twin's row must cover its rendered Markdown table: {csv:?}"
+    );
+    assert!(
+        !markdown.contains('|') && markdown.contains("site,phase,lead"),
+        "the Markdown twin's row must cover its own raw bytes, not the CSV twin's table: \
+         {markdown:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.path == b"code.rs"),
+        "the ordinary text resource is still indexed beside them"
+    );
+
+    // (3, again) Selection re-verifies every row's coordinates against the
+    // source, per resource. A verification that hydrated by object id
+    // alone condemns this sound edition.
+    assert_eq!(
+        estate
+            .store
+            .verify_edition_coordinates(&estate.membership.clone(), &edition)
+            .unwrap(),
+        SemanticVerification::Verified
+    );
+    let membership = estate.membership.clone();
+    estate
+        .store
+        .select_semantic(&membership, &edition.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        estate.store.semantic_availability(&membership).unwrap(),
+        wirk_atlas::SemanticAvailability::Available
+    );
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The bytes one recorded resource actually reads as, through the same
+/// public path the product's own hydration takes: the committed object,
+/// rendered when the resource is a document.
+fn blob_of(estate: &Estate, path: &[u8], object_id: &str) -> Vec<u8> {
+    let raw = Command::new("git")
+        .arg("-C")
+        .arg(&estate.membership.locator)
+        .args(["cat-file", "blob", object_id])
+        .output()
+        .unwrap();
+    assert!(raw.status.success());
+    let name = String::from_utf8_lossy(path).to_string();
+    if name.ends_with(".csv") {
+        // The CSV twin's units index the Markdown table `anydoc` renders,
+        // so its bytes here are that rendering. Derived through the same
+        // installed reader the product uses, not re-implemented.
+        anydoc::to_markdown_bytes(&raw.stdout, anydoc::Format::from_extension("csv").unwrap())
+            .unwrap()
+            .into_bytes()
+    } else {
+        raw.stdout
+    }
+}
 
 /// Building stages; it never publishes. The catalog is untouched until a
 /// separate `select`, and `status`'s view of the estate says so.
@@ -1342,10 +1522,11 @@ fn u_backend_environment_is_re_measured_bound_and_honestly_absent() {
     );
     // The scheme this product writes now: `v4` bound the chunker, the
     // retrieval representation and the coverage on top of everything `v3`
-    // bound, and `v5` adds the grammar libraries the boundaries actually
-    // came out of. `v1`/`v2`/`v3` records still read back as themselves,
-    // which `v_...` and `w_g_...` below pin.
-    assert_eq!(bare.identity, wirk_atlas::IDENTITY_V5);
+    // bound, `v5` added the grammar libraries the boundaries actually came
+    // out of, and `v6` binds every unitizer the generation committed to
+    // rather than one. `v1`/`v2`/`v3` records still read back as
+    // themselves, which `v_...` and `w_g_...` below pin.
+    assert_eq!(bare.identity, wirk_atlas::IDENTITY_V6);
 
     let reported = staged(build_with_args(
         &mut estate,
@@ -1420,6 +1601,7 @@ fn v_a_v1_edition_record_still_reads_back_as_v1() {
             .unwrap()
             .remove("environment");
     }
+    downgrade_to_single_unitizer(&mut value);
     let legacy = EditionId(legacy_edition_id(&value, wirk_atlas::IDENTITY_V1));
     value
         .as_object_mut()
@@ -1443,6 +1625,12 @@ fn v_a_v1_edition_record_still_reads_back_as_v1() {
 
     let read = estate.store.read_edition(&legacy).unwrap();
     assert_eq!(read.identity, wirk_atlas::IDENTITY_V1);
+    // The single name such a record carries reads back as the one-element
+    // list it means, and the record keeps the id it was written with.
+    assert_eq!(
+        read.chunker.unitizers,
+        vec!["utf8-multiline-chunks-65536/v1".to_owned()]
+    );
     assert_eq!(
         read.backend.environment,
         wirk_atlas::BackendEnvironment::Unreported
@@ -1464,6 +1652,25 @@ fn v_a_v1_edition_record_still_reads_back_as_v1() {
         estate.store.semantic_availability(&membership).unwrap(),
         wirk_atlas::SemanticAvailability::Available
     );
+}
+
+/// Rewrite a record's `unitizers` list into the single `unitizer` string
+/// every edition written before `v6` carried, which is the shape the
+/// legacy records below actually had. Reading it back as the one-element
+/// list it means, with the identity it was written under intact, is itself
+/// part of what these checks pin.
+fn downgrade_to_single_unitizer(value: &mut serde_json::Value) {
+    let chunker = value["chunker"].as_object_mut().unwrap();
+    let list = chunker
+        .remove("unitizers")
+        .expect("a record this product wrote names its unitizers");
+    let list = list.as_array().unwrap();
+    assert_eq!(
+        list.len(),
+        1,
+        "only a single-unitizer edition has a legacy shape to downgrade to"
+    );
+    chunker.insert("unitizer".into(), list[0].clone());
 }
 
 /// The `v1` edition id, recomputed here from the record's own JSON — an
@@ -1697,7 +1904,7 @@ fn w_a_two_implementation_mutations_with_identical_counts_are_distinct_editions(
         wirk_atlas::ModuleAttribution::Declared("stubdist".into())
     );
     assert_eq!(measured.coverage, wirk_atlas::EnvironmentCoverage::Complete);
-    assert_eq!(c.identity, wirk_atlas::IDENTITY_V5);
+    assert_eq!(c.identity, wirk_atlas::IDENTITY_V6);
 }
 
 /// Item 1. A module that loads from somewhere the claiming distribution's
@@ -2011,6 +2218,7 @@ fn w_g_a_v2_edition_record_reads_back_as_v2_with_unmeasured_coverage() {
     // A `v2` record is genuinely a different edition — the scheme name is
     // absorbed — so this is written as the `v2` edition it is, at the id
     // the `v2` computation gives, rather than a `v3` record relabelled.
+    downgrade_to_single_unitizer(&mut value);
     let legacy = EditionId(legacy_edition_id(&value, wirk_atlas::IDENTITY_V2));
     value.as_object_mut().unwrap()["id"] = serde_json::json!(legacy.0);
     let directory = estate.root.join("atlas").join("semantic").join(&legacy.0);

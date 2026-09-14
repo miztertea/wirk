@@ -1,11 +1,13 @@
 use crate::doctree;
+use crate::document;
 use crate::domain::{actual_line_bounds, now_unix_millis};
 use crate::extract::ExtractorPolicy;
 use crate::git;
+use crate::http_source;
 use crate::{
-    AcquisitionAttempt, AtlasError, CoverageDisposition, EstateScope, ExactCoordinate,
-    FORMAT_VERSION, GenerationId, Membership, MembershipId, Relationship, ResolveOutcome,
-    ResolvedEvidence, SourceGeneration, SourceId,
+    AcquisitionAttempt, AtlasError, ContentFamily, CoverageDisposition, EstateScope,
+    ExactCoordinate, FORMAT_VERSION, GenerationId, Membership, MembershipId, Relationship,
+    ResolveOutcome, ResolvedEvidence, SourceGeneration, SourceId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -335,6 +337,13 @@ impl AcquisitionKind {
     }
 }
 
+/// Where one HTTP generation's raw response bytes live, beside its
+/// `manifest.json`/`resources.ndjson` — written once by `stage`, read
+/// back (never re-fetched) by `resolve_exact_http`/`publish_verify_http`.
+fn content_bin(generation_dir: &Path) -> PathBuf {
+    generation_dir.join("content.bin")
+}
+
 impl AtlasStore {
     pub fn open(
         estate_root: impl AsRef<Path>,
@@ -516,6 +525,45 @@ impl AtlasStore {
         self.register(alias, locator, requested_ref, doctree::ACQUISITION_POLICY)
     }
 
+    /// Explicit admission of one public HTTP(S) URL as its own source.
+    /// Shares every catalog mechanic `register_git`/
+    /// `register_document_tree` already have; the only differences are
+    /// that `locator` is validated as a URL rather than canonicalized as
+    /// a filesystem path (`http_source::validate_url`), and
+    /// `Membership::policy` records `http_source::ACQUISITION_POLICY` —
+    /// which is what later makes `acquire`/`refresh`/`publish`/
+    /// `resolve_exact` treat this source as one bounded fetch rather
+    /// than a Git repository or a local document collection.
+    ///
+    /// `requested_ref` is checked against
+    /// `http_source::CURRENT_OBSERVATION` and refused by name
+    /// otherwise, for the same reason `register_document_tree` checks
+    /// it: an HTTP source has no revision besides its own last observed
+    /// fetch, and an arbitrary caller-supplied string here would later
+    /// be read back as if it named something this policy had checked.
+    pub fn register_http(
+        &mut self,
+        alias: &str,
+        url: &str,
+        requested_ref: &str,
+    ) -> Result<Membership, AtlasError> {
+        if requested_ref != http_source::CURRENT_OBSERVATION {
+            return Err(AtlasError::InvalidRequest(format!(
+                "an HTTP source observes only the state its last acquire/refresh actually \
+                 fetched; pass {:?} for --revision (or omit it) rather than {requested_ref:?}, \
+                 which this policy has nothing to check it against",
+                http_source::CURRENT_OBSERVATION
+            )));
+        }
+        http_source::validate_url(url)?;
+        self.register_with_locator(
+            alias,
+            url.to_string(),
+            requested_ref,
+            http_source::ACQUISITION_POLICY,
+        )
+    }
+
     fn register(
         &mut self,
         alias: &str,
@@ -523,14 +571,29 @@ impl AtlasStore {
         requested_ref: &str,
         policy: &str,
     ) -> Result<Membership, AtlasError> {
-        if alias.is_empty() || alias.contains('/') || alias.contains('\0') {
-            return Err(AtlasError::InvalidCoordinate("invalid source alias".into()));
-        }
         let locator = locator
             .as_ref()
             .canonicalize()?
             .to_string_lossy()
             .into_owned();
+        self.register_with_locator(alias, locator, requested_ref, policy)
+    }
+
+    /// The catalog mechanics every registration shares once its
+    /// `locator` is already resolved to its final recorded string form —
+    /// a canonicalized filesystem path for `git`/`document-tree`, an
+    /// already-validated URL for `http` — so this never re-derives or
+    /// re-validates what kind of locator it was given.
+    fn register_with_locator(
+        &mut self,
+        alias: &str,
+        locator: String,
+        requested_ref: &str,
+        policy: &str,
+    ) -> Result<Membership, AtlasError> {
+        if alias.is_empty() || alias.contains('/') || alias.contains('\0') {
+            return Err(AtlasError::InvalidCoordinate("invalid source alias".into()));
+        }
         if let Some(existing) = self.catalog.memberships.get(alias) {
             if existing.locator == locator && existing.policy == policy {
                 return Ok(existing.clone());
@@ -684,7 +747,9 @@ impl AtlasStore {
                 self.read_generation(&id)?
             } else {
                 let resources = match (kind, doctree_captured) {
-                    (AcquisitionKind::Git, _) => git::resources(repo, &revision, &id, &policy)?,
+                    (AcquisitionKind::Git, _) => {
+                        git::resources(repo, &revision, &id, &policy, &self.capture_limits())?
+                    }
                     (AcquisitionKind::DocumentTree, Some(captured)) => {
                         doctree::finish(&id, &policy, captured, &stop)?
                     }
@@ -722,8 +787,9 @@ impl AtlasStore {
                     locator: membership.locator.clone(),
                     requested_ref: requested_ref.into(),
                     resources,
+                    origin: None,
                 };
-                self.stage(&generation)?;
+                self.stage(&generation, None)?;
                 generation
             };
             Ok::<_, AtlasError>(generation)
@@ -808,6 +874,138 @@ impl AtlasStore {
         )
     }
 
+    /// Acquisition over the HTTP-source policy: one bounded fetch of
+    /// `membership.locator` (`http_source::capture`), refused
+    /// (`InvalidRequest`, before any network access) if `membership` was
+    /// not itself registered under `http_source::ACQUISITION_POLICY` or
+    /// `requested_ref` is not `http_source::CURRENT_OBSERVATION`.
+    pub fn acquire_http(
+        &mut self,
+        membership: &Membership,
+        requested_ref: &str,
+        policy: ExtractorPolicy,
+    ) -> Result<AcquireOutcome, AtlasError> {
+        self.acquire_http_kind("atlas acquire", membership, requested_ref, policy)
+    }
+
+    /// `acquire_http`'s explicit-refresh counterpart. Identical
+    /// mechanics; `refresh` never re-registers so this is never told a
+    /// kind and dispatches purely on `membership.policy`, exactly as
+    /// `refresh`/`refresh_document_tree` already do.
+    pub fn refresh_http(
+        &mut self,
+        membership: &Membership,
+        requested_ref: &str,
+        policy: ExtractorPolicy,
+    ) -> Result<AcquireOutcome, AtlasError> {
+        self.acquire_http_kind("atlas refresh", membership, requested_ref, policy)
+    }
+
+    fn acquire_http_kind(
+        &mut self,
+        verb: &str,
+        membership: &Membership,
+        requested_ref: &str,
+        policy: ExtractorPolicy,
+    ) -> Result<AcquireOutcome, AtlasError> {
+        self.check_membership(membership)?;
+        if membership.policy != http_source::ACQUISITION_POLICY {
+            return Err(AtlasError::InvalidRequest(format!(
+                "source {:?} was registered under {}, not {}",
+                membership.alias,
+                membership.policy,
+                http_source::ACQUISITION_POLICY
+            )));
+        }
+        if requested_ref != http_source::CURRENT_OBSERVATION {
+            return Err(AtlasError::InvalidRequest(format!(
+                "an HTTP source observes only the state its last acquire/refresh actually \
+                 fetched; pass {:?} for --revision (or omit it) rather than {requested_ref:?}",
+                http_source::CURRENT_OBSERVATION
+            )));
+        }
+        let limits = http_source::FetchLimits::from_policy(&self.jobs.policy);
+        let result = http_source::capture(
+            verb,
+            &membership.locator,
+            &limits,
+            &self.root,
+            &self.jobs,
+            &membership.alias,
+        )
+        .and_then(|(revision, content, origin, bytes)| {
+            let id = GenerationId(ExtractorPolicy::generation_id(
+                &membership.source.0,
+                &revision,
+                &content,
+                policy.id(),
+                http_source::ACQUISITION_POLICY,
+            ));
+            let destination = self.generation_dir(&id)?;
+            let generation = if destination.exists() {
+                self.read_generation(&id)?
+            } else {
+                let resource = http_source::finish(
+                    &id,
+                    &policy,
+                    &membership.locator,
+                    &revision,
+                    &bytes,
+                    origin.content_type.as_deref(),
+                );
+                let generation = SourceGeneration {
+                    id: id.clone(),
+                    source: membership.source.clone(),
+                    revision,
+                    content,
+                    extractor_set: policy.id().into(),
+                    acquisition_policy: http_source::ACQUISITION_POLICY.into(),
+                    locator: membership.locator.clone(),
+                    requested_ref: requested_ref.into(),
+                    resources: vec![resource],
+                    origin: Some(Box::new(origin)),
+                };
+                self.stage(&generation, Some(&bytes))?;
+                generation
+            };
+            Ok::<_, AtlasError>(generation)
+        });
+        match result {
+            Ok(generation) => {
+                self.record_attempt(AcquisitionAttempt {
+                    at_unix_millis: now_unix_millis(),
+                    membership: membership.id.clone(),
+                    requested_ref: requested_ref.into(),
+                    outcome: "staged".into(),
+                    generation: Some(generation.id.clone()),
+                    diagnostic: None,
+                })?;
+                Ok(AcquireOutcome::Staged(generation))
+            }
+            Err(AtlasError::SourceBytesUnavailable(detail)) => {
+                self.record_attempt(AcquisitionAttempt {
+                    at_unix_millis: now_unix_millis(),
+                    membership: membership.id.clone(),
+                    requested_ref: requested_ref.into(),
+                    outcome: "unavailable".into(),
+                    generation: None,
+                    diagnostic: Some(detail.clone()),
+                })?;
+                Ok(AcquireOutcome::Unavailable(detail))
+            }
+            Err(error) => {
+                self.record_attempt(AcquisitionAttempt {
+                    at_unix_millis: now_unix_millis(),
+                    membership: membership.id.clone(),
+                    requested_ref: requested_ref.into(),
+                    outcome: "error".into(),
+                    generation: None,
+                    diagnostic: Some(error.to_string()),
+                })?;
+                Err(error)
+            }
+        }
+    }
     /// Removes this source's own catalog membership, publication and
     /// semantic selection —
     /// never the source's own original files, which this crate has
@@ -885,6 +1083,7 @@ impl AtlasStore {
             // of this arm, before the catalog is touched, so a cancel
             // that arrives after verification passes finds nothing to
             // stop rather than stopping a catalog commit half way.
+            http_source::ACQUISITION_POLICY => self.publish_verify_http(&staged)?,
             doctree::ACQUISITION_POLICY => {
                 let job = self.jobs.in_process("atlas publish", &membership.alias);
                 self.publish_verify_doctree(&staged, &job.stop())?
@@ -975,6 +1174,33 @@ impl AtlasStore {
         }
         Ok(())
     }
+
+    /// `publish`'s HTTP counterpart. Unlike `publish_verify_doctree`,
+    /// this never touches the network — an HTTP generation's "current
+    /// state" was already fixed the moment `acquire`/`refresh` fetched
+    /// it (`http_source`'s own top-level doc: `search`/`resolve` never
+    /// reach the network, and neither does `publish`). What this checks
+    /// is narrower and purely local: that the cached `content.bin` this
+    /// generation staged is still exactly the bytes its own recorded
+    /// `revision`/`content` name, catching on-disk corruption of this
+    /// estate's own working cache rather than upstream drift — drift is
+    /// what an explicit `refresh` is for.
+    fn publish_verify_http(&self, staged: &SourceGeneration) -> Result<(), AtlasError> {
+        let path = content_bin(&self.generation_dir(&staged.id)?);
+        let bytes = fs::read(&path).map_err(|error| {
+            AtlasError::Generation(format!(
+                "cached response bytes for {} are missing or unreadable: {error}",
+                staged.locator
+            ))
+        })?;
+        let digest = http_source::hash_hex(&bytes);
+        if digest != staged.revision || format!("sha256:{digest}") != staged.content {
+            return Err(AtlasError::Generation(
+                "cached response bytes no longer match this generation's recorded identity".into(),
+            ));
+        }
+        Ok(())
+    }
     pub fn current(&self, membership: &Membership) -> Result<Option<SourceGeneration>, AtlasError> {
         self.check_membership(membership)?;
         self.catalog
@@ -1057,6 +1283,7 @@ impl AtlasStore {
         match generation.acquisition_policy.as_str() {
             git::ACQUISITION_POLICY => self.resolve_exact_git(membership, &generation, coordinate),
             doctree::ACQUISITION_POLICY => self.resolve_exact_doctree(&generation, coordinate),
+            http_source::ACQUISITION_POLICY => self.resolve_exact_http(&generation, coordinate),
             other => Err(AtlasError::Generation(format!(
                 "generation names an unknown acquisition policy {other:?}"
             ))),
@@ -1095,7 +1322,12 @@ impl AtlasStore {
             Err(error) => return Err(error),
         }
         match git::blob(repo, &coordinate.object_id) {
-            Ok(bytes) => Self::resolved_from_bytes(coordinate, &bytes, "committed Git bytes"),
+            Ok(bytes) => match document::render_if_document(&coordinate.path, bytes) {
+                Ok(rendered) => {
+                    Self::resolved_from_bytes(coordinate, &rendered, "committed Git bytes")
+                }
+                Err(detail) => Ok(ResolveOutcome::Unavailable(detail)),
+            },
             Err(AtlasError::SourceBytesUnavailable(detail)) => {
                 Ok(ResolveOutcome::Unavailable(detail))
             }
@@ -1137,7 +1369,12 @@ impl AtlasStore {
             &coordinate.object_id,
             &self.capture_limits(),
         ) {
-            Ok(bytes) => Self::resolved_from_bytes(coordinate, &bytes, "document-tree bytes"),
+            Ok(bytes) => match document::render_if_document(&coordinate.path, bytes) {
+                Ok(rendered) => {
+                    Self::resolved_from_bytes(coordinate, &rendered, "document-tree bytes")
+                }
+                Err(detail) => Ok(ResolveOutcome::Unavailable(detail)),
+            },
             Err(AtlasError::SourceBytesUnavailable(detail)) => {
                 Ok(ResolveOutcome::Unavailable(detail))
             }
@@ -1146,7 +1383,157 @@ impl AtlasStore {
         }
     }
 
-    /// Shared by both policies' final step: exact bytes have been read
+    /// `resolve_exact`'s HTTP counterpart. Reads this generation's own
+    /// cached `content.bin` **from disk, never the network** — the
+    /// whole point of persisting the fetch once (`http_source`'s own
+    /// top-level doc) — and refuses unless its SHA-256 equals the
+    /// coordinate's own `object_id`, the same proof-the-returned-bytes-
+    /// are-the-named-bytes discipline `resolve_exact_doctree` applies to
+    /// a live file. `Unavailable` here means this estate's own working
+    /// cache is missing or has been corrupted since it was staged; an
+    /// operator's remedy is an explicit `refresh`, never an implicit
+    /// re-fetch from this call.
+    fn resolve_exact_http(
+        &self,
+        generation: &SourceGeneration,
+        coordinate: &ExactCoordinate,
+    ) -> Result<ResolveOutcome, AtlasError> {
+        let path = content_bin(&self.generation_dir(&generation.id)?);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return Ok(ResolveOutcome::Unavailable(format!(
+                    "cached response bytes for {} {error}",
+                    generation.locator
+                )));
+            }
+        };
+        let digest = http_source::hash_hex(&bytes);
+        if digest != coordinate.object_id {
+            return Ok(ResolveOutcome::Unavailable(
+                "staged response bytes no longer match the recorded content hash".into(),
+            ));
+        }
+        // Routed through the same renderer every other policy resolves
+        // through: a fetched response that this extractor admitted as a
+        // document was unitized against its Markdown rendering, so the
+        // span a coordinate names is a span of that rendering here too.
+        match document::render_if_document(&coordinate.path, bytes) {
+            Ok(rendered) => {
+                Self::resolved_from_bytes(coordinate, &rendered, "staged HTTP response bytes")
+            }
+            Err(detail) => Ok(ResolveOutcome::Unavailable(detail)),
+        }
+    }
+
+    /// Read one already-recorded resource through `anydoc`'s shared
+    /// document model and describe what it holds: its shape, and an
+    /// inventory of the assets it embeds — never their bytes.
+    ///
+    /// **Addressed by the resource a coordinate already names.** This
+    /// takes the same `ExactCoordinate` `resolve_exact` does and uses the
+    /// same part of it — estate, membership, generation, path, object id —
+    /// so a caller that can resolve a hit can inspect the source behind
+    /// it without a second addressing scheme. Its byte and line bounds
+    /// name a span of the *rendering* and have no meaning for the
+    /// structure, so they are deliberately not read here; the document is
+    /// the whole resource either way.
+    ///
+    /// **Parent-source authority is the caller's to establish, exactly as
+    /// it is for `resolve_exact`:** the membership must already have been
+    /// admitted under the asking scope, and `check_membership` re-checks
+    /// it against this estate's own catalog before anything is read.
+    /// Bytes are read raw — the original container, not its Markdown
+    /// rendering — and refused unless they still hash to the object id the
+    /// coordinate names, the same proof `resolve_exact` requires.
+    pub fn document_reading(
+        &self,
+        membership: &Membership,
+        coordinate: &ExactCoordinate,
+    ) -> Result<crate::document::DocumentReading, AtlasError> {
+        let bytes = self.source_bytes_for(membership, coordinate)?;
+        Ok(document::inspect(&coordinate.path, &bytes))
+    }
+
+    /// One embedded asset's bytes, selected by the `id` a
+    /// [`Self::document_reading`] inventory listed — `anydoc`'s own
+    /// `AssetId`, the selector the document model already uses, rather
+    /// than a second coordinate vocabulary invented for assets.
+    ///
+    /// `max_bytes` bounds what this will hand back: an asset larger than
+    /// the caller's own limit is refused by name and size rather than
+    /// read into a reply. `Ok(None)` means this document defines no asset
+    /// with that id — never some other asset's bytes.
+    pub fn document_asset(
+        &self,
+        membership: &Membership,
+        coordinate: &ExactCoordinate,
+        id: usize,
+        max_bytes: u64,
+    ) -> Result<Option<crate::document::ResolvedAsset>, AtlasError> {
+        let bytes = self.source_bytes_for(membership, coordinate)?;
+        let found = document::asset(&coordinate.path, &bytes, id)
+            .map_err(AtlasError::SourceBytesUnavailable)?;
+        if let Some(found) = &found
+            && found.descriptor.byte_len > max_bytes
+        {
+            return Err(AtlasError::InvalidRequest(format!(
+                "embedded asset {id} is {} bytes, past the {max_bytes}-byte bound on one asset \
+                 this daemon will read into memory",
+                found.descriptor.byte_len
+            )));
+        }
+        Ok(found)
+    }
+
+    /// The original source bytes one coordinate names — the container as
+    /// the source holds it, before any document rendering — proven to be
+    /// the bytes that coordinate names by re-hashing them against its own
+    /// `object_id`. Shared by the two structured readers above, which both
+    /// need the container and neither of which may accept a substitute.
+    fn source_bytes_for(
+        &self,
+        membership: &Membership,
+        coordinate: &ExactCoordinate,
+    ) -> Result<Vec<u8>, AtlasError> {
+        self.check_membership(membership)?;
+        let generation = self.read_generation(&coordinate.generation)?;
+        if generation.source != coordinate.source {
+            return Err(AtlasError::InvalidCoordinate(
+                "coordinate's generation belongs to another source".into(),
+            ));
+        }
+        let Some(resource) = generation
+            .resources
+            .iter()
+            .find(|resource| resource.path == coordinate.path)
+        else {
+            return Err(AtlasError::InvalidCoordinate(
+                "this generation records no resource at that path".into(),
+            ));
+        };
+        if resource.object_id.as_deref() != Some(coordinate.object_id.as_str()) {
+            return Err(AtlasError::InvalidCoordinate(
+                "coordinate's object id is not what this generation recorded for that path".into(),
+            ));
+        }
+        // Each policy's own raw read is already the identity check: a Git
+        // object is addressed by its own content hash, and the
+        // document-tree and HTTP arms re-hash what they read and refuse a
+        // mismatch. Nothing here accepts bytes that are not the ones the
+        // coordinate names.
+        crate::hydrate::raw_blob(
+            &generation.acquisition_policy,
+            Path::new(&generation.locator),
+            self.root(),
+            &generation.id,
+            &coordinate.path,
+            &coordinate.object_id,
+            &self.capture_limits(),
+        )
+    }
+
+    /// Shared by every policy's final step: exact bytes have been read
     /// and their identity already confirmed by the caller: only the
     /// byte/line-bound arithmetic and the coordinate's own promised
     /// line bounds remain to check, identically either way.
@@ -1172,7 +1559,14 @@ impl AtlasStore {
             bytes: bytes[coordinate.byte_start as usize..coordinate.byte_end as usize].to_vec(),
         }))
     }
-    fn stage(&self, generation: &SourceGeneration) -> Result<(), AtlasError> {
+    /// `raw` is `Some` only for an `http-source-policy/v1` generation:
+    /// the fetched response bytes, persisted once as `content.bin`
+    /// beside `manifest.json`/`resources.ndjson` — this policy's whole
+    /// working cache, immutable and removable through the same
+    /// generation-directory lifecycle every other policy's already is
+    /// (`http_source`'s own top-level doc). Every other policy reads its
+    /// bytes live from its own source and passes `None`.
+    fn stage(&self, generation: &SourceGeneration, raw: Option<&[u8]>) -> Result<(), AtlasError> {
         let temp = self.root.join(format!(".tmp-{}", Ulid::generate()));
         fs::create_dir(&temp)?;
         self.write_sync(
@@ -1186,6 +1580,10 @@ impl AtlasStore {
             resources.push(b'\n');
         }
         self.write_sync(&temp.join("resources.ndjson"), &resources)?;
+        if let Some(bytes) = raw {
+            self.write_sync(&content_bin(&temp), bytes)?;
+            checkpoint("stage-content-synced");
+        }
         File::open(&temp)?.sync_all()?;
         checkpoint("stage-directory-synced");
         fs::rename(&temp, self.generation_dir(&generation.id)?)?;
@@ -1303,7 +1701,7 @@ impl AtlasStore {
                     && generation.content.starts_with("sha1:")
                     && valid_sha1(&generation.content[5..])
             }
-            doctree::ACQUISITION_POLICY => {
+            doctree::ACQUISITION_POLICY | http_source::ACQUISITION_POLICY => {
                 valid_sha256(&generation.revision)
                     && generation.content.starts_with("sha256:")
                     && valid_sha256(&generation.content[7..])
@@ -1360,12 +1758,18 @@ impl AtlasStore {
                         "indexed resource lacks a blob identity".into(),
                     ));
                 };
-                let expected_unitizer = edition.unitizer_id();
+                let Some((expected_family, expected_unitizer)) =
+                    edition.recorded_shape(&resource.path)
+                else {
+                    return Err(AtlasError::Generation(
+                        "indexed resource at a path this edition admits nothing at".into(),
+                    ));
+                };
                 let mut previous_end = 0;
                 let mut previous_end_line = 0;
                 for unit in &resource.units {
                     if unit.unitizer != expected_unitizer
-                        || Some(unit.family) != edition.family(&resource.path)
+                        || unit.family != expected_family
                         || unit.id
                             != ExtractorPolicy::unit_id(
                                 &generation.id,
@@ -1392,7 +1796,24 @@ impl AtlasStore {
                     previous_end = unit.byte_end;
                     previous_end_line = unit.line_end;
                 }
-                if resource.byte_len != Some(previous_end) {
+                // `resource.byte_len` is always the *original* file's
+                // length (set once in `doctree::finish`/`git::resources`
+                // from the bytes actually read, never recomputed here).
+                // For every other family that is also the span the
+                // resource's own units tile, so a gap or short tail is
+                // real evidence of a bad extractor. A `Document`
+                // resource's units tile `crate::document::render`'s
+                // *Markdown* rendering instead — an unrelated length —
+                // so this comparison would be checking the original PDF
+                // or DOCX's byte count against how much Markdown it
+                // rendered to, which is never expected to match and
+                // proves nothing about coverage. The ordering/identity
+                // checks above this line still run unconditionally: a
+                // `Document` resource's units still have to be
+                // contiguous, correctly identified and correctly typed.
+                if expected_family != ContentFamily::Document
+                    && resource.byte_len != Some(previous_end)
+                {
                     return Err(AtlasError::Generation(
                         "derived retrieval units do not cover the complete blob".into(),
                     ));

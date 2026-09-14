@@ -11,10 +11,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use crate::wirkd::{
-    AtlasAcquirePayload, AtlasCancelPayload, AtlasFindingsPayload, AtlasPublishPayload,
-    AtlasRefreshPayload, AtlasRelatePayload, AtlasRemovePayload, AtlasResolvePayload,
-    AtlasSearchPayload, AtlasSemanticBuildPayload, AtlasSemanticSelectPayload, AtlasStatusPayload,
-    CancelTarget, Reply, Request,
+    AtlasAcquirePayload, AtlasCancelPayload, AtlasDocumentPayload, AtlasFindingsPayload,
+    AtlasPublishPayload, AtlasRefreshPayload, AtlasRelatePayload, AtlasRemovePayload,
+    AtlasResolvePayload, AtlasSearchPayload, AtlasSemanticBuildPayload, AtlasSemanticSelectPayload,
+    AtlasStatusPayload, CancelTarget, Reply, Request,
 };
 use crate::{ActorContext, actor_context, flag_value, warn_if_index_incomplete, wirkd_client_call};
 use wirk_core::WorkId;
@@ -32,6 +32,10 @@ pub fn atlas_command(rest: &[String]) -> ExitCode {
         Some("cancel") => cancel_command(&rest[1..]),
         Some("search") => search_command(&rest[1..]),
         Some("resolve") => resolve_command(&rest[1..]),
+        // P5: the structured document reader beside the byte resolver —
+        // what a source actually holds, and its embedded assets on
+        // demand.
+        Some("document") => document_command(&rest[1..]),
         Some("relate") => relate_command(&rest[1..]),
         Some("semantic") => semantic_command(&rest[1..]),
         // W-B (§7): the estate's derived, rebuildable Findings index —
@@ -44,12 +48,14 @@ pub fn atlas_command(rest: &[String]) -> ExitCode {
 
 fn atlas_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk atlas acquire --estate <root> --source <name> --repository <path> --revision <ref> [--kind git|document-tree] [--requesting-work <id> | --admin] [--json] \
+        "usage: wirk atlas acquire --estate <root> --source <name> --repository <path-or-url> --revision <ref> [--kind git|document-tree|http] [--requesting-work <id> | --admin] [--json] \
          (--repository names a Git repository/subdirectory/worktree under --kind git, the default; \
-          a plain local directory under --kind document-tree. --revision names the Git ref to \
-          acquire under --kind git, required; under --kind document-tree it can only mean the \
-          tree's current state, so it is optional there, defaults to \"current\", and any other \
-          value is refused by name — a document tree has no other revision to honour) \
+          a plain local directory under --kind document-tree; one explicit public http:// or \
+          https:// URL under --kind http, with no embedded credential and no \"..\" path segment. \
+          --revision names the Git ref to acquire under --kind git, required; under --kind \
+          document-tree or --kind http it can only mean the source's own last-observed current \
+          state, so it is optional there, defaults to \"current\", and any other value is refused \
+          by name — neither policy has another revision to honour) \
          | wirk atlas refresh --estate <root> --source <name> [--revision <ref>] [--requesting-work <id> | --admin] [--json] \
          (--revision is optional: omitted, the source's own registered acquisition policy \
           supplies it — the ref a Git source was admitted to track, or a document tree's \
@@ -62,12 +68,22 @@ fn atlas_usage() -> ExitCode {
          | wirk atlas remove --estate <root> --source <name> [--json] \
          | wirk atlas status --estate <root> [--source <name>] [--work <id>] [--json] \
          | wirk atlas cancel --estate <root> (--list | --job <id> | --source <name> | --all) [--reason <text>] [--wait <secs>] [--requesting-work <id> | --admin] [--json] \
-         | wirk atlas resolve [--estate <root>] [--work <id>] --coordinate <encoded> [--json] \
-         | wirk atlas search --estate <root> [--work <id>] --query <text> [--source <name>] [--semantic requested|disabled] [--semantic-backend <path>] [--semantic-backend-arg <arg>...] [--semantic-model <dir>] [--family code|knowledge|config]... [--limit <n>] [--capacity <n>] [--continue <token>] [--json] \
+         | wirk atlas resolve [--estate <root>] [--work <id> | --admin] --coordinate <encoded> [--json] \
+         | wirk atlas document [--estate <root>] [--work <id> | --admin] --coordinate <encoded> [--asset <id> --output <path>] [--json] \
+         (reads the source a coordinate names through the native document reader: without \
+          --asset, its structure and an inventory of the assets it embeds, with no asset bytes; \
+          with --asset <id> from that inventory, that one asset's bytes, written to --output \
+          <path>, which is required for them — binary payloads are never printed) \
+         | wirk atlas search [--estate <root>] [--work <id> | --admin] --query <text> [--source <name>] [--semantic requested|disabled] [--semantic-backend <path>] [--semantic-backend-arg <arg>...] [--semantic-model <dir>] [--family code|knowledge|config|document]... [--limit <n>] [--capacity <n>] [--continue <token>] [--json] \
          | wirk atlas semantic build --estate <root> --source <name> --generation <id> --backend <path> [--backend-arg <arg>...] --model <dir> [--chunker units|native] [--json] \
          | wirk atlas semantic select --estate <root> --source <name> --edition <id> [--json] \
          | wirk atlas relate --estate <root> --work <id> --kind governed_by --from <coordinate> --to <coordinate> --evidence <coordinate> [--evidence <coordinate>...] [--run <id>] [--world <hash>] [--json] \
-         | wirk atlas findings --estate <root> (--requesting-work <id> | --admin [--rebuild | --retire-preserved-index]) [--json]"
+         | wirk atlas findings --estate <root> (--requesting-work <id> | --admin [--rebuild | --retire-preserved-index]) [--json] \
+         \n(search, resolve and document read under one scope rule: outside an actor context an \
+          omitted --work is the operator's read of the whole estate, unchanged; inside one, \
+          naming that actor's own estate reads as its own Work and says so, naming a different \
+          estate with no explicit scope is refused, and --admin is the explicit administrative \
+          read. Scope is decided daemon-side either way.)"
     );
     ExitCode::from(1)
 }
@@ -94,6 +110,61 @@ fn is_json(rest: &[String]) -> bool {
 /// eleven call sites (R2 — one implementation, in `crate`).
 fn check_flags(verb: &str, rest: &[String], allowed: &[(&str, bool)]) -> Result<(), ExitCode> {
     crate::check_flags(&format!("atlas {verb}"), rest, allowed)
+}
+
+/// The estate and Work one Atlas **reading** verb asks under.
+///
+/// Reading verbs used to select `(--estate, --work)` directly, which made
+/// an explicit `--estate` discard the Work an actor was executing as: a
+/// native caller inside one Work that named its own estate and omitted
+/// `--work` was answered estate-wide. Acquisition and every other scoped
+/// verb already resolved this through `crate::resolve_scope`; these now do
+/// too, so one rule decides for all of them:
+///
+/// - Outside an actor context nothing changes: the operator's omitted
+///   scope is still the administrative read of the whole estate.
+/// - Inside one, naming the same estate preserves that actor's Work, and
+///   says so on stderr rather than silently narrowing or widening.
+/// - Inside one, naming a *different* estate with no explicit scope is
+///   refused: this actor's Work is not a scope for another estate.
+/// - `--admin` is the explicit, disclosed operator read, and `--work`
+///   naming this actor's own Work stays legal and explicit.
+/// - A half-injected context names no identity and is refused rather than
+///   read as an operator shell.
+///
+/// The estate itself still comes from `--estate` when it is given and from
+/// the injected context otherwise, so the `fetch` line a stage projection
+/// prints runs verbatim inside a pane.
+fn reading_scope(verb: &str, rest: &[String]) -> Result<(String, Option<WorkId>), ExitCode> {
+    let estate = match flag_value(rest, "--estate") {
+        Some(estate) => estate,
+        None => match actor_context() {
+            ActorContext::Present { estate_root, .. } => estate_root,
+            ActorContext::Partial { missing } => {
+                eprintln!(
+                    "{verb}: --estate was not given and the injected context is incomplete ({}); \
+                     name --estate <root> explicitly, or run inside a complete execution context",
+                    missing.join(", ")
+                );
+                return Err(ExitCode::from(1));
+            }
+            ActorContext::Absent => return Err(atlas_usage()),
+        },
+    };
+    let scope = crate::resolve_scope(
+        verb,
+        &estate,
+        flag_value(rest, "--work"),
+        rest.iter().any(|arg| arg == "--admin"),
+    )
+    .map_err(|refusal| {
+        eprintln!("{verb}: {refusal}");
+        ExitCode::from(1)
+    })?;
+    if let Some(note) = &scope.note {
+        eprintln!("{verb}: {note}");
+    }
+    Ok((estate, scope.requesting))
 }
 
 const ESTATE: (&str, bool) = ("--estate", true);
@@ -219,6 +290,7 @@ fn acquire_command(rest: &[String]) -> ExitCode {
     let revision = match (flag_value(rest, "--revision"), kind.as_deref()) {
         (Some(value), _) => value,
         (None, Some("document-tree")) => wirk_atlas::DOCUMENT_TREE_CURRENT_OBSERVATION.to_string(),
+        (None, Some("http")) => wirk_atlas::HTTP_SOURCE_CURRENT_OBSERVATION.to_string(),
         (None, _) => return atlas_usage(),
     };
     let json = is_json(rest);
@@ -697,6 +769,7 @@ fn search_command(rest: &[String]) -> ExitCode {
             ("--limit", true),
             ("--capacity", true),
             ("--continue", true),
+            ("--admin", false),
         ],
     ) {
         return code;
@@ -704,33 +777,11 @@ fn search_command(rest: &[String]) -> ExitCode {
     let Some(query) = flag_value(rest, "--query") else {
         return atlas_usage();
     };
-    // The same fallback `resolve` runs on (ruling 0126 F3, ruling 0117):
-    // `--estate`/`--work` come from the injected triple when they are not
-    // named, so the `fetch` line a stage projection prints under every
-    // reachable handle runs verbatim inside a pane. An explicit
-    // `--estate` is an operator invocation and keeps the operator's
-    // meaning for an omitted `--work`; a half-injected environment is
-    // refused rather than widened; outside an actor context nothing
-    // changes. Scope is still decided daemon-side.
-    let named_work = flag_value(rest, "--work").map(WorkId);
-    let (estate, work) = match flag_value(rest, "--estate") {
-        Some(estate) => (estate, named_work),
-        None => match actor_context() {
-            ActorContext::Present {
-                estate_root,
-                work_id,
-            } => (estate_root, named_work.or(Some(WorkId(work_id)))),
-            ActorContext::Partial { missing } => {
-                eprintln!(
-                    "wirk atlas search: --estate was not given and the injected context is \
-                     incomplete ({}); name --estate <root> explicitly, or run inside a complete \
-                     execution context",
-                    missing.join(", ")
-                );
-                return ExitCode::from(1);
-            }
-            ActorContext::Absent => return atlas_usage(),
-        },
+    // One resolver for every reading verb; see `reading_scope`. Scope is
+    // still decided daemon-side — this settles only what is asked.
+    let (estate, work) = match reading_scope("wirk atlas search", rest) {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
     };
     let json = is_json(rest);
     let source = flag_value(rest, "--source");
@@ -1282,34 +1333,22 @@ fn resolve_command(rest: &[String]) -> ExitCode {
     if let Err(code) = check_flags(
         "resolve",
         rest,
-        &[ESTATE, JSON, ("--work", true), ("--coordinate", true)],
+        &[
+            ESTATE,
+            JSON,
+            ("--work", true),
+            ("--admin", false),
+            ("--coordinate", true),
+        ],
     ) {
         return code;
     }
     let Some(coordinate) = flag_value(rest, "--coordinate") else {
         return atlas_usage();
     };
-    let named_work = flag_value(rest, "--work").map(WorkId);
-    let (estate, work) = match flag_value(rest, "--estate") {
-        Some(estate) => (estate, named_work),
-        None => match actor_context() {
-            ActorContext::Present {
-                estate_root,
-                work_id,
-            } => (estate_root, named_work.or(Some(WorkId(work_id)))),
-            // Half a triple names no identity, and reading it as "no
-            // context" is the wider reading. Refused, never widened.
-            ActorContext::Partial { missing } => {
-                eprintln!(
-                    "wirk atlas resolve: --estate was not given and the injected context is \
-                     incomplete ({}); name --estate <root> explicitly, or run inside a complete \
-                     execution context",
-                    missing.join(", ")
-                );
-                return ExitCode::from(1);
-            }
-            ActorContext::Absent => return atlas_usage(),
-        },
+    let (estate, work) = match reading_scope("wirk atlas resolve", rest) {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
     };
     let json = is_json(rest);
     call_expecting_outcome(
@@ -1408,6 +1447,249 @@ fn relate_command(rest: &[String]) -> ExitCode {
             });
         },
     )
+}
+
+/// `wirk atlas document [--estate <root>] [--work <id> | --admin]
+/// --coordinate <encoded> [--asset <id> --output <path>] [--json]`.
+///
+/// The reader beside `resolve`. `resolve` answers with the bytes a
+/// coordinate's span names, which for a document source is a span of its
+/// Markdown rendering; this answers with what the document itself is —
+/// headings, tables, lists, links, notes, equations — and with an
+/// inventory of the assets it embeds. `--asset <id>` then reads one of
+/// those assets by the id that inventory listed.
+///
+/// **`--output` is required for asset bytes, and that is the point.** An
+/// embedded asset is binary. Printing it would put it into whatever
+/// transcript or prompt the caller's output lands in, which is exactly
+/// what this reader is supposed to make unnecessary: the bytes go to a
+/// file the caller named, and what is printed is the descriptor —
+/// id, media type, origin part, length and digest.
+fn document_command(rest: &[String]) -> ExitCode {
+    if let Err(code) = check_flags(
+        "document",
+        rest,
+        &[
+            ESTATE,
+            JSON,
+            ("--work", true),
+            ("--admin", false),
+            ("--coordinate", true),
+            ("--asset", true),
+            ("--output", true),
+        ],
+    ) {
+        return code;
+    }
+    let Some(coordinate) = flag_value(rest, "--coordinate") else {
+        return atlas_usage();
+    };
+    let asset = match flag_value(rest, "--asset") {
+        None => None,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                eprintln!(
+                    "wirk atlas document: --asset {raw:?} is not an asset id; ids are the \
+                     non-negative integers this document's own inventory lists"
+                );
+                return ExitCode::from(1);
+            }
+        },
+    };
+    let output = flag_value(rest, "--output");
+    match (asset, &output) {
+        (Some(_), None) => {
+            eprintln!(
+                "wirk atlas document: --asset also needs --output <path>; an embedded asset is \
+                 binary and is written to a file rather than printed"
+            );
+            return ExitCode::from(1);
+        }
+        (None, Some(_)) => {
+            eprintln!(
+                "wirk atlas document: --output is only for --asset <id>; without one this verb \
+                 answers with structure and an asset inventory, and writes no file"
+            );
+            return ExitCode::from(1);
+        }
+        _ => {}
+    }
+    let (estate, work) = match reading_scope("wirk atlas document", rest) {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
+    };
+    let json = is_json(rest);
+    // **The delivery is part of the answer.** A validated daemon reply
+    // says the asset was read, not that it reached the caller's disk, and
+    // the two can disagree: an unwritable directory, a full filesystem, a
+    // destination that is not a file. Recorded here and folded into the
+    // exit code below, because the reply-shaped exit code alone would
+    // report success for an asset that was never delivered.
+    let delivery: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    let code = call_expecting_outcome(
+        &estate,
+        &Request::atlas_document(AtlasDocumentPayload {
+            work,
+            coordinate,
+            asset,
+        }),
+        &["read", "asset"],
+        |result| {
+            if let (Some(path), Some(hex)) = (&output, result["bytes_hex"].as_str()) {
+                match decode_hex(hex) {
+                    Some(bytes) => {
+                        if let Err(error) = write_asset(path, &bytes) {
+                            *delivery.borrow_mut() = Some(format!("writing {path}: {error}"));
+                            return;
+                        }
+                    }
+                    None => {
+                        *delivery.borrow_mut() =
+                            Some("the daemon's asset bytes were malformed".into());
+                        return;
+                    }
+                }
+            }
+            // `bytes_hex` is transport, not an answer: it is never
+            // printed, in `--json` or out of it.
+            let mut shown = result.clone();
+            if let Some(object) = shown.as_object_mut() {
+                object.remove("bytes_hex");
+                if let Some(path) = &output {
+                    object.insert("written".into(), serde_json::Value::String(path.clone()));
+                }
+            }
+            print_result(json, &shown, |shown| match shown["outcome"].as_str() {
+                Some("asset") => {
+                    println!(
+                        "asset {} {} {} bytes {}",
+                        shown["asset"]["id"],
+                        shown["asset"]["media_type"].as_str().unwrap_or("?"),
+                        shown["asset"]["bytes"],
+                        short(shown["asset"]["digest"].as_str().unwrap_or("")),
+                    );
+                    println!("  from {}", shown["asset"]["origin_part"]);
+                    if let Some(path) = &output {
+                        println!("  written {path}");
+                    }
+                }
+                // Every other outcome is a truthful non-answer — a
+                // format with no document model, a resource read as text,
+                // a parse that failed, an asset id this document does not
+                // define — and each one names itself rather than being
+                // rendered as an empty document.
+                Some(outcome @ ("model_unavailable" | "not_a_document" | "failed" | "absent")) => {
+                    println!("{outcome} {}", shown["path"].as_str().unwrap_or(""),);
+                    if let Some(detail) = shown["detail"].as_str() {
+                        println!("  {detail}");
+                    }
+                }
+                _ => {
+                    println!(
+                        "document {} {}",
+                        shown["path"].as_str().unwrap_or("?"),
+                        shown["format"].as_str().unwrap_or("?"),
+                    );
+                    let structure = &shown["structure"];
+                    println!(
+                        "  blocks {} headings {} tables {} lists {} notes {} equations {} links \
+                         {} images {}",
+                        structure["blocks"],
+                        structure["headings"].as_array().map_or(0, Vec::len),
+                        structure["tables"].as_array().map_or(0, Vec::len),
+                        structure["lists"],
+                        structure["notes"],
+                        structure["equations"],
+                        structure["links"].as_array().map_or(0, Vec::len),
+                        structure["images"],
+                    );
+                    for heading in structure["headings"].as_array().into_iter().flatten() {
+                        println!(
+                            "  h{} {}",
+                            heading["level"],
+                            heading["text"].as_str().unwrap_or("")
+                        );
+                    }
+                    for asset in shown["assets"].as_array().into_iter().flatten() {
+                        println!(
+                            "  asset {} {} {} bytes  (--asset {} --output <path>)",
+                            asset["id"],
+                            asset["media_type"].as_str().unwrap_or("?"),
+                            asset["bytes"],
+                            asset["id"],
+                        );
+                    }
+                }
+            });
+        },
+    );
+    if let Some(failure) = delivery.into_inner() {
+        eprintln!("wirk atlas document: {failure}");
+        // Nothing was delivered, so nothing here reports success — whatever
+        // the daemon's own reply said about reading the asset.
+        return ExitCode::from(2);
+    }
+    code
+}
+
+/// Write one asset's bytes to the destination the caller named, without
+/// destroying whatever is already there if the write cannot finish.
+///
+/// `fs::write` truncates on open, so a failure part-way through leaves the
+/// caller's existing file emptied — the one outcome an export must not
+/// produce. The bytes go to a sibling temporary in the destination's own
+/// directory and are renamed onto it, which is atomic on the same
+/// filesystem: either the destination holds the whole asset or it holds
+/// exactly what it held before. A destination whose directory cannot be
+/// written fails at the temporary, before anything is touched.
+///
+/// Authority is the caller's own filesystem authority and nothing more:
+/// this is an explicit export to a path the caller named, running as the
+/// caller. There is no privileged write path here and none is added.
+fn write_asset(destination: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let destination = Path::new(destination);
+    let directory = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let name = destination.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "that destination does not name a file",
+        )
+    })?;
+    let mut temporary = std::ffi::OsString::from(".");
+    temporary.push(name);
+    temporary.push(format!(".wirk-asset-{}", std::process::id()));
+    let temporary = match directory {
+        Some(directory) => directory.join(temporary),
+        None => Path::new(&temporary).to_path_buf(),
+    };
+    std::fs::write(&temporary, bytes)?;
+    match std::fs::rename(&temporary, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+/// The inverse of the daemon's own `hex_encode`, for the one reply that
+/// carries bytes. `None` for anything that is not an even-length run of
+/// hex digits, so a malformed answer is refused rather than written to
+/// the caller's file half-decoded.
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in bytes.chunks(2) {
+        let pair = std::str::from_utf8(pair).ok()?;
+        out.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    Some(out)
 }
 
 /// `wirk atlas findings --estate <root> (--requesting-work <id> |

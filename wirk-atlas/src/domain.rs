@@ -30,6 +30,25 @@ pub enum ContentFamily {
     /// generation cannot contain one, which is why adding it does not
     /// disturb any generation already staged.
     Config,
+    /// P5.2 (ruling 0293/0264/0313): a document admitted through the
+    /// whole native `anydoc` 0.2.4 reader (`crate::document`) —
+    /// Word/PowerPoint/Excel (legacy and current), OpenDocument text/
+    /// sheet/presentation, RTF, EPUB, CSV and PDF, every extension
+    /// `anydoc` itself recognizes, not only the four examples the P5.2
+    /// brief originally named. Only extraction edition
+    /// `DocumentsAnyDocV5` ever produces it.
+    ///
+    /// **A `Document` unit's `byte_start`/`byte_end` index the
+    /// document's normalized Markdown rendering, never the original
+    /// file's bytes.** There is no worksheet name, page number or A1-style
+    /// cell address here — `anydoc`'s own tables carry no such origin
+    /// (`knowledge/evidence/p5-document-reader-reuse-2026-09-13.md`), so
+    /// none is claimed. Every caller that turns this family's coordinate
+    /// back into bytes (`crate::hydrate`, `AtlasStore::resolve_exact_*`)
+    /// must route through `crate::document::render_if_document` first;
+    /// slicing the original binary at these offsets is simply wrong, not
+    /// merely imprecise.
+    Document,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +161,46 @@ pub struct SourceGeneration {
     pub locator: String,
     pub requested_ref: String,
     pub resources: Vec<ResourceRecord>,
+    /// What one `http-source-policy/v1` fetch actually observed about
+    /// its origin — set only by `crate::http_source::capture`, `None`
+    /// for every other policy. `#[serde(default)]`: a generation
+    /// written before this field existed still deserializes. Boxed so
+    /// this rarely-populated field does not grow every generation
+    /// (including every Git/document-tree one, which never sets it) by
+    /// `HttpOrigin`'s own size, and so `AcquireOutcome::Staged`'s
+    /// `SourceGeneration` payload does not tower over its
+    /// `Unavailable(String)` sibling.
+    #[serde(default)]
+    pub origin: Option<Box<HttpOrigin>>,
+}
+
+/// What one HTTP acquisition/refresh actually observed about the
+/// response it read, disclosed for a caller to read — never the
+/// identity a coordinate resolves against (`SourceGeneration::revision`/
+/// `content`, the SHA-256 of the response bytes, are that) and never
+/// presented as an upstream publication or revision date.
+/// `fetched_at_unix_millis` is this process's own clock at the moment
+/// the fetch completed, not a claim about when the origin last changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpOrigin {
+    /// The URL this fetch was explicitly asked to acquire —
+    /// `Membership::locator` for this source, restated here so a
+    /// generation is self-describing without a membership lookup.
+    pub requested_url: String,
+    /// The URL the response actually came from, after following
+    /// redirects (curl's own `%{url_effective}`). Equal to
+    /// `requested_url` when nothing redirected.
+    pub final_url: String,
+    /// The final HTTP status code (after redirects).
+    pub status: u16,
+    /// The origin's own `ETag`, verbatim, when it disclosed one.
+    pub etag: Option<String>,
+    /// The origin's own `Last-Modified`, verbatim, when it disclosed
+    /// one. A caller's own timeline, never this product's.
+    pub last_modified: Option<String>,
+    pub content_type: Option<String>,
+    /// This process's own clock at the moment the fetch completed.
+    pub fetched_at_unix_millis: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -28,7 +28,9 @@
 //! unchanged stays resolvable regardless of what else in the tree
 //! moved.
 
-use crate::{AtlasError, CoverageDisposition, ExtractorPolicy, GenerationId, ResourceRecord};
+use crate::{
+    AtlasError, ContentFamily, CoverageDisposition, ExtractorPolicy, GenerationId, ResourceRecord,
+};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
@@ -294,6 +296,28 @@ fn read_bounded_no_follow(
         ));
     }
     Ok(bytes)
+}
+
+/// The first [`crate::document::SNIFF_BYTES`] of `name`, read through
+/// the same descriptor-relative no-follow chain
+/// [`read_bounded_no_follow`] uses. Never reads more than that: this is
+/// the screen that decides whether a file whose name settles nothing is
+/// worth reading in full, and it must not itself become the unbounded
+/// read it exists to avoid.
+fn sniff_no_follow(dir: BorrowedFd<'_>, name: &[u8]) -> std::io::Result<Vec<u8>> {
+    let opened = open_no_follow(dir, name, false)?;
+    let mut file = File::from(opened);
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no longer an ordinary file",
+        ));
+    }
+    let mut prefix = Vec::with_capacity(crate::document::SNIFF_BYTES);
+    file.by_ref()
+        .take(crate::document::SNIFF_BYTES as u64)
+        .read_to_end(&mut prefix)?;
+    Ok(prefix)
 }
 
 /// One phrasing for every point this policy's work can be stopped at,
@@ -611,9 +635,10 @@ fn recurse(
         }
 
         let len = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
-        // Exclusion and family support are decided from the path alone,
-        // before anything about this file is opened: excluded,
-        // secret-like content is never read.
+        // Exclusion is decided from the path alone, before anything about
+        // this file is opened: excluded, secret-like content is never
+        // read, and an unrecognized name is never treated as the same
+        // kind of refusal.
         if ExtractorPolicy::excluded(&relative) {
             out.push(Captured {
                 relative,
@@ -622,13 +647,54 @@ fn recurse(
             });
             continue;
         }
-        if !policy.supports(&relative) {
-            out.push(Captured {
-                relative,
-                kind: CapturedKind::Unsupported("no extractor for path family"),
-                byte_len: Some(len),
-            });
-            continue;
+        match policy.admission(&relative) {
+            crate::extract::PathAdmission::Family(_) => {}
+            crate::extract::PathAdmission::No => {
+                out.push(Captured {
+                    relative,
+                    kind: CapturedKind::Unsupported("no extractor for path family"),
+                    byte_len: Some(len),
+                });
+                continue;
+            }
+            // The name settles nothing. The per-file size bound is
+            // checked first, so a file too large to admit is never even
+            // sniffed; then one bounded prefix decides whether reading
+            // the rest could possibly be worth it. Both refusals below
+            // cost one open and at most `SNIFF_BYTES`, and neither
+            // charges the aggregate budget, which only the full read
+            // does.
+            crate::extract::PathAdmission::Candidate => {
+                if len > limits.max_file_bytes {
+                    out.push(Captured {
+                        relative,
+                        kind: CapturedKind::Unsupported(
+                            "file exceeds the bounded document read size",
+                        ),
+                        byte_len: Some(len),
+                    });
+                    continue;
+                }
+                match sniff_no_follow(dir, &name) {
+                    Ok(prefix) if crate::document::could_be_document(&prefix) => {}
+                    Ok(_) => {
+                        out.push(Captured {
+                            relative,
+                            kind: CapturedKind::Unsupported("no extractor for path family"),
+                            byte_len: Some(len),
+                        });
+                        continue;
+                    }
+                    Err(err) => {
+                        out.push(Captured {
+                            relative,
+                            kind: CapturedKind::Unavailable(err.to_string()),
+                            byte_len: Some(len),
+                        });
+                        continue;
+                    }
+                }
+            }
         }
         if len > limits.max_file_bytes {
             out.push(Captured {
@@ -735,13 +801,24 @@ pub(crate) fn finish(
                 entry.byte_len,
                 vec![],
             ),
-            CapturedKind::Content { digest, bytes } if bytes.contains(&0) => (
-                CoverageDisposition::Unsupported,
-                Some("binary blob".to_string()),
-                Some(digest),
-                Some(bytes.len() as u64),
-                vec![],
-            ),
+            // The null-byte heuristic only screens the plain-text path:
+            // an admitted document format's own bytes are expected to be
+            // binary, and `policy.units` (`crate::document::render`) reads
+            // them directly rather than treating them as UTF-8. Decided
+            // from the same bytes the family decision now reads, so a
+            // detected document is never rejected here as a binary blob.
+            CapturedKind::Content { digest, bytes }
+                if policy.family(&entry.relative, &bytes) != Some(ContentFamily::Document)
+                    && bytes.contains(&0) =>
+            {
+                (
+                    CoverageDisposition::Unsupported,
+                    Some("binary blob".to_string()),
+                    Some(digest),
+                    Some(bytes.len() as u64),
+                    vec![],
+                )
+            }
             CapturedKind::Content { digest, bytes } => {
                 match policy.units(generation, &entry.relative, &digest, &bytes) {
                     Ok(units) => (

@@ -808,15 +808,22 @@ pub(crate) fn rank(
         // for a document collection. Deduplicated by identity, because
         // one resource backs every row cut out of it.
         let mut wanted: Vec<(Vec<u8>, String)> = Vec::new();
-        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
         for row in &admitted.rows {
-            if seen.insert(row.object_id.as_str()) {
+            // Deduplicated by `hydration_key`, not `object_id` alone —
+            // see `query.rs`'s identical comment and `hydrate.rs`: one
+            // raw byte string can back two rows recorded under
+            // different derived interpretations.
+            let key = crate::document::resource_key(&row.path, &row.object_id);
+            if seen.insert(key) {
                 wanted.push((row.path.clone(), row.object_id.clone()));
             }
         }
-        let cache: BTreeMap<String, Vec<u8>> = match crate::hydrate::blobs(
+        let cache: BTreeMap<Vec<u8>, std::sync::Arc<Vec<u8>>> = match crate::hydrate::blobs(
             &admitted.edition.acquisition_policy,
             Path::new(&admitted.locator),
+            &crate::atlas_layout(&jobs.estate_root).root,
+            &admitted.edition.generation,
             &wanted,
             &crate::doctree::CaptureLimits::from_policy(&jobs.policy),
         ) {
@@ -833,7 +840,8 @@ pub(crate) fn rank(
             // Borrowed, not cloned: one blob backs every row that
             // addresses a range inside it, and cloning it per row copied
             // the whole object once per chunk of it.
-            let Some(bytes) = cache.get(&row.object_id) else {
+            let key = crate::document::resource_key(&row.path, &row.object_id);
+            let Some(bytes) = cache.get(&key) else {
                 // What is actually known: the batched read returned no
                 // bytes for this object. Naming a `git` message this
                 // process never received would put an invented diagnosis

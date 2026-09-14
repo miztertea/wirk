@@ -346,9 +346,15 @@ fn the_v3_family_vocabulary_follows_the_reference() {
     assert_eq!(family("g.rst"), Some(Knowledge));
     // the reference's own `_DATA_LANGUAGES`: no ContentType claims them,
     // so `semble --content code docs config` does not index them and
-    // neither do we. Matching the reference is the point.
+    // neither do we for this one. Matching the reference is the point.
     assert_eq!(family("h.json"), None);
-    assert_eq!(family("i.csv"), None);
+    // `.csv` is the one deliberate exception (P5.2, ruling 0293/0264):
+    // the current default edition (`v5`) admits it through the whole
+    // native `anydoc` document reader (`ContentFamily::Document`),
+    // widening past the semble text vocabulary this test otherwise
+    // pins. `ExtractorPolicy::content_families_v4()` still reproduces
+    // the exact pre-P5.2 vocabulary this assertion used to make.
+    assert_eq!(family("i.csv"), Some(Document));
     // a dotfile has no suffix in Python's sense, so the `.gitignore`
     // row matches `j.gitignore` and not `.gitignore` itself
     assert_eq!(family(".gitignore"), None);

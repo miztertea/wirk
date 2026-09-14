@@ -1509,6 +1509,12 @@ fn dispatch(
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
+        Verb::AtlasDocument => {
+            match serde_json::from_value::<super::AtlasDocumentPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_atlas_document(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::AtlasRelate => {
             match serde_json::from_value::<super::AtlasRelatePayload>(request.payload.clone()) {
                 Ok(payload) => Outcome::Reply(handle_atlas_relate(state, payload)),
@@ -9563,6 +9569,20 @@ fn generation_json(generation: &wirk_atlas::SourceGeneration) -> Value {
             "error": coverage["error"],
             "total": generation.resources.len(),
         },
+        // `Some` only for an `http-source-policy/v1` generation: what
+        // that fetch actually observed about its origin, disclosed
+        // rather than folded into `revision`/`content` — see
+        // `wirk_atlas::HttpOrigin`'s own doc for why this is evidence, not
+        // identity.
+        "origin": generation.origin.as_ref().map(|origin| json!({
+            "requested_url": origin.requested_url,
+            "final_url": origin.final_url,
+            "status": origin.status,
+            "etag": origin.etag,
+            "last_modified": origin.last_modified,
+            "content_type": origin.content_type,
+            "fetched_at_unix_millis": origin.fetched_at_unix_millis,
+        })),
     })
 }
 
@@ -9603,10 +9623,19 @@ fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePay
         Some("document-tree") => {
             atlas.register_document_tree(&payload.source, &payload.repository, &payload.revision)
         }
+        // `payload.repository` carries the URL under this kind — the
+        // same field every other kind already reuses for its own
+        // locator shape (a filesystem path for `git`/`document-tree`).
+        Some("http") => {
+            atlas.register_http(&payload.source, &payload.repository, &payload.revision)
+        }
         Some(other) => {
             return err_reply(
                 "InvalidRequest",
-                &format!("unknown source kind {other:?}; expected \"git\" or \"document-tree\""),
+                &format!(
+                    "unknown source kind {other:?}; expected \"git\", \"document-tree\", or \
+                     \"http\""
+                ),
             );
         }
     };
@@ -9667,6 +9696,8 @@ fn handle_atlas_refresh(state: &Arc<WirkdState>, payload: super::AtlasRefreshPay
     let revision = payload.revision.clone().unwrap_or_else(|| {
         if membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY {
             wirk_atlas::DOCUMENT_TREE_CURRENT_OBSERVATION.to_string()
+        } else if membership.policy == wirk_atlas::HTTP_SOURCE_POLICY {
+            wirk_atlas::HTTP_SOURCE_CURRENT_OBSERVATION.to_string()
         } else {
             membership.requested_ref.clone()
         }
@@ -9705,26 +9736,30 @@ fn acquire_reply(
     revision: &str,
     is_refresh: bool,
 ) -> Reply {
-    let outcome = match (
-        membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY,
-        is_refresh,
-    ) {
-        (true, false) => atlas.acquire_document_tree(
-            membership,
-            revision,
-            wirk_atlas::ExtractorPolicy::default(),
-        ),
-        (true, true) => atlas.refresh_document_tree(
-            membership,
-            revision,
-            wirk_atlas::ExtractorPolicy::default(),
-        ),
-        (false, false) => {
-            atlas.acquire(membership, revision, wirk_atlas::ExtractorPolicy::default())
+    let outcome = if membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY {
+        if is_refresh {
+            atlas.refresh_document_tree(
+                membership,
+                revision,
+                wirk_atlas::ExtractorPolicy::default(),
+            )
+        } else {
+            atlas.acquire_document_tree(
+                membership,
+                revision,
+                wirk_atlas::ExtractorPolicy::default(),
+            )
         }
-        (false, true) => {
-            atlas.refresh(membership, revision, wirk_atlas::ExtractorPolicy::default())
+    } else if membership.policy == wirk_atlas::HTTP_SOURCE_POLICY {
+        if is_refresh {
+            atlas.refresh_http(membership, revision, wirk_atlas::ExtractorPolicy::default())
+        } else {
+            atlas.acquire_http(membership, revision, wirk_atlas::ExtractorPolicy::default())
         }
+    } else if is_refresh {
+        atlas.refresh(membership, revision, wirk_atlas::ExtractorPolicy::default())
+    } else {
+        atlas.acquire(membership, revision, wirk_atlas::ExtractorPolicy::default())
     };
     match outcome {
         Ok(wirk_atlas::AcquireOutcome::Staged(generation)) => ok_reply(json!({
@@ -10487,7 +10522,12 @@ fn edition_json(edition: &wirk_atlas::SemanticEdition) -> Value {
         "acquisition_policy": edition.acquisition_policy,
         "chunker": {
             "extractor_set": edition.chunker.extractor_set,
-            "unitizer": edition.chunker.unitizer,
+            // Every unitizer the generation committed to, not one: a
+            // source holding documents and ordinary notes carries both,
+            // and a reader is told both. A record written before mixed
+            // generations were buildable carries its single name here as
+            // a one-element list, which is what it says.
+            "unitizers": edition.chunker.unitizers,
             // The chunker that actually produced the rows. `null` is the
             // honest answer for an edition whose rows are the
             // generation's own units — it says "nothing else chunked
@@ -11845,6 +11885,7 @@ fn handle_atlas_search(state: &Arc<WirkdState>, payload: super::AtlasSearchPaylo
             "code" => wirk_atlas::ContentFamily::Code,
             "knowledge" => wirk_atlas::ContentFamily::Knowledge,
             "config" => wirk_atlas::ContentFamily::Config,
+            "document" => wirk_atlas::ContentFamily::Document,
             other => return err_reply("BadRequest", &format!("unknown content family {other}")),
         });
     }
@@ -12176,34 +12217,185 @@ fn handle_atlas_resolve(state: &Arc<WirkdState>, payload: super::AtlasResolvePay
     }
 }
 
+/// `handle_atlas_document`: the structured document reader, and
+/// on-demand access to one embedded asset.
+///
+/// **Same address, same authority, same refusals as `resolve`.** It takes
+/// the coordinate a search hit already carries, refuses one naming
+/// another estate without disclosing anything about it, and refuses one
+/// whose membership this scope does not admit. What it adds is the
+/// reading the Markdown rendering cannot express: the document's own
+/// structure, an inventory of what it embeds, and — only when a caller
+/// names one — that asset's bytes.
+///
+/// **Asset bytes never ride along.** The inventory carries media type,
+/// origin part, length and digest, which is what a caller needs to decide
+/// whether it wants the payload; the payload itself comes only from an
+/// explicit second request for one named id, is bounded by this daemon's
+/// own `artifact_max_bytes`, and is carried as hex so no binary ever
+/// lands in an ordinary answer's text.
+fn handle_atlas_document(state: &Arc<WirkdState>, payload: super::AtlasDocumentPayload) -> Reply {
+    let scope = match resolve_query_scope(state, &payload.work) {
+        Ok(scope) => scope,
+        Err(reply) => return reply,
+    };
+    let coordinate = match decode_coordinate(&payload.coordinate) {
+        Ok(coordinate) => coordinate,
+        Err(detail) => return err_reply("MalformedCoordinate", &detail),
+    };
+    if coordinate.estate.0 != state.estate_root.display().to_string() {
+        return err_reply(
+            "InadmissibleEstate",
+            "coordinate names a different estate than this daemon's own",
+        );
+    }
+    let atlas = match lock_atlas_cheap(state) {
+        Ok(atlas) => atlas,
+        Err(busy) => return busy,
+    };
+    let Some(membership) = admitted_membership_for(&atlas, &scope, &coordinate.membership) else {
+        return err_reply(
+            "Inadmissible",
+            "coordinate's membership is not admissible under this scope",
+        );
+    };
+    let Some(asset_id) = payload.asset else {
+        return match atlas.document_reading(&membership, &coordinate) {
+            Ok(reading) => ok_reply(document_reading_json(&coordinate, reading)),
+            Err(err) => err_reply("AtlasError", &err.to_string()),
+        };
+    };
+    match atlas.document_asset(
+        &membership,
+        &coordinate,
+        asset_id,
+        state.resource_policy.artifact_max_bytes,
+    ) {
+        Ok(Some(asset)) => ok_reply(json!({
+            "outcome": "asset",
+            "path": String::from_utf8_lossy(&coordinate.path),
+            "asset": {
+                "id": asset.descriptor.id,
+                "media_type": asset.descriptor.media_type,
+                "origin_part": asset.descriptor.origin_part,
+                "bytes": asset.descriptor.byte_len,
+                "digest": asset.descriptor.digest,
+            },
+            "bytes_hex": hex_encode(&asset.bytes),
+        })),
+        Ok(None) => ok_reply(json!({
+            "outcome": "absent",
+            "detail": format!("this document defines no embedded asset {asset_id}"),
+        })),
+        Err(err) => err_reply("AtlasError", &err.to_string()),
+    }
+}
+
+fn document_reading_json(
+    coordinate: &wirk_atlas::ExactCoordinate,
+    reading: wirk_atlas::DocumentReading,
+) -> Value {
+    let path = String::from_utf8_lossy(&coordinate.path).into_owned();
+    match reading {
+        wirk_atlas::DocumentReading::Read(outline) => json!({
+            "outcome": "read",
+            "path": path,
+            "format": outline.format,
+            "structure": {
+                "blocks": outline.blocks,
+                "headings": outline.headings.iter().map(|heading| json!({
+                    "level": heading.level,
+                    "text": heading.text,
+                })).collect::<Vec<_>>(),
+                "tables": outline.tables.iter().map(|table| json!({
+                    "rows": table.rows,
+                    "columns": table.columns,
+                    "header": table.header,
+                })).collect::<Vec<_>>(),
+                "lists": outline.lists,
+                "code_blocks": outline.code_blocks,
+                "equations": outline.equations,
+                "notes": outline.notes,
+                "links": outline.links,
+                "images": outline.images,
+            },
+            "assets": outline.assets.iter().map(|asset| json!({
+                "id": asset.id,
+                "media_type": asset.media_type,
+                "origin_part": asset.origin_part,
+                "bytes": asset.byte_len,
+                "digest": asset.digest,
+            })).collect::<Vec<_>>(),
+        }),
+        wirk_atlas::DocumentReading::NotADocument => json!({
+            "outcome": "not_a_document",
+            "path": path,
+            "detail": "this resource is read as text, not through the document reader",
+        }),
+        wirk_atlas::DocumentReading::ModelUnavailable(detail) => json!({
+            "outcome": "model_unavailable",
+            "path": path,
+            "detail": detail,
+        }),
+        wirk_atlas::DocumentReading::Failed(detail) => json!({
+            "outcome": "failed",
+            "path": path,
+            "detail": detail,
+        }),
+    }
+}
+
 /// The full resource's own byte length, so a caller can tell a
 /// deliberately narrow span from the whole object.
 ///
 /// `resolve`'s answer already names the exact `byte_start`/`byte_end`
 /// span the caller asked for; this discloses how large the thing it was
-/// cut from actually is.
+/// cut from actually is — which for a `Document`-family resource is the
+/// *converted Markdown*, never the original container. `resolve_exact`
+/// already routes a `Document` unit's bytes through
+/// `document::render_if_document` (`wirk-atlas/src/document.rs`), so
+/// `evidence.bytes` in `resolve_outcome_json` is always a slice of that
+/// Markdown for such a resource. Pairing that against the *original*
+/// file's raw length mixed two different byte strings under one
+/// "budget": a converted snippet's own length could exceed the
+/// "total" it was supposedly cut from, or a converted total could
+/// under-disclose remaining Markdown that the original file's small
+/// raw size does not reflect (the independently observed
+/// `returned_bytes 83 / total_bytes 47`). A `Document` resource's own
+/// `TextUnit`s already tile the converted Markdown contiguously
+/// (`ExtractorPolicy::document_units`), so the highest `byte_end`
+/// across them *is* that Markdown's total length — read from the
+/// already-recorded units, with no re-render needed.
 ///
-/// **Read from whichever source actually holds the resource.** For a
-/// Git source that is `git cat-file -s` against the object store — the
-/// same real object `resolve_exact` re-verified the span against. For a
-/// local document collection there is no object store and no
-/// repository to run `git` in: spawning one there produced a failed
-/// process and a `null` length, so a document resolve silently lost the
-/// budget disclosure a Git resolve got. The length is already recorded
-/// on the generation's own `ResourceRecord`, read and verified at
-/// acquisition, so it is taken from there.
+/// **Otherwise, read from whichever source actually holds the
+/// resource.** For a Git source that is `git cat-file -s` against the
+/// object store — the same real object `resolve_exact` re-verified the
+/// span against. For a local document collection there is no object
+/// store and no repository to run `git` in: spawning one there
+/// produced a failed process and a `null` length, so a document
+/// resolve silently lost the budget disclosure a Git resolve got. The
+/// length is already recorded on the generation's own `ResourceRecord`,
+/// read and verified at acquisition, so it is taken from there.
 fn resource_total_bytes(
     atlas: &wirk_atlas::AtlasStore,
     membership: &wirk_atlas::Membership,
     coordinate: &wirk_atlas::ExactCoordinate,
 ) -> Option<u64> {
-    if membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY {
-        let generation = atlas.generation(&coordinate.generation).ok()?;
-        return generation
+    let generation = atlas.generation(&coordinate.generation).ok();
+    let resource = generation.as_ref().and_then(|generation| {
+        generation
             .resources
             .iter()
-            .find(|resource| resource.path == coordinate.path)
-            .and_then(|resource| resource.byte_len);
+            .find(|r| r.path == coordinate.path)
+    });
+    if let Some(resource) = resource
+        && resource.units.first().map(|unit| unit.family)
+            == Some(wirk_atlas::ContentFamily::Document)
+    {
+        return resource.units.iter().map(|unit| unit.byte_end).max();
+    }
+    if membership.policy == wirk_atlas::DOCUMENT_TREE_POLICY {
+        return resource.and_then(|resource| resource.byte_len);
     }
     let output = Command::new("git")
         .arg("-C")
@@ -23744,6 +23936,7 @@ fn family_label(family: wirk_atlas::ContentFamily) -> &'static str {
         wirk_atlas::ContentFamily::Code => "code",
         wirk_atlas::ContentFamily::Knowledge => "knowledge",
         wirk_atlas::ContentFamily::Config => "config",
+        wirk_atlas::ContentFamily::Document => "document",
     }
 }
 
@@ -25680,6 +25873,7 @@ fn admitted_handle(
         "code" => wirk_atlas::ContentFamily::Code,
         "knowledge" => wirk_atlas::ContentFamily::Knowledge,
         "config" => wirk_atlas::ContentFamily::Config,
+        "document" => wirk_atlas::ContentFamily::Document,
         other => {
             return Err(format!(
                 "the delivered handle `{wanted}` names a content family this binary does not \

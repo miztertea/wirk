@@ -979,7 +979,7 @@ fn lexical_hits(
         // cannot be read still degrades `coverage.source_unavailable`
         // and is skipped, never a hard failure.
         let mut wanted: Vec<(Vec<u8>, String)> = Vec::new();
-        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut seen: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
         for resource in &generation.resources {
             if resource.disposition != CoverageDisposition::Indexed {
                 continue;
@@ -991,13 +991,23 @@ fn lexical_hits(
                 continue;
             }
             let object_id = resource.object_id.clone().unwrap_or_default();
-            if seen.insert(object_id.clone()) {
+            // Deduplicated by `hydration_key`, not `object_id` alone: two
+            // resources can share raw bytes under one object id while
+            // naming different derived interpretations (one a document
+            // path, one not), and each interpretation needs its own
+            // batched render rather than one silently standing in for
+            // the other (the independently demonstrated hydration
+            // defect this keying fixes).
+            let key = crate::document::resource_key(&resource.path, &object_id);
+            if seen.insert(key) {
                 wanted.push((resource.path.clone(), object_id));
             }
         }
         let blob_cache = match crate::hydrate::blobs(
             &generation.acquisition_policy,
             Path::new(&source.membership.locator),
+            store.root(),
+            &generation.id,
             &wanted,
             &limits,
         ) {
@@ -1019,7 +1029,8 @@ fn lexical_hits(
                 continue;
             }
             let object_id = resource.object_id.clone().unwrap_or_default();
-            let Some(bytes) = blob_cache.get(&object_id) else {
+            let key = crate::document::resource_key(&resource.path, &object_id);
+            let Some(bytes) = blob_cache.get(&key) else {
                 coverage.source_unavailable = true;
                 continue;
             };
@@ -1266,6 +1277,8 @@ pub fn resolve_path(
     let bytes = match crate::hydrate::blob(
         &generation.acquisition_policy,
         Path::new(&source.membership.locator),
+        store.root(),
+        &generation.id,
         &record.path,
         &object_id,
         &store.capture_limits(),

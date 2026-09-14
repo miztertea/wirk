@@ -923,6 +923,22 @@ pub struct ResourcePolicy {
     /// that has clearly been pointed at something other than a document
     /// collection.
     pub document_max_entries: usize,
+    /// Largest response body one HTTP source acquisition/refresh will
+    /// read, in bytes. Enforced by the fetch itself (the transfer is
+    /// aborted once it is exceeded), not only checked after the fact —
+    /// mirrors `document_max_file_bytes` for the one other kind of
+    /// content this product reads from outside its own filesystem.
+    pub http_max_response_bytes: u64,
+    /// Wall-clock bound on one HTTP acquire/refresh fetch, including
+    /// every redirect hop, in seconds. An operator's own network being
+    /// slow is not this product's problem to solve; it is this
+    /// product's job to refuse to hang on it.
+    pub http_timeout_secs: u64,
+    /// How many redirects one HTTP fetch will follow before refusing.
+    /// Bounds the same "keeps redirecting forever" failure a browser's
+    /// own redirect cap exists for, not a policy about which hosts a
+    /// redirect may land on.
+    pub http_max_redirects: u32,
     /// The largest single claimed artifact this daemon will read into
     /// memory to serve `wirk artifact` (`handle_run_artifact`), in
     /// bytes. Default 64 MiB.
@@ -975,6 +991,9 @@ impl Default for ResourcePolicy {
             document_max_total_bytes: 128 * 1024 * 1024,
             document_max_entries_depth: 128,
             document_max_entries: 200_000,
+            http_max_response_bytes: 8 * 1024 * 1024,
+            http_timeout_secs: 20,
+            http_max_redirects: 5,
         }
     }
 }
@@ -1002,6 +1021,9 @@ struct ConfiguredPolicy {
     document_max_total_bytes: Option<u64>,
     document_max_entries_depth: Option<usize>,
     document_max_entries: Option<usize>,
+    http_max_response_bytes: Option<u64>,
+    http_timeout_secs: Option<u64>,
+    http_max_redirects: Option<u32>,
 }
 
 impl ResourcePolicy {
@@ -1059,6 +1081,9 @@ impl ResourcePolicy {
         overlay!(document_max_total_bytes);
         overlay!(document_max_entries_depth);
         overlay!(document_max_entries);
+        overlay!(http_max_response_bytes);
+        overlay!(http_timeout_secs);
+        overlay!(http_max_redirects);
         if let Some(bytes) = configured.job_memory_max_bytes {
             policy.job_memory_max_bytes = (bytes > 0).then_some(bytes);
         }
@@ -1138,6 +1163,20 @@ impl ResourcePolicy {
                 complaints.push(format!("{label} 0 would admit nothing; using 1"));
                 *value = 1;
             }
+        }
+        if policy.http_max_response_bytes == 0 {
+            complaints.push(
+                "http_max_response_bytes 0 would read nothing; using the built-in default"
+                    .to_string(),
+            );
+            policy.http_max_response_bytes = defaults.http_max_response_bytes;
+        }
+        if policy.http_timeout_secs == 0 {
+            complaints.push(
+                "http_timeout_secs 0 would time out immediately; using the built-in default"
+                    .to_string(),
+            );
+            policy.http_timeout_secs = defaults.http_timeout_secs;
         }
         if policy.artifact_max_bytes == 0 {
             // Same rule as the concurrency values above: a bound of zero

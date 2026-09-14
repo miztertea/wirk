@@ -433,6 +433,30 @@ fn large_fixture_repo() -> TempDir {
     repo
 }
 
+/// A repository whose one generation holds a document and an ordinary
+/// note: `twin.csv` and `twin.md`, committed byte-identical so they share
+/// one object id, beside ordinary code. The `.csv` half is cut as the
+/// Markdown table `anydoc` renders, the `.md` half as its own bytes, so
+/// this generation carries two unitizers — the ordinary shape of a
+/// collection of reports and the notes about them.
+fn mixed_fixture_repo() -> TempDir {
+    let repo = TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "a@b"]);
+    git(repo.path(), &["config", "user.name", "A"]);
+    fs::write(
+        repo.path().join("code.rs"),
+        "fn alpha() { let admitted = 1; }\nfn beta() { let ranking = 2; }\n",
+    )
+    .unwrap();
+    let twin = "site,phase,lead\nHarbour,Build,Nia\n";
+    fs::write(repo.path().join("twin.csv"), twin).unwrap();
+    fs::write(repo.path().join("twin.md"), twin).unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "fixture"]);
+    repo
+}
+
 fn estate_with(repo: TempDir) -> Estate {
     estate_with_alias(repo, "fixture")
 }
@@ -534,10 +558,12 @@ fn search_request(estate: &Estate, backend: Option<&Path>) -> SearchRequest {
 fn a_every_native_row_re_derives_from_its_committed_bytes() {
     let mut estate = estate();
     let edition = staged(build(&mut estate, "honest"));
-    // `v5` is the scheme this product writes now: it binds the parser
-    // shared libraries a boundary came out of on top of everything `v4`
-    // bound, and earlier records still read back as themselves.
-    assert_eq!(edition.identity, wirk_atlas::IDENTITY_V5);
+    // `v6` is the scheme this product writes now: on top of everything
+    // `v4` and `v5` bound — the chunker, the retrieval representation, the
+    // coverage, and the parser shared libraries a boundary came out of —
+    // it binds every unitizer the generation committed to rather than one.
+    // Earlier records still read back as themselves.
+    assert_eq!(edition.identity, wirk_atlas::IDENTITY_V6);
     let rows = read_rows(&estate, &edition);
     assert!(
         rows.len() > 4,
@@ -810,6 +836,88 @@ fn k_the_ranking_view_contains_only_admitted_rows() {
     assert!(
         !reason.contains(&estate.membership.locator),
         "a denial must not disclose a locator: {reason}"
+    );
+}
+
+/// A11b. The same contract over a generation that mixes a document with
+/// an ordinary note: native chunks over both, ranked together, and each
+/// twin's snippet is its own reading even though the two share one object
+/// id.
+///
+/// This is the retrieval half of the mixed-source correction — the build
+/// half is `semantic_lifecycle`'s `a0_…`, in units mode. What it adds here
+/// is the native chunking path and the query's own hydration: a snippet is
+/// read back from the source at query time, so a reader keyed by object id
+/// alone shows one twin the other's text long after the edition itself was
+/// built correctly.
+#[test]
+fn k2_a_mixed_document_and_text_edition_ranks_both_readings() {
+    let mut estate = estate_with(mixed_fixture_repo());
+    let edition = staged(build(&mut estate, "honest"));
+    assert_eq!(edition.identity, wirk_atlas::IDENTITY_V6);
+    assert_eq!(
+        edition.chunker.unitizers,
+        vec![
+            "anydoc-0.2.4-markdown+utf8-multiline-chunks-65536/v1".to_owned(),
+            "utf8-multiline-chunks-65536/v1".to_owned(),
+        ]
+    );
+    estate
+        .store
+        .select_semantic(&estate.membership.clone(), &edition.id)
+        .unwrap()
+        .unwrap();
+
+    let backend = query_backend(&estate.directory, "query-mixed.py", "honest");
+    let mut request = search_request(&estate, Some(&backend));
+    request.query = "Harbour".into();
+    let answer = wirk_atlas::search(&estate.store, &request).unwrap();
+    assert_eq!(
+        answer.semantic,
+        SemanticStatus::Applied,
+        "{:?}",
+        answer.semantic
+    );
+    assert_eq!(answer.mode, wirk_atlas::RankingMode::Semantic);
+
+    let snippets_of = |path: &str| -> Vec<String> {
+        let found: Vec<String> = answer
+            .hits
+            .iter()
+            .filter(|hit| String::from_utf8_lossy(&hit.coordinate.path) == path)
+            .map(|hit| hit.snippet.clone())
+            .collect();
+        assert!(
+            !found.is_empty(),
+            "no ranked hit for {path}: {:?}",
+            answer
+                .hits
+                .iter()
+                .map(|hit| String::from_utf8_lossy(&hit.coordinate.path).into_owned())
+                .collect::<Vec<_>>()
+        );
+        found
+    };
+    // The stub chunker cuts fixed character windows, so each twin reaches
+    // the answer as more than one row; what has to hold is that every one
+    // of them came from that twin's own reading.
+    let csv = snippets_of("twin.csv");
+    let markdown = snippets_of("twin.md");
+    assert!(
+        csv.iter().all(|snippet| snippet.contains('|')),
+        "every CSV-twin row is part of its rendered table: {csv:?}"
+    );
+    assert!(
+        csv.concat().contains("Harbour"),
+        "the CSV twin's own content is there: {csv:?}"
+    );
+    assert!(
+        markdown.iter().all(|snippet| !snippet.contains('|')),
+        "the Markdown twin ranks as its own raw text, not the CSV twin's table: {markdown:?}"
+    );
+    assert!(
+        markdown.concat().contains("site,phase,lead"),
+        "the Markdown twin keeps its own comma-separated bytes: {markdown:?}"
     );
 }
 
@@ -1959,7 +2067,7 @@ fn q10_an_incomplete_producer_pin_is_not_called_pre_correction_history() {
 fn g1_grammar_library_bytes_are_bound_into_the_edition_identity() {
     let mut estate = estate();
     let first = staged(build(&mut estate, "grammar_measured"));
-    assert_eq!(first.identity, wirk_atlas::IDENTITY_V5);
+    assert_eq!(first.identity, wirk_atlas::IDENTITY_V6);
     let library_path = estate.directory.join("libtest_grammar.so");
     let chunks = first.chunker.chunks.as_ref().unwrap();
     let wirk_atlas::GrammarCoverage::Measured(measured) = &chunks.grammars else {

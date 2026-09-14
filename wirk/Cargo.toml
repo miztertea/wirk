@@ -52,6 +52,12 @@ sha2 = "0.11.0"
 # already used by wirk-core/Cargo.toml's Journal round-trip fixtures,
 # ruling 0031 D97's latest-then-pin checked 2026-09-04).
 tempfile = "3.27.0"
+# Test-only: wirk/tests/document_tree_wire.rs builds one small real OOXML
+# package with an embedded image, so the asset-export path is exercised
+# against a genuine document rather than a stubbed reply. Same pin
+# wirk-atlas's own dev-dependencies already carry, already in this
+# workspace's lock (R2).
+zip = "8.6.0"
 # wirk/tests/plugin_manifest.rs parses herdr-plugin.toml (item 7 W1).
 # Latest stable on crates.io today (0031 D97), checked 2026-09-04:
 # `curl -s https://crates.io/api/v1/crates/toml -A wirk` ->

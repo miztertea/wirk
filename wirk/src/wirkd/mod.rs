@@ -147,6 +147,11 @@ pub enum Verb {
     AtlasSearch,
     /// P3 W3: exact evidence-coordinate resolution.
     AtlasResolve,
+    /// P5: reads one already-recorded document source through the native
+    /// reader's shared document model — its structure, and the inventory
+    /// of what it embeds — or one of its embedded assets by that
+    /// inventory's own id.
+    AtlasDocument,
     /// P3 W3: admits one evidenced `GovernedBy` relationship.
     AtlasRelate,
     /// W-B (§5.2): an actor's own bounded, evidence-backed claim.
@@ -438,6 +443,13 @@ impl Request {
         Request {
             verb: Verb::AtlasResolve,
             payload: serde_json::to_value(payload).expect("AtlasResolvePayload always serializes"),
+        }
+    }
+
+    pub fn atlas_document(payload: AtlasDocumentPayload) -> Self {
+        Request {
+            verb: Verb::AtlasDocument,
+            payload: serde_json::to_value(payload).expect("AtlasDocumentPayload always serializes"),
         }
     }
 
@@ -1206,6 +1218,22 @@ pub struct AtlasResolvePayload {
     #[serde(default)]
     pub work: Option<WorkId>,
     pub coordinate: String,
+}
+
+/// `atlas document`'s payload. Addressed by the same encoded coordinate
+/// `atlas resolve` takes — the resource identity a search hit already
+/// carries — plus, optionally, one embedded asset's own id from this
+/// document's inventory. `work` scopes the read exactly as it does for
+/// `resolve`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AtlasDocumentPayload {
+    #[serde(default)]
+    pub work: Option<WorkId>,
+    pub coordinate: String,
+    /// `Some(id)` asks for that one asset's bytes; `None` asks for the
+    /// document's structure and asset inventory, with no payload bytes.
+    #[serde(default)]
+    pub asset: Option<usize>,
 }
 
 /// `atlas relate`'s payload: `work` is required (never optional) —

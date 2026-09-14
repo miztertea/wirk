@@ -1,4 +1,6 @@
-use crate::{AtlasError, CoverageDisposition, ExtractorPolicy, GenerationId, ResourceRecord};
+use crate::{
+    AtlasError, ContentFamily, CoverageDisposition, ExtractorPolicy, GenerationId, ResourceRecord,
+};
 use std::path::Path;
 use std::process::Command;
 
@@ -56,11 +58,30 @@ pub(crate) fn commit_and_tree(
     )?;
     Ok((commit, format!("sha1:{tree}")))
 }
+/// Every committed path of `commit`, classified and — where admitted —
+/// extracted, under this estate's own source input bounds.
+///
+/// **The bounds are this policy's, not the extractor's.** A blob larger
+/// than `limits.max_file_bytes` is reported `Unsupported` from the size
+/// `ls-tree -l` already returned, without being read at all, and the
+/// aggregate of everything actually read is charged against
+/// `limits.max_total_bytes` before each read it bounds. Both come from the
+/// estate's configurable `ResourcePolicy`, so a Git source is bounded by
+/// the same operator-visible numbers a document collection is rather than
+/// by whatever the extractor happens to refuse after the bytes are already
+/// in memory.
+///
+/// **Two passes, because detection needs bytes and bounds do not.** The
+/// first decides everything a path settles on its own. Paths the name
+/// settles nothing about are screened together, in one batched read of at
+/// most `document::SNIFF_BYTES` per object, and only those whose content
+/// `anydoc` actually recognizes go on to a full read.
 pub(crate) fn resources(
     repo: &Path,
     commit: &str,
     generation: &GenerationId,
     policy: &ExtractorPolicy,
+    limits: &crate::doctree::CaptureLimits,
 ) -> Result<Vec<ResourceRecord>, AtlasError> {
     let raw = git(
         repo,
@@ -72,7 +93,26 @@ pub(crate) fn resources(
             commit.into(),
         ],
     )?;
-    let mut records = Vec::new();
+
+    enum Classified {
+        /// Settled without reading anything.
+        Decided(CoverageDisposition, Option<String>),
+        /// Admitted by name; read and extract.
+        Read,
+        /// The name settles nothing; screen a bounded prefix first.
+        Screen,
+    }
+
+    /// One `ls-tree` row, with everything its path alone already settled.
+    struct Entry {
+        path: Vec<u8>,
+        mode: String,
+        oid: String,
+        size: Option<u64>,
+        classified: Classified,
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
     for entry in raw.split(|b| *b == 0).filter(|x| !x.is_empty()) {
         let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
             return Err(AtlasError::SourceBytesUnavailable(
@@ -91,45 +131,133 @@ pub(crate) fn resources(
         let mode = fields[0].to_owned();
         let oid = fields[2].to_owned();
         let size = fields[3].parse::<u64>().ok();
-        let (disposition, detail, units) = if mode == "160000" {
-            (
-                CoverageDisposition::Unsupported,
-                Some("gitlink".into()),
-                vec![],
-            )
+        let classified = if mode == "160000" {
+            Classified::Decided(CoverageDisposition::Unsupported, Some("gitlink".into()))
         } else if mode == "120000" {
-            (
-                CoverageDisposition::Unsupported,
-                Some("symlink".into()),
-                vec![],
-            )
+            Classified::Decided(CoverageDisposition::Unsupported, Some("symlink".into()))
         } else if ExtractorPolicy::excluded(&path) {
-            (
+            Classified::Decided(
                 CoverageDisposition::Excluded,
                 Some("fixed secret-like policy".into()),
-                vec![],
-            )
-        } else if !policy.supports(&path) {
-            (
-                CoverageDisposition::Unsupported,
-                Some("no extractor for path family".into()),
-                vec![],
             )
         } else {
-            match git(repo, &["cat-file".into(), "blob".into(), oid.clone()]) {
-                Ok(bytes) if bytes.contains(&0) => (
+            match policy.admission(&path) {
+                crate::extract::PathAdmission::No => Classified::Decided(
                     CoverageDisposition::Unsupported,
-                    Some("binary blob".into()),
-                    vec![],
+                    Some("no extractor for path family".into()),
                 ),
-                Ok(bytes) => match policy.units(generation, &path, &oid, &bytes) {
-                    Ok(units) => (CoverageDisposition::Indexed, None, units),
-                    Err(detail) => (CoverageDisposition::Error, Some(detail.into()), vec![]),
-                },
-                Err(AtlasError::SourceBytesUnavailable(detail)) => {
-                    (CoverageDisposition::Unavailable, Some(detail), vec![])
+                // Checked from the size Git already reported, before the
+                // object is read: the bound refuses the read rather than
+                // complaining about one that already happened.
+                _ if size.is_some_and(|size| size > limits.max_file_bytes) => Classified::Decided(
+                    CoverageDisposition::Unsupported,
+                    Some("blob exceeds the bounded source read size".into()),
+                ),
+                crate::extract::PathAdmission::Family(_) => Classified::Read,
+                crate::extract::PathAdmission::Candidate => Classified::Screen,
+            }
+        };
+        entries.push(Entry {
+            path,
+            mode,
+            oid,
+            size,
+            classified,
+        });
+    }
+
+    // **Screening is a read, and it is charged as one.** Git streams a
+    // whole object across the batch pipe whatever the reader keeps, so
+    // "look at the first kilobyte" costs the object's full length in real
+    // I/O: keeping 1024 bytes in memory bounds the buffer, not the input.
+    // A screen that was not charged would have let a tree of unrecognized
+    // names move arbitrarily many bytes outside the budget that is
+    // supposed to bound exactly that, and a screen-positive object would
+    // then have been read a second time in full.
+    //
+    // So each candidate is read once, charged once, and its bytes are
+    // reused: the same buffer that answers "is this a document?" is the
+    // buffer extraction runs on. The per-file bound already refused
+    // anything oversize from `ls-tree -l`'s own size, before this.
+    //
+    // Deduplication is kept where it can still save the work: a screen
+    // decision is remembered per object id, so a second path naming an
+    // object already screened negative is refused without reading it
+    // again and without charging for it.
+    let mut screened: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    let mut total_bytes: u64 = 0;
+    let mut records = Vec::with_capacity(entries.len());
+    for Entry {
+        path,
+        mode,
+        oid,
+        size,
+        classified,
+    } in entries
+    {
+        let unsupported_family = || {
+            (
+                CoverageDisposition::Unsupported,
+                Some("no extractor for path family".to_string()),
+                vec![],
+            )
+        };
+        let (disposition, detail, units) = match classified {
+            Classified::Decided(disposition, detail) => (disposition, detail, vec![]),
+            // Already screened negative under another path: no read, no
+            // charge, same answer.
+            Classified::Screen if screened.get(&oid) == Some(&false) => unsupported_family(),
+            Classified::Read | Classified::Screen => {
+                // The aggregate budget is charged before the read it
+                // bounds, from the length Git already reported: a visible
+                // refusal before the read, not an unbounded read followed
+                // by a complaint. A candidate's screening read is charged
+                // here too, because it is the same read.
+                total_bytes = total_bytes.saturating_add(size.unwrap_or(0));
+                if total_bytes > limits.max_total_bytes {
+                    return Err(AtlasError::InvalidRequest(format!(
+                        "git source exceeds the {}-byte bounded aggregate read budget for one \
+                         capture; raise document_max_total_bytes in this estate's \
+                         .wirk/resources.json to admit a larger tree",
+                        limits.max_total_bytes
+                    )));
                 }
-                Err(error) => return Err(error),
+                match git(repo, &["cat-file".into(), "blob".into(), oid.clone()]) {
+                    // The screen, on the bytes this read already has.
+                    Ok(bytes)
+                        if matches!(classified, Classified::Screen) && {
+                            let window = &bytes[..bytes.len().min(crate::document::SNIFF_BYTES)];
+                            let could = crate::document::could_be_document(window);
+                            screened.insert(oid.clone(), could);
+                            !could
+                        } =>
+                    {
+                        unsupported_family()
+                    }
+                    // An admitted document format's own bytes are expected
+                    // to be binary, and `policy.units` reads them directly
+                    // rather than as UTF-8, so the null-byte heuristic must
+                    // not preempt it. Decided from the same bytes the
+                    // family decision reads.
+                    Ok(bytes)
+                        if policy.family(&path, &bytes) != Some(ContentFamily::Document)
+                            && bytes.contains(&0) =>
+                    {
+                        (
+                            CoverageDisposition::Unsupported,
+                            Some("binary blob".into()),
+                            vec![],
+                        )
+                    }
+                    Ok(bytes) => match policy.units(generation, &path, &oid, &bytes) {
+                        Ok(units) => (CoverageDisposition::Indexed, None, units),
+                        Err(detail) => (CoverageDisposition::Error, Some(detail), vec![]),
+                    },
+                    Err(AtlasError::SourceBytesUnavailable(detail)) => {
+                        (CoverageDisposition::Unavailable, Some(detail), vec![])
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         };
         records.push(ResourceRecord {
@@ -549,5 +677,253 @@ mod batched_read_tests {
         assert_eq!(blobs.len(), 1);
         // Every object `blob` returns, `blobs` returns the same bytes for.
         assert_eq!(blob(repo, &present).expect("blob"), blobs[&present]);
+    }
+
+    /// One committed repository whose files are named by `files`, with its
+    /// own Git identity so the commit does not depend on this host's.
+    fn commit_repo(files: &[(&str, &[u8])]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path();
+        for argv in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.invalid"],
+            vec!["config", "user.name", "t"],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(&argv)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {argv:?}");
+        }
+        for (name, bytes) in files {
+            std::fs::write(repo.join(name), bytes).expect("write");
+        }
+        for argv in [vec!["add", "-A"], vec!["commit", "-qm", "x"]] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(&argv)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {argv:?}");
+        }
+        let head = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .expect("git")
+                .stdout,
+        )
+        .expect("utf8")
+        .trim()
+        .to_owned();
+        (dir, head)
+    }
+
+    fn record<'a>(records: &'a [ResourceRecord], name: &str) -> &'a ResourceRecord {
+        records
+            .iter()
+            .find(|record| record.path == name.as_bytes())
+            .unwrap_or_else(|| panic!("no record for {name}"))
+    }
+
+    /// A Git source is bounded by this estate's own configurable source
+    /// input bounds, not by whatever the extractor happens to refuse once
+    /// the bytes are already in memory. The per-file bound is decided from
+    /// the size `ls-tree -l` reports, so an oversize blob is named without
+    /// being read, and raising the bound indexes it.
+    #[test]
+    fn a_blob_over_the_per_file_bound_is_named_then_admitted_when_raised() {
+        let big = vec![b'x'; 40_000];
+        let (dir, head) = commit_repo(&[("big.md", &big), ("small.md", b"# small\n")]);
+        let policy = ExtractorPolicy::default();
+        let generation = GenerationId("g-test".into());
+
+        let tight = crate::doctree::CaptureLimits {
+            max_file_bytes: 4_096,
+            ..Default::default()
+        };
+        let records = resources(dir.path(), &head, &generation, &policy, &tight).expect("capture");
+        let refused = record(&records, "big.md");
+        assert_eq!(refused.disposition, CoverageDisposition::Unsupported);
+        assert_eq!(
+            refused.detail.as_deref(),
+            Some("blob exceeds the bounded source read size")
+        );
+        assert_eq!(
+            record(&records, "small.md").disposition,
+            CoverageDisposition::Indexed
+        );
+
+        let mut raised = tight;
+        raised.max_file_bytes = 1_000_000;
+        let records = resources(dir.path(), &head, &generation, &policy, &raised).expect("capture");
+        assert_eq!(
+            record(&records, "big.md").disposition,
+            CoverageDisposition::Indexed
+        );
+    }
+
+    /// The aggregate half of the same bound: a whole capture that would
+    /// read past it is refused visibly, naming the setting an operator
+    /// raises, rather than read and complained about afterwards.
+    #[test]
+    fn the_aggregate_budget_refuses_the_whole_git_capture_visibly() {
+        let body = vec![b'x'; 4_000];
+        let (dir, head) = commit_repo(&[("a.md", &body), ("b.md", &body), ("c.md", &body)]);
+        let policy = ExtractorPolicy::default();
+        let generation = GenerationId("g-test".into());
+        let tight = crate::doctree::CaptureLimits {
+            max_total_bytes: 6_000,
+            ..Default::default()
+        };
+        match resources(dir.path(), &head, &generation, &policy, &tight) {
+            Err(AtlasError::InvalidRequest(detail)) => {
+                assert!(detail.contains("document_max_total_bytes"), "{detail}");
+            }
+            other => panic!("expected a visible aggregate refusal, got {other:?}"),
+        }
+    }
+
+    /// Screening is real input, and the bound counts it.
+    ///
+    /// Git streams a whole object across the batch pipe however few of its
+    /// bytes a reader keeps, so screening two unrecognized names costs
+    /// their full length. A screen charged only for what it kept would
+    /// have let a tree of such names move arbitrarily many bytes outside
+    /// the budget that exists to bound exactly that.
+    #[test]
+    fn screening_an_unrecognized_name_is_charged_against_the_aggregate_budget() {
+        let body = vec![b'x'; 4_000];
+        // Two distinct bodies, so neither can be deduplicated away, and
+        // neither is a document: their bytes are only ever read to find
+        // that out.
+        let mut other = body.clone();
+        other[0] = b'y';
+        let (dir, head) = commit_repo(&[("one.unknown", &body), ("two.unknown", &other)]);
+        let policy = ExtractorPolicy::default();
+        let generation = GenerationId("g-test".into());
+        let tight = crate::doctree::CaptureLimits {
+            max_total_bytes: 6_000,
+            ..Default::default()
+        };
+        match resources(dir.path(), &head, &generation, &policy, &tight) {
+            Err(AtlasError::InvalidRequest(detail)) => {
+                assert!(detail.contains("document_max_total_bytes"), "{detail}");
+            }
+            other => panic!("the bytes a screen actually reads must be charged; got {other:?}"),
+        }
+
+        // Raised past what the screening reads really cost, the same tree
+        // is admitted -- and still reported unsupported, because neither
+        // body is a document.
+        let raised = crate::doctree::CaptureLimits {
+            max_total_bytes: 100_000,
+            ..Default::default()
+        };
+        let records = resources(dir.path(), &head, &generation, &policy, &raised).expect("capture");
+        for name in ["one.unknown", "two.unknown"] {
+            assert_eq!(
+                record(&records, name).disposition,
+                CoverageDisposition::Unsupported,
+                "{name}"
+            );
+        }
+    }
+
+    /// One object screened once. Two unrecognized names over the identical
+    /// blob are one read and one charge, not two: the second is answered
+    /// from the decision the first produced.
+    #[test]
+    fn a_screen_decision_is_reused_across_paths_sharing_one_object() {
+        let body = vec![b'x'; 4_000];
+        let (dir, head) = commit_repo(&[("one.unknown", &body), ("two.unknown", &body)]);
+        let policy = ExtractorPolicy::default();
+        let generation = GenerationId("g-test".into());
+        // Room for exactly one of the two reads. Reading the same object
+        // twice would exceed it.
+        let tight = crate::doctree::CaptureLimits {
+            max_total_bytes: 6_000,
+            ..Default::default()
+        };
+        let records = resources(dir.path(), &head, &generation, &policy, &tight)
+            .expect("one object is read and charged once");
+        for name in ["one.unknown", "two.unknown"] {
+            let found = record(&records, name);
+            assert_eq!(
+                found.disposition,
+                CoverageDisposition::Unsupported,
+                "{name}"
+            );
+            assert_eq!(
+                found.detail.as_deref(),
+                Some("no extractor for path family"),
+                "{name}"
+            );
+        }
+    }
+
+    /// A candidate that really is a document is read once, not twice: the
+    /// bytes the screen looked at are the bytes extraction runs on. A
+    /// second full read would charge its length again, so the budget is
+    /// what proves it.
+    #[test]
+    fn a_screen_positive_candidate_is_not_read_a_second_time() {
+        let rtf = b"{\\rtf1\\ansi\\deff0 {\\fonttbl{\\f0 Times;}}\\f0 Chargemarker prose.\\par}";
+        let (dir, head) = commit_repo(&[("brief", rtf.as_slice())]);
+        let policy = ExtractorPolicy::default();
+        let generation = GenerationId("g-test".into());
+        // Enough for one read of this blob, not two.
+        let tight = crate::doctree::CaptureLimits {
+            max_total_bytes: (rtf.len() as u64) + 1,
+            ..Default::default()
+        };
+        let records = resources(dir.path(), &head, &generation, &policy, &tight)
+            .expect("a screened-and-extracted blob is charged once");
+        let found = record(&records, "brief");
+        assert_eq!(
+            found.disposition,
+            CoverageDisposition::Indexed,
+            "{:?}",
+            found.detail
+        );
+    }
+
+    /// A committed document whose name settles nothing is screened on a
+    /// bounded prefix and then admitted for what its content is, while an
+    /// unrecognized name over ordinary bytes stays unsupported.
+    #[test]
+    fn a_committed_document_under_an_unrecognized_name_is_detected() {
+        let rtf = b"{\\rtf1\\ansi\\deff0 {\\fonttbl{\\f0 Times;}}\\f0 Gitmarker prose.\\par}";
+        let (dir, head) = commit_repo(&[
+            ("brief", rtf.as_slice()),
+            ("payload.unknown", b"just prose, no container\n"),
+        ]);
+        let policy = ExtractorPolicy::default();
+        let generation = GenerationId("g-test".into());
+        let limits = crate::doctree::CaptureLimits::default();
+        let records = resources(dir.path(), &head, &generation, &policy, &limits).expect("capture");
+
+        let detected = record(&records, "brief");
+        assert_eq!(
+            detected.disposition,
+            CoverageDisposition::Indexed,
+            "{:?}",
+            detected.detail
+        );
+        assert_eq!(
+            detected.units.first().map(|unit| unit.family),
+            Some(ContentFamily::Document)
+        );
+        let plain = record(&records, "payload.unknown");
+        assert_eq!(plain.disposition, CoverageDisposition::Unsupported);
+        assert_eq!(
+            plain.detail.as_deref(),
+            Some("no extractor for path family")
+        );
     }
 }

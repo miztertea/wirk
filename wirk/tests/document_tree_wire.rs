@@ -1161,3 +1161,432 @@ fn wirk_cli() -> Command {
         .env_remove("WIRK_RUN_ID");
     command
 }
+
+/// `wirk atlas <verb>` with an explicit actor triple in the environment,
+/// so a fixture can ask as an actor rather than as the operator it
+/// otherwise looks like.
+fn atlas_as_actor(
+    estate: &Path,
+    actor_estate: &Path,
+    work: &str,
+    args: &[&str],
+) -> (bool, serde_json::Value, String) {
+    let mut full = vec!["atlas"];
+    full.extend_from_slice(args);
+    full.push("--estate");
+    let estate = estate.to_str().expect("estate path is utf-8");
+    full.push(estate);
+    full.push("--json");
+    let output = wirk_cli()
+        .env("WIRK_ESTATE_ROOT", actor_estate)
+        .env("WIRK_WORK_ID", work)
+        .env("WIRK_RUN_ID", "run-fixture")
+        .args(&full)
+        .output()
+        .expect("wirk atlas runs");
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let value = serde_json::from_str(&stdout).unwrap_or(serde_json::Value::Null);
+    (output.status.success(), value, stderr)
+}
+
+/// One estate holding one published document source, plus the daemon
+/// serving it — the fixture every scope case below asks the same question
+/// of.
+fn published_estate(dir: &Path) -> (std::path::PathBuf, KillOnDrop) {
+    let estate = dir.join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    let wirkd_child = start_wirkd(&estate);
+    let docs = dir.join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(
+        docs.join("brief.md"),
+        "# Client brief\n\nScopemarker here.\n",
+    )
+    .unwrap();
+    let (ok, acquired, err) = atlas(
+        &estate,
+        &[
+            "acquire",
+            "--source",
+            "docs",
+            "--repository",
+            docs.to_str().unwrap(),
+            "--kind",
+            "document-tree",
+        ],
+    );
+    assert!(ok, "acquire: {err}");
+    let generation = acquired["generation"]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (ok, _, err) = atlas(
+        &estate,
+        &["publish", "--source", "docs", "--generation", &generation],
+    );
+    assert!(ok, "publish: {err}");
+    (estate, wirkd_child)
+}
+
+/// Naming the estate an actor already belongs to must not discard the
+/// Work it is executing as.
+///
+/// Before this, `search`/`resolve` selected `(--estate, --work)` directly,
+/// so an explicit `--estate` dropped the injected Work whenever `--work`
+/// was absent and the daemon read the missing scope as the whole estate.
+/// An actor inside one Work was answered estate-wide by asking for its own
+/// estate. Every other scoped verb already resolved this through the
+/// shared resolver; these now do too, so the Work travels and the daemon
+/// decides against it — here, by refusing a Work its own journal does not
+/// hold, which is exactly the point: the identity reached the daemon
+/// instead of being dropped on the way.
+#[test]
+fn an_actor_naming_its_own_estate_keeps_its_work_on_every_reading_verb() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (estate, wirkd_child) = published_estate(dir.path());
+
+    // The operator's own read is unchanged: omitted scope still means the
+    // administrative read of the whole estate.
+    let (ok, operator, err) = atlas(&estate, &["search", "--query", "Scopemarker"]);
+    assert!(ok, "operator search: {err}");
+    assert!(
+        operator["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "an operator outside any actor context still reads the estate: {operator}"
+    );
+    let coordinate = first_hit_coordinate(&operator);
+
+    for args in [
+        vec!["search", "--query", "Scopemarker"],
+        vec!["resolve", "--coordinate", coordinate.as_str()],
+        vec!["document", "--coordinate", coordinate.as_str()],
+    ] {
+        let (ok, reply, err) = atlas_as_actor(&estate, &estate, "work-not-in-this-journal", &args);
+        assert!(
+            !ok,
+            "{args:?}: an actor's own Work must reach the daemon, not be dropped: {reply}"
+        );
+        assert!(
+            err.contains("no such work"),
+            "{args:?}: the daemon must answer about the Work that was carried; stderr={err}"
+        );
+        // And it says which Work it is asking as, rather than narrowing
+        // silently.
+        assert!(
+            err.contains("work-not-in-this-journal"),
+            "{args:?}: the resolved scope is disclosed; stderr={err}"
+        );
+    }
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+/// The explicit operator read stays available and stays observable: an
+/// actor that means to read administratively says `--admin`, and is told
+/// that is what it did.
+#[test]
+fn admin_is_the_explicit_disclosed_operator_read_from_inside_an_actor_context() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (estate, wirkd_child) = published_estate(dir.path());
+
+    let (ok, reply, err) = atlas_as_actor(
+        &estate,
+        &estate,
+        "work-not-in-this-journal",
+        &["search", "--query", "Scopemarker", "--admin"],
+    );
+    assert!(ok, "--admin search: {err}");
+    assert!(
+        reply["hits"]
+            .as_array()
+            .is_some_and(|hits| !hits.is_empty()),
+        "--admin reads the estate: {reply}"
+    );
+    assert!(
+        err.contains("--admin named"),
+        "an administrative read from inside an actor context is said out loud; stderr={err}"
+    );
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+/// A different estate, or half an injected context, must not silently
+/// widen into an estate-wide read.
+#[test]
+fn a_foreign_or_partial_actor_context_is_refused_rather_than_widened() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (estate, wirkd_child) = published_estate(dir.path());
+    let elsewhere = dir.path().join("another-estate");
+    fs::create_dir_all(&elsewhere).unwrap();
+
+    // A different estate: this actor's Work is not a scope for it, and
+    // the refusal names both explicit ways to ask.
+    let (ok, reply, err) = atlas_as_actor(
+        &estate,
+        &elsewhere,
+        "work-elsewhere",
+        &["search", "--query", "Scopemarker"],
+    );
+    assert!(!ok, "a cross-estate read must be deliberate: {reply}");
+    assert!(
+        err.contains("--requesting-work") && err.contains("--admin"),
+        "the refusal names the explicit ways to ask; stderr={err}"
+    );
+
+    // Half a triple names no identity at all, and reading it as "no
+    // context" is the wider reading.
+    let output = wirk_cli()
+        .env("WIRK_ESTATE_ROOT", &estate)
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID")
+        .args([
+            "atlas",
+            "search",
+            "--query",
+            "Scopemarker",
+            "--estate",
+            estate.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .expect("wirk atlas runs");
+    assert!(
+        !output.status.success(),
+        "a half-injected context must be refused, not read as an operator shell"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        stderr.contains("incomplete"),
+        "the refusal says what is missing; stderr={stderr}"
+    );
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+/// A real, minimal DOCX with one genuinely valid embedded PNG — the same
+/// shape `wirk-atlas`'s own reader tests use, built here so the asset
+/// export path runs against a real document rather than a stubbed reply.
+fn docx_with_a_real_image() -> (Vec<u8>, Vec<u8>) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    // A real 8x8 RGB PNG: signature, IHDR, one deflate IDAT, IEND, every
+    // chunk CRC correct. Committed beside `wirk-atlas`'s own fixtures.
+    let image = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../wirk-atlas/tests/fixtures/embedded-diagram.png"),
+    )
+    .expect("the committed PNG fixture");
+
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+        <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+        <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+        <Default Extension=\"png\" ContentType=\"image/png\"/>\
+        <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+        </Types>";
+    let root_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>\
+        </Relationships>";
+    let document = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+        xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+        <w:body>\
+        <w:p><w:r><w:t>Exportmarker: notes beside the site diagram.</w:t></w:r></w:p>\
+        <w:p><w:r><w:drawing><w:inline><a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:graphicData><pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\"><pic:blipFill><a:blip r:embed=\"rId1\"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></w:inline></w:drawing></w:r></w:p>\
+        </w:body></w:document>";
+    let document_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image\" Target=\"media/image1.png\"/>\
+        </Relationships>";
+
+    let mut buffer = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
+        let options = SimpleFileOptions::default();
+        for (name, content) in [
+            ("[Content_Types].xml", content_types),
+            ("_rels/.rels", root_rels),
+            ("word/document.xml", document),
+            ("word/_rels/document.xml.rels", document_rels),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.start_file("word/media/image1.png", options).unwrap();
+        zip.write_all(&image).unwrap();
+        zip.finish().unwrap();
+    }
+    (buffer, image)
+}
+
+/// A validated daemon reply says the asset was *read*, never that it
+/// reached the caller's disk. `wirk atlas document --asset` has to answer
+/// for the delivery too: a destination it cannot write is a nonzero exit
+/// and a named reason, not a success line over a file that is not there —
+/// and an existing file at that destination is left exactly as it was,
+/// because an export that fails must not also destroy what it was aimed
+/// at.
+#[test]
+fn a_failed_asset_export_exits_nonzero_and_preserves_what_was_already_there() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    let wirkd_child = start_wirkd(&estate);
+
+    let docs = dir.path().join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    let (docx, image) = docx_with_a_real_image();
+    fs::write(docs.join("rfp.docx"), &docx).unwrap();
+
+    let (ok, acquired, err) = atlas(
+        &estate,
+        &[
+            "acquire",
+            "--source",
+            "docs",
+            "--repository",
+            docs.to_str().unwrap(),
+            "--kind",
+            "document-tree",
+        ],
+    );
+    assert!(ok, "acquire: {err}");
+    let generation = acquired["generation"]["generation"].as_str().unwrap();
+    let (ok, _, err) = atlas(
+        &estate,
+        &["publish", "--source", "docs", "--generation", generation],
+    );
+    assert!(ok, "publish: {err}");
+
+    let (ok, search, err) = atlas(&estate, &["search", "--query", "Exportmarker"]);
+    assert!(ok, "search: {err}");
+    let coordinate = first_hit_coordinate(&search);
+
+    // The inventory lists the asset, and carries no bytes of it.
+    let (ok, reading, err) = atlas(&estate, &["document", "--coordinate", &coordinate]);
+    assert!(ok, "document: {err}");
+    assert_eq!(
+        reading["assets"][0]["media_type"].as_str(),
+        Some("image/png")
+    );
+    assert_eq!(
+        reading["assets"][0]["bytes"].as_u64(),
+        Some(image.len() as u64)
+    );
+    assert!(
+        reading.get("bytes_hex").is_none(),
+        "an inventory carries no payload: {reading}"
+    );
+
+    // A destination this process cannot write: an existing file, with
+    // known content, inside a directory whose write permission is off.
+    let locked = dir.path().join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    let destination = locked.join("diagram.png");
+    fs::write(&destination, b"existing content that must survive").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    }
+
+    let (ok, _, err) = atlas(
+        &estate,
+        &[
+            "document",
+            "--coordinate",
+            &coordinate,
+            "--asset",
+            "0",
+            "--output",
+            destination.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !ok,
+        "an asset that could not be written is not a success; stderr={err}"
+    );
+    assert!(
+        err.contains("wirk atlas document:") && err.contains(destination.to_str().unwrap()),
+        "the refusal names the destination it could not write; stderr={err}"
+    );
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        b"existing content that must survive",
+        "a failed export must not destroy what was already at the destination"
+    );
+
+    // A destination that is not a file at all: the failure no method can
+    // write through, and the one the reviewed shape reported as a success
+    // because a `()` callback had nowhere to put it.
+    let a_directory = dir.path().join("not-a-file");
+    fs::create_dir_all(&a_directory).unwrap();
+    let (ok, _, err) = atlas(
+        &estate,
+        &[
+            "document",
+            "--coordinate",
+            &coordinate,
+            "--asset",
+            "0",
+            "--output",
+            a_directory.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !ok,
+        "a destination that is a directory is not a delivered asset; stderr={err}"
+    );
+    assert!(
+        err.contains("wirk atlas document:"),
+        "the refusal says what went wrong; stderr={err}"
+    );
+    assert!(
+        fs::read_dir(&a_directory).unwrap().next().is_none(),
+        "nothing was written into the directory that was named as a file"
+    );
+
+    // The same request to a writable destination delivers the real bytes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let good = dir.path().join("diagram.png");
+    let (ok, reply, err) = atlas(
+        &estate,
+        &[
+            "document",
+            "--coordinate",
+            &coordinate,
+            "--asset",
+            "0",
+            "--output",
+            good.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "asset export: {err}");
+    assert_eq!(fs::read(&good).unwrap(), image);
+    assert!(
+        reply.get("bytes_hex").is_none(),
+        "asset bytes are never printed: {reply}"
+    );
+    assert_eq!(reply["written"].as_str(), good.to_str());
+
+    // No leftover temporary beside any destination.
+    for parent in [dir.path(), locked.as_path(), a_directory.as_path()] {
+        let stray: Vec<String> = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("wirk-asset-"))
+            .collect();
+        assert!(stray.is_empty(), "left a temporary behind: {stray:?}");
+    }
+
+    stop_wirkd(&estate, wirkd_child);
+}

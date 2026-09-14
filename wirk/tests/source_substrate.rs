@@ -1675,10 +1675,18 @@ fn the_admitted_corpus_covers_code_docs_and_config_without_widening_exclusions()
         .as_str()
         .unwrap()
         .to_string();
+    // The identity names the current default edition, and says plainly
+    // what its units are: text chunks over a byte budget, plus the
+    // document reader's own name for the resources it converts — never a
+    // claim to know syntax. This literal moves with the default edition,
+    // and moving it is the deliberate act of changing what a generation
+    // records about how it was made.
     assert_eq!(
         acquired["generation"]["extractor_set"].as_str(),
-        Some("text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families/v4"),
-        "the identity must name the edition and say plainly that it is text line chunks, not syntax"
+        Some(
+            "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families+anydoc-0.2.4-detected-documents/v6"
+        ),
+        "the identity must name the edition and say plainly that it is text chunks, not syntax"
     );
     let (ok, _, err) = atlas(
         &estate,
@@ -1735,12 +1743,24 @@ fn the_admitted_corpus_covers_code_docs_and_config_without_widening_exclusions()
             "{excluded} must stay excluded: widening the vocabulary must not widen disclosure"
         );
     }
-    for data_language in ["data/blob.json", "data/rows.csv"] {
-        assert!(
-            !all.contains(&data_language.to_string()),
-            "{data_language} is a reference data language no content type claims"
-        );
-    }
+    // `.json` remains a reference data language no content type claims.
+    // `.csv` no longer belongs with it: the document reader admits it as
+    // `ContentFamily::Document` and renders it to a Markdown table, which
+    // is a deliberate widening of the *vocabulary*, not of disclosure —
+    // the excluded paths above are still excluded, and this file is
+    // reachable only under the family it was actually admitted as.
+    assert!(
+        !all.contains(&"data/blob.json".to_string()),
+        "data/blob.json is a reference data language no content type claims"
+    );
+    assert!(
+        paths_for(Some("document")).contains(&"data/rows.csv".to_string()),
+        "a CSV is admitted through the document reader, under the document family"
+    );
+    assert!(
+        !paths_for(Some("code")).contains(&"data/rows.csv".to_string()),
+        "and under no other family"
+    );
 
     // Exact byte/path/span provenance on a newly admitted file: the hit's
     // own coordinate must resolve to the exact bytes the real committed

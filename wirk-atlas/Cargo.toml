@@ -16,6 +16,18 @@ libc = "0.2.189"
 # equivalent for. Pinned exact: raised deliberately, never silently.
 # Already in this workspace's lock at this version.
 rustix = { version = "=1.1.4", features = ["fs"] }
+# Whole native Office/PDF/CSV-to-Markdown reader, R5:0264/0293. Verified
+# 2026-09-14 as still crates.io's and GitHub's latest stable (0.2.4,
+# released 2026-08-27) before adoption; pinned exact per ruling 0031 so a
+# later release is only ever picked up deliberately. See
+# knowledge/evidence/p5-document-reader-reuse-2026-09-13.md for the prior
+# research and knowledge/work/p5-document-formats/ for this increment's
+# tests.
+anydoc = "=0.2.4"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Test-only: builds a small source-known XLSX fixture (non-A1 origin,
+# text repeated across sheets) for `document_formats.rs`. Already in
+# this workspace's lock, pulled in transitively by `anydoc`.
+zip = "8.6.0"

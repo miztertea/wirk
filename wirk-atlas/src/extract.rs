@@ -15,6 +15,14 @@ const UNITIZER_ID: &str = "utf8-line-chunks-65536/v1";
 /// lines. A line that alone exceeds the budget still splits exactly as
 /// `v1` did. See `W4-EXTRACTOR-MULTILINE.md`.
 const MULTILINE_UNITIZER_ID: &str = "utf8-multiline-chunks-65536/v1";
+/// Edition v5's document unitizer: the same byte-budget chunker
+/// `MULTILINE_UNITIZER_ID` names, applied to the Markdown `anydoc` 0.2.4
+/// renders from an Office/PDF/CSV file rather than to the file's own
+/// bytes. Distinct from `MULTILINE_UNITIZER_ID` on purpose — a reader
+/// must be able to tell from this id alone that a unit's offsets index
+/// converted Markdown, not the original document
+/// (`ContentFamily::Document`'s own doc comment carries the rest).
+const DOCUMENT_MARKDOWN_UNITIZER_ID: &str = "anydoc-0.2.4-markdown+utf8-multiline-chunks-65536/v1";
 
 /// The content-family vocabulary of edition v3, derived mechanically from
 /// the installed `semble` 0.5.2's own
@@ -404,6 +412,22 @@ fn path_suffix_lowercase(path: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&name[dot..]).to_ascii_lowercase())
 }
 
+/// Whether `path`'s extension names one of the plain-text content
+/// families (`Code`/`Knowledge`/`Config`). `crate::document` asks this to
+/// decide whether a resource's bytes may be sniffed at all: a path the
+/// text vocabulary already claims is read as text, and nothing about its
+/// content changes that. That is what keeps ordinary Markdown and code
+/// interpretation intact, and what keeps a byte-identical CSV/Markdown
+/// pair two different readings of one blob.
+pub(crate) fn path_names_text_family(path: &[u8]) -> bool {
+    let Some(suffix) = path_suffix_lowercase(path) else {
+        return false;
+    };
+    EXTENSION_FAMILY
+        .binary_search_by_key(&suffix.as_str(), |(ext, _)| ext)
+        .is_ok()
+}
+
 /// Which extraction edition produced (or must validate) a generation.
 ///
 /// P3 W3 extractor completion (`W3-EXTRACTOR-COMPLETION.md`, under
@@ -445,6 +469,26 @@ pub enum ExtractorEdition {
     /// multi-line unit's `line_start`..`line_end` names exactly the
     /// lines it packs.
     ContentFamiliesV4,
+    /// Same text vocabulary and chunking as `v4`, plus
+    /// `ContentFamily::Document` for every extension
+    /// `crate::document::format_for_path` admits. A document's bytes never
+    /// reach the plain-text unitizer directly; `ExtractorPolicy::units`
+    /// routes them through `crate::document::render` first, then chunks
+    /// the resulting Markdown exactly as `v4` chunks any other text, under
+    /// `DOCUMENT_MARKDOWN_UNITIZER_ID` rather than `v4`'s. Historical:
+    /// admission here is decided from the path's extension alone, so a
+    /// document carrying no recognized extension is never opened.
+    DocumentsAnyDocV5,
+    /// Current. Same vocabulary, chunking and document rendering as `v5`,
+    /// with admission decided by `crate::document::resolved_format` rather
+    /// than by the extension alone: a path neither vocabulary recognizes
+    /// is screened on a bounded prefix
+    /// (`crate::document::could_be_document`, `SNIFF_BYTES`) and admitted
+    /// as `Document` only when `anydoc`'s own detector confirms it. An
+    /// extensionless or deliberately mislabeled document is read for what
+    /// it is; a path the text vocabulary already claims is still read as
+    /// text, and an excluded path is still never opened.
+    DocumentsDetectedV6,
 }
 
 impl ExtractorEdition {
@@ -458,6 +502,12 @@ impl ExtractorEdition {
             Self::ContentFamiliesV4 => {
                 "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families/v4"
             }
+            Self::DocumentsAnyDocV5 => {
+                "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families+anydoc-0.2.4-documents/v5"
+            }
+            Self::DocumentsDetectedV6 => {
+                "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families+anydoc-0.2.4-detected-documents/v6"
+            }
         }
     }
     /// The inverse of `id`, for validating a generation against the
@@ -470,11 +520,34 @@ impl ExtractorEdition {
             Self::MarkdownOnlyV2,
             Self::ContentFamiliesV3,
             Self::ContentFamiliesV4,
+            Self::DocumentsAnyDocV5,
+            Self::DocumentsDetectedV6,
         ]
         .into_iter()
         .find(|edition| edition.id() == id)
     }
-    pub(crate) fn family(self, path: &[u8]) -> Option<ContentFamily> {
+    /// What this edition can decide about `path` **before any byte of it
+    /// is read**. The first gate on every ingestion path, and the reason
+    /// widening admission does not widen what gets opened: a path this
+    /// answers `No` for is reported `Unsupported` without a read, exactly
+    /// as it always was.
+    pub(crate) fn admission(self, path: &[u8]) -> PathAdmission {
+        if let Some(family) = self.path_family(path) {
+            return PathAdmission::Family(family);
+        }
+        match self {
+            // Only the detecting edition is willing to look further than
+            // the name. Every historical edition keeps reading exactly the
+            // paths it always did, so a generation staged under one still
+            // re-verifies byte for byte.
+            Self::DocumentsDetectedV6 => PathAdmission::Candidate,
+            _ => PathAdmission::No,
+        }
+    }
+
+    /// The family `path`'s extension names on its own, or `None` when the
+    /// name settles nothing. Never sniffs.
+    fn path_family(self, path: &[u8]) -> Option<ContentFamily> {
         match self {
             Self::RustMarkdownV2 => {
                 if path.ends_with(b".md") {
@@ -499,14 +572,45 @@ impl ExtractorEdition {
                     .ok()
                     .map(|index| EXTENSION_FAMILY[index].1)
             }
+            Self::DocumentsAnyDocV5 | Self::DocumentsDetectedV6 => {
+                if crate::document::format_for_path(path).is_some() {
+                    return Some(ContentFamily::Document);
+                }
+                let suffix = path_suffix_lowercase(path)?;
+                EXTENSION_FAMILY
+                    .binary_search_by_key(&suffix.as_str(), |(ext, _)| ext)
+                    .ok()
+                    .map(|index| EXTENSION_FAMILY[index].1)
+            }
+        }
+    }
+    /// The family a resource is actually recorded under, decided from its
+    /// name and — for the detecting edition, and only where the name
+    /// settles nothing — its bytes. Every consumer that has the bytes in
+    /// hand asks this rather than `path_family`, so capture, extraction,
+    /// publish re-verification and the binary-blob screen all agree on one
+    /// answer for one resource.
+    pub(crate) fn family(self, path: &[u8], bytes: &[u8]) -> Option<ContentFamily> {
+        if let Some(family) = self.path_family(path) {
+            return Some(family);
+        }
+        match self {
+            Self::DocumentsDetectedV6 => {
+                crate::document::resolved_format(path, bytes).map(|_| ContentFamily::Document)
+            }
+            _ => None,
         }
     }
     /// Whether this edition packs consecutive short lines into one unit
-    /// (`v4`) or bounds each unit to exactly one line (`v2`/`v3`,
-    /// historical). Governs both the unitizer id units are stamped with
-    /// and the chunking algorithm `ExtractorPolicy::units` runs.
+    /// (`v4`/`v5`/`v6`) or bounds each unit to exactly one line
+    /// (`v2`/`v3`, historical). Governs both the unitizer id units are
+    /// stamped with and the chunking algorithm `ExtractorPolicy::units`
+    /// runs.
     pub(crate) fn multiline(self) -> bool {
-        matches!(self, Self::ContentFamiliesV4)
+        matches!(
+            self,
+            Self::ContentFamiliesV4 | Self::DocumentsAnyDocV5 | Self::DocumentsDetectedV6
+        )
     }
     pub(crate) fn unitizer_id(self) -> &'static str {
         if self.multiline() {
@@ -515,6 +619,61 @@ impl ExtractorEdition {
             UNITIZER_ID
         }
     }
+    /// The `anydoc::Format` this edition reads a resource through, or
+    /// `None` to fall through to the plain-text extractor. `v5` decides
+    /// from the extension alone; `v6` defers to
+    /// `crate::document::resolved_format`, which lets content override a
+    /// misleading name and admit a document whose name says nothing.
+    /// Every pre-document edition keeps reading exactly the paths it
+    /// always did.
+    pub(crate) fn document_format(self, path: &[u8], bytes: &[u8]) -> Option<anydoc::Format> {
+        match self {
+            Self::DocumentsAnyDocV5 => crate::document::format_for_path(path),
+            Self::DocumentsDetectedV6 => crate::document::resolved_format(path, bytes),
+            _ => None,
+        }
+    }
+    /// The `(family, unitizer)` pair a recorded resource must carry under
+    /// this edition, decided from its path alone, or `None` for a path
+    /// this edition admits nothing at.
+    ///
+    /// This is what `validate_generation` checks a staged manifest
+    /// against, and it is deliberately bytes-free: validation re-derives
+    /// identity from the record, never from a second read of a source that
+    /// may have moved on. Where the name settles the family, that family
+    /// and its unitizer are the only admissible answer. Where the name
+    /// settles nothing, the only way this edition admits a resource at all
+    /// is by detecting a document in its content, so `Document` under the
+    /// document unitizer is again the only admissible answer — a manifest
+    /// claiming any other family for such a path is inconsistent with the
+    /// edition it names, whatever the source now holds.
+    pub(crate) fn recorded_shape(self, path: &[u8]) -> Option<(ContentFamily, &'static str)> {
+        match self.admission(path) {
+            PathAdmission::Family(ContentFamily::Document) => {
+                Some((ContentFamily::Document, DOCUMENT_MARKDOWN_UNITIZER_ID))
+            }
+            PathAdmission::Family(family) => Some((family, self.unitizer_id())),
+            PathAdmission::Candidate => {
+                Some((ContentFamily::Document, DOCUMENT_MARKDOWN_UNITIZER_ID))
+            }
+            PathAdmission::No => None,
+        }
+    }
+}
+
+/// What a path alone settles about admission, before anything is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathAdmission {
+    /// The name decides: this family, no sniff.
+    Family(ContentFamily),
+    /// The name decides nothing. A bounded prefix
+    /// (`crate::document::SNIFF_BYTES`) may be read and screened
+    /// (`crate::document::could_be_document`); only if `anydoc`'s own
+    /// detector then recognizes the content is this admitted, as
+    /// `ContentFamily::Document`.
+    Candidate,
+    /// Not admitted, and not opened.
+    No,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,7 +683,7 @@ pub struct ExtractorPolicy {
 impl Default for ExtractorPolicy {
     fn default() -> Self {
         Self {
-            edition: ExtractorEdition::ContentFamiliesV4,
+            edition: ExtractorEdition::DocumentsDetectedV6,
         }
     }
 }
@@ -550,6 +709,15 @@ impl ExtractorPolicy {
             edition: ExtractorEdition::ContentFamiliesV3,
         }
     }
+    /// The historical `v4` edition (multiline text chunking, no document
+    /// admission), kept constructible so a test can stage it on purpose
+    /// and prove it still validates and resolves under the current
+    /// binary alongside `v5`.
+    pub fn content_families_v4() -> Self {
+        Self {
+            edition: ExtractorEdition::ContentFamiliesV4,
+        }
+    }
     pub(crate) fn id(&self) -> &str {
         self.edition.id()
     }
@@ -566,11 +734,20 @@ impl ExtractorPolicy {
     pub(crate) fn from_id(id: &str) -> Option<Self> {
         ExtractorEdition::from_id(id).map(|edition| Self { edition })
     }
-    pub(crate) fn supports(&self, path: &[u8]) -> bool {
-        self.family(path).is_some()
+    /// The historical `v5` edition (documents admitted by extension
+    /// alone), kept constructible so a test can stage it on purpose and
+    /// prove it still validates and resolves under the current binary
+    /// alongside `v6`.
+    pub fn documents_anydoc_v5() -> Self {
+        Self {
+            edition: ExtractorEdition::DocumentsAnyDocV5,
+        }
     }
-    pub(crate) fn family(&self, path: &[u8]) -> Option<ContentFamily> {
-        self.edition.family(path)
+    pub(crate) fn admission(&self, path: &[u8]) -> PathAdmission {
+        self.edition.admission(path)
+    }
+    pub(crate) fn family(&self, path: &[u8], bytes: &[u8]) -> Option<ContentFamily> {
+        self.edition.family(path, bytes)
     }
     pub(crate) fn excluded(path: &[u8]) -> bool {
         path.split(|b| *b == b'/')
@@ -584,79 +761,87 @@ impl ExtractorPolicy {
         path: &[u8],
         object_id: &str,
         bytes: &[u8],
-    ) -> Result<Vec<TextUnit>, &'static str> {
+    ) -> Result<Vec<TextUnit>, String> {
+        if let Some(format) = self.edition.document_format(path, bytes) {
+            return self.document_units(generation, path, object_id, bytes, format);
+        }
         if bytes.len() > MAX_TEXT_BYTES {
-            return Err("text blob exceeds bounded extractor size");
+            return Err("text blob exceeds bounded extractor size".to_string());
         }
         let text = std::str::from_utf8(bytes).map_err(|_| "text blob is not valid UTF-8")?;
         let family = self
-            .family(path)
+            .family(path, bytes)
             .ok_or("path has no configured content family")?;
-        let unitizer = self.edition.unitizer_id();
-        let mut lines: Vec<(usize, usize, u64)> = Vec::new();
-        let mut start = 0usize;
-        let mut line = 1u64;
-        for (index, byte) in bytes.iter().enumerate() {
-            if *byte == b'\n' {
-                lines.push((start, index + 1, line));
-                start = index + 1;
-                line += 1;
-            }
+        chunk_units(
+            generation,
+            path,
+            object_id,
+            bytes,
+            text,
+            family,
+            self.edition.unitizer_id(),
+            self.edition.multiline(),
+        )
+    }
+    /// The `Document`-family counterpart of `units`: an admitted
+    /// Office/PDF/CSV/OpenDocument/RTF/EPUB file's bytes never reach
+    /// `chunk_units` themselves. They are first rendered to Markdown
+    /// through `crate::document::render` — a scanned/malformed/
+    /// encrypted input surfaces here as a truthful `Err`, the same
+    /// `CoverageDisposition::Error` path a text-extraction failure
+    /// already takes, never as an empty success — and only that
+    /// Markdown is chunked, under `DOCUMENT_MARKDOWN_UNITIZER_ID` so a
+    /// reader can tell from the unitizer id alone that offsets index
+    /// converted text, not the original file
+    /// (`ContentFamily::Document`'s doc comment).
+    ///
+    /// Deliberately no raw-byte size gate ahead of conversion. The
+    /// original container's size is already bounded upstream, before
+    /// this ever runs, by the estate's own configurable
+    /// `document_max_file_bytes`/`document_max_total_bytes`
+    /// (`wirk_core::jobs::ResourcePolicy`, `doctree::CaptureLimits`) —
+    /// re-imposing a second, smaller, hard-coded ceiling on the same
+    /// raw bytes here double-charged that bound and, for a container
+    /// format (Office/OpenDocument/EPUB/PDF), charged it against the
+    /// wrong thing: those formats' raw bytes include compressed
+    /// embedded media that has nothing to do with how much text comes
+    /// out. A modest-text Office file with one ordinary embedded image
+    /// can comfortably exceed `MAX_TEXT_BYTES` in raw container bytes
+    /// while converting to a few hundred bytes of Markdown; gating on
+    /// the raw side would refuse it for a reason that never applied to
+    /// its actual content. `MAX_TEXT_BYTES` below, checked against the
+    /// *converted* Markdown, is the real rendered-context budget: how
+    /// much text this reader is willing to hand the index for one
+    /// document, independent of how large or media-heavy the source
+    /// container was. A hostile container (deep nesting, decompression
+    /// bombs, runaway entry counts) is still caught before it reaches
+    /// that check — by `anydoc`'s own `ConvertError::ResourceLimit`
+    /// inside `render`, native to the dependency and exercised by the
+    /// corpus's `06-hostile-entry-expansion.docx`/
+    /// `17-pptx-hostile-entry-expansion.pptx` fixtures — not by a raw
+    /// byte count this reader would otherwise have to guess at.
+    fn document_units(
+        &self,
+        generation: &GenerationId,
+        path: &[u8],
+        object_id: &str,
+        bytes: &[u8],
+        format: anydoc::Format,
+    ) -> Result<Vec<TextUnit>, String> {
+        let markdown = crate::document::render(format, bytes)?;
+        if markdown.len() > MAX_TEXT_BYTES {
+            return Err("converted document text exceeds bounded extractor size".to_string());
         }
-        if start < bytes.len() || bytes.is_empty() {
-            lines.push((start, bytes.len(), line));
-        }
-        let mut units = Vec::new();
-        if self.edition.multiline() {
-            let mut chunk: Option<(usize, u64, usize, u64)> = None; // (byte_start, line_start, byte_end, line_end)
-            for (line_start, line_end, line_no) in lines {
-                if line_end - line_start > MAX_UNIT_BYTES {
-                    if let Some((cs, csl, ce, cel)) = chunk.take() {
-                        push_unit(
-                            &mut units, generation, path, object_id, family, unitizer, cs, ce, csl,
-                            cel,
-                        )?;
-                    }
-                    push_line_chunks(
-                        &mut units, text, line_start, line_end, line_no, generation, path,
-                        object_id, family, unitizer,
-                    )?;
-                    continue;
-                }
-                chunk = Some(match chunk {
-                    None => (line_start, line_no, line_end, line_no),
-                    Some((cs, csl, _, _)) if line_end - cs > MAX_UNIT_BYTES => {
-                        push_unit(
-                            &mut units,
-                            generation,
-                            path,
-                            object_id,
-                            family,
-                            unitizer,
-                            cs,
-                            line_start,
-                            csl,
-                            line_no - 1,
-                        )?;
-                        (line_start, line_no, line_end, line_no)
-                    }
-                    Some((cs, csl, _, _)) => (cs, csl, line_end, line_no),
-                });
-            }
-            if let Some((cs, csl, ce, cel)) = chunk {
-                push_unit(
-                    &mut units, generation, path, object_id, family, unitizer, cs, ce, csl, cel,
-                )?;
-            }
-        } else {
-            for (line_start, line_end, line_no) in lines {
-                push_line_chunks(
-                    &mut units, text, line_start, line_end, line_no, generation, path, object_id,
-                    family, unitizer,
-                )?;
-            }
-        }
-        Ok(units)
+        chunk_units(
+            generation,
+            path,
+            object_id,
+            markdown.as_bytes(),
+            &markdown,
+            ContentFamily::Document,
+            DOCUMENT_MARKDOWN_UNITIZER_ID,
+            true,
+        )
     }
     /// `acquisition_policy` is folded into the identity as an explicit
     /// parameter, so a generation binds the policy it was acquired
@@ -706,6 +891,10 @@ impl ExtractorPolicy {
                 // New in edition v3. A distinct tag, so a `config` unit
                 // can never collide with a `code`/`knowledge` unit id.
                 ContentFamily::Config => b"config".as_slice(),
+                // New in edition v5. A distinct tag, so a `document`
+                // unit (offsets into converted Markdown) can never
+                // collide with a unit of any other family.
+                ContentFamily::Document => b"document".as_slice(),
             },
             byte_start.to_string().as_bytes(),
             byte_end.to_string().as_bytes(),
@@ -716,6 +905,90 @@ impl ExtractorPolicy {
         }
         UnitId(format!("u-{}", hex(&h.finalize())))
     }
+}
+
+/// Shared by the plain-text path (`ExtractorPolicy::units`) and the
+/// document path (`ExtractorPolicy::document_units`): splits `text` into
+/// lines over `bytes`, then either packs consecutive short lines into
+/// one unit up to `MAX_UNIT_BYTES` (`multiline`) or bounds each unit to
+/// exactly one line, tagging every resulting unit with `family` and
+/// `unitizer`. `bytes` and `text` must be the same content — `bytes` for
+/// the line/offset arithmetic, `text` because line-splitting a mid-line
+/// chunk has to stay on a UTF-8 boundary.
+#[allow(clippy::too_many_arguments)]
+fn chunk_units(
+    generation: &GenerationId,
+    path: &[u8],
+    object_id: &str,
+    bytes: &[u8],
+    text: &str,
+    family: ContentFamily,
+    unitizer: &str,
+    multiline: bool,
+) -> Result<Vec<TextUnit>, String> {
+    let mut lines: Vec<(usize, usize, u64)> = Vec::new();
+    let mut start = 0usize;
+    let mut line = 1u64;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            lines.push((start, index + 1, line));
+            start = index + 1;
+            line += 1;
+        }
+    }
+    if start < bytes.len() || bytes.is_empty() {
+        lines.push((start, bytes.len(), line));
+    }
+    let mut units = Vec::new();
+    if multiline {
+        let mut chunk: Option<(usize, u64, usize, u64)> = None; // (byte_start, line_start, byte_end, line_end)
+        for (line_start, line_end, line_no) in lines {
+            if line_end - line_start > MAX_UNIT_BYTES {
+                if let Some((cs, csl, ce, cel)) = chunk.take() {
+                    push_unit(
+                        &mut units, generation, path, object_id, family, unitizer, cs, ce, csl, cel,
+                    )?;
+                }
+                push_line_chunks(
+                    &mut units, text, line_start, line_end, line_no, generation, path, object_id,
+                    family, unitizer,
+                )?;
+                continue;
+            }
+            chunk = Some(match chunk {
+                None => (line_start, line_no, line_end, line_no),
+                Some((cs, csl, _, _)) if line_end - cs > MAX_UNIT_BYTES => {
+                    push_unit(
+                        &mut units,
+                        generation,
+                        path,
+                        object_id,
+                        family,
+                        unitizer,
+                        cs,
+                        line_start,
+                        csl,
+                        line_no - 1,
+                    )?;
+                    (line_start, line_no, line_end, line_no)
+                }
+                Some((cs, csl, _, _)) => (cs, csl, line_end, line_no),
+            });
+        }
+        if let Some((cs, csl, ce, cel)) = chunk {
+            push_unit(
+                &mut units, generation, path, object_id, family, unitizer, cs, ce, csl, cel,
+            )?;
+        }
+    } else {
+        for (line_start, line_end, line_no) in lines {
+            push_line_chunks(
+                &mut units, text, line_start, line_end, line_no, generation, path, object_id,
+                family, unitizer,
+            )?;
+        }
+    }
+    Ok(units)
 }
 
 #[allow(clippy::too_many_arguments)]

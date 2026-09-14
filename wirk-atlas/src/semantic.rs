@@ -497,17 +497,40 @@ pub struct BackendIdentity {
 }
 
 /// Where the embedded text came from, in the product's own terms: the
-/// extraction edition and unitizer the *generation* already committed to.
+/// extraction edition and unitizers the *generation* already committed to.
 /// The product never re-chunks; a different chunking is a different
 /// generation, which is a different edition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkerIdentity {
     pub extractor_set: String,
-    pub unitizer: String,
+    /// Every unitizer this edition's resources were cut by, sorted and
+    /// deduplicated — not one, because one generation legitimately holds
+    /// more than one.
+    ///
+    /// An extraction edition admitting documents stamps a document's units
+    /// with `anydoc-…-markdown+utf8-multiline-chunks-65536/v1`, because
+    /// their offsets index converted Markdown, and an ordinary text or
+    /// code resource's units with `utf8-multiline-chunks-65536/v1`,
+    /// because theirs index the file itself. A collection of documents
+    /// *and* notes carries both, and an edition over it has to say both:
+    /// a single name would be a false claim about half its own rows.
+    /// The per-row provenance is unchanged and remains exact — every
+    /// mapping row names the unit or unit run it covers, and that unit
+    /// carries its own unitizer in the generation.
+    ///
+    /// Read from a record written as a single string (`"unitizer": "…"`,
+    /// every edition built before this correction) as a one-element list,
+    /// which is exactly what such a record says.
+    #[serde(
+        rename = "unitizers",
+        alias = "unitizer",
+        deserialize_with = "one_or_many_unitizers"
+    )]
+    pub unitizers: Vec<String>,
     /// The chunker that actually produced this edition's rows, and the
     /// silent inputs that determine its output.
     ///
-    /// `extractor_set`/`unitizer` above describe the *generation*: what
+    /// `extractor_set`/`unitizers` above describe the *generation*: what
     /// W3 committed. They do not determine a semantic row, because a
     /// semantic edition may group those units differently. Absent on
     /// every edition built before native chunking existed, which is
@@ -515,6 +538,28 @@ pub struct ChunkerIdentity {
     /// are the generation's units" and stays readable as that.
     #[serde(default)]
     pub chunks: Option<NativeChunkerIdentity>,
+}
+
+/// Read [`ChunkerIdentity::unitizers`] from either shape a record on disk
+/// can legitimately carry: the single string every edition written before
+/// mixed generations were buildable used, or the list written since. A
+/// string reads as the one-element list it means, so such a record keeps
+/// its own identity (`EditionId::compute` absorbs it exactly as it always
+/// did) instead of being declared unreadable by a scheme it predates.
+fn one_or_many_unitizers<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(single) => vec![single],
+        OneOrMany::Many(list) => list,
+    })
 }
 
 /// The installed chunker as it actually is, not as a name.
@@ -940,6 +985,34 @@ pub const IDENTITY_V4: &str = "wirk-semantic-edition/v4";
 /// stays labelled as that, and no historical edition gains coverage it
 /// never had.
 pub const IDENTITY_V5: &str = "wirk-semantic-edition/v5";
+/// `v6` binds *every* unitizer the edition's generation committed to,
+/// rather than one. `v1`..`v5` absorbed a single name, which was accurate
+/// only while a generation could hold exactly one — a documents-and-notes
+/// collection holds two, and the single name would have had to be either a
+/// false claim about half the rows or a refusal to build at all. Absorbing
+/// the sorted list, with its length, keeps two editions distinct when they
+/// were cut by different sets. As with every previous bump nothing is
+/// recomputed: a `v5` record absorbs its own single name under `v5` and
+/// keeps the id it was written with.
+///
+/// Pre-release development, and deliberately not a migration: an edition
+/// built before this bump keeps its identity and stays readable, and no
+/// promise is made that a new build over the same generation reproduces an
+/// old edition's id.
+pub const IDENTITY_V6: &str = "wirk-semantic-edition/v6";
+
+/// Whether `identity` is a scheme that absorbs the `v4` additions — the
+/// retrieval representation, the chunker that produced the rows and the
+/// coverage they claim. Every scheme from `v4` on does.
+fn absorbs_v4_additions(identity: &str) -> bool {
+    matches!(identity, IDENTITY_V4 | IDENTITY_V5 | IDENTITY_V6)
+}
+
+/// Whether `identity` is a scheme that absorbs the grammar libraries `v5`
+/// introduced. Every scheme from `v5` on does.
+fn scheme_absorbs_grammar_libraries(identity: &str) -> bool {
+    matches!(identity, IDENTITY_V5 | IDENTITY_V6)
+}
 
 fn identity_v1() -> String {
     IDENTITY_V1.to_owned()
@@ -1467,7 +1540,7 @@ impl EditionId {
     /// keeps the `v1` computation, so an edition built before the
     /// correction still reads back with its own id intact rather than
     /// being declared forged by a scheme it predates. This product only
-    /// ever *writes* `v2`.
+    /// ever *writes* the newest scheme, `IDENTITY_V6`.
     fn compute(edition: &SemanticEdition) -> Self {
         let mut hasher = Sha256::new();
         absorb(&mut hasher, edition.identity.as_bytes());
@@ -1480,7 +1553,37 @@ impl EditionId {
             edition.generation_content.as_bytes(),
             edition.acquisition_policy.as_bytes(),
             edition.chunker.extractor_set.as_bytes(),
-            edition.chunker.unitizer.as_bytes(),
+        ] {
+            absorb(&mut hasher, part);
+        }
+        // The unitizers, in this scheme's own shape and in the position
+        // the single name always occupied. A `v1`..`v5` record absorbs
+        // exactly the one string it was written with — one element, or the
+        // empty string a generation with no unit ever produced — so its id
+        // is unchanged. `v6` absorbs the count and then each name, so a
+        // one-element list can never collide with the single-name form and
+        // two editions cut by different sets stay distinct.
+        if edition.identity == IDENTITY_V6 {
+            absorb(
+                &mut hasher,
+                &(edition.chunker.unitizers.len() as u64).to_be_bytes(),
+            );
+            for unitizer in &edition.chunker.unitizers {
+                absorb(&mut hasher, unitizer.as_bytes());
+            }
+        } else {
+            absorb(
+                &mut hasher,
+                edition
+                    .chunker
+                    .unitizers
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+        }
+        for part in [
             edition.model.consumed.canonical.as_bytes(),
             edition.model.consumed.digest.as_bytes(),
             edition.model.reported_path.as_bytes(),
@@ -1536,7 +1639,7 @@ impl EditionId {
                 }
             }
         }
-        if edition.identity == IDENTITY_V4 || edition.identity == IDENTITY_V5 {
+        if absorbs_v4_additions(&edition.identity) {
             // The retrieval representation, the chunker that produced the
             // rows and the coverage they honestly claim. Absorbed only
             // under the scheme that declares them, so no earlier record's
@@ -1565,7 +1668,7 @@ impl EditionId {
                         absorb(&mut hasher, file.canonical.as_bytes());
                         absorb(&mut hasher, file.digest.as_bytes());
                     }
-                    if edition.identity == IDENTITY_V5 {
+                    if scheme_absorbs_grammar_libraries(&edition.identity) {
                         // Only under the scheme that declares it, so no
                         // `v4` id moves and no earlier edition is
                         // retroactively said to have covered a grammar.
@@ -2883,7 +2986,7 @@ impl crate::AtlasStore {
             }
         }
 
-        let (inputs, unitizer) = match self.collect_inputs(membership, &generation)? {
+        let (inputs, unitizers) = match self.collect_inputs(membership, &generation)? {
             Ok(collected) => collected,
             Err(reason) => return Ok(SemanticBuildOutcome::Refused(reason)),
         };
@@ -2907,7 +3010,7 @@ impl crate::AtlasStore {
             arguments,
             argv,
             inputs,
-            unitizer,
+            unitizers,
             &staging,
         );
         match outcome {
@@ -2953,7 +3056,7 @@ impl crate::AtlasStore {
         arguments: Vec<ConfiguredPath>,
         argv: Vec<BackendArgument>,
         inputs: Vec<BuildInput>,
-        unitizer: String,
+        unitizers: Vec<String>,
         staging: &Path,
     ) -> Result<SemanticBuildOutcome, AtlasError> {
         let vectors_path = staging.join(VECTORS_FILE);
@@ -3232,7 +3335,7 @@ impl crate::AtlasStore {
 
         let mut edition = SemanticEdition {
             id: EditionId(String::new()),
-            identity: IDENTITY_V5.into(),
+            identity: IDENTITY_V6.into(),
             estate: membership.estate.clone(),
             membership: membership.id.clone(),
             source: membership.source.clone(),
@@ -3242,7 +3345,7 @@ impl crate::AtlasStore {
             acquisition_policy: generation.acquisition_policy.clone(),
             chunker: ChunkerIdentity {
                 extractor_set: generation.extractor_set.clone(),
-                unitizer,
+                unitizers,
                 chunks: chunker_identity.clone(),
             },
             model: ModelIdentity {
@@ -3307,10 +3410,16 @@ impl crate::AtlasStore {
         &self,
         membership: &Membership,
         generation: &SourceGeneration,
-    ) -> Result<Result<(Vec<BuildInput>, String), String>, AtlasError> {
+    ) -> Result<Result<(Vec<BuildInput>, Vec<String>), String>, AtlasError> {
         let mut inputs = Vec::new();
-        let mut unitizer: Option<String> = None;
-        let mut blob_cache: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut unitizers: BTreeSet<String> = BTreeSet::new();
+        // Keyed by `document::resource_key`, not by object id alone, for
+        // the reason that function states: one raw byte string can back
+        // two resources that hydrate to two different strings — a CSV and
+        // a byte-identical Markdown twin, say — and a cache keyed by
+        // object id holds only one of them, silently embedding the other's
+        // rows from the wrong text.
+        let mut blob_cache: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for resource in &generation.resources {
             if resource.disposition != crate::CoverageDisposition::Indexed {
                 continue;
@@ -3321,17 +3430,20 @@ impl crate::AtlasStore {
                     String::from_utf8_lossy(&resource.path)
                 )));
             };
-            let bytes = match blob_cache.get(&object_id) {
+            let cache_key = crate::document::resource_key(&resource.path, &object_id);
+            let bytes = match blob_cache.get(&cache_key) {
                 Some(bytes) => bytes.clone(),
                 None => match crate::hydrate::blob(
                     &generation.acquisition_policy,
                     Path::new(&membership.locator),
+                    self.root(),
+                    &generation.id,
                     &resource.path,
                     &object_id,
                     &self.capture_limits(),
                 ) {
                     Ok(bytes) => {
-                        blob_cache.insert(object_id.clone(), bytes.clone());
+                        blob_cache.insert(cache_key, bytes.clone());
                         bytes
                     }
                     Err(AtlasError::SourceBytesUnavailable(detail)) => {
@@ -3343,17 +3455,14 @@ impl crate::AtlasStore {
                     Err(error) => return Err(error),
                 },
             };
+            // Every unitizer present is recorded, not reduced to one. A
+            // generation holding both documents and ordinary text is
+            // ordinary — a collection of reports and the notes about them
+            // is exactly the estate this reads — and each resource is
+            // embedded from its own hydrated bytes under its own units, so
+            // there is nothing here for a single name to be true of.
             for unit in &resource.units {
-                match unitizer.as_deref() {
-                    None => unitizer = Some(unit.unitizer.clone()),
-                    Some(seen) if seen == unit.unitizer => {}
-                    Some(seen) => {
-                        return Ok(Err(format!(
-                            "generation mixes unitizers {seen} and {}",
-                            unit.unitizer
-                        )));
-                    }
-                }
+                unitizers.insert(unit.unitizer.clone());
             }
             let Some(family) = resource.units.first().map(|unit| unit.family) else {
                 continue;
@@ -3368,8 +3477,7 @@ impl crate::AtlasStore {
                 units: resource.units.clone(),
             });
         }
-        let unitizer = unitizer.unwrap_or_default();
-        Ok(Ok((inputs, unitizer)))
+        Ok(Ok((inputs, unitizers.into_iter().collect())))
     }
 
     pub fn read_edition(&self, id: &EditionId) -> Result<SemanticEdition, AtlasError> {
@@ -3510,7 +3618,12 @@ impl crate::AtlasStore {
             Ok(bytes) => bytes,
             Err(error) => return Ok(SemanticVerification::Missing(error.to_string())),
         };
-        let mut blob_cache: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        // Keyed by `document::resource_key` for the same reason the build
+        // keys its own reads that way: two rows can name one object id and
+        // hydrate to different bytes, and checking the second row's
+        // recorded digest against the first row's rendering would either
+        // condemn a sound edition or pass a corrupt one.
+        let mut blob_cache: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         for line in mapping_bytes.split(|byte| *byte == b'\n') {
             if line.is_empty() {
                 continue;
@@ -3523,7 +3636,8 @@ impl crate::AtlasStore {
                     )));
                 }
             };
-            let bytes = match blob_cache.get(&row.object_id) {
+            let cache_key = crate::document::resource_key(&row.path, &row.object_id);
+            let bytes = match blob_cache.get(&cache_key) {
                 Some(bytes) => bytes.clone(),
                 // The edition records the policy its own generation was
                 // acquired under, so verification reads the rows back
@@ -3532,12 +3646,14 @@ impl crate::AtlasStore {
                 None => match crate::hydrate::blob(
                     &edition.acquisition_policy,
                     Path::new(&membership.locator),
+                    self.root(),
+                    &edition.generation,
                     &row.path,
                     &row.object_id,
                     &self.capture_limits(),
                 ) {
                     Ok(bytes) => {
-                        blob_cache.insert(row.object_id.clone(), bytes.clone());
+                        blob_cache.insert(cache_key, bytes.clone());
                         bytes
                     }
                     Err(AtlasError::SourceBytesUnavailable(detail)) => {

@@ -4,10 +4,12 @@
 
 mod admission;
 mod doctree;
+mod document;
 mod domain;
 mod extract;
 mod findings;
 mod git;
+mod http_source;
 mod hydrate;
 mod query;
 mod relationship;
@@ -33,6 +35,11 @@ pub use doctree::CURRENT_OBSERVATION as DOCUMENT_TREE_CURRENT_OBSERVATION;
 /// outside the crate that holds it, or the only way to test the race is
 /// to sleep and hope.
 pub use doctree::OPEN_WINDOW as DOCTREE_OPEN_WINDOW;
+/// The structured document reader: what one source actually holds, and
+/// the descriptor a caller selects one of its embedded assets by.
+pub use document::{
+    DocumentAsset, DocumentHeading, DocumentOutline, DocumentReading, DocumentTable, ResolvedAsset,
+};
 pub use domain::*;
 pub use extract::ExtractorPolicy;
 pub use findings::{
@@ -43,6 +50,12 @@ pub use findings::{
     UnaccountedFindingRow, atlas_directory_listing, backing_after_failed_index_write,
     unaccounted_finding_rows,
 };
+/// The HTTP(S) source acquisition policy label, parallel to
+/// `DOCUMENT_TREE_POLICY`.
+pub use http_source::ACQUISITION_POLICY as HTTP_SOURCE_POLICY;
+/// The only `--revision`/`requested_ref` spelling an HTTP source
+/// honours, parallel to `DOCUMENT_TREE_CURRENT_OBSERVATION`.
+pub use http_source::CURRENT_OBSERVATION as HTTP_SOURCE_CURRENT_OBSERVATION;
 pub use query::{
     AnswerBudget, AnswerCoverage, EvidenceHit, HitGenerationIdentity, PathLookupOutcome,
     PathLookupRequest, PinnedProducer, SearchAnswer, SearchRequest, SemanticRequest,
@@ -62,14 +75,14 @@ pub use semantic::{
     EMBED_PROTOCOL_V2, EMBEDDING_BATCH_POLICY, ENVIRONMENT_SCOPE_V2, EditionCoverage, EditionId,
     EditionState, EnvironmentCoverage, EnvironmentIdentity, GRAMMAR_SCOPE_V1, GrammarCoverage,
     GrammarLibraries, GrammarLibrary, IDENTITY_V1, IDENTITY_V2, IDENTITY_V3, IDENTITY_V4,
-    IDENTITY_V5, LEGACY_CANDIDATE_LIMIT, MAPPING_FILE, MappingManifest, MappingRow, ModelIdentity,
-    ModuleAttribution, ModuleIdentity, NativeChunkerIdentity, ProducerIdentity, QUERY_HASH_SEED,
-    QUERY_ORDERING_POLICY, QUERY_PRODUCER_BASIS_MEASURED, QUERY_PRODUCER_BASIS_MISSING,
-    QUERY_PRODUCER_SCHEME, QUERY_PRODUCER_SCOPE, QUERY_PROTOCOL, QueryProducerBasis,
-    QueryProducerPin, RANKING_PATH_CONVENTION, RETRIEVAL_SCHEME, RetrievalIdentity,
-    SemanticAvailability, SemanticBuildConfig, SemanticBuildOutcome, SemanticChunking,
-    SemanticEdition, SemanticVerification, TEXT_IDENTITY, TEXT_NORMALIZED, UnavailableEntry,
-    VECTOR_FORMAT, VECTORS_FILE, VectorManifest,
+    IDENTITY_V5, IDENTITY_V6, LEGACY_CANDIDATE_LIMIT, MAPPING_FILE, MappingManifest, MappingRow,
+    ModelIdentity, ModuleAttribution, ModuleIdentity, NativeChunkerIdentity, ProducerIdentity,
+    QUERY_HASH_SEED, QUERY_ORDERING_POLICY, QUERY_PRODUCER_BASIS_MEASURED,
+    QUERY_PRODUCER_BASIS_MISSING, QUERY_PRODUCER_SCHEME, QUERY_PRODUCER_SCOPE, QUERY_PROTOCOL,
+    QueryProducerBasis, QueryProducerPin, RANKING_PATH_CONVENTION, RETRIEVAL_SCHEME,
+    RetrievalIdentity, SemanticAvailability, SemanticBuildConfig, SemanticBuildOutcome,
+    SemanticChunking, SemanticEdition, SemanticVerification, TEXT_IDENTITY, TEXT_NORMALIZED,
+    UnavailableEntry, VECTOR_FORMAT, VECTORS_FILE, VectorManifest,
 };
 pub use store::{
     AcquireOutcome, AtlasLayout, AtlasStore, BARRIER_RELEASE_SOCKET, RemovalOutcome, atlas_layout,
