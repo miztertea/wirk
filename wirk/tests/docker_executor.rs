@@ -11,14 +11,16 @@
 //! (R6, a third test binary); `d5_10` needs no wirkd at all (a nonzero
 //! exit never reaches the claim path), unchanged.
 //!
-//! `wirk` has no `lib.rs` (bin-only): `wirkd` and `executors` are
-//! compiled into this test binary's own crate root via `#[path]`, the
-//! established move (`child_executor.rs`, R2).
+//! `wirkd` comes from `wirk`'s own library crate (`use wirk::wirkd`).
+//! `executors` stays compiled into this test binary's
+//! own crate root via `#[path]`, the established move
+//! (`child_executor.rs`, R2) — its own internal unit tests
+//! (`executor.rs`, singular, a different module) are never
+//! `#[path]`-included this way, so nothing there needed dedup.
 
 #[path = "../src/executors/mod.rs"]
 mod executors;
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::collections::BTreeMap;
 use std::fs;

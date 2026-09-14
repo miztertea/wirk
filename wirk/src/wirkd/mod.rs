@@ -34,13 +34,16 @@
 //! itself lives behind wirkd's own socket, not a handle that process
 //! holds.
 
-// `wirk/tests/wirkd_client.rs` compiles this module into its own crate
-// root via `#[path]` (not through `main.rs`) to unit-test the wire
-// types and the client directly; that test binary never calls into
-// `server`'s items, so its own dead-code analysis would otherwise flag
-// them there even though `main.rs` uses every one of them for real.
-// Allowed at the module level, not scattered per item (`#![...]`
-// cascades to `client`/`server` as this module's own descendants).
+// `wirkd` compiles once as part of `wirk`'s own library crate; every
+// consumer — `main.rs` and each test binary that needs it, including
+// `wirk/tests/wirkd_client.rs`, which calls only the wire types and
+// `client`, never `server` — links that single compiled copy (`use
+// wirk::wirkd;`) rather than getting its own. Not every `server`/
+// `client` item is exercised by every one of those consumers, so the
+// attribute stays at the module level rather than being narrowed or
+// removed. Allowed at the module level, not scattered per item
+// (`#![...]` cascades to `client`/`server` as this module's own
+// descendants).
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -1142,9 +1142,14 @@ fn managed_container_names() -> HashSet<String> {
 /// journal-walk shape `remove_owned_containers` already uses) so the
 /// unit test can feed it a throwaway `works/` directory with no daemon
 /// at all.
-pub(crate) fn open_deterministic_runs(
-    estate_root: &Path,
-) -> Vec<(WorkId, RunId, DeterministicWorld)> {
+///
+/// `pub`, not `pub(crate)`: `tests/docker_executor.rs`
+/// exercises this directly as `wirk::wirkd::server::open_deterministic_runs`
+/// from its own separate crate, now that `wirkd` lives in `wirk`'s
+/// library rather than being copied into that test binary's own crate
+/// root — `pub(crate)` there would scope visibility to the `wirk`
+/// library crate alone and refuse the test's build.
+pub fn open_deterministic_runs(estate_root: &Path) -> Vec<(WorkId, RunId, DeterministicWorld)> {
     let works_dir = estate_root.join("works");
     let Ok(entries) = std::fs::read_dir(&works_dir) else {
         return Vec::new();
@@ -1189,8 +1194,12 @@ pub(crate) fn open_deterministic_runs(
 
 /// One matched outcome for an open Deterministic Run against the
 /// daemon's own `io.wirk.managed` listing.
+///
+/// `pub`, not `pub(crate)`, same reason as
+/// `open_deterministic_runs`: named directly by
+/// `tests/docker_executor.rs` from outside the `wirk` library crate.
 #[derive(Debug)]
-pub(crate) enum RunMatch {
+pub enum RunMatch {
     /// `wirk-<run_id>` is still known to the daemon: re-adopt it.
     Reattach {
         work_id: WorkId,
@@ -1211,7 +1220,10 @@ pub(crate) enum RunMatch {
 /// test needs no daemon): one `RunMatch` per open Run, plus the names
 /// in `managed` matched to none of them — a labelled container whose
 /// Run is not open in any journal, left alone by the caller.
-pub(crate) fn match_docker_runs(
+///
+/// `pub`, not `pub(crate)`, same reason as
+/// `open_deterministic_runs`.
+pub fn match_docker_runs(
     open_runs: Vec<(WorkId, RunId, DeterministicWorld)>,
     managed: &HashSet<String>,
 ) -> (Vec<RunMatch>, Vec<String>) {

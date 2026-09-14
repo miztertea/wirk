@@ -30,13 +30,13 @@
 //!   marker and a substituted directory are still refused;
 //! * the estate root is not written to at all.
 //!
-//! `wirk` has no `lib.rs` (bin-only), so `wirkd` is compiled in via
-//! `#[path]`, the move every other test binary in this crate makes.
+//! `wirkd` comes from `wirk`'s own library crate (`use wirk::wirkd`),
+//! the same shared import every other test binary in this crate now
+//! uses.
 
 #[path = "support/nested_harness.rs"]
 mod harness;
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};

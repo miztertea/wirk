@@ -14,8 +14,7 @@
 //! --command`) whose `cwd` is a real git repo of its own, retried after
 //! the branch moves.
 
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};

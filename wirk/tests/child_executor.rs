@@ -13,19 +13,16 @@
 //! `submit_actor`/`wait_for_pointer` shape, duplicated for a
 //! Deterministic submit (R6: two submit helpers for two World kinds).
 //!
-//! `wirk` has no `lib.rs` (bin-only): `wirkd` and `executors` are
-//! compiled into this test binary's own crate root via `#[path]`, the
-//! established move (`wirkd_client.rs`, R2) rather than a library
-//! target added purely for tests.
-//! `wirk` has no `lib.rs` (bin-only): `wirkd` and `executors` are
-//! compiled into this test binary's own crate root via `#[path]`, the
-//! established move (`wirkd_client.rs`, R2) rather than a library
-//! target added purely for tests.
+//! `wirkd` comes from `wirk`'s own library crate (`use wirk::wirkd`).
+//! `executors` has no such library boundary yet — its
+//! own internal unit tests (`executor.rs`, singular, a different
+//! module) are never `#[path]`-included by any test binary, so nothing
+//! there needed dedup — and stays compiled into this test binary's own
+//! crate root via `#[path]`, the established move (R2).
 
 #[path = "../src/executors/mod.rs"]
 mod executors;
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::collections::BTreeMap;
 use std::fs;

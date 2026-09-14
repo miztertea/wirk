@@ -7,8 +7,7 @@
 
 #[path = "support/route_fixture.rs"]
 mod route_fixture;
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::Path;

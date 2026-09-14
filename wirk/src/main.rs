@@ -46,7 +46,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // wirkd wire protocol (envelope, verb, payload types), the client
 // (`locate`, `call`) that reaches a running wirkd, and the server loop
 // itself (W2 `orient/transport.md` §2-4; W3 `orient/build-brief.md` §3).
-mod wirkd;
+// Lives in `wirk`'s library crate so every integration test binary can
+// share this one compiled copy instead of each `#[path]`-including its
+// own; `use` here introduces the same `crate::wirkd` name a local `mod
+// wirkd;` would.
+use wirk::wirkd;
 
 // Deterministic (child/docker) executors, wirk-owned per 0001 D4, in
 // the `wirk` bin per 0022 D78 (no fifth crate). W1 (item 5 build-brief.md

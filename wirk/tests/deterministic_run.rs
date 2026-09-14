@@ -4,9 +4,9 @@
 //! `wirk work submit --kind deterministic --command ...`, `wirk
 //! run-deterministic` — never a library call, the same discipline
 //! `wirk/tests/wirkd_process.rs` uses. `wirkd::client`/`Request`/
-//! `StatusPayload` (compiled in via `#[path]`, same move
-//! `wirkd_process.rs` makes) are used only to read `status` directly,
-//! which has no CLI verb of its own.
+//! `StatusPayload` (from `wirk`'s own library crate, `use wirk::wirkd`)
+//! are used only to read `status` directly, which has no CLI verb of
+//! its own.
 //!
 //! No sleeps as waits: readiness is a bounded poll on `client::locate`
 //! succeeding (issue 359's shape), never a tuned sleep; the wirkd child
@@ -14,8 +14,7 @@
 //! failing partway through still cannot leak the process (ruling 0030
 //! — "no wirkd... survives the run that started it").
 
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::path::Path;
 use std::process::{Command, Stdio};

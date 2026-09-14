@@ -19,8 +19,7 @@
 //! `route_files.rs`'s own tests, re-run here as-is by the same suite,
 //! not duplicated.
 
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};

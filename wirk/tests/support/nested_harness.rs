@@ -3,9 +3,10 @@
 //! `nested_work.rs` when the correction wave added a second binary that
 //! needs the same real `wirkd`/`git`/CLI discipline (R2: one harness,
 //! not a second copy). Included with `#[path]` the same way
-//! `route_fixture.rs` already is; each including binary brings its own
-//! `mod wirkd` (the `#[path = "../src/wirkd/mod.rs"]` include) and this
-//! module reads it through `crate::wirkd`.
+//! `route_fixture.rs` already is; each including binary brings `wirkd`
+//! into scope with `use wirk::wirkd;` (`wirk`'s own library crate,
+//! shared rather than `#[path]`-copied per binary) and this module
+//! reads it through `crate::wirkd`, exactly as before.
 
 // Included into several test binaries; whichever helper a given binary
 // does not call would otherwise warn as dead code there

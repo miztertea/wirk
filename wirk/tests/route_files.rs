@@ -9,8 +9,7 @@
 //! reads the *next* Waypoint's command from there, never re-reading the
 //! file.
 
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};

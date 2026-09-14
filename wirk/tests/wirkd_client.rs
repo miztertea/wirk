@@ -4,16 +4,14 @@
 //! this proves `client::call`/`client::locate` against the envelope
 //! shape without needing W3's listener loop.
 //!
-//! `wirk` has no `lib.rs` (bin-only, `wirk/tests/claim.rs` and
-//! `journal_demo.rs` both drive the built binary as a subprocess
-//! instead); the wire types this test needs to call directly —
-//! `Request`, `Reply`, `client::call`, `client::locate` — are compiled
-//! into *this* test binary's own crate root via `#[path]`, the
-//! ordinary way to unit-test a bin crate's internals without adding a
-//! library target purely for tests.
+//! `wirk/tests/claim.rs` and `journal_demo.rs` drive the built binary
+//! as a subprocess instead; the wire types this test needs to call
+//! directly — `Request`, `Reply`, `client::call`, `client::locate` —
+//! come from `wirk`'s own library crate (`use wirk::wirkd`), shared
+//! with every other test binary that needs them rather than each
+//! recompiling its own copy.
 
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;

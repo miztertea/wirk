@@ -3,9 +3,9 @@
 //! (`env!("CARGO_BIN_EXE_wirk")`) as a child process, never a library
 //! call — the same discipline `wirk/tests/claim.rs` and
 //! `journal_demo.rs` already use. `wirkd::client`/`Request`/`Reply`
-//! (compiled in via `#[path]`, same move `wirkd_client.rs` makes) are
-//! used only for the `status` verb, which has no CLI subcommand of its
-//! own this wave — every other verb goes through `wirk wirkd`/`wirk
+//! (from `wirk`'s own library crate, `use wirk::wirkd`) are used only
+//! for the `status` verb, which has no CLI subcommand of
+//! its own this wave — every other verb goes through `wirk wirkd`/`wirk
 //! work`/`wirk claim`.
 //!
 //! Readiness is a bounded poll on the pointer file appearing (issue
@@ -13,8 +13,7 @@
 
 #[path = "support/route_fixture.rs"]
 mod route_fixture;
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::Path;

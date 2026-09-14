@@ -14,8 +14,7 @@
 mod harness;
 #[path = "support/read_barrier.rs"]
 mod read_barrier;
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};

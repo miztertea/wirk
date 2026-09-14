@@ -9,8 +9,7 @@
 //! the tried step (W3) is where a live opencode actor exercises this
 //! for real.
 
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};

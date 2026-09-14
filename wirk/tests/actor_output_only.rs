@@ -27,12 +27,11 @@
 //! actor exercising this for real is a later stage's job, not this
 //! file's.
 //!
-//! `wirk` has no `lib.rs` (bin-only), so `wirkd` is compiled into this
-//! test binary via `#[path]` — the move other test files in this crate
-//! already use.
+//! `wirkd` comes from `wirk`'s own library crate (`use wirk::wirkd`) —
+//! the same shared import every other test file in this crate now
+//! uses.
 
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};

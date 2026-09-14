@@ -2,8 +2,7 @@
 //! binary and a real `wirkd` child against disposable estates and Git repos;
 //! no in-process server or substitute service stands in for either boundary.
 
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::collections::BTreeMap;
 use std::fs;

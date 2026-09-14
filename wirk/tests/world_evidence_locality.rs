@@ -18,8 +18,7 @@
 
 #[path = "support/nested_harness.rs"]
 mod harness;
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::path::{Path, PathBuf};

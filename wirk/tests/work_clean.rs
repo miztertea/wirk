@@ -13,8 +13,7 @@ mod live_herdr;
 mod route_fixture;
 #[path = "../../wirk-herdr/tests/support/scripted_actor.rs"]
 mod scripted_actor;
-#[path = "../src/wirkd/mod.rs"]
-mod wirkd;
+use wirk::wirkd;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
