@@ -130,7 +130,45 @@ pub fn start_wirkd_with_path(estate: &Path, path: Option<&str>) -> (KillOnDrop, 
 /// write boundary (`AtlasStore::checkpoint`'s own doc: "deliberately
 /// process-level so a verifier can exercise real crash windows from a
 /// child process, rather than substituting a fake store failure").
+/// Give this estate its own expensive-job host pool, unless a fixture
+/// already wrote `resources.json` itself (`job_authority.rs`'s and
+/// `estate_storage.rs`'s own fixtures configure the policy deliberately
+/// — extra keys, a chosen `max_host_expensive` — and must win outright).
+///
+/// Every other fixture that reaches `wirkd` through this one shared
+/// entry point previously fell through to the unset default:
+/// `$XDG_RUNTIME_DIR/wirk/expensive`, this uid's own runtime directory,
+/// shared with every other wirk job on the box — including every other
+/// test estate a full, more-than-two-thread `cargo test` run starts at
+/// once. `atlas acquire` (`disclosure.rs`'s `publish_and_locate_as`,
+/// reused by a dozen other fixtures) takes that pool's admission slot,
+/// so independent estates raced it under real parallelism and lost to
+/// `HostExpensiveBusy` (CI run 34795934050, `disclosure.rs:156`; ruling
+/// 0291). None of these fixtures' subject is that shared pool itself —
+/// unlike `job_authority.rs`'s, which deliberately configures its own
+/// scoped one to test admission and visibility — so each gets a private
+/// pool nested under its own estate path, unique for the life of its
+/// tempdir and cleaned up with it, never the live default pool a real
+/// concurrent `wirk` job on this host might be using.
+fn ensure_isolated_host_pool(estate: &Path) {
+    let wirk_dir = estate.join(".wirk");
+    if wirk_dir.join("resources.json").exists() {
+        return;
+    }
+    fs::create_dir_all(&wirk_dir).expect("create estate .wirk dir");
+    let pool = wirk_dir.join("host-pool");
+    fs::write(
+        wirk_dir.join("resources.json"),
+        format!(
+            "{{\"host_pool_dir\": {:?}}}\n",
+            pool.to_str().expect("pool path is utf-8")
+        ),
+    )
+    .expect("write isolated resources.json");
+}
+
 pub fn start_wirkd_with_env(estate: &Path, env: &[(&str, &str)]) -> (KillOnDrop, WirkdPointer) {
+    ensure_isolated_host_pool(estate);
     let mut command = Command::new(wirk_bin());
     command
         .args(["wirkd", "start", "--estate"])

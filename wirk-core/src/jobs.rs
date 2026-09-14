@@ -236,6 +236,33 @@ impl OwnerLock {
     }
 }
 
+/// Release the lock explicitly, rather than relying on closing the file
+/// to do it.
+///
+/// `flock(2)` belongs to the **open file description**, so closing our
+/// own descriptor releases the lock only once *every* descriptor
+/// referring to that description is closed. Any child forked by another
+/// thread while this lock is held inherits a duplicate of it, and every
+/// wirk job child is spawned through [`harden_execution_child`], whose
+/// `pre_exec` hook forces the real `fork`+`exec` path — so the duplicate
+/// exists for the whole window until `exec`, and longer for anything
+/// that does not `exec` promptly. Until then a dropped [`Admission`]
+/// kept its slot: the next admission was refused, naming the holder that
+/// had already let go (measured — `a_released_slot_returns_even_while_a_
+/// forked_child_holds_the_descriptor`).
+///
+/// `LOCK_UN` removes the lock from the open file description itself, so
+/// it takes effect for every inherited duplicate at once. This is the
+/// release path; the kernel's release on process death remains the
+/// backstop that makes a stale-lock reaper unnecessary.
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        // SAFETY: `flock(2)` on a descriptor this process owns, which is
+        // open for as long as `self.file` is.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// The recorded hint, read with the crate's own JSON dependency rather
 /// than a hand-rolled scanner.
 ///

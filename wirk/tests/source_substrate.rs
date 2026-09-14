@@ -52,7 +52,33 @@ fn wait_for_pointer(estate: &Path) -> WirkdPointer {
     }
 }
 
+/// Its own expensive-job host pool (`job_authority.rs`'s and
+/// `estate_storage.rs`'s established `resources.json` pattern, ruling
+/// 0291): the unset default is `$XDG_RUNTIME_DIR/wirk/expensive`, this
+/// uid's own runtime directory, shared with every other wirk job on the
+/// box. This file's acquisitions call `atlas acquire`, which takes that
+/// pool's admission slot; under real `cargo test` parallelism each of
+/// this file's estates raced every other test estate for it and lost to
+/// `HostExpensiveBusy` (CI run 34795934050). Nested under each estate's
+/// own path so `estate_a` and `estate_b` each get a distinct pool, not
+/// each other's — the two-estate *source* isolation this file is
+/// actually about is unaffected either way.
+fn ensure_isolated_host_pool(estate: &Path) {
+    let wirk_dir = estate.join(".wirk");
+    fs::create_dir_all(&wirk_dir).expect("create estate .wirk dir");
+    let pool = wirk_dir.join("host-pool");
+    fs::write(
+        wirk_dir.join("resources.json"),
+        format!(
+            "{{\"host_pool_dir\": {:?}}}\n",
+            pool.to_str().expect("pool path is utf-8")
+        ),
+    )
+    .expect("write isolated resources.json");
+}
+
 fn start_wirkd(estate: &Path) -> KillOnDrop {
+    ensure_isolated_host_pool(estate);
     let child = KillOnDrop(
         Command::new(wirk_bin())
             .args(["wirkd", "start", "--estate"])

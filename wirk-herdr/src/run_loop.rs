@@ -2048,6 +2048,27 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
             contract_text.as_deref(),
             self.claim_hook.as_ref(),
         );
+        let describe = progress.describe();
+        // W6 (module doc, build-brief.md §10): the baseline is taken for
+        // every prompt *except* the very first (the intent) — that first
+        // prompt only marks `has_prompted`, so the next turn end earns an
+        // unconditional continuation instead of being compared against a
+        // baseline that was never a "continue" ask.
+        //
+        // Taken *before* the prompt is sent, never after. `prompt_agent`
+        // hands the ask to a live agent that can begin writing the
+        // moment it arrives, so a snapshot taken afterwards races it:
+        // whatever the actor managed to write in that window is read
+        // into the baseline itself, and the turn end that follows then
+        // compares equal and judges a working actor stuck. The snapshot
+        // must describe the state the continuation was asked *about*,
+        // which is the state as of just before the ask.
+        match progress {
+            PromptProgress::First => self.has_prompted = true,
+            PromptProgress::FirstContinuation | PromptProgress::SinceLastPrompt { .. } => {
+                self.progress_baseline = Some(self.progress_snapshot(actor));
+            }
+        }
         self.executor
             .client()
             .prompt_agent(PromptAgent {
@@ -2055,18 +2076,6 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
                 text: text.clone(),
             })
             .map_err(HerdrExecutorError::from)?;
-        let describe = progress.describe();
-        // W6 (module doc, build-brief.md §10): the baseline is taken
-        // after every prompt *except* the very first (the intent) — that
-        // first prompt only marks `has_prompted`, so the next turn end
-        // earns an unconditional continuation instead of being compared
-        // against a baseline that was never a "continue" ask.
-        match progress {
-            PromptProgress::First => self.has_prompted = true,
-            PromptProgress::FirstContinuation | PromptProgress::SinceLastPrompt { .. } => {
-                self.progress_baseline = Some(self.progress_snapshot(actor));
-            }
-        }
         self.log_line(&format!(
             "prompt: {agent_status:?} answered (run {}); {}; sending: {}",
             run.id.0,

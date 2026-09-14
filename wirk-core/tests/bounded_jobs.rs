@@ -51,6 +51,14 @@ fn permissive() -> ResourcePolicy {
 
 /// One private host pool per check, shared between the estates that check
 /// uses.
+///
+/// Keyed by the running test's own thread id, which is what makes it
+/// per-check: `libtest` runs each `#[test]` on its own freshly spawned
+/// thread, and a `ThreadId` is never reused for the life of the process
+/// (measured on this toolchain: 40 concurrent checks, 40 distinct ids).
+/// A check that shares one pool between several estates deliberately
+/// does so by naming `host_pool_dir` explicitly, which overrides the one
+/// `permissive()` mints here.
 fn host_pool() -> PathBuf {
     let pool = std::env::temp_dir().join(format!(
         "wirk-test-host-pool-{}-{:?}",
@@ -106,6 +114,75 @@ fn a_second_expensive_job_is_refused_visibly_and_the_slot_returns_on_release() {
     assert!(
         again.is_ok(),
         "releasing the slot must admit the next job: {:?}",
+        again.err()
+    );
+}
+
+/// A released admission frees its slot even while a child process
+/// spawned by an unrelated thread still holds a duplicate of the lock's
+/// descriptor.
+///
+/// `flock(2)` belongs to the **open file description**, not to the
+/// descriptor: a lock released only by closing the file stays held until
+/// every inherited duplicate is closed too. Every wirk job child is
+/// spawned through [`jobs::harden_execution_child`], which installs a
+/// `pre_exec` hook and so forces the real `fork`+`exec` path — for the
+/// whole window between the two, the child holds a copy of every
+/// descriptor this process had open, including another thread's
+/// still-held admission. Under real `cargo test` parallelism that window
+/// is hit, and the slot a check had just dropped did not come back: the
+/// refusal named the check's *own* already-released holder.
+///
+/// The fork here is that window, made deterministic rather than raced.
+#[test]
+fn a_released_slot_returns_even_while_a_forked_child_holds_the_descriptor() {
+    let estate = estate();
+    let policy = ResourcePolicy {
+        max_expensive: 1,
+        max_host_expensive: 4,
+        ..permissive()
+    };
+    let first = jobs::admit(
+        estate.path(),
+        &policy,
+        &JobRequest::new("atlas semantic build", "fixture"),
+    )
+    .expect("the first expensive job is admitted");
+
+    // The window an unrelated concurrent job spawn opens. SAFETY: the
+    // child only `pause`s and `_exit`s, both async-signal-safe, which is
+    // all a forked child of a threaded process may do before `exec`.
+    let child = unsafe { libc::fork() };
+    assert!(
+        child >= 0,
+        "fork failed: {}",
+        std::io::Error::last_os_error()
+    );
+    if child == 0 {
+        unsafe {
+            libc::pause();
+            libc::_exit(0);
+        }
+    }
+
+    drop(first);
+    let again = jobs::admit(
+        estate.path(),
+        &policy,
+        &JobRequest::new("atlas acquire", "fixture"),
+    );
+
+    // Reap before asserting, so a failure never leaks the child.
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        let mut status = 0;
+        libc::waitpid(child, &mut status, 0);
+    }
+
+    assert!(
+        again.is_ok(),
+        "releasing the slot must admit the next job even while a forked \
+         child still holds the descriptor: {:?}",
         again.err()
     );
 }
