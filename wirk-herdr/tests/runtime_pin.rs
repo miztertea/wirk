@@ -255,6 +255,7 @@ fn run() -> Run {
 
 fn actor_world(run: &Run, estate_root: &Path) -> World {
     World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: "wirk".to_string(),
         worktree_path: estate_root.join("worktrees").join("work-1"),
         branch: "p3/execution-recovery".to_string(),

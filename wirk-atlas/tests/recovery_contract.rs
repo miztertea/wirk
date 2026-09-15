@@ -67,6 +67,11 @@ fn failed_publication_never_becomes_current_in_memory() {
         .acquire(&membership, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     atlas.publish(&membership, &old.id).unwrap();
     git(repo.path(), &["commit", "--allow-empty", "-qm", "two"]);
@@ -74,6 +79,11 @@ fn failed_publication_never_becomes_current_in_memory() {
         .acquire(&membership, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     let atlas_dir = estate.path().join("atlas");
     let original = fs::metadata(&atlas_dir).unwrap().permissions();
@@ -113,6 +123,11 @@ fn post_rename_directory_sync_failure_is_explicit_and_recoverable() {
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     atlas.publish(&member, &old.id).unwrap();
     git(repo.path(), &["commit", "--allow-empty", "-qm", "two"]);
@@ -120,6 +135,11 @@ fn post_rename_directory_sync_failure_is_explicit_and_recoverable() {
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     drop(atlas);
 

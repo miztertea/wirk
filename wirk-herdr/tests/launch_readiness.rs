@@ -47,6 +47,7 @@ fn run_id() -> Run {
 fn actor_world(run: &Run, estate_root: &std::path::Path) -> World {
     let worktree_path = estate_root.join("worktrees").join("work-1");
     World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: "wirk".to_string(),
         worktree_path,
         branch: "p2/w2-launch-readiness".to_string(),

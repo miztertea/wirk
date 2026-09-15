@@ -49,6 +49,7 @@ fn opencode_run() -> Run {
 
 fn actor_world(run: &Run, estate_root: &std::path::Path, worktree_path: &std::path::Path) -> World {
     World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: "wirk".to_string(),
         worktree_path: worktree_path.to_path_buf(),
         branch: "p4-worker-contract/pane-config".to_string(),

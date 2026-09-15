@@ -58,19 +58,27 @@ pub const CURRENT_OBSERVATION: &str = "current";
 /// and hold, resolved from the estate's own resource policy rather than
 /// fixed in this module.
 ///
-/// Every bound here is a refusal, never a truncation: a collection over
-/// one of them is reported as refused, and a file over the per-file
-/// bound is reported `Unsupported` by name. An operator who needs a
-/// different shape of collection raises the corresponding field in
-/// `<estate>/.wirk/resources.json`; the defaults live on
-/// `wirk_core::jobs::ResourcePolicy`, which documents the workload each
-/// one is sized against.
+/// **Every field is optional and every default is absent.** This policy
+/// walks the collection an operator explicitly admitted; its size, its
+/// shape and its file count are facts about that collection, not
+/// capabilities of this process, so none of them refuses it by default
+/// (ruling 0398, applied to this path by 0401). Where an operator does
+/// set a bound in `<estate>/.wirk/resources.json` it is enforced exactly
+/// as written and refused visibly — a collection over an aggregate or
+/// traversal bound is reported as refused, and a file over the per-file
+/// bound is reported `Unsupported` by name, never truncated and never
+/// skipped in silence.
+///
+/// What is *not* optional is the real condition a depth number used to
+/// stand in for: a directory cycle is detected as a cycle, by identity,
+/// and refused whether or not any depth bound is configured. See
+/// `wirk_core::jobs::ResourcePolicy::document_max_entries_depth`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CaptureLimits {
-    pub(crate) max_file_bytes: u64,
-    pub(crate) max_total_bytes: u64,
-    pub(crate) max_depth: usize,
-    pub(crate) max_entries: usize,
+    pub(crate) max_file_bytes: Option<u64>,
+    pub(crate) max_total_bytes: Option<u64>,
+    pub(crate) max_depth: Option<usize>,
+    pub(crate) max_entries: Option<usize>,
 }
 
 impl CaptureLimits {
@@ -82,11 +90,11 @@ impl CaptureLimits {
             max_entries: policy.document_max_entries,
         }
     }
-}
 
-impl Default for CaptureLimits {
-    fn default() -> Self {
-        Self::from_policy(&wirk_core::jobs::ResourcePolicy::default())
+    /// Whether `len` is over the configured per-file bound. No bound
+    /// configured is never over.
+    pub(crate) fn file_over(&self, len: u64) -> bool {
+        self.max_file_bytes.is_some_and(|max| len > max)
     }
 }
 
@@ -160,6 +168,33 @@ fn lstat_at(parent: BorrowedFd<'_>, name: &[u8]) -> std::io::Result<libc::stat> 
     Ok(stat)
 }
 
+/// Whatever the estate's own `ResourcePolicy` defaults to — never a
+/// second set of numbers written here. Only test call sites reach this;
+/// production always goes through `from_policy` with the estate's real
+/// policy, and routing the default through the same place is what keeps
+/// a check about "the default" about the actual default.
+impl Default for CaptureLimits {
+    fn default() -> Self {
+        Self::from_policy(&wirk_core::jobs::ResourcePolicy::default())
+    }
+}
+
+/// `fstat` on an already-open descriptor: the identity of the directory
+/// this walk is actually inside, taken from the descriptor rather than
+/// from any path, so no rename or mount can make two different
+/// directories answer the same way. `(st_dev, st_ino)` is the pair the
+/// operating system itself uses to say "the same directory".
+fn fstat_of(fd: BorrowedFd<'_>) -> std::io::Result<libc::stat> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is a valid, zeroed `libc::stat` the kernel fills
+    // in, and `fd` is a live borrowed descriptor.
+    let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat)
+}
+
 /// The window between classifying an entry and opening it.
 ///
 /// Both operations are real and separated by a real instant, and what
@@ -226,12 +261,13 @@ fn read_dir_names(
         }
         stop.check().map_err(stopped)?;
         *examined = examined.saturating_add(1);
-        if *examined > limits.max_entries {
+        if let Some(max_entries) = limits.max_entries
+            && *examined > max_entries
+        {
             return Err(AtlasError::InvalidRequest(format!(
-                "document-tree source exceeds the {}-entry bounded traversal budget; raise \
-                 document_max_entries in this estate's .wirk/resources.json to walk a larger \
-                 collection",
-                limits.max_entries
+                "document-tree source exceeds the {max_entries}-entry bounded traversal budget; \
+                 raise document_max_entries in this estate's .wirk/resources.json to walk a \
+                 larger collection"
             )));
         }
         names.push(name.to_vec());
@@ -244,23 +280,39 @@ fn read_dir_names(
     Ok(names)
 }
 
-/// Reads at most `limits.max_file_bytes + 1` bytes from `name` inside
-/// `dir`, opened by descriptor exactly as `open_no_follow` documents,
-/// then confirms the descriptor that was actually read names an
-/// ordinary file of exactly `expected_len` bytes.
+/// Reads `name` inside `dir` — opened by descriptor exactly as
+/// [`open_no_follow`] documents — folding its content identity as the
+/// bytes go past, and keeping only what a later classification needs:
+/// the sha256 of everything read, the number of bytes, whether any of
+/// them was NUL, and the leading [`crate::document::SNIFF_BYTES`].
 ///
-/// **The bound is on the read, not only on the earlier metadata.** The
+/// **Nothing here holds the file.** That is the whole point of reading
+/// it this way: a capture's resident cost is one buffer per file rather
+/// than every admitted file's bytes at once, which is what made a
+/// collection's *aggregate* size something this process had to refuse
+/// rather than simply read. Extraction reads the one file it is
+/// extracting back through [`blob`], under the same no-follow chain and
+/// against this digest.
+///
+/// **The bound, where one is configured, is on the read itself.** The
 /// `max_file_bytes` comparison made at listing time is against a length
 /// that can be stale by the time this runs; `Read::take` bounds this
-/// read itself, so a file that grew in that window is caught at
-/// `max_file_bytes + 1` bytes rather than after an unbounded read had
-/// already allocated to its new size.
-fn read_bounded_no_follow(
+/// read too, so a file that grew in that window is caught at
+/// `max_file_bytes + 1` bytes rather than after a read that had already
+/// gone past it.
+struct ReadIdentity {
+    digest: String,
+    len: u64,
+    contains_nul: bool,
+    prefix: Vec<u8>,
+}
+
+fn read_identity_no_follow(
     dir: BorrowedFd<'_>,
     name: &[u8],
     expected_len: u64,
     limits: &CaptureLimits,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<ReadIdentity> {
     let opened = open_no_follow(dir, name, false)?;
     let mut file = File::from(opened);
     // `fstat` on the descriptor just opened, never a path: this is the
@@ -276,18 +328,103 @@ fn read_bounded_no_follow(
             "no longer an ordinary file",
         ));
     }
-    let mut bytes = Vec::with_capacity(expected_len.min(limits.max_file_bytes) as usize);
-    file.by_ref()
-        .take(limits.max_file_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limits.max_file_bytes {
+    let mut hasher = Sha256::new();
+    let mut prefix: Vec<u8> = Vec::new();
+    let mut len = 0u64;
+    let mut contains_nul = false;
+    let mut buffer = vec![0u8; 64 * 1024];
+    // One byte past a configured bound, deliberately, so growth past it
+    // is *detected* rather than silently cut at the boundary — a
+    // truncated read folded into a content identity would name bytes
+    // nothing holds.
+    let ceiling = limits.max_file_bytes.map(|max| max.saturating_add(1));
+    loop {
+        let room = match ceiling {
+            Some(ceiling) if len >= ceiling => break,
+            Some(ceiling) => buffer.len().min((ceiling - len) as usize),
+            None => buffer.len(),
+        };
+        let read = match file.read(&mut buffer[..room]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        let chunk = &buffer[..read];
+        hasher.update(chunk);
+        contains_nul = contains_nul || chunk.contains(&0);
+        if prefix.len() < crate::document::SNIFF_BYTES {
+            let want = crate::document::SNIFF_BYTES - prefix.len();
+            prefix.extend_from_slice(&chunk[..read.min(want)]);
+        }
+        len = len.saturating_add(read as u64);
+    }
+    if limits.file_over(len) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "grew past the {}-byte bounded document read size while being read",
-                limits.max_file_bytes
+                limits.max_file_bytes.unwrap_or_default()
             ),
         ));
+    }
+    if len != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "changed size while being read",
+        ));
+    }
+    Ok(ReadIdentity {
+        digest: hex(&hasher.finalize()),
+        len,
+        contains_nul,
+        prefix,
+    })
+}
+
+/// One resource's whole bytes, read through the same no-follow chain
+/// [`read_identity_no_follow`] streams: this is the read whose *result*
+/// a caller actually needs in hand — serving a coordinate's content, or
+/// converting one document for extraction — so the bytes are returned
+/// rather than folded away.
+///
+/// The cost is one file, which is what reading a document costs. Where
+/// an operator configured `document_max_file_bytes`, the read itself is
+/// bounded one byte past it so growth in the window since the `stat` is
+/// detected instead of quietly truncating.
+fn read_bytes_no_follow(
+    dir: BorrowedFd<'_>,
+    name: &[u8],
+    expected_len: u64,
+    limits: &CaptureLimits,
+) -> std::io::Result<Vec<u8>> {
+    let opened = open_no_follow(dir, name, false)?;
+    let mut file = File::from(opened);
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no longer an ordinary file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    match limits.max_file_bytes {
+        Some(max) => {
+            bytes.reserve(expected_len.min(max) as usize);
+            file.by_ref()
+                .take(max.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > max {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("grew past the {max}-byte bounded document read size while being read"),
+                ));
+            }
+        }
+        None => {
+            bytes.reserve(expected_len as usize);
+            file.read_to_end(&mut bytes)?;
+        }
     }
     if bytes.len() as u64 != expected_len {
         return Err(std::io::Error::new(
@@ -300,7 +437,7 @@ fn read_bounded_no_follow(
 
 /// The first [`crate::document::SNIFF_BYTES`] of `name`, read through
 /// the same descriptor-relative no-follow chain
-/// [`read_bounded_no_follow`] uses. Never reads more than that: this is
+/// [`read_identity_no_follow`] uses. Never reads more than that: this is
 /// the screen that decides whether a file whose name settles nothing is
 /// worth reading in full, and it must not itself become the unbounded
 /// read it exists to avoid.
@@ -356,9 +493,10 @@ fn display_path(root: &Path, relative: &[u8]) -> String {
 }
 
 /// What one walked entry actually was, decided by a single `lstat`/
-/// `openat`/bounded-read sequence — never re-derived by a second,
-/// separate filesystem lookup later (`finish`, below, works entirely
-/// from this, in memory).
+/// `openat`/streamed-read sequence. Nothing here carries a document's
+/// bytes: an entry carries the *identity* of what was read, and
+/// `finish` reads the one file it is extracting back against that
+/// identity.
 pub(crate) enum CapturedKind {
     Symlink,
     /// A socket, fifo, or device: named and reported `Unsupported`,
@@ -376,12 +514,21 @@ pub(crate) enum CapturedKind {
     /// an ordinary file. Does not abort the rest of the collection — a
     /// single unreadable document leaves every other document usable.
     Unavailable(String),
-    /// Successfully read, in-bound bytes, ready for `finish` to run
-    /// binary detection and extraction over without reading the file
-    /// again.
+    /// Successfully read: the content identity this resource is
+    /// recorded under, plus the little that classification needs and a
+    /// re-read cannot cheaply recover.
+    ///
+    /// `contains_nul` is folded over the *whole* file as it streamed
+    /// past, so the binary-blob screen is the same answer it always
+    /// was; `prefix` is the leading [`crate::document::SNIFF_BYTES`],
+    /// which is the exact window `anydoc`'s own detector acts in, so a
+    /// preview can place the file without a second read. Extraction
+    /// itself uses neither — it reads the file back in full through
+    /// [`blob`], against `digest`.
     Content {
         digest: String,
-        bytes: Vec<u8>,
+        contains_nul: bool,
+        prefix: Vec<u8>,
     },
 }
 
@@ -399,10 +546,15 @@ impl std::fmt::Debug for CapturedKind {
             Self::Excluded => f.write_str("Excluded"),
             Self::Unsupported(why) => write!(f, "Unsupported({why})"),
             Self::Unavailable(why) => write!(f, "Unavailable({why})"),
-            Self::Content { digest, bytes } => f
+            Self::Content {
+                digest,
+                contains_nul,
+                prefix,
+            } => f
                 .debug_struct("Content")
                 .field("digest", digest)
-                .field("bytes", &format_args!("<{} bytes>", bytes.len()))
+                .field("contains_nul", contains_nul)
+                .field("prefix", &format_args!("<{} bytes>", prefix.len()))
                 .finish(),
         }
     }
@@ -480,10 +632,16 @@ pub(crate) fn capture(
     let mut out = Vec::new();
     let mut total_bytes = 0u64;
     let mut examined = 0usize;
+    // The identity of every directory on the path currently being
+    // walked, root first. A directory that turns out to be one of its
+    // own ancestors is a cycle, and this is what proves it.
+    let root_stat = fstat_of(root_fd.as_fd())?;
+    let mut ancestors = vec![(root_stat.st_dev, root_stat.st_ino)];
     recurse(
         root_fd.as_fd(),
         b"",
         0,
+        &mut ancestors,
         &mut out,
         &mut total_bytes,
         &mut examined,
@@ -533,6 +691,7 @@ fn recurse(
     dir: BorrowedFd<'_>,
     prefix: &[u8],
     depth: usize,
+    ancestors: &mut Vec<(u64, u64)>,
     out: &mut Vec<Captured>,
     total_bytes: &mut u64,
     examined: &mut usize,
@@ -540,12 +699,13 @@ fn recurse(
     limits: &CaptureLimits,
     stop: &wirk_core::jobs::JobStop,
 ) -> Result<(), AtlasError> {
-    if depth >= limits.max_depth {
+    if let Some(max_depth) = limits.max_depth
+        && depth >= max_depth
+    {
         return Err(AtlasError::InvalidRequest(format!(
-            "document-tree source exceeds the {}-directory bounded traversal depth; raise \
-             document_max_entries_depth in this estate's .wirk/resources.json to walk a deeper \
-             collection",
-            limits.max_depth
+            "document-tree source exceeds the {max_depth}-directory bounded traversal depth; \
+             raise document_max_entries_depth in this estate's .wirk/resources.json to walk a \
+             deeper collection"
         )));
     }
     let names = read_dir_names(dir, examined, limits, stop)?;
@@ -592,17 +752,43 @@ fn recurse(
         crate::store::checkpoint(OPEN_WINDOW);
         if file_type == libc::S_IFDIR {
             match open_no_follow(dir, &name, true) {
-                Ok(sub) => recurse(
-                    sub.as_fd(),
-                    &relative,
-                    depth + 1,
-                    out,
-                    total_bytes,
-                    examined,
-                    policy,
-                    limits,
-                    stop,
-                )?,
+                Ok(sub) => {
+                    // The real condition a depth number used to stand in
+                    // for. A symlink is already refused outright above,
+                    // so the way a directory becomes its own ancestor is
+                    // a bind mount pointed back at an enclosing
+                    // directory — and `(st_dev, st_ino)` on the
+                    // descriptor just opened is what identifies it,
+                    // whatever name it was reached by. Refused by what it
+                    // is, not by how deep the walk happened to be.
+                    let sub_stat = fstat_of(sub.as_fd())?;
+                    let identity = (sub_stat.st_dev, sub_stat.st_ino);
+                    if ancestors.contains(&identity) {
+                        return Err(AtlasError::InvalidRequest(format!(
+                            "document-tree source contains a directory cycle: {} is a directory \
+                             this walk is already inside (device {}, inode {}), so walking it \
+                             would not terminate",
+                            String::from_utf8_lossy(&relative),
+                            identity.0,
+                            identity.1
+                        )));
+                    }
+                    ancestors.push(identity);
+                    let walked = recurse(
+                        sub.as_fd(),
+                        &relative,
+                        depth + 1,
+                        ancestors,
+                        out,
+                        total_bytes,
+                        examined,
+                        policy,
+                        limits,
+                        stop,
+                    );
+                    ancestors.pop();
+                    walked?;
+                }
                 // Swapped for a symlink between the lstat above and this
                 // open: `O_NOFOLLOW` refuses it (`ELOOP`) rather than
                 // descending into wherever it now points. Reported the
@@ -665,7 +851,7 @@ fn recurse(
             // charges the aggregate budget, which only the full read
             // does.
             crate::extract::PathAdmission::Candidate => {
-                if len > limits.max_file_bytes {
+                if limits.file_over(len) {
                     out.push(Captured {
                         relative,
                         kind: CapturedKind::Unsupported(
@@ -696,7 +882,7 @@ fn recurse(
                 }
             }
         }
-        if len > limits.max_file_bytes {
+        if limits.file_over(len) {
             out.push(Captured {
                 relative,
                 kind: CapturedKind::Unsupported("file exceeds the bounded document read size"),
@@ -704,27 +890,33 @@ fn recurse(
             });
             continue;
         }
-        // The aggregate budget is charged before the read it bounds,
-        // from the length already checked: a visible refusal before the
-        // read, not an unbounded read followed by a complaint.
+        // The running total is kept whether or not anything bounds it:
+        // it is what a preview reports and what an aggregate bound, when
+        // an operator sets one, is charged against — before the read it
+        // bounds, from the length already checked, so a configured
+        // refusal happens before the read rather than after it.
         *total_bytes = total_bytes.saturating_add(len);
-        if *total_bytes > limits.max_total_bytes {
+        if let Some(max_total) = limits.max_total_bytes
+            && *total_bytes > max_total
+        {
             return Err(AtlasError::InvalidRequest(format!(
-                "document-tree source exceeds the {}-byte bounded aggregate read budget for one \
-                 capture; raise document_max_total_bytes in this estate's .wirk/resources.json \
-                 to admit a larger collection",
-                limits.max_total_bytes
+                "document-tree source reached {} bytes, over the {max_total}-byte bounded \
+                 aggregate read budget this estate configured for one capture; raise \
+                 document_max_total_bytes in this estate's .wirk/resources.json to admit a \
+                 larger collection",
+                *total_bytes
             )));
         }
-        match read_bounded_no_follow(dir, &name, len, limits) {
-            Ok(bytes) => {
-                let mut hasher = Sha256::new();
-                hasher.update(&bytes);
-                let digest = hex(&hasher.finalize());
+        match read_identity_no_follow(dir, &name, len, limits) {
+            Ok(read) => {
                 out.push(Captured {
                     relative,
-                    kind: CapturedKind::Content { digest, bytes },
-                    byte_len: Some(len),
+                    kind: CapturedKind::Content {
+                        digest: read.digest,
+                        contains_nul: read.contains_nul,
+                        prefix: read.prefix,
+                    },
+                    byte_len: Some(read.len),
                 });
             }
             // A permission-denied file, one that vanished mid-read, or
@@ -748,13 +940,20 @@ fn recurse(
 /// and no generation is written.
 ///
 /// Unlike `git::preview`, this **does** read file content: `capture`'s
-/// own walk already performs the bounded sniff/read that decides
+/// own walk already streams each admitted file past a hasher to decide
 /// `Excluded`/`Unsupported`/`Unavailable` before this function ever
 /// sees the result (see `recurse`'s own doc), so there is no cheaper
 /// document-tree walk to fall back to without re-implementing it — the
 /// one thing P6.3-B's brief rules out. `content_sniffed: true` names
 /// this honestly rather than leaving a caller to assume both source
 /// kinds cost the same to preview.
+///
+/// It reports what it observed rather than refusing to observe it: a
+/// collection larger than anything this estate has configured is still
+/// walked and still counted, so the operator asking "how big is this,
+/// and will wirk take it?" gets the total rather than a refusal in
+/// place of one. A bound an operator *has* set still refuses the real
+/// acquisition, and `capture` names the observed total when it does.
 ///
 /// A `Content` entry — read in full by `capture`, same as a real
 /// acquisition would read it — is classified `candidate` unless the
@@ -787,9 +986,20 @@ pub(crate) fn preview(
             }
             CapturedKind::Excluded => report.excluded.add(size),
             CapturedKind::Unavailable(_) => report.unavailable.add(size),
-            CapturedKind::Content { bytes, .. } => {
-                if policy.family(&entry.relative, &bytes) != Some(ContentFamily::Document)
-                    && bytes.contains(&0)
+            CapturedKind::Content {
+                contains_nul,
+                prefix,
+                ..
+            } => {
+                // The same screen `finish` applies, from what the walk
+                // recorded: the NUL flag was folded over the whole file
+                // as it streamed past, and the family decision reads the
+                // leading bytes, which is the window the detector acts
+                // in. Whether a candidate's real extraction then
+                // succeeds is still decided only by `finish`, which this
+                // never calls — the gap this function's own doc names.
+                if policy.family(&entry.relative, &prefix) != Some(ContentFamily::Document)
+                    && contains_nul
                 {
                     report.unsupported.add(size);
                 } else {
@@ -804,24 +1014,50 @@ pub(crate) fn preview(
 /// Attaches generation-dependent identity — retrieval unit ids, which
 /// fold in the `GenerationId` this policy cannot know until the whole
 /// tree has been walked and its manifest identity finalized — to what
-/// `capture` already read. Entirely from memory: no filesystem access
-/// and no second read of any file, with the same bytes and digest used
-/// for both the manifest fold and this.
+/// `capture` already observed.
 ///
-/// `stop` is checked once per entry here as well, and for a different
-/// reason than in `capture`. This pass does no I/O, but it is where
-/// extraction actually runs (`ExtractorPolicy::units`), so on a
-/// collection of large text documents it is the more expensive half in
-/// CPU and the one that holds the most memory. A walk that could be
+/// **One file resident at a time.** Extraction needs a document's whole
+/// bytes (a UTF-8 string to chunk, or a container for `anydoc` to
+/// convert), so those bytes have to exist somewhere; what they no
+/// longer have to do is exist *all at once*. Each entry's file is read
+/// back here through [`blob`] — the same no-follow descriptor chain the
+/// walk used, verified against the content digest `capture` recorded —
+/// extracted, and dropped before the next one is opened. A capture's
+/// resident source bytes are therefore one file's, whatever the
+/// collection's size, which is what makes an aggregate ceiling on the
+/// collection unnecessary rather than merely raised.
+///
+/// **A file that moved between the two reads is reported, not
+/// smoothed.** `blob` refuses bytes that do not hash to the recorded
+/// identity, and that refusal arrives here as
+/// `CoverageDisposition::Error` on that one resource, carrying its
+/// reason — the same disposition a document that fails to convert
+/// takes. The resource keeps the identity the manifest folded, so what
+/// the generation says it saw and what it recorded stay the same
+/// statement; the collection's other documents are unaffected. This is
+/// the concurrent-edit window `capture`'s own doc already names, now
+/// visible per resource instead of silently absent.
+///
+/// `stop` is checked once per entry, for the same reason it is checked
+/// in `capture`: this is where extraction actually runs
+/// (`ExtractorPolicy::units`), so on a collection of large text
+/// documents it is the more expensive half in CPU. A walk that could be
 /// stopped and an extraction that could not would leave the operator's
 /// cancellation reaching only the cheaper part of the work.
 pub(crate) fn finish(
+    root: &Path,
     generation: &GenerationId,
     policy: &ExtractorPolicy,
-    captured: Vec<Captured>,
+    mut captured: Vec<Captured>,
+    limits: &CaptureLimits,
     stop: &wirk_core::jobs::JobStop,
-) -> Result<Vec<ResourceRecord>, AtlasError> {
-    let mut records = Vec::with_capacity(captured.len());
+    sink: &mut dyn FnMut(ResourceRecord) -> Result<(), AtlasError>,
+) -> Result<(), AtlasError> {
+    // Sorted before extraction rather than after it, because records now
+    // leave this function one at a time and their order is part of what
+    // a generation records (`AtlasStore::validate_generation` refuses a
+    // resource list that is not uniquely sorted).
+    captured.sort_by(|a, b| a.relative.cmp(&b.relative));
     for entry in captured {
         stop.check().map_err(stopped)?;
         let is_symlink = matches!(entry.kind, CapturedKind::Symlink);
@@ -867,38 +1103,62 @@ pub(crate) fn finish(
             // them directly rather than treating them as UTF-8. Decided
             // from the same bytes the family decision now reads, so a
             // detected document is never rejected here as a binary blob.
-            CapturedKind::Content { digest, bytes }
-                if policy.family(&entry.relative, &bytes) != Some(ContentFamily::Document)
-                    && bytes.contains(&0) =>
-            {
-                (
-                    CoverageDisposition::Unsupported,
-                    Some("binary blob".to_string()),
-                    Some(digest),
-                    Some(bytes.len() as u64),
-                    vec![],
-                )
-            }
-            CapturedKind::Content { digest, bytes } => {
-                match policy.units(generation, &entry.relative, &digest, &bytes) {
-                    Ok(units) => (
-                        CoverageDisposition::Indexed,
-                        None,
-                        Some(digest),
-                        Some(bytes.len() as u64),
-                        units,
-                    ),
-                    Err(detail) => (
+            CapturedKind::Content {
+                digest,
+                contains_nul,
+                ..
+            } => {
+                // Read back here, against the identity the walk folded,
+                // and dropped at the end of this arm.
+                match blob(root, &entry.relative, &digest, limits) {
+                    Ok(bytes) => {
+                        let byte_len = Some(bytes.len() as u64);
+                        if policy.family(&entry.relative, &bytes) != Some(ContentFamily::Document)
+                            && contains_nul
+                        {
+                            (
+                                CoverageDisposition::Unsupported,
+                                Some("binary blob".to_string()),
+                                Some(digest),
+                                byte_len,
+                                vec![],
+                            )
+                        } else {
+                            match policy.units(generation, &entry.relative, &digest, &bytes) {
+                                Ok(units) => (
+                                    CoverageDisposition::Indexed,
+                                    None,
+                                    Some(digest),
+                                    byte_len,
+                                    units,
+                                ),
+                                Err(detail) => (
+                                    CoverageDisposition::Error,
+                                    Some(detail.to_string()),
+                                    Some(digest),
+                                    byte_len,
+                                    vec![],
+                                ),
+                            }
+                        }
+                    }
+                    Err(err) => (
                         CoverageDisposition::Error,
-                        Some(detail.to_string()),
+                        Some(format!(
+                            "its recorded content could not be read back for extraction: {err}"
+                        )),
                         Some(digest),
-                        Some(bytes.len() as u64),
+                        entry.byte_len,
                         vec![],
                     ),
                 }
             }
         };
-        records.push(ResourceRecord {
+        // Handed over and dropped here: the record, its units and the
+        // bytes they were derived from all go out of scope before the
+        // next entry is opened, so what is resident is one document's
+        // worth, whatever the collection holds.
+        sink(ResourceRecord {
             path: entry.relative,
             mode: (if is_symlink { "120000" } else { "100644" }).into(),
             object_id,
@@ -906,10 +1166,9 @@ pub(crate) fn finish(
             disposition,
             detail,
             units,
-        });
+        })?;
     }
-    records.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(records)
+    Ok(())
 }
 
 /// Exact bytes for one already-validated resource, read live from the
@@ -959,9 +1218,9 @@ pub(crate) fn blob(
         )));
     }
     let len = u64::try_from(stat.st_size).unwrap_or(u64::MAX);
-    if len > limits.max_file_bytes {
+    if limits.file_over(len) {
         return Err(AtlasError::SourceBytesUnavailable(format!(
-            "{} now exceeds the bounded document read size",
+            "{} now exceeds the bounded document read size this estate configures",
             display_path(root, relative_path)
         )));
     }
@@ -970,7 +1229,7 @@ pub(crate) fn blob(
     // opened, and the open below neither follows a symlink nor blocks
     // on a FIFO that replaced it.
     crate::store::checkpoint(OPEN_WINDOW);
-    let bytes = read_bounded_no_follow(dir.as_fd(), last, len, limits).map_err(|err| {
+    let bytes = read_bytes_no_follow(dir.as_fd(), last, len, limits).map_err(|err| {
         AtlasError::SourceBytesUnavailable(format!("{} {err}", display_path(root, relative_path)))
     })?;
     let mut hasher = Sha256::new();
@@ -1053,6 +1312,87 @@ mod tests {
         wirk_core::jobs::JobStop::unbounded()
     }
 
+    /// Extraction hands each resource over as it is produced, not as one
+    /// list at the end.
+    ///
+    /// The observable difference, and the reason this is a check rather
+    /// than a comment: a sink that refuses the first record stops the
+    /// whole walk there. If `finish` still built the collection's
+    /// records and handed them over afterwards, every file would have
+    /// been read and extracted before the sink was consulted once, and
+    /// the count below would be the collection's size instead of one.
+    /// That is the same property production depends on — the records,
+    /// and the units inside them, reach `resources.ndjson` and are
+    /// dropped one at a time rather than accumulating until publication
+    /// (rulings 0401/0403).
+    ///
+    /// Watched failing against `16840cf`, whose `finish` returned
+    /// `Vec<ResourceRecord>` and had no sink to stop.
+    #[test]
+    fn extraction_hands_over_each_resource_as_it_is_produced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for index in 0..8 {
+            std::fs::write(
+                dir.path().join(format!("doc-{index}.md")),
+                format!("# document {index}\n\nbody\n"),
+            )
+            .expect("write a document");
+        }
+        let policy = ExtractorPolicy::markdown_only();
+        let generation = GenerationId("g-test".into());
+        let limits = limits();
+        let (_, _, captured) =
+            capture(dir.path(), &policy, &limits, &unstopped()).expect("capture");
+        assert_eq!(captured.len(), 8, "the fixture really holds eight files");
+
+        let mut delivered = 0usize;
+        let error = finish(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits,
+            &unstopped(),
+            &mut |_record| {
+                delivered += 1;
+                Err(AtlasError::InvalidRequest("the sink refused".into()))
+            },
+        )
+        .expect_err("a sink that refuses stops the walk");
+        assert!(matches!(error, AtlasError::InvalidRequest(_)), "{error:?}");
+        assert_eq!(
+            delivered, 1,
+            "extraction stopped at the first refused record instead of building all eight first"
+        );
+    }
+
+    /// `finish` streams its records to a sink; a check that wants the
+    /// whole list collects them here, which is exactly what production
+    /// no longer does.
+    fn finish_to_vec(
+        root: &Path,
+        generation: &GenerationId,
+        policy: &ExtractorPolicy,
+        captured: Vec<Captured>,
+        limits: &CaptureLimits,
+        stop: &wirk_core::jobs::JobStop,
+    ) -> Result<Vec<ResourceRecord>, AtlasError> {
+        let mut records = Vec::new();
+        finish(
+            root,
+            generation,
+            policy,
+            captured,
+            limits,
+            stop,
+            &mut |record| {
+                records.push(record);
+                Ok(())
+            },
+        )?;
+        Ok(records)
+    }
+
     fn captured_names(entries: &[Captured]) -> Vec<String> {
         entries
             .iter()
@@ -1094,6 +1434,181 @@ mod tests {
         assert!(content.starts_with("sha256:"));
     }
 
+    /// The default capture reads the collection it was pointed at, and
+    /// the extractor then indexes what it read. A file well past the
+    /// byte count that used to be the built-in per-file bound, and past
+    /// the 1 MiB ceiling `extract` used to impose on the text it would
+    /// hold, produces real retrieval units covering the whole file
+    /// (rulings 0401/0403): neither size was a statement about this
+    /// reader's capability.
+    ///
+    /// Watched failing twice: first against the previous capture
+    /// defaults, where this file came back `Unsupported("file exceeds
+    /// the bounded document read size")` without being read at all; then
+    /// against `16840cf`, where it was read but came back
+    /// `Error("text blob exceeds bounded extractor size")` with zero
+    /// units — acquired, identified, and not indexed.
+    #[test]
+    fn a_file_past_the_old_built_in_per_file_bound_is_read_and_indexed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Past the 8 MiB that used to be `document_max_file_bytes`, and
+        // therefore also far past the 1 MiB that used to be
+        // `extract::MAX_TEXT_BYTES`. Both are gone, so this is one
+        // ordinary document.
+        let mut body = String::from("# large\n");
+        while body.len() < 9 * 1024 * 1024 {
+            body.push_str("a line of ordinary prose in a large document\n");
+        }
+        std::fs::write(dir.path().join("large.md"), &body).expect("write a large document");
+        let policy = ExtractorPolicy::markdown_only();
+        let generation = GenerationId("g-test".into());
+        // The estate's own default limits, whatever they are: the
+        // assertions below are about what the default actually does to
+        // this file, not about the shape of the setting.
+        let limits = limits();
+        let (_, _, captured) =
+            capture(dir.path(), &policy, &limits, &unstopped()).expect("capture");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits,
+            &unstopped(),
+        )
+        .expect("finish");
+        let large = records
+            .iter()
+            .find(|r| r.path == b"large.md")
+            .expect("large.md present");
+        assert_eq!(
+            large.disposition,
+            CoverageDisposition::Indexed,
+            "a large admitted document is indexed, not refused: {:?}",
+            large.detail
+        );
+        assert_eq!(
+            large.byte_len,
+            Some(body.len() as u64),
+            "the whole file was read, not a bounded prefix"
+        );
+        assert!(
+            large.object_id.is_some(),
+            "it carries the content identity of what was actually read"
+        );
+        assert!(
+            !large.units.is_empty(),
+            "an indexed resource carries retrievable units"
+        );
+        assert_eq!(
+            large.units.iter().map(|unit| unit.byte_end).max(),
+            Some(body.len() as u64),
+            "the units tile the whole file rather than a capped prefix"
+        );
+    }
+
+    /// A collection deeper than the 128 directories that used to be the
+    /// built-in depth bound walks, because a depth number never proved
+    /// anything about this walk. What it stood in for — a directory
+    /// that is its own ancestor — is detected as itself in `recurse`,
+    /// and the real cost of depth is one open descriptor per level,
+    /// which the operating system reports as its own limit.
+    ///
+    /// Watched failing against the previous default, which refused at
+    /// depth 128 with "exceeds the 128-directory bounded traversal
+    /// depth".
+    #[test]
+    fn a_collection_deeper_than_the_old_built_in_depth_bound_is_walked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut deep = dir.path().to_path_buf();
+        for level in 0..200 {
+            deep = deep.join(format!("d{level}"));
+        }
+        std::fs::create_dir_all(&deep).expect("mkdir -p a deep collection");
+        std::fs::write(deep.join("bottom.md"), b"# bottom\n").expect("write the deepest file");
+        let policy = ExtractorPolicy::markdown_only();
+        let limits = limits();
+        let (_, _, captured) =
+            capture(dir.path(), &policy, &limits, &unstopped()).expect("a deep collection walks");
+        assert!(
+            captured
+                .iter()
+                .any(|entry| entry.relative.ends_with(b"bottom.md")),
+            "the file at the bottom was reached"
+        );
+
+        // And a depth an operator *does* configure still refuses, by
+        // name, exactly as it did.
+        let mut shallow = limits;
+        shallow.max_depth = Some(4);
+        let err = capture(dir.path(), &policy, &shallow, &unstopped())
+            .expect_err("a configured depth bound still refuses");
+        let AtlasError::InvalidRequest(detail) = err else {
+            panic!("expected a visible refusal, got {err:?}");
+        };
+        assert!(
+            detail.contains("document_max_entries_depth"),
+            "the refusal names the setting that caused it: {detail}"
+        );
+    }
+
+    /// The window between folding a file's identity and reading it back
+    /// to extract it is real, and it is reported on the one resource it
+    /// affects rather than smoothed over or allowed to abort the
+    /// collection. The generation still records the identity the
+    /// manifest folded, so what it says it saw and what it recorded stay
+    /// one statement.
+    #[test]
+    fn a_file_changed_between_identity_and_extraction_is_reported_on_that_resource_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("stable.md"), b"# stable\n").expect("write stable");
+        std::fs::write(dir.path().join("moving.md"), b"# v1\n").expect("write moving");
+        let policy = ExtractorPolicy::markdown_only();
+        let generation = GenerationId("g-test".into());
+        let limits = limits();
+        let (_, _, captured) =
+            capture(dir.path(), &policy, &limits, &unstopped()).expect("capture");
+        // Between the two reads, deterministically: no timing window is
+        // being raced, the edit simply happens here.
+        std::fs::write(dir.path().join("moving.md"), b"# v2, longer now\n").expect("edit");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits,
+            &unstopped(),
+        )
+        .expect("one changed file does not abort the collection");
+        let moving = records
+            .iter()
+            .find(|r| r.path == b"moving.md")
+            .expect("moving.md is still recorded");
+        assert_eq!(moving.disposition, CoverageDisposition::Error);
+        assert!(
+            moving
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be read back for extraction"),
+            "the reason is named: {:?}",
+            moving.detail
+        );
+        assert!(
+            moving.object_id.is_some(),
+            "it keeps the identity the manifest folded"
+        );
+        let stable = records
+            .iter()
+            .find(|r| r.path == b"stable.md")
+            .expect("stable.md present");
+        assert_eq!(
+            stable.disposition,
+            CoverageDisposition::Indexed,
+            "every other document stays usable"
+        );
+    }
+
     #[test]
     fn a_symlink_is_reported_unsupported_and_never_followed() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1103,7 +1618,15 @@ mod tests {
         let generation = GenerationId("g-test".into());
         let (_, _, captured) =
             capture(dir.path(), &policy, &limits(), &unstopped()).expect("capture");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         let link = records
             .iter()
             .find(|r| r.path == b"link.txt")
@@ -1114,22 +1637,42 @@ mod tests {
         assert_eq!(link.mode, "120000");
     }
 
+    /// A per-file bound an operator *configured* still refuses by name,
+    /// before the file is read. What changed under ruling 0401 is which
+    /// captures have one at all: the bound is written here rather than
+    /// inherited from a default, because there is no default any more.
     #[test]
     fn an_oversize_file_is_bounded_not_read_fully() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Sized from the bound actually in force, so this stays the
         // oversize case whatever the estate's policy says.
-        let limits = limits();
+        let mut limits = limits();
+        limits.max_file_bytes = Some(4_096);
+        let limits = limits;
         std::fs::write(
             dir.path().join("huge.md"),
-            vec![b'a'; (limits.max_file_bytes + 1) as usize],
+            vec![
+                b'a';
+                (limits
+                    .max_file_bytes
+                    .expect("the oversize case needs a bound")
+                    + 1) as usize
+            ],
         )
         .expect("write huge file");
         let policy = ExtractorPolicy::markdown_only();
         let generation = GenerationId("g-test".into());
         let (_, _, captured) =
             capture(dir.path(), &policy, &limits, &unstopped()).expect("capture");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits,
+            &unstopped(),
+        )
+        .expect("finish");
         let huge = records
             .iter()
             .find(|r| r.path == b"huge.md")
@@ -1156,7 +1699,15 @@ mod tests {
         let generation = GenerationId("g-test".into());
         let (_, _, captured) =
             capture(dir.path(), &policy, &limits(), &unstopped()).expect("capture");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         let env = records
             .iter()
             .find(|r| r.path == b".env")
@@ -1179,7 +1730,15 @@ mod tests {
         let (_, _, captured) =
             capture(dir.path(), &policy, &limits(), &unstopped()).expect("capture");
         assert!(captured_names(&captured).contains(&"pipe".to_string()));
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         let pipe = records
             .iter()
             .find(|r| r.path == b"pipe")
@@ -1206,7 +1765,15 @@ mod tests {
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o644))
             .expect("restore permissions");
         let (_, _, captured) = result.expect("capture must not abort on one unreadable file");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         let blocked_record = records
             .iter()
             .find(|r| r.path == b"blocked.md")
@@ -1238,7 +1805,15 @@ mod tests {
         let generation = GenerationId("g-test".into());
         let (_, _, captured) =
             capture(dir.path(), &policy, &limits(), &unstopped()).expect("capture");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         assert!(
             records.iter().any(|r| r.path == b"real/inside.md"),
             "the real directory is walked normally"
@@ -1266,7 +1841,15 @@ mod tests {
         let generation = GenerationId("g-test".into());
         let (_, _, captured) =
             capture(dir.path(), &policy, &limits(), &unstopped()).expect("capture");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         let stable = records
             .iter()
             .find(|r| r.path == b"stable.md")
@@ -1286,7 +1869,15 @@ mod tests {
         let generation = GenerationId("g-test".into());
         let (_, _, captured) =
             capture(dir.path(), &policy, &limits(), &unstopped()).expect("capture");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         let object_id = records
             .iter()
             .find(|r| r.path == b"moved.md")
@@ -1311,7 +1902,7 @@ mod tests {
         }
         let policy = ExtractorPolicy::markdown_only();
         let mut limits = limits();
-        limits.max_entries = 5;
+        limits.max_entries = Some(5);
         let err = capture(dir.path(), &policy, &limits, &unstopped())
             .expect_err("a tree of directories alone must still trip the entry budget");
         let AtlasError::InvalidRequest(detail) = err else {
@@ -1338,7 +1929,7 @@ mod tests {
         }
         let policy = ExtractorPolicy::markdown_only();
         let mut limits = limits();
-        limits.max_entries = 10;
+        limits.max_entries = Some(10);
         let err = capture(dir.path(), &policy, &limits, &unstopped())
             .expect_err("wide directory refused");
         assert!(matches!(err, AtlasError::InvalidRequest(_)));
@@ -1355,14 +1946,14 @@ mod tests {
         }
         let policy = ExtractorPolicy::markdown_only();
         let mut tight = limits();
-        tight.max_entries = 5;
+        tight.max_entries = Some(5);
         assert!(
             capture(dir.path(), &policy, &tight, &unstopped()).is_err(),
             "the tight bound must refuse this collection"
         );
 
         let mut raised = tight;
-        raised.max_entries = 500;
+        raised.max_entries = Some(500);
         let (_, _, captured) =
             capture(dir.path(), &policy, &raised, &unstopped()).expect("a raised bound admits it");
         assert_eq!(captured.len(), 20);
@@ -1379,9 +1970,17 @@ mod tests {
         let generation = GenerationId("g-test".into());
 
         let mut tight = limits();
-        tight.max_file_bytes = 1024;
+        tight.max_file_bytes = Some(1024);
         let (_, _, captured) = capture(dir.path(), &policy, &tight, &unstopped()).expect("capture");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         let big = records
             .iter()
             .find(|r| r.path == b"big.md")
@@ -1390,10 +1989,18 @@ mod tests {
         assert_eq!(big.byte_len, Some(4096));
 
         let mut raised = tight;
-        raised.max_file_bytes = 1024 * 1024;
+        raised.max_file_bytes = Some(1024 * 1024);
         let (_, _, captured) =
             capture(dir.path(), &policy, &raised, &unstopped()).expect("capture");
-        let records = finish(&generation, &policy, captured, &unstopped()).expect("finish");
+        let records = finish_to_vec(
+            dir.path(),
+            &generation,
+            &policy,
+            captured,
+            &limits(),
+            &unstopped(),
+        )
+        .expect("finish");
         let big = records
             .iter()
             .find(|r| r.path == b"big.md")
@@ -1412,7 +2019,7 @@ mod tests {
         }
         let policy = ExtractorPolicy::markdown_only();
         let mut limits = limits();
-        limits.max_total_bytes = 4096;
+        limits.max_total_bytes = Some(4096);
         let err = capture(dir.path(), &policy, &limits, &unstopped())
             .expect_err("aggregate budget refuses");
         let AtlasError::InvalidRequest(detail) = err else {

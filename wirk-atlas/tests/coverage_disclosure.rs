@@ -58,12 +58,24 @@ fn repo_with(files: &[(&str, String)]) -> (TempDir, String) {
     (temp, commit)
 }
 
-/// Real, valid UTF-8 Rust text past `wirk-atlas/src/extract.rs`'s
-/// `MAX_TEXT_BYTES` (1 MiB) — the same budget the actual product file
-/// `wirk/src/wirkd/server.rs` (902,199 bytes at `73d6d2d`) is
-/// approaching. Nothing about it is a stub: the extractor reads it,
-/// measures it and refuses it exactly as it refuses any other blob over
-/// the budget.
+/// A file this estate genuinely cannot extract: a real `.pdf` path whose
+/// content is not a PDF at all, so `anydoc`'s own parser runs and
+/// genuinely fails (`ConvertError::Malformed`). The disposition is
+/// `Error` for a reason that belongs to the document, not to its size.
+///
+/// This replaced an over-1 MiB source file, which stopped being an
+/// extraction failure when rulings 0402/0403 removed the extractor's
+/// own size ceiling: large admitted text is now indexed, so it is no
+/// longer available as a positive control for "something really could
+/// not be extracted". A malformed document still is, and always was the
+/// truthful kind of failure.
+fn unconvertible_document() -> String {
+    "not really a pdf, just text pretending to be one\n".to_string()
+}
+
+/// Real, valid UTF-8 Rust text, large enough to derive more than one
+/// packed unit. Nothing about it is refused any more; it is a fixture
+/// for the packing contract, not for a budget.
 fn oversize_source() -> String {
     let mut text = String::with_capacity(1_200_000);
     let mut line = 0u32;
@@ -110,10 +122,15 @@ fn request(scope: wirk_atlas::QueryScope, query: &str) -> SearchRequest {
     }
 }
 
-fn staged(outcome: AcquireOutcome) -> wirk_atlas::SourceGeneration {
+/// The acquisition reports identity and coverage; the generation's own
+/// resource list lives in the immutable generation directory, which is
+/// what these checks read it back from.
+fn read_staged(atlas: &AtlasStore, outcome: AcquireOutcome) -> wirk_atlas::SourceGeneration {
     match outcome {
-        AcquireOutcome::Staged(generation) => generation,
-        other => panic!("{other:?}"),
+        AcquireOutcome::Staged(staged) => atlas
+            .generation(&staged.id)
+            .expect("the generation just staged reads back"),
+        other => panic!("expected Staged, got {other:?}"),
     }
 }
 
@@ -136,10 +153,13 @@ fn assert_one_real_extraction_error(generation: &wirk_atlas::SourceGeneration) {
             .map(|r| (String::from_utf8_lossy(&r.path).to_string(), r.disposition))
             .collect::<Vec<_>>()
     );
-    assert_eq!(
-        failed[0].detail.as_deref(),
-        Some("text blob exceeds bounded extractor size"),
-        "the failure must be the extractor's own diagnostic, not an inferred one"
+    assert!(
+        failed[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("document conversion failed")),
+        "the failure must be the extractor's own diagnostic, not an inferred one: {:?}",
+        failed[0].detail
     );
 }
 
@@ -149,16 +169,17 @@ fn assert_one_real_extraction_error(generation: &wirk_atlas::SourceGeneration) {
 fn a_search_over_a_generation_that_failed_to_extract_a_resource_never_calls_itself_complete() {
     let (repo, revision) = repo_with(&[
         ("small.rs", "pub fn alphamarker() {}\n".to_string()),
-        ("huge.rs", oversize_source()),
+        ("holed.pdf", unconvertible_document()),
     ]);
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     let membership = atlas.register_git("code", repo.path(), "HEAD").unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire(&membership, &revision, ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     assert_one_real_extraction_error(&generation);
     atlas.publish(&membership, &generation.id).unwrap();
 
@@ -201,11 +222,12 @@ fn intentionally_unsupported_or_excluded_resources_are_never_reported_as_extract
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     let membership = atlas.register_git("code", repo.path(), "HEAD").unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire(&membership, &revision, ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     // Positive control: this generation really does index fewer resources
     // than it holds, for reasons that are not failures.
     let counted = |wanted: CoverageDisposition| {
@@ -241,16 +263,17 @@ fn intentionally_unsupported_or_excluded_resources_are_never_reported_as_extract
 fn a_zero_hit_search_over_a_partially_extracted_generation_is_not_reported_as_no_match() {
     let (repo, revision) = repo_with(&[
         ("small.rs", "pub fn alphamarker() {}\n".to_string()),
-        ("huge.rs", oversize_source()),
+        ("holed.pdf", unconvertible_document()),
     ]);
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     let membership = atlas.register_git("code", repo.path(), "HEAD").unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire(&membership, &revision, ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     assert_one_real_extraction_error(&generation);
     atlas.publish(&membership, &generation.id).unwrap();
 
@@ -273,7 +296,7 @@ fn a_requester_bound_only_to_a_healthy_source_learns_nothing_about_another_sourc
         repo_with(&[("open.rs", "pub fn alphamarker() {}\n".to_string())]);
     let (closed_repo, closed_revision) = repo_with(&[
         ("closed.rs", "pub fn alphamarker() {}\n".to_string()),
-        ("quarantinedhuge.rs", oversize_source()),
+        ("quarantined.pdf", unconvertible_document()),
     ]);
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
@@ -283,16 +306,18 @@ fn a_requester_bound_only_to_a_healthy_source_learns_nothing_about_another_sourc
     let closed = atlas
         .register_git("closed", closed_repo.path(), "HEAD")
         .unwrap();
-    let open_generation = staged(
-        atlas
+    let open_generation = {
+        let outcome = atlas
             .acquire(&open, &open_revision, ExtractorPolicy::default())
-            .unwrap(),
-    );
-    let closed_generation = staged(
-        atlas
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
+    let closed_generation = {
+        let outcome = atlas
             .acquire(&closed, &closed_revision, ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     assert_one_real_extraction_error(&closed_generation);
     atlas.publish(&open, &open_generation.id).unwrap();
     atlas.publish(&closed, &closed_generation.id).unwrap();
@@ -313,7 +338,7 @@ fn a_requester_bound_only_to_a_healthy_source_learns_nothing_about_another_sourc
     );
     assert!(answer.coverage.is_complete());
     let rendered = format!("{answer:?}");
-    for needle in ["closed", "quarantinedhuge", "exceeds bounded"] {
+    for needle in ["closed", "quarantined.pdf", "conversion failed"] {
         assert!(
             !rendered.contains(needle),
             "the denied source leaked {needle:?} into an answer built for a \
@@ -333,33 +358,38 @@ fn a_requester_bound_only_to_a_healthy_source_learns_nothing_about_another_sourc
 fn a_repaired_republished_generation_recovers_while_the_pinned_old_one_keeps_its_own_truth() {
     let (repo, first_revision) = repo_with(&[
         ("small.rs", "pub fn alphamarker() {}\n".to_string()),
-        ("huge.rs", oversize_source()),
+        ("holed.pdf", unconvertible_document()),
     ]);
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     let membership = atlas.register_git("code", repo.path(), "HEAD").unwrap();
-    let broken = staged(
-        atlas
+    let broken = {
+        let outcome = atlas
             .acquire(&membership, &first_revision, ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     assert_one_real_extraction_error(&broken);
     atlas.publish(&membership, &broken.id).unwrap();
     let before = search(&atlas, &request(work(&["code"]), "alphamarker")).unwrap();
     assert!(before.coverage.source_extraction_incomplete);
 
     // A real refresh of the source itself: a new commit that no longer
-    // carries a blob past the extractor's budget. Nothing already
+    // carries a document the parser cannot read. Nothing already
     // recorded is edited.
-    fs::remove_file(repo.path().join("huge.rs")).unwrap();
+    fs::remove_file(repo.path().join("holed.pdf")).unwrap();
     git(repo.path(), &["add", "-A"]);
-    git(repo.path(), &["commit", "-qm", "drop the oversize blob"]);
-    let second_revision = git(repo.path(), &["rev-parse", "HEAD"]);
-    let repaired = staged(
-        atlas
-            .acquire(&membership, &second_revision, ExtractorPolicy::default())
-            .unwrap(),
+    git(
+        repo.path(),
+        &["commit", "-qm", "drop the unconvertible document"],
     );
+    let second_revision = git(repo.path(), &["rev-parse", "HEAD"]);
+    let repaired = {
+        let outcome = atlas
+            .acquire(&membership, &second_revision, ExtractorPolicy::default())
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     assert!(
         repaired
             .resources
@@ -411,11 +441,12 @@ fn packed_multiline_units_name_exactly_the_committed_bytes_and_lines_they_span()
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     let membership = atlas.register_git("code", repo.path(), "HEAD").unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire(&membership, &revision, ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     let resource = generation
         .resources
         .iter()
@@ -488,11 +519,12 @@ fn reported_term_matches_are_tokens_the_ranker_scored_not_substrings() {
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     let member = atlas.register_git("code", repo.path(), "HEAD").unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire(&member, "HEAD", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     atlas.publish(&member, &generation.id).unwrap();
 
     let answer = search(&atlas, &request(work(&["code"]), "alphamarker")).unwrap();
@@ -552,11 +584,12 @@ fn a_unit_that_matches_nothing_reports_no_term_location() {
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
     let member = atlas.register_git("code", repo.path(), "HEAD").unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire(&member, "HEAD", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     atlas.publish(&member, &generation.id).unwrap();
 
     let answer = search(&atlas, &request(work(&["code"]), "gammamarkerabsent")).unwrap();

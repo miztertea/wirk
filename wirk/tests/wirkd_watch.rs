@@ -467,6 +467,78 @@ fn watch_of_path_like_work_id_is_refused_not_panicked() {
     drop(wirkd_child);
 }
 
+/// Ruling 0425 F2: `WatchPayload::work_id` became `Option<WorkId>` to
+/// carry the estate-wide stream (ruling 0394), so
+/// `{"verb":"watch","payload":{"admin":false}}` now deserializes where
+/// it used to fail as JSON before that field existed. `handle_connection`
+/// only branches to the estate handler when `admin && work_id.is_none()`,
+/// so that payload used to fall through to `handle_watch_connection`,
+/// which unwrapped `work_id` with `.expect(...)` — a reachable panic of
+/// the connection thread, silent to the caller as a bare `EOF` (not
+/// reachable from the CLI, which never builds this payload; reachable by
+/// any socket peer). Constructs the malformed payload directly, since no
+/// `WatchPayload` constructor produces this shape.
+#[test]
+fn non_admin_watch_naming_no_work_is_refused_not_panicked() {
+    let dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = dir.path().to_path_buf();
+    let wirkd_child = KillOnDrop(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_pointer(&estate);
+
+    let malformed = WatchPayload {
+        work_id: None,
+        requester: None,
+        admin: false,
+    };
+    let (tx, rx) = mpsc::channel();
+    let socket = pointer.socket.clone();
+    std::thread::spawn(move || {
+        let outcome = match wirkd::client::watch(&socket, malformed) {
+            Ok(mut events) => events.next().map(|r| r.map_err(|err| err.to_string())),
+            Err(err) => Some(Err(err.to_string())),
+        };
+        let _ = tx.send(outcome);
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Some(Err(msg))) => {
+            assert!(
+                msg.contains("BadRequest"),
+                "expected a labelled BadRequest refusal for a non-administrative watch \
+                 naming no work, got: {msg}"
+            );
+        }
+        other => panic!(
+            "expected the malformed watch to be refused with a labelled BadRequest, not to \
+             panic its connection thread, hang, or silently close, got: {other:?}"
+        ),
+    }
+
+    // The daemon must survive the malformed request and keep answering —
+    // proof the connection thread returned a reply instead of panicking.
+    let (work_id, _run_id) = submit(
+        &estate,
+        &pointer.socket,
+        "post-malformed-watch liveness check",
+    );
+    assert!(estate.join("works").join(&work_id.0).exists());
+
+    let stop = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(stop.status.success());
+    drop(wirkd_child);
+}
+
 /// P3 foundation correction (0069, `foundation-verify/VERDICT.md`
 /// "What is established"): a live-streamed `Event`'s own `EventId` is
 /// nonempty and equals the id the journal actually persisted for it.
@@ -579,6 +651,279 @@ fn spawn_cli_watch(estate: &Path) -> (std::process::Child, mpsc::Receiver<String
 fn recv_line(rx: &mpsc::Receiver<String>, what: &str) -> String {
     rx.recv_timeout(Duration::from_secs(10))
         .unwrap_or_else(|_| panic!("never observed: {what}"))
+}
+
+/// `spawn_cli_watch` with stderr piped too (one line at a time into its own
+/// `mpsc`), so a test can wait on the estate stream's real subscription
+/// barrier — the `subscribed` line the CLI prints once the daemon has
+/// confirmed the dial (ruling 0404 F2) — instead of a sleep.
+fn spawn_cli_watch_err(
+    estate: &Path,
+) -> (
+    std::process::Child,
+    mpsc::Receiver<String>,
+    mpsc::Receiver<String>,
+) {
+    let mut child = wirk_cli()
+        // The operator's own stream (ruling 0117), not the runner's
+        // inherited actor context.
+        .env_remove("WIRK_ESTATE_ROOT")
+        .env_remove("WIRK_WORK_ID")
+        .env_remove("WIRK_RUN_ID")
+        .args(["wirkd", "watch", "--estate"])
+        .arg(estate)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn wirk wirkd watch");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if out_tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => {
+                    if err_tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    (child, out_rx, err_rx)
+}
+
+/// Ruling 0394: the operator's unfiltered estate watch is dialed once and
+/// must keep receiving durable events for Works submitted *after* the dial
+/// — the per-Work discovery walk names only the Works present when it
+/// lists the estate, so it can never see a Work that does not exist yet.
+/// Red before this correction: a Work submitted after the dial is named by
+/// no reader thread, so its `WorkSubmitted` never reaches the already-open
+/// stream (the bounded `recv_line` below is the test's own termination
+/// bound, not a product one — the required line is a positive event, and it
+/// must arrive for the fixed stream).
+#[test]
+fn estate_watch_streams_a_work_submitted_after_the_dial() {
+    let dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = dir.path().to_path_buf();
+    let wirkd_child = KillOnDrop(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_pointer(&estate);
+    let (work_a, _run_a) = submit(&estate, &pointer.socket, "estate watch: existing work");
+
+    // The operator's unfiltered stream, dialed while work_a exists. The
+    // dial is proven live once it has replayed work_a's own journaled
+    // events — no sleep, the readiness is the event itself.
+    let (mut cli, rx) = spawn_cli_watch(&estate);
+    let mut saw_work_a = false;
+    for _ in 0..16 {
+        let line = recv_line(&rx, "work_a's replayed WorkSubmitted");
+        if line.starts_with(&format!("{} ", work_a.0)) && line.contains("WorkSubmitted") {
+            saw_work_a = true;
+            break;
+        }
+    }
+    assert!(
+        saw_work_a,
+        "the estate stream must replay work_a's already-journaled events"
+    );
+
+    // The Work under test: submitted after the dial above.
+    let (work_b, _run_b) = submit(&estate, &pointer.socket, "estate watch: new work");
+
+    // Its `WorkSubmitted` must arrive on the same already-open stream, live.
+    let mut saw_work_b = false;
+    for _ in 0..16 {
+        let line = recv_line(&rx, "work_b's WorkSubmitted, appended after the dial");
+        if line.starts_with(&format!("{} ", work_b.0)) && line.contains("WorkSubmitted") {
+            saw_work_b = true;
+            break;
+        }
+    }
+    assert!(
+        saw_work_b,
+        "a Work submitted after the dial must stream to the already-open estate watch (ruling 0394)"
+    );
+
+    let stop = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(stop.status.success());
+
+    let status = cli.wait().expect("watch exits on its own");
+    assert!(
+        status.success(),
+        "an unrefused estate stream ends clean on stop, got: {status:?}"
+    );
+    drop(wirkd_child);
+}
+
+/// Ruling 0394: an estate watch dialed on an estate with no Work yet stays
+/// open and receives the first Work's events. Red before this correction:
+/// the per-Work walk found no Work, so the command refused the empty estate
+/// (exit 2) and the stream never opened at all — the first Work submitted
+/// afterwards reaches nothing.
+#[test]
+fn estate_watch_streams_the_first_work_on_an_empty_estate() {
+    let dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = dir.path().to_path_buf();
+    let wirkd_child = KillOnDrop(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_pointer(&estate);
+
+    // No Work exists yet: the operator's stream still opens and stays open.
+    // The barrier is the daemon's own confirmation, observed on the stream
+    // (ruling 0404 F2): the CLI reports `subscribed` once the daemon has
+    // registered this dial, which is what makes the first append below
+    // guaranteed to reach it — a real connection/subscription state, not a
+    // sleep that merely hopes the dial is up.
+    let (mut cli, rx, err_rx) = spawn_cli_watch_err(&estate);
+    let mut subscribed = false;
+    for _ in 0..64 {
+        let line = recv_line(&err_rx, "the estate stream's subscription barrier");
+        if line.contains("subscribed") {
+            subscribed = true;
+            break;
+        }
+    }
+    assert!(
+        subscribed,
+        "the estate stream must report its own subscription before the first Work is submitted (ruling 0404)"
+    );
+
+    // The estate's first Work, created after the barrier above.
+    let (work_a, _run_a) = submit(&estate, &pointer.socket, "estate watch: first work");
+
+    let mut saw_work_a = false;
+    for _ in 0..16 {
+        let line = recv_line(&rx, "work_a's WorkSubmitted, the estate's first Work");
+        if line.starts_with(&format!("{} ", work_a.0)) && line.contains("WorkSubmitted") {
+            saw_work_a = true;
+            break;
+        }
+    }
+    assert!(
+        saw_work_a,
+        "the first Work on an estate must stream to a watch dialed before it existed (ruling 0394)"
+    );
+
+    let stop = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(stop.status.success());
+
+    let status = cli.wait().expect("watch exits on its own");
+    assert!(
+        status.success(),
+        "an unrefused estate stream ends clean on stop, got: {status:?}"
+    );
+    drop(wirkd_child);
+}
+
+/// Ruling 0425 F3: `estate_drain`'s journal and replay errors named no
+/// Work, though on a stream spanning the whole estate that is the one
+/// piece of information an operator needs to locate the failure.
+/// Corrupts one Work's own journal file directly — the same corruption
+/// shape `journal_demo.rs`'s own corruption test builds, bypassing the
+/// daemon entirely so the write is a genuine on-disk corruption, not a
+/// crafted request — so the *replay* branch inside `estate_drain` fails,
+/// and checks the estate stream's terminal `JournalError` names that
+/// Work's own id, not just "journal"/"replay".
+#[test]
+fn estate_watch_journal_error_names_the_failing_work() {
+    let dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = dir.path().to_path_buf();
+    let wirkd_child = KillOnDrop(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_pointer(&estate);
+
+    let (work_id, _run_id) = submit(&estate, &pointer.socket, "corrupted-journal target");
+
+    // Bypasses the daemon entirely: a hand-mangled line appended straight
+    // to the file on disk, so `Journal::open` still succeeds (append mode,
+    // no parse on open) and only `replay()` fails, once the estate stream
+    // reaches this Work in its sorted walk of `works/`.
+    let journal_path = estate.join("works").join(&work_id.0).join("journal.ndjson");
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .expect("open journal for corruption");
+        writeln!(file, "not json").expect("write malformed line");
+    }
+
+    let events =
+        wirkd::client::watch(&pointer.socket, WatchPayload::estate()).expect("estate watch dials");
+    let mut terminal_err = None;
+    for event in events {
+        if let Err(err) = event {
+            terminal_err = Some(err.to_string());
+            break;
+        }
+    }
+    let msg = terminal_err.expect(
+        "the estate stream must end with a nonzero JournalError once it reaches the \
+         corrupted journal, not a clean EOF or a silently empty history",
+    );
+    assert!(
+        msg.contains("JournalError"),
+        "expected a JournalError refusal, got: {msg}"
+    );
+    assert!(
+        msg.contains(&work_id.0),
+        "expected the JournalError to name the failing Work {}, got: {msg}",
+        work_id.0
+    );
+
+    let stop = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(stop.status.success());
+    drop(wirkd_child);
 }
 
 /// Spawns the real `watch` CLI with `--json`, stdout and stderr each
@@ -704,22 +1049,17 @@ fn cli_watch_of_unknown_work_exits_nonzero_and_labels_the_refusal() {
     drop(wirkd_child);
 }
 
-/// P3 (0069 correction, `FINAL-REFUSAL-CORRECTION.md` item 1): the
-/// multi-Work discovery stream must keep serving a valid Work's own
-/// events, live, after a sibling Work's watch is refused — and the
-/// whole command's final exit still reflects that refusal. `work_b` is
-/// never submitted through this daemon at all: only its bare directory
-/// is created directly under `works/`, so `wirk wirkd watch`'s own
-/// discovery (a plain directory listing, `list_work_ids`) names it, but
-/// the daemon has no journal for it — neither on disk nor in its own
-/// in-memory cache (submitting `work_b` through this same daemon and
-/// then deleting its journal file does *not* reproduce this: `submit`
-/// already cached the journal handle in memory, so the daemon would
-/// keep serving it from that cache regardless of the file's removal —
-/// watched directly and ruled out before writing this fixture this
-/// way).
+/// P3 (ruling 0394): the operator's unfiltered estate watch is one
+/// stream, not a per-Work fan-out — so a bare, journal-less Work
+/// directory contributes nothing to it (it is simply absent, never
+/// refused), a valid Work's own events still replay and stream live, and
+/// with no refusal to record the whole command exits clean. `work_b` is
+/// never submitted through this daemon at all: only its bare directory is
+/// created directly under `works/`, so it has no journal to replay — and
+/// the estate stream has no per-Work admission to refuse, so it neither
+/// errors nor contributes a line.
 #[test]
-fn cli_watch_multi_work_keeps_streaming_after_a_sibling_refusal_and_exits_nonzero() {
+fn cli_watch_estate_skips_a_journalless_sibling_and_streams_to_a_clean_exit() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let wirkd_child = KillOnDrop(
@@ -739,40 +1079,35 @@ fn cli_watch_multi_work_keeps_streaming_after_a_sibling_refusal_and_exits_nonzer
 
     let (mut cli, rx) = spawn_cli_watch(&estate);
 
+    // work_a's replay must reach the one estate stream; a bare,
+    // journal-less sibling must not — refused or otherwise — because the
+    // estate stream has no per-Work admission to refuse.
     let mut saw_work_a_submitted = false;
-    let mut saw_work_b_refused = false;
     for _ in 0..16 {
-        if saw_work_a_submitted && saw_work_b_refused {
-            break;
-        }
-        let line = recv_line(&rx, "work_a's own event or work_b's refusal");
+        let line = recv_line(&rx, "work_a's own replayed event");
+        assert!(
+            !line.starts_with(&format!("{work_b_id} ")),
+            "a bare, journal-less Work must not appear on the estate stream, refused or otherwise: {line}"
+        );
         if line.starts_with(&format!("{} ", work_a.0)) && line.contains("WorkSubmitted") {
             saw_work_a_submitted = true;
-        }
-        if line.starts_with(&format!("{work_b_id} refused")) {
-            assert!(line.contains("NotFound"), "expected NotFound, got: {line}");
-            assert!(
-                !line.contains("malformed"),
-                "must not be labeled malformed, got: {line}"
-            );
-            saw_work_b_refused = true;
+            break;
         }
     }
     assert!(
         saw_work_a_submitted,
-        "work_a's own stream must keep serving despite work_b's refusal"
-    );
-    assert!(
-        saw_work_b_refused,
-        "work_b's own watch must be refused and labeled as such"
+        "work_a's own replay must reach the estate stream"
     );
 
-    // work_a's stream is still alive after work_b's refusal: a fresh
-    // live append must still arrive, unkilled.
+    // A live append after the dial must also reach the same stream.
     record(&pointer.socket, &work_a, &run_a, EventKind::RunVanished);
     let mut saw_live = false;
     for _ in 0..16 {
         let line = recv_line(&rx, "work_a's live RunVanished append");
+        assert!(
+            !line.starts_with(&format!("{work_b_id} ")),
+            "a bare, journal-less Work must not appear on the estate stream, refused or otherwise: {line}"
+        );
         if line.starts_with(&format!("{} ", work_a.0)) && line.contains("RunVanished") {
             saw_live = true;
             break;
@@ -780,12 +1115,12 @@ fn cli_watch_multi_work_keeps_streaming_after_a_sibling_refusal_and_exits_nonzer
     }
     assert!(
         saw_live,
-        "work_a's stream must keep delivering live events after the sibling refusal"
+        "work_a's stream must keep delivering live events across the skipped sibling"
     );
 
-    // Ending wirkd ends work_a's own stream too (EOF); the whole CLI
-    // process then exits on its own — no kill, no timeout on the
-    // stream itself, only this test's own bound on waiting for it.
+    // Ending wirkd ends the estate stream (EOF); with no refusal recorded
+    // anywhere, the whole command exits clean — the flip from the per-Work
+    // refusal contract this correction removes.
     let stop = wirk_cli()
         .args(["wirkd", "stop", "--estate"])
         .arg(&estate)
@@ -793,10 +1128,10 @@ fn cli_watch_multi_work_keeps_streaming_after_a_sibling_refusal_and_exits_nonzer
         .expect("wirkd stop runs");
     assert!(stop.status.success());
 
-    let status = cli.wait().expect("wirk wirkd watch exits on its own");
+    let status = cli.wait().expect("wirkd watch exits on its own");
     assert!(
-        !status.success(),
-        "the whole command's exit must reflect work_b's refusal even though work_a streamed cleanly the whole time, got: {status:?}"
+        status.success(),
+        "the estate watch must exit clean with no refusal to record, got: {status:?}"
     );
 
     drop(wirkd_child);
@@ -959,13 +1294,16 @@ fn cli_watch_json_of_unknown_work_refuses_on_stderr_and_prints_no_stdout() {
     drop(wirkd_child);
 }
 
-/// One Work's json refusal must not cut a sibling's parseable stream:
-/// every stdout line observed after the refusal still parses as one
-/// event of the admitted Work, the refusal itself reaches stderr only,
-/// live appends keep arriving, and the final exit still reflects the
-/// refusal.
+/// P3 (ruling 0394): the operator's unfiltered estate watch, in
+/// `--json` mode, is one parseable stream — not a per-Work fan-out — so
+/// a bare, journal-less Work directory contributes no line to it (the
+/// stream has no per-Work admission to refuse), a valid Work's own events
+/// still replay and stream live, and with no refusal to record the whole
+/// command exits clean. Every stdout line still parses as one event of the
+/// admitted Work, because a journal-less sibling has no events to name
+/// itself.
 #[test]
-fn cli_watch_json_keeps_streaming_after_a_sibling_refusal_and_exits_nonzero() {
+fn cli_watch_json_estate_skips_a_journalless_sibling_and_streams_to_a_clean_exit() {
     let dir = tempfile::tempdir().expect("estate tempdir");
     let estate = dir.path().to_path_buf();
     let mut wirkd_child = KillOnDrop(
@@ -985,6 +1323,9 @@ fn cli_watch_json_keeps_streaming_after_a_sibling_refusal_and_exits_nonzero() {
 
     let (mut cli, out, err) = spawn_cli_watch_json(&estate, None);
 
+    // work_a's replay must reach the one estate stream, and every line it
+    // sends still parses as one event of the admitted Work — a journal-less
+    // sibling has no events to name itself, so it names no Work here.
     let mut saw_work_a = false;
     for _ in 0..16 {
         if saw_work_a {
@@ -995,7 +1336,12 @@ fn cli_watch_json_keeps_streaming_after_a_sibling_refusal_and_exits_nonzero() {
         assert_eq!(
             event["work"].as_str(),
             Some(work_a.0.as_str()),
-            "stdout must carry only the admitted Work's events: {line}"
+            "stdout must carry only the admitted Work's events, a bare sibling having none: {line}"
+        );
+        assert_ne!(
+            event["work"].as_str(),
+            Some(work_b_id.as_str()),
+            "a bare, journal-less Work must not appear on the estate stream: {line}"
         );
         if event["kind"]["kind"].as_str() == Some("WorkSubmitted") {
             saw_work_a = true;
@@ -1003,29 +1349,7 @@ fn cli_watch_json_keeps_streaming_after_a_sibling_refusal_and_exits_nonzero() {
     }
     assert!(
         saw_work_a,
-        "work_a's own stream must keep serving despite work_b's refusal"
-    );
-
-    let mut saw_refusal = false;
-    for _ in 0..16 {
-        if saw_refusal {
-            break;
-        }
-        let line = err
-            .recv_timeout(Duration::from_secs(10))
-            .unwrap_or_else(|_| panic!("work_b's refusal never reached stderr"));
-        if line.contains(&work_b_id) && line.contains("refused") {
-            assert!(line.contains("NotFound"), "expected NotFound, got: {line}");
-            assert!(
-                !line.contains("malformed"),
-                "must not be labeled malformed, got: {line}"
-            );
-            saw_refusal = true;
-        }
-    }
-    assert!(
-        saw_refusal,
-        "work_b's own watch must be refused, labeled as such, on stderr"
+        "work_a's own replay must reach the estate stream"
     );
 
     record(&pointer.socket, &work_a, &run_a, EventKind::RunVanished);
@@ -1040,7 +1364,7 @@ fn cli_watch_json_keeps_streaming_after_a_sibling_refusal_and_exits_nonzero() {
     }
     assert!(
         saw_live,
-        "work_a must keep delivering parseable live events after the sibling refusal"
+        "work_a must keep delivering parseable live events across the skipped sibling"
     );
 
     let stop = wirk_cli()
@@ -1052,9 +1376,19 @@ fn cli_watch_json_keeps_streaming_after_a_sibling_refusal_and_exits_nonzero() {
 
     let status = cli.wait().expect("watch exits on its own");
     assert!(
-        !status.success(),
-        "the whole command's exit must still reflect work_b's refusal, got: {status:?}"
+        status.success(),
+        "the estate watch must exit clean with no refusal to record, got: {status:?}"
     );
+
+    // The estate stream has no per-Work admission to refuse, so it records
+    // no refusal diagnostic at all; the stderr channel closes once the
+    // process has (asserted above) exited, so this drain ends.
+    for line in err {
+        assert!(
+            !line.contains("refused"),
+            "the estate stream must not record a refusal it never makes: {line}"
+        );
+    }
     let _ = wirkd_child.0.wait();
     drop(wirkd_child);
 }

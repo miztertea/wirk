@@ -289,8 +289,23 @@ pub fn watch(
     // out — not from a separate preflight, which could reach a
     // different daemon than the one that serves the stream.
     // `Some(target)` is "this stream must acknowledge the scope, for
-    // this Work" — the Work asked about, not the requester (F-2).
-    let require_scope_ack = (!payload.admin).then(|| payload.work_id.clone());
+    // this Work" — the Work asked about, not the requester (F-2). An
+    // administrative stream (a single named Work, or the estate-wide
+    // stream, ruling 0394) reads raw journals, so it requires no scope
+    // acknowledgment at all.
+    let require_scope_ack = if payload.admin {
+        None
+    } else {
+        payload.work_id.clone()
+    };
+    // The estate-wide stream (ruling 0394/0404) has no scope to
+    // acknowledge, but it does establish itself with a one-line barrier
+    // before any `Event`; read that barrier here, synchronously, so this
+    // `watch` returns only once the daemon has registered the
+    // subscription — the caller's first append on this estate is then
+    // guaranteed to reach the dial, which is the real readiness signal a
+    // scripted consumer can wait on instead of a sleep.
+    let estate_stream = payload.admin && payload.work_id.is_none();
     let request = Request::watch(payload);
     let mut line = serde_json::to_vec(&request).map_err(|err| {
         ClientError::Io(io::Error::other(format!(
@@ -300,8 +315,36 @@ pub fn watch(
     line.push(b'\n');
     (&stream).write_all(&line)?;
 
+    let mut reader = BufReader::new(stream);
+    // Consume the estate barrier before the iterator is handed out, so the
+    // `WatchLines` that follows reads raw `Event` lines exactly as an
+    // administrative stream always has. A control line, never an `Event`,
+    // so it never reaches stdout.
+    if estate_stream {
+        let mut ack = String::new();
+        match reader.read_line(&mut ack) {
+            Ok(0) => {
+                return Err(ClientError::ScopeNotApplied(
+                    "this estate stream ended before acknowledging its subscription",
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => return Err(ClientError::Io(err)),
+        }
+        match serde_json::from_str::<Reply>(ack.trim_end_matches(['\n', '\r'])) {
+            Ok(Reply::Ok { result, .. })
+                if result.get("scope").and_then(|scope| scope.as_str()) == Some("estate") => {}
+            Ok(Reply::Err { error, .. }) => return Err(ClientError::Refused(error)),
+            _ => {
+                return Err(ClientError::ScopeNotApplied(
+                    "this estate stream opened with no subscription barrier",
+                ));
+            }
+        }
+    }
+
     Ok(WatchLines {
-        reader: BufReader::new(stream),
+        reader,
         require_scope_ack,
         done: false,
     })

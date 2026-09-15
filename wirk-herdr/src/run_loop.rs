@@ -2028,15 +2028,51 @@ impl<C: HerdrClient, W: WirkdApi> RunLoop<C, W> {
         // launch itself is held to.
         let contract_text = match self.contract_delivery.as_ref() {
             Some(delivery) if delivery.mode == wirk_core::ContractDeliveryMode::Prompt => {
-                let reference = wirk_core::WorkerContractRef {
-                    version: delivery.version.clone(),
-                    digest: delivery.digest.clone(),
+                let estate_root = std::path::Path::new(&actor.triple.estate_root);
+                // P6.7: when the launch composed the contract with this
+                // estate's doctrine, the document that was delivered is
+                // the composed one, and it is the composed one that is
+                // re-proved here. Reading the bare contract instead
+                // would quietly drop the estate's own rules out of every
+                // prompt after the first.
+                let text = match &delivery.composed {
+                    Some(composed) => {
+                        let store = crate::estate_doctrine::store_dir(estate_root);
+                        crate::content_store::read_verified(&store, &composed.digest)
+                            .map_err(|error| {
+                                RunLoopError::Herdr(HerdrExecutorError::DoctrineStore {
+                                    path: crate::content_store::path_in(&store, &composed.digest)
+                                        .display()
+                                        .to_string(),
+                                    reason: match error {
+                                        crate::content_store::StoreError::Unreadable {
+                                            reason,
+                                            ..
+                                        } => reason,
+                                        crate::content_store::StoreError::DigestMismatch {
+                                            found,
+                                            ..
+                                        } => format!(
+                                            "it hashes to {found}, not the {} this Run was                                              launched with",
+                                            composed.digest
+                                        ),
+                                    },
+                                })
+                            })?
+                            .1
+                    }
+                    None => {
+                        let reference = wirk_core::WorkerContractRef {
+                            version: delivery.version.clone(),
+                            digest: delivery.digest.clone(),
+                        };
+                        crate::worker_contract::read_verified(estate_root, &reference)
+                            .map_err(|error| {
+                                RunLoopError::Herdr(HerdrExecutorError::Contract(error))
+                            })?
+                            .1
+                    }
                 };
-                let (_, text) = crate::worker_contract::read_verified(
-                    std::path::Path::new(&actor.triple.estate_root),
-                    &reference,
-                )
-                .map_err(|error| RunLoopError::Herdr(HerdrExecutorError::Contract(error)))?;
                 Some(text)
             }
             _ => None,
@@ -2460,7 +2496,11 @@ pub fn compose_first_prompt(
                     .unwrap_or("no native mechanism was available");
                 format!(
                     "{}\n\n{}\n\n---\n\n",
-                    crate::worker_contract::prompt_disclosure(&kind.0, reason),
+                    crate::worker_contract::prompt_disclosure(
+                        &kind.0,
+                        reason,
+                        delivery.composed.is_some(),
+                    ),
                     text.trim()
                 )
             }

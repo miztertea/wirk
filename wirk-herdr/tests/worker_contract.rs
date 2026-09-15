@@ -64,6 +64,7 @@ fn actor_world(
     contract: Option<WorkerContractRef>,
 ) -> World {
     World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: "wirk".to_string(),
         worktree_path: worktree_path.to_path_buf(),
         branch: "p4/worker-contract".to_string(),
@@ -84,7 +85,7 @@ fn actor_world(
         boundary: Boundary(vec!["src/**".to_string()]),
         review_targets: Vec::new(),
         evidence: None,
-        contract,
+        contract: contract.map(Box::new),
     })
 }
 

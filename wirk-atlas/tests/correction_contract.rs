@@ -116,6 +116,11 @@ fn publication_binds_locator_but_refresh_accepts_each_explicit_ref() {
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     let manifest = estate
         .path()
@@ -137,6 +142,11 @@ fn publication_binds_locator_but_refresh_accepts_each_explicit_ref() {
         .refresh(&member, &first, ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     assert_eq!(refreshed.id, generation.id);
     assert_eq!(atlas.attempts().last().unwrap().requested_ref, first);
@@ -156,6 +166,11 @@ fn exact_source_spans_are_blob_qualified_and_independent_of_retrieval_units() {
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     let record = generation
         .resources
@@ -222,6 +237,11 @@ fn long_utf8_lines_are_deterministic_bounded_lossless_derived_units() {
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     let record = generation
         .resources

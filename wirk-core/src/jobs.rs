@@ -773,10 +773,29 @@ pub fn recover_owned_jobs(estate_root: &Path) -> RecoveryOutcome {
 // Policy
 // ---------------------------------------------------------------------
 
-/// Resource policy for one estate. Defaults are *construction* choices,
-/// chosen to change no existing behaviour on the day they land, and are
-/// overridable per estate in `<estate>/.wirk/resources.json`. No
-/// machine-specific path or value appears here.
+/// Resource policy for one estate, overridable per estate in
+/// `<estate>/.wirk/resources.json`. No machine-specific path or value
+/// appears here.
+///
+/// **What a default is allowed to be.** The concurrency and
+/// mutual-exclusion fields below carry real defaults, because they
+/// describe mechanisms this process operates: how many of its own
+/// expensive jobs it runs at once, how long it waits on a lock it
+/// itself holds. The fields that could *refuse, kill or truncate work
+/// an operator already admitted* — a job's deadline, a document
+/// collection's size, shape or count, an HTTP response's size or clock,
+/// an artifact's size, an admission's memory floor — default to `None`,
+/// meaning this product imposes no bound of its own on them (ruling
+/// 0398: "the work defines the work, not time or file size or any other
+/// arbitrary measurement", applied to existing behaviour by 0400/0401).
+/// Each stays configurable: an operator who has a reason for a bound
+/// writes it, and it is then enforced exactly as it says.
+///
+/// `None` is an *absence*, never a very large number standing in for
+/// one. Nothing here compares against a sentinel, and a real limit that
+/// does exist — the host's own memory, its open-file limit, a parser's
+/// own capability — is reported as itself where it is hit, not
+/// anticipated with a guess.
 #[derive(Debug, Clone)]
 pub struct ResourcePolicy {
     /// Expensive jobs this estate may run at once. Default 1 — the value
@@ -822,13 +841,37 @@ pub struct ResourcePolicy {
     /// answering `AtlasBusy`. Small and non-zero: a cheap read should
     /// tolerate another cheap read, never queue behind a build.
     pub cheap_wait_millis: u64,
-    /// Wall-clock bound on one expensive child. Default 1 hour.
-    pub job_deadline_secs: u64,
+    /// Wall-clock bound on one expensive child, when an operator asks
+    /// for one.
+    ///
+    /// `None` — the default — is **no deadline**: a job that is still
+    /// doing the work it was admitted to do is not ended because a clock
+    /// passed a number this product chose (ruling 0398, "the work
+    /// defines the work"). Nothing on the host refuses at any particular
+    /// elapsed time, so there was no platform boundary behind the old
+    /// one-hour default; what ends a job that will never finish is the
+    /// operator's own `atlas cancel`, which reaches a child through the
+    /// same watchdog and in-process work through [`JobStop`].
+    ///
+    /// `Some(0)` still means a deadline that has *already* passed, which
+    /// is a deterministic stop control with no timing race in it, and is
+    /// used as exactly that.
+    pub job_deadline_secs: Option<u64>,
     /// `some avg10` on `/proc/pressure/memory` above which admission is
-    /// refused. Advisory (see [`PressureSample`]).
-    pub memory_pressure_avg10_max: f64,
-    /// `MemAvailable` floor below which admission is refused. Advisory.
-    pub min_available_memory_bytes: u64,
+    /// refused, when an operator sets one. Advisory (see
+    /// [`PressureSample`]).
+    ///
+    /// `None` — the default — refuses nothing. The sample is still taken
+    /// and still disclosed on every admission's notes and on
+    /// `wirkd ping`: an observation an operator can act on, rather than
+    /// a product-chosen figure that turns admitted work away.
+    pub memory_pressure_avg10_max: Option<f64>,
+    /// `MemAvailable` floor below which admission is refused, when an
+    /// operator sets one. Advisory, and `None` by default for the same
+    /// reason as `memory_pressure_avg10_max`: observing that a host has
+    /// less memory free than some number is not a statement that this
+    /// job needs more than that.
+    pub min_available_memory_bytes: Option<u64>,
     /// Where the per-user host slot pool lives.
     ///
     /// `None` means the default: `$XDG_RUNTIME_DIR/wirk/expensive`, this
@@ -843,6 +886,13 @@ pub struct ResourcePolicy {
     /// supports it. `None` means no cap is requested — and where a cap is
     /// requested but unsupported, the caller is told, never silently
     /// ignored.
+    ///
+    /// A written `0` is applied as written, like every other value here.
+    /// The loader used to drop it to `None`, which turned the most
+    /// restrictive cap an operator can write into no cap at all; `0` is
+    /// a value cgroup v2's own `memory.max` accepts and means what it
+    /// says, so it is passed through rather than guessed away
+    /// (ruling 0402).
     pub job_memory_max_bytes: Option<u64>,
     /// Per-class **soft** storage limits, in bytes, keyed by a name in
     /// [`crate::storage::CLASSES`]. Default empty.
@@ -862,103 +912,147 @@ pub struct ResourcePolicy {
     /// limit at all.
     pub storage_soft_limits: BTreeMap<String, u64>,
     /// Largest single document a local document-collection capture will
-    /// read into memory, in bytes.
+    /// read into memory, in bytes, when an operator asks for a bound.
     ///
-    /// The workload is a directory of arbitrary local files chosen by
-    /// whoever admitted it, not a curated object store, so nothing is
-    /// read unbounded merely to decide it is not text. The default is
-    /// sized to the workload rather than to any particular machine: it
-    /// is far above the largest ordinary prose, Markdown or source
-    /// document, and far below a size at which one file would dominate
-    /// a capture's resident memory. A file over it is reported
+    /// `None` — the default — admits a file of any size the machine can
+    /// actually read. A collection's files were chosen by whoever
+    /// admitted it, and refusing one of them because it crossed a number
+    /// this product picked is a size policy, not a capability boundary
+    /// (ruling 0398). The real per-input boundaries are the ones the
+    /// reader actually has, and they are the dependency's own: `anydoc`'s
+    /// fixed `ConvertError::ResourceLimit` safety limits inside a
+    /// container conversion, its malformed/encrypted/needs-OCR errors,
+    /// and UTF-8 validity on the text path. Those refuse by name, per
+    /// input, and say what they are. The extractor's own 1 MiB text
+    /// ceiling is gone (rulings 0402/0403): it refused admitted text for
+    /// its length and left the file acquired but unindexed.
+    ///
+    /// Where a bound *is* set it is enforced on the read itself, not
+    /// only against a stale `stat`, and a file over it is reported
     /// `Unsupported` by name, never skipped in silence.
-    pub document_max_file_bytes: u64,
-    /// Ceiling on the sum of every file one document-collection capture
-    /// holds in memory at once, in bytes.
+    pub document_max_file_bytes: Option<u64>,
+    /// Ceiling on the bytes one document-collection capture reads in
+    /// total, when an operator asks for one.
     ///
-    /// A capture needs each file's bytes twice — once to fold the
-    /// manifest identity, once to extract retrieval units — and holds
-    /// them between those two uses, so a collection of individually
-    /// small files still has an aggregate cost. The default bounds one
-    /// capture's resident bytes to a size an ordinary workstation or
-    /// small container can hold beside the rest of the process. Exceeded
-    /// is a visible refusal of the whole capture, never a partial
-    /// generation reported as complete.
+    /// `None` — the default — is no aggregate ceiling. The ceiling used
+    /// to exist because a capture held every admitted file's bytes in
+    /// memory at once, between folding the manifest identity and
+    /// extracting retrieval units; a collection's *own* size then had to
+    /// be refused to bound this process. That coupling is gone: a
+    /// capture now folds each file's identity from a streamed read and
+    /// keeps only its content digest, and extraction reads one file back
+    /// at a time, so resident source bytes are one file's, not the
+    /// collection's. Refusing a collection for its total size would now
+    /// be refusing admitted work on a measurement that bounds nothing
+    /// (rulings 0397, 0398).
     ///
-    /// **What it bounds transitively, and what it does not account
-    /// for.** It bounds one capture's read bytes directly, and with them
-    /// one later *hydration* of that generation: reading a generation's
-    /// bytes back — for a lexical search, a path lookup, an edition
-    /// build or a ranking pass — holds at most the bytes that capture
-    /// was allowed to read, and a hydration is scoped to one generation
-    /// at a time, so this ceiling is the peak either way. That is the
-    /// same relationship a Git source has to its own object reads; it is
-    /// not a second bound and does not need one.
+    /// Extraction *output* is not charged against it either, and no
+    /// longer accumulates: a resource's retrieval units are written into
+    /// the staged generation's `resources.ndjson` as each record is
+    /// produced and dropped immediately afterwards, so what is resident
+    /// is one document's units rather than the collection's.
+    pub document_max_total_bytes: Option<u64>,
+    /// How deep a document-collection walk may descend, when an
+    /// operator asks for a bound.
     ///
-    /// What it does **not** count is extraction output. Retrieval units
-    /// are produced from those bytes and live alongside them until the
-    /// generation is staged, so a capture's true peak is this ceiling
-    /// plus whatever the extraction edition derived from it —
-    /// proportional to the input rather than free, and uncharged here.
-    /// Stated rather than fixed: an operator sizing this field should
-    /// know the real peak sits somewhat above the number they wrote.
-    pub document_max_total_bytes: u64,
-    /// How deep a document-collection walk may recurse.
+    /// `None` — the default — sets no depth number, because a depth
+    /// number never proved the thing it was written for. The condition
+    /// it stood in for is a **cycle**, and that is now detected as
+    /// itself: the walk carries the `(st_dev, st_ino)` of every
+    /// directory on the path it is currently inside, and a directory
+    /// that is already one of its own ancestors — a bind mount pointed
+    /// back at an enclosing directory is the way that happens, since the
+    /// walk refuses symlinks outright — is refused by name rather than
+    /// descended into again.
     ///
-    /// Bounds stack growth and cycles introduced by mounts rather than
-    /// symlinks (which the walk refuses outright). The default is far
-    /// past any hand-built document hierarchy and well short of a depth
-    /// at which recursion itself becomes the risk.
-    pub document_max_entries_depth: usize,
+    /// The other thing depth costs is one open directory descriptor per
+    /// level, held for as long as that level is being walked. That is a
+    /// real limit and it is this process's own `RLIMIT_NOFILE`: a walk
+    /// deep enough to exhaust it fails with the operating system's own
+    /// "too many open files", named as what it is. It is not restated
+    /// here as a product number.
+    pub document_max_entries_depth: Option<usize>,
     /// How many directory entries one document-collection walk may
     /// examine, counting every name it reads — files, directories,
     /// symlinks, special files and names that vanish before they can be
-    /// inspected alike.
+    /// inspected alike — when an operator asks for a bound.
     ///
-    /// This is the allocation bound as well as the work bound: it is
-    /// tested while the directory is being streamed, so a single
-    /// enormously wide directory is refused partway through rather than
-    /// listed in full first. The default admits document collections far
-    /// larger than any this is expected to serve while refusing a walk
-    /// that has clearly been pointed at something other than a document
-    /// collection.
-    pub document_max_entries: usize,
+    /// `None` — the default — walks the collection it was pointed at. A
+    /// count of names is a measurement of the operator's own tree, not a
+    /// capability of this process, so it decides nothing about whether
+    /// the tree can be admitted. Where a bound is set it is still tested
+    /// while the directory is being streamed, so it refuses partway
+    /// through rather than listing an enormous directory in full first.
+    pub document_max_entries: Option<usize>,
     /// Largest response body one HTTP source acquisition/refresh will
-    /// read, in bytes. Enforced by the fetch itself (the transfer is
-    /// aborted once it is exceeded), not only checked after the fact —
-    /// mirrors `document_max_file_bytes` for the one other kind of
-    /// content this product reads from outside its own filesystem.
-    pub http_max_response_bytes: u64,
-    /// Wall-clock bound on one HTTP acquire/refresh fetch, including
-    /// every redirect hop, in seconds. An operator's own network being
-    /// slow is not this product's problem to solve; it is this
-    /// product's job to refuse to hang on it.
-    pub http_timeout_secs: u64,
-    /// How many redirects one HTTP fetch will follow before refusing.
-    /// Bounds the same "keeps redirecting forever" failure a browser's
-    /// own redirect cap exists for, not a policy about which hosts a
-    /// redirect may land on.
-    pub http_max_redirects: u32,
-    /// The largest single claimed artifact this daemon will read into
-    /// memory to serve `wirk artifact` (`handle_run_artifact`), in
-    /// bytes. Default 64 MiB.
+    /// read, in bytes, when an operator asks for a bound.
     ///
-    /// This is a *bound on one read*, not a policy about what may be
-    /// claimed: a Claim validates whatever bytes it validates, and this
-    /// never changes that. It exists because serving an artifact means
-    /// the daemon reads it whole in order to re-hash it, and an
-    /// unbounded read of a file another process chose the size of is a
-    /// resource decision the operator should own rather than a constant
-    /// compiled into the product. Exceeding it is an *explicit
-    /// refusal* naming the size and this setting — never a truncated
-    /// answer, which would be a different artifact reported under the
-    /// Claim's digest.
+    /// `None` — the default — reads the resource the operator admitted.
+    /// Where a bound is set it is enforced by the fetch itself (`curl
+    /// --max-filesize`, the transfer is aborted rather than checked
+    /// afterwards), and only an installed `curl` that can honour it on a
+    /// body of undeclared length is accepted — that capability check is
+    /// asked for exactly when a bound is configured, never as a
+    /// precondition for fetching at all.
+    pub http_max_response_bytes: Option<u64>,
+    /// Wall-clock bound on one HTTP acquire/refresh fetch, including
+    /// every redirect hop, in seconds, when an operator asks for one.
+    ///
+    /// `None` — the default — sets no clock on the transfer, for the
+    /// same reason `job_deadline_secs` sets none on a job: a transfer
+    /// that is still transferring has not failed. A fetch that will
+    /// never complete is ended by the operator's `atlas cancel
+    /// --source`, which reaches this `curl` through the ordinary bounded
+    /// child, and the connect/DNS/reset failures a host really does
+    /// produce are reported as `curl`'s own.
+    ///
+    /// Where a budget *is* set it bounds the fetch, not each hop: a
+    /// redirect chain is charged against one budget, with each hop
+    /// receiving what is left of it. A written `0` is a budget that has
+    /// already run out and is applied as written — the fetch is refused
+    /// before it starts — because `curl --max-time 0` is libcurl's
+    /// documented "no timeout" and would mean the opposite.
+    pub http_timeout_secs: Option<u64>,
+    /// How many redirects one HTTP fetch will follow before refusing,
+    /// when an operator asks for a bound.
+    ///
+    /// `None` — the default — follows the chain the origin actually
+    /// serves, however long it is. A hop count never distinguished a
+    /// long legitimate chain from a loop, so the loop is detected as
+    /// itself instead: `crate`-side, `wirk_atlas::http_source::capture`
+    /// walks the chain one hop at a time through `curl`'s own
+    /// `%{redirect_url}` and refuses a destination it has already
+    /// requested, by name (ruling 0403). Where a bound *is* set it is
+    /// applied to the hop count across the whole chain. Each hop is
+    /// re-validated for protocol and credential scope before it is
+    /// requested, which is the part that is about authority rather than
+    /// about counting.
+    pub http_max_redirects: Option<u32>,
+    /// The largest single payload this daemon will read whole into
+    /// memory to answer for it, in bytes, when an operator asks for a
+    /// bound. `None` by default.
+    ///
+    /// **It cannot decide what may be claimed, and no longer can.** A
+    /// validated Claim's managed artifact is taken into custody by a
+    /// streamed copy that hashes as it writes, so recording its content
+    /// identity costs one buffer whatever the artifact's size, and
+    /// `wirk artifact`'s own verification streams the same way — neither
+    /// reads a whole artifact into memory, so neither consults this
+    /// field at all.
+    ///
+    /// What is left is the one read that really does materialize a whole
+    /// payload in one reply: an embedded document asset requested by id
+    /// (`handle_atlas_document`), carried hex-encoded. A caller asks for
+    /// that only after the inventory has already told it the asset's
+    /// media type, length and digest, so the size is disclosed before
+    /// anything is read; an operator who wants a ceiling on it anyway
+    /// sets one here.
     ///
     /// A summary cap is not this number and must not be reused as one:
     /// `ASSEMBLY_SUMMARY_BYTES` (320) bounds a one-line *description* of
     /// an artifact in an orientation projection, which is a different
     /// job from delivering the artifact.
-    pub artifact_max_bytes: u64,
+    pub artifact_max_bytes: Option<u64>,
     /// Whether this estate's `max_host_expensive` may *set* the shared
     /// host pool's agreed capacity, rather than merely be bound by it.
     ///
@@ -979,21 +1073,21 @@ impl Default for ResourcePolicy {
             admission_wait_secs: 0,
             store_ownership_wait_millis: 2_000,
             cheap_wait_millis: 250,
-            job_deadline_secs: 3600,
-            memory_pressure_avg10_max: 60.0,
-            min_available_memory_bytes: 512 * 1024 * 1024,
+            job_deadline_secs: None,
+            memory_pressure_avg10_max: None,
+            min_available_memory_bytes: None,
             job_memory_max_bytes: None,
-            artifact_max_bytes: 64 * 1024 * 1024,
+            artifact_max_bytes: None,
             host_pool_dir: None,
             host_pool_capacity_authority: false,
             storage_soft_limits: BTreeMap::new(),
-            document_max_file_bytes: 8 * 1024 * 1024,
-            document_max_total_bytes: 128 * 1024 * 1024,
-            document_max_entries_depth: 128,
-            document_max_entries: 200_000,
-            http_max_response_bytes: 8 * 1024 * 1024,
-            http_timeout_secs: 20,
-            http_max_redirects: 5,
+            document_max_file_bytes: None,
+            document_max_total_bytes: None,
+            document_max_entries_depth: None,
+            document_max_entries: None,
+            http_max_response_bytes: None,
+            http_timeout_secs: None,
+            http_max_redirects: None,
         }
     }
 }
@@ -1026,6 +1120,27 @@ struct ConfiguredPolicy {
     http_max_redirects: Option<u32>,
 }
 
+/// A `<estate>/.wirk/resources.json` that exists and cannot be run on.
+///
+/// Returned by [`ResourcePolicy::load`] instead of a printable note,
+/// because that is the difference between reporting a configuration
+/// failure and enforcing it (ruling 0402). Every caller that builds an
+/// estate's job context propagates this, so the acquisitions, custody
+/// reads and admissions the file would have bounded never start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnusablePolicy {
+    pub path: PathBuf,
+    pub detail: String,
+}
+
+impl std::fmt::Display for UnusablePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.detail)
+    }
+}
+
+impl std::error::Error for UnusablePolicy {}
+
 impl ResourcePolicy {
     pub fn config_path(estate_root: &Path) -> PathBuf {
         estate_root.join(".wirk").join("resources.json")
@@ -1033,36 +1148,90 @@ impl ResourcePolicy {
 
     /// Read `<estate>/.wirk/resources.json` over the defaults.
     ///
-    /// An absent file is the ordinary case, not an error. A **malformed**
-    /// file is reported, and a value that cannot be applied is reported:
-    /// silently falling back to a default the operator did not choose is
-    /// the invisible behaviour this increment exists to remove. Every
-    /// field is optional and overlays the default.
-    pub fn load(estate_root: &Path) -> (Self, Option<String>) {
+    /// **An absent file is the ordinary case.** There was never a
+    /// constraint to lose, the built-in defaults apply, and nothing is
+    /// reported.
+    ///
+    /// **A file that exists and cannot be used is a refusal, not a
+    /// note** (ruling 0402). It used to fall back to the built-in
+    /// defaults and print a complaint its callers were free to ignore —
+    /// which, now that the bounding defaults are all *absences*, meant
+    /// an estate whose `resources.json` had become unreadable or
+    /// unparseable ran with every bound it had configured silently not
+    /// in force. A warning is not enforcement. So this returns `Err`,
+    /// and the callers that build an estate's job context propagate it:
+    /// the operations the policy would have bounded do not start.
+    ///
+    /// **A value an operator wrote is applied as written.** There is no
+    /// "an operator cannot have meant that" substitution any more. A
+    /// bound of `0` means the bound it says — admit no document over
+    /// zero bytes, walk no directory level, retain no artifact over zero
+    /// bytes — and each of those is a coherent lockdown an operator can
+    /// have chosen and each is enforced by the same code path any other
+    /// value takes. Absence still means absence, and the two are never
+    /// conflated. `job_deadline_secs: 0` keeps the meaning it always
+    /// had: a deadline that has already passed.
+    ///
+    /// The one class this *cannot* apply as written is the concurrency
+    /// counts (`max_expensive`, `max_host_expensive`,
+    /// `max_materialization`): admission clamps an expensive offer to at
+    /// least one slot (`offered.max(1)` in [`admit`]), so a written `0`
+    /// is a value the machinery physically does not honour. Rather than
+    /// print "using 1" and run on a number nobody chose, that is
+    /// reported as unusable configuration too.
+    pub fn load(estate_root: &Path) -> Result<(Self, Option<String>), UnusablePolicy> {
         let path = Self::config_path(estate_root);
-        let Ok(body) = fs::read_to_string(&path) else {
-            return (Self::default(), None);
+        let unusable = |detail: String| {
+            Err(UnusablePolicy {
+                path: path.clone(),
+                detail,
+            })
+        };
+        let body = match fs::read_to_string(&path) {
+            Ok(body) => body,
+            // Not found is the ordinary "no policy file" case. Anything
+            // else — a permission, an I/O error, a directory standing
+            // where the file should be — is a file this estate may well
+            // have configured and cannot read, which is not the same
+            // thing at all.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Self::default(), None));
+            }
+            Err(error) => {
+                return unusable(format!(
+                    "exists but could not be read ({error}); any deadline, document, HTTP, \
+                     artifact or memory bound it sets is not in force, so this estate will not \
+                     run the work it would have bounded"
+                ));
+            }
         };
         let configured: ConfiguredPolicy = match serde_json::from_str(&body) {
             Ok(configured) => configured,
             Err(error) => {
-                return (
-                    Self::default(),
-                    Some(format!(
-                        "{}: is not readable as resource policy ({error}); this estate is \
-                         running on built-in defaults, NOT on the values in that file",
-                        path.display()
-                    )),
-                );
+                return unusable(format!(
+                    "is not readable as resource policy ({error}); any deadline, document, HTTP, \
+                     artifact or memory bound it sets is not in force, so this estate will not \
+                     run the work it would have bounded"
+                ));
             }
         };
-        let defaults = Self::default();
         let mut policy = Self::default();
         let mut complaints = Vec::new();
+        // The fields that still carry a real default overlay in place.
         macro_rules! overlay {
             ($field:ident) => {
                 if let Some(value) = configured.$field {
                     policy.$field = value;
+                }
+            };
+        }
+        // The optional-bound fields carry the operator's number as the
+        // `Some` it already is: a written value means that bound, an
+        // omitted one means no bound, and the two are never conflated.
+        macro_rules! overlay_bound {
+            ($field:ident) => {
+                if configured.$field.is_some() {
+                    policy.$field = configured.$field;
                 }
             };
         }
@@ -1072,21 +1241,19 @@ impl ResourcePolicy {
         overlay!(admission_wait_secs);
         overlay!(store_ownership_wait_millis);
         overlay!(cheap_wait_millis);
-        overlay!(job_deadline_secs);
-        overlay!(memory_pressure_avg10_max);
-        overlay!(min_available_memory_bytes);
-        overlay!(artifact_max_bytes);
+        overlay_bound!(job_deadline_secs);
+        overlay_bound!(memory_pressure_avg10_max);
+        overlay_bound!(min_available_memory_bytes);
+        overlay_bound!(artifact_max_bytes);
+        overlay_bound!(job_memory_max_bytes);
         overlay!(host_pool_capacity_authority);
-        overlay!(document_max_file_bytes);
-        overlay!(document_max_total_bytes);
-        overlay!(document_max_entries_depth);
-        overlay!(document_max_entries);
-        overlay!(http_max_response_bytes);
-        overlay!(http_timeout_secs);
-        overlay!(http_max_redirects);
-        if let Some(bytes) = configured.job_memory_max_bytes {
-            policy.job_memory_max_bytes = (bytes > 0).then_some(bytes);
-        }
+        overlay_bound!(document_max_file_bytes);
+        overlay_bound!(document_max_total_bytes);
+        overlay_bound!(document_max_entries_depth);
+        overlay_bound!(document_max_entries);
+        overlay_bound!(http_max_response_bytes);
+        overlay_bound!(http_timeout_secs);
+        overlay_bound!(http_max_redirects);
         if let Some(directory) = configured.host_pool_dir {
             policy.host_pool_dir = Some(PathBuf::from(directory));
         }
@@ -1108,89 +1275,26 @@ impl ResourcePolicy {
             }
             policy.storage_soft_limits = known;
         }
-        // A document bound of 0 would refuse every collection, including
-        // an empty one, which is a configuration that can express nothing
-        // an operator wants. Named and ignored, exactly as a 0 concurrency
-        // value is, rather than applied into an estate that then cannot
-        // admit a document source at all.
-        // The restored value is read from `Self::default()` itself, not
-        // restated here: a default raised in one place must not leave a
-        // zero-value complaint quietly restoring the old number.
-        for (label, value, default) in [
-            (
-                "document_max_file_bytes",
-                &mut policy.document_max_file_bytes,
-                defaults.document_max_file_bytes,
-            ),
-            (
-                "document_max_total_bytes",
-                &mut policy.document_max_total_bytes,
-                defaults.document_max_total_bytes,
-            ),
-        ] {
-            if *value == 0 {
-                complaints.push(format!(
-                    "{label} 0 would read nothing; using the built-in default {default}"
-                ));
-                *value = default;
-            }
-        }
-        for (label, value, default) in [
-            (
-                "document_max_entries_depth",
-                &mut policy.document_max_entries_depth,
-                defaults.document_max_entries_depth,
-            ),
-            (
-                "document_max_entries",
-                &mut policy.document_max_entries,
-                defaults.document_max_entries,
-            ),
-        ] {
-            if *value == 0 {
-                complaints.push(format!(
-                    "{label} 0 would walk nothing; using the built-in default {default}"
-                ));
-                *value = default;
-            }
-        }
+        // The one value this loader cannot apply as written: admission
+        // offers at least one expensive slot whatever this says, so a
+        // written 0 would be a bound that is not in force. Reported as
+        // unusable rather than quietly replaced with 1.
         for (label, value) in [
-            ("max_expensive", &mut policy.max_expensive),
-            ("max_host_expensive", &mut policy.max_host_expensive),
-            ("max_materialization", &mut policy.max_materialization),
+            ("max_expensive", policy.max_expensive),
+            ("max_host_expensive", policy.max_host_expensive),
+            ("max_materialization", policy.max_materialization),
         ] {
-            if *value == 0 {
-                complaints.push(format!("{label} 0 would admit nothing; using 1"));
-                *value = 1;
+            if value == 0 {
+                return unusable(format!(
+                    "sets {label} 0, which job admission cannot honour (it offers at least one \
+                     slot); write the concurrency this estate should actually run at, or remove \
+                     the field"
+                ));
             }
-        }
-        if policy.http_max_response_bytes == 0 {
-            complaints.push(
-                "http_max_response_bytes 0 would read nothing; using the built-in default"
-                    .to_string(),
-            );
-            policy.http_max_response_bytes = defaults.http_max_response_bytes;
-        }
-        if policy.http_timeout_secs == 0 {
-            complaints.push(
-                "http_timeout_secs 0 would time out immediately; using the built-in default"
-                    .to_string(),
-            );
-            policy.http_timeout_secs = defaults.http_timeout_secs;
-        }
-        if policy.artifact_max_bytes == 0 {
-            // Same rule as the concurrency values above: a bound of zero
-            // refuses every artifact, which is not a limit an operator
-            // can have meant by writing a number. Reported, not applied
-            // in silence.
-            complaints.push(
-                "artifact_max_bytes 0 would refuse every artifact; using the default".to_string(),
-            );
-            policy.artifact_max_bytes = Self::default().artifact_max_bytes;
         }
         let note = (!complaints.is_empty())
             .then(|| format!("{}: {}", path.display(), complaints.join("; ")));
-        (policy, note)
+        Ok((policy, note))
     }
 
     /// This estate's own local clamp: `min(max_expensive,
@@ -2283,8 +2387,39 @@ pub fn admit(
              rather than claiming a check it did not make"
         ));
     }
-    if let Some(avg10) = memory.admission_some_avg10()
-        && avg10 > policy.memory_pressure_avg10_max
+    // Both figures below are observed either way, and both are
+    // disclosed either way. What an estate's own configuration decides
+    // is whether an observation of the *host* also turns this job away:
+    // with no floor and no pressure ceiling configured — the default —
+    // memory is reported and admission proceeds, because "this machine
+    // is busy" is not a statement about what this job needs.
+    if let Some(avg10) = memory.admission_some_avg10() {
+        notes.push(format!(
+            "memory pressure: {} some avg10 is {avg10:.2}{}",
+            memory.admission_some_avg10_origin(),
+            match policy.memory_pressure_avg10_max {
+                Some(max) => format!(" (this estate refuses above {max:.2})"),
+                None => ", an observation this estate refuses nothing on".to_string(),
+            }
+        ));
+    }
+    if let Some(available) = memory.effective_available_bytes() {
+        notes.push(format!(
+            "memory available: {available} bytes before the tightest bound that applies to this \
+             process ({}){}",
+            memory
+                .effective_available_origin()
+                .unwrap_or_else(|| "not identified".to_string()),
+            match policy.min_available_memory_bytes {
+                Some(floor) => format!(", against this estate's floor of {floor}"),
+                None => ", an observation this estate refuses nothing on".to_string(),
+            }
+        ));
+    }
+    if let (Some(avg10), Some(max)) = (
+        memory.admission_some_avg10(),
+        policy.memory_pressure_avg10_max,
+    ) && avg10 > max
     {
         return Err(Refusal {
             notes: notes.clone(),
@@ -2295,12 +2430,14 @@ pub fn admit(
                  unsafe; raise memory_pressure_avg10_max in .wirk/resources.json to admit anyway",
                 request.verb,
                 memory.admission_some_avg10_origin(),
-                policy.memory_pressure_avg10_max
+                max
             ),
         });
     }
-    if let Some(available) = memory.effective_available_bytes()
-        && available < policy.min_available_memory_bytes
+    if let (Some(available), Some(floor)) = (
+        memory.effective_available_bytes(),
+        policy.min_available_memory_bytes,
+    ) && available < floor
     {
         return Err(Refusal {
             notes: notes.clone(),
@@ -2311,7 +2448,7 @@ pub fn admit(
                  {}. That number is advisory: an estimate and a sample, not a guarantee that \
                  an admitted job can allocate what it needs",
                 request.verb,
-                policy.min_available_memory_bytes,
+                floor,
                 memory
                     .effective_available_origin()
                     .unwrap_or_else(|| "not identified".to_string()),
@@ -2797,7 +2934,13 @@ pub struct InProcessJob {
 
 impl InProcessJob {
     /// Announce a job of `verb` over `scope` for `requester`, bounded by
-    /// `deadline_secs`.
+    /// `deadline_secs` where the estate sets one.
+    ///
+    /// `deadline_secs: None` carries through to [`JobStop`]'s own
+    /// already-documented `None`: the work is still cancellable, and is
+    /// not stopped merely for having run. It is passed through rather
+    /// than wrapped, so "no deadline configured" and "a deadline of some
+    /// length" stay different states all the way down.
     ///
     /// `registry: None` runs unregistered — for tests that drive the
     /// token directly, matching [`BoundedChild`]'s own option.
@@ -2806,7 +2949,7 @@ impl InProcessJob {
         verb: &str,
         scope: &str,
         requester: Option<String>,
-        deadline_secs: u64,
+        deadline_secs: Option<u64>,
     ) -> Self {
         let job_id = new_job_id();
         let cancel = CancelToken::new();
@@ -2826,7 +2969,7 @@ impl InProcessJob {
             stop: JobStop {
                 cancel,
                 started: Instant::now(),
-                deadline: Some(Duration::from_secs(deadline_secs)),
+                deadline: deadline_secs.map(Duration::from_secs),
             },
         }
     }
@@ -3210,7 +3353,7 @@ impl BoundedChild<'_> {
         };
         let writer = std::thread::spawn(move || write(&mut stdin));
 
-        let deadline = Duration::from_secs(self.policy.job_deadline_secs);
+        let deadline = self.policy.job_deadline_secs.map(Duration::from_secs);
         let cancel = self.cancel.clone();
         let finished = Arc::new(AtomicBool::new(false));
         let watchdog_finished = finished.clone();
@@ -3231,7 +3374,9 @@ impl BoundedChild<'_> {
                             .reason()
                             .unwrap_or_else(|| "was cancelled".to_string()),
                     )
-                } else if start.elapsed() >= deadline {
+                } else if let Some(deadline) = deadline
+                    && start.elapsed() >= deadline
+                {
                     Some(format!("exceeded its {}s deadline", deadline.as_secs()))
                 } else {
                     None
@@ -3392,7 +3537,7 @@ mod in_process_tests {
                 "atlas acquire",
                 "clientdocs",
                 Some("work-1".to_string()),
-                3600,
+                Some(3600),
             );
             let listed = registry.list();
             assert_eq!(listed.len(), 1);
@@ -3419,7 +3564,7 @@ mod in_process_tests {
             "atlas publish",
             "clientdocs",
             None,
-            3600,
+            Some(3600),
         );
         let stop = job.stop();
         assert!(stop.check().is_ok(), "nothing has asked it to stop yet");
@@ -3449,14 +3594,14 @@ mod in_process_tests {
             "atlas acquire",
             "otherdocs",
             None,
-            3600,
+            Some(3600),
         );
         let ours = InProcessJob::register(
             Some(registry.clone()),
             "atlas acquire",
             "clientdocs",
             None,
-            3600,
+            Some(3600),
         );
         registry.cancel(&JobSelector::Scope("clientdocs".to_string()), "stop");
         assert!(ours.stop().check().is_err());
@@ -3471,7 +3616,7 @@ mod in_process_tests {
             "atlas acquire",
             "clientdocs",
             None,
-            3600,
+            Some(3600),
         );
         assert!(
             later.stop().check().is_ok(),
@@ -3485,7 +3630,7 @@ mod in_process_tests {
     /// same meaning it has for a bounded child.
     #[test]
     fn a_passed_deadline_stops_the_work_and_says_so_as_a_deadline() {
-        let job = InProcessJob::register(None, "atlas acquire", "clientdocs", None, 0);
+        let job = InProcessJob::register(None, "atlas acquire", "clientdocs", None, Some(0));
         let stopped = job
             .stop()
             .check()

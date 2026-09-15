@@ -75,7 +75,9 @@ fn acquisition_reads_pinned_bytes_and_accounts_for_non_text_without_checkout_tra
         .acquire(&membership, &first, ExtractorPolicy::default())
         .unwrap();
     let generation = match staged {
-        AcquireOutcome::Staged(g) => g,
+        AcquireOutcome::Staged(g) => atlas
+            .generation(&g.id)
+            .expect("the generation just staged reads back"),
         other => panic!("{other:?}"),
     };
     let pinned = coordinate(&membership, &generation, b"kept.rs");
@@ -107,6 +109,11 @@ fn failed_refresh_retains_publication_and_refuses_out_of_scope_membership() {
         .acquire(&member, &first, ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     atlas.publish(&member, &staged.id).unwrap();
     assert!(matches!(
@@ -138,16 +145,31 @@ fn generations_are_revision_and_extractor_specific_and_publication_is_explicit_r
         .acquire(&membership, &first, ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     let two = atlas
         .acquire(&membership, &second, ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     let three = atlas
         .acquire(&membership, &second, ExtractorPolicy::markdown_only())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     assert_eq!(one.content, two.content);
     assert_ne!(one.id, two.id);
@@ -192,6 +214,11 @@ fn a_v2_generation_still_validates_and_resolves_under_the_v3_default() {
         .acquire(&membership, &second, ExtractorPolicy::rust_markdown_v2())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     assert_eq!(
         old.extractor_set,
@@ -210,6 +237,11 @@ fn a_v2_generation_still_validates_and_resolves_under_the_v3_default() {
         .acquire(&membership, &second, ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     assert_ne!(old.id, new.id, "a new edition is a new generation");
     assert_ne!(old.extractor_set, new.extractor_set);
@@ -323,6 +355,11 @@ fn the_v3_family_vocabulary_follows_the_reference() {
         .acquire(&membership, &rev, ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
 
     let family = |name: &str| {

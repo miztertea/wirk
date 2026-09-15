@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 pub mod claim_hook;
+pub mod content_store;
+pub mod estate_doctrine;
 pub mod fake;
 pub mod git;
 pub mod run_loop;
@@ -1210,11 +1212,22 @@ struct ContractPlan {
     /// forward so the prompt fallback discloses the real reason rather
     /// than a generic one.
     pending_fallback: Option<String>,
+    /// P6.7: set when this Run's World also reserved estate doctrine, in
+    /// which case `path`/`text` above are the **composed** document —
+    /// the contract plus that doctrine — and this names it and what rode
+    /// in it. `None` is a contract-only launch, byte-identical to what
+    /// every launch was before estate doctrine existed.
+    composed: Option<wirk_core::ComposedDelivery>,
 }
 
 impl ContractPlan {
     fn deliver(&mut self, mode: wirk_core::ContractDeliveryMode, reason: Option<String>) {
-        self.delivery = Some(worker_contract::delivery(&self.reference, mode, reason));
+        self.delivery = Some(worker_contract::delivery(
+            &self.reference,
+            mode,
+            reason,
+            self.composed.clone(),
+        ));
     }
 }
 
@@ -1378,19 +1391,55 @@ impl<C: HerdrClient> HerdrExecutor<C> {
         let wirk_core::World::Actor(actor) = world else {
             return Ok(None);
         };
-        let Some(reference) = actor.contract.clone() else {
+        let Some(reference) = actor.contract.as_deref().cloned() else {
             return Ok(None);
         };
-        let (path, text) = worker_contract::read_verified(
-            std::path::Path::new(&actor.triple.estate_root),
-            &reference,
-        )?;
+        let estate_root = std::path::Path::new(&actor.triple.estate_root);
+        let (path, text) = worker_contract::read_verified(estate_root, &reference)?;
+        // P6.7: the estate's own doctrine, proved the same way and in
+        // the same breath. Every document this World reserved must be
+        // readable and must hash to what the reservation named, or the
+        // launch refuses — the actor is not started under an estate's
+        // rules that nobody can show are the rules it was given.
+        if actor.doctrine.is_empty() {
+            return Ok(Some(ContractPlan {
+                reference,
+                path,
+                text,
+                delivery: None,
+                pending_fallback: None,
+                composed: None,
+            }));
+        }
+        let mut documents = Vec::with_capacity(actor.doctrine.len());
+        for document in &actor.doctrine {
+            let body = estate_doctrine::read_verified(estate_root, document)?;
+            documents.push((document.clone(), body));
+        }
+        // One transport document, content-addressed in the estate's own
+        // doctrine store: two of the three native mechanisms take
+        // exactly one value, and storing the composed bytes is what lets
+        // a prompt fallback re-prove on every prompt exactly what the
+        // launch delivered.
+        let composed_text = estate_doctrine::compose(&text, &documents);
+        let store = estate_doctrine::store_dir(estate_root);
+        let composed_digest =
+            content_store::store(&store, composed_text.as_bytes()).map_err(|error| {
+                HerdrExecutorError::DoctrineStore {
+                    path: store.display().to_string(),
+                    reason: error.to_string(),
+                }
+            })?;
         Ok(Some(ContractPlan {
             reference,
-            path,
-            text,
+            path: estate_doctrine::stored_path(estate_root, &composed_digest),
+            text: composed_text,
             delivery: None,
             pending_fallback: None,
+            composed: Some(wirk_core::ComposedDelivery {
+                digest: composed_digest,
+                documents: actor.doctrine.clone(),
+            }),
         }))
     }
 
@@ -2195,6 +2244,18 @@ pub enum HerdrExecutorError {
     /// instruction-less actor is not success".
     #[error(transparent)]
     Contract(#[from] worker_contract::ContractError),
+    /// P6.7: a launch whose World reserved estate doctrine whose bytes
+    /// this launch cannot verify — missing, or not the bytes the
+    /// reservation named. Same posture as `Contract` above, for the same
+    /// reason.
+    #[error(transparent)]
+    Doctrine(#[from] estate_doctrine::DoctrineError),
+    /// P6.7: the composed contract-plus-doctrine document could not be
+    /// written into the estate's own store, so there is nothing for a
+    /// native mechanism to point at and nothing a fallback could
+    /// re-prove.
+    #[error("the composed instruction document could not be stored under {path}: {reason}")]
+    DoctrineStore { path: String, reason: String },
 }
 
 /// Every way `build_selection_args` refuses a requested model/effort

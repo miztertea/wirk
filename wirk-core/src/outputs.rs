@@ -59,6 +59,7 @@
 //!    component — final or ancestor — can be a symlink and no lookup is
 //!    repeated (`wirkd::server::read_staged_output`).
 
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -544,6 +545,112 @@ pub fn store_claimed_bytes(
     name: &str,
     bytes: &[u8],
 ) -> Result<PathBuf, OutputWriteError> {
+    let (dir, final_path) = claimed_destination(estate_root, work_id, claim_id, name)?;
+    let (path, _digest, durability) = publish(&dir, &final_path, name, |file| {
+        file.write_all(bytes)?;
+        Ok(crate::ArtifactReceipt::digest_of_bytes(bytes))
+    })?;
+    // This caller already holds the digest, so the uncertain-durability
+    // outcome is expressible as the error variant it has always been.
+    match durability {
+        Some(detail) => Err(OutputWriteError::DurabilityUncertain(detail)),
+        None => Ok(path),
+    }
+}
+
+/// [`store_claimed_bytes`]'s streaming twin: the same write-once,
+/// durable-before-referenced snapshot, copied from `reader` instead of
+/// from a buffer, and returning the digest of exactly the bytes that
+/// were written together with how many there were.
+///
+/// **Why the copy hashes as it goes.** Custody has to record the digest
+/// of the content it stored, and the only way to do that from a buffer
+/// is to hold the whole artifact in memory first — which is what made an
+/// artifact's *size* able to refuse a Claim that had already validated.
+/// Hashing the stream while copying it gives the identical guarantee for
+/// one buffer's worth of memory: the digest returned is taken from the
+/// same bytes that landed in the file, in the same pass, so nothing can
+/// come between what was vouched for and what was stored.
+///
+/// Everything else is unchanged and deliberately so — the same
+/// `create_new` temp, the same fsync-then-rename-then-directory-fsync
+/// order ruling 0145 requires, and the same refusal to replace a final
+/// path that already exists.
+pub fn store_claimed_stream<R: std::io::Read>(
+    estate_root: &Path,
+    work_id: &crate::WorkId,
+    claim_id: &crate::ClaimId,
+    name: &str,
+    mut reader: R,
+) -> Result<StoredClaim, OutputWriteError> {
+    let (dir, final_path) = claimed_destination(estate_root, work_id, claim_id, name)?;
+    let mut written = 0u64;
+    let (path, digest, durability) = publish(&dir, &final_path, name, |file| {
+        let (digest, total) = copy_hashing(&mut reader, file)?;
+        written = total;
+        Ok(digest)
+    })?;
+    Ok(StoredClaim {
+        path,
+        digest,
+        bytes: written,
+        durability,
+    })
+}
+
+/// What a streamed snapshot actually produced.
+///
+/// `durability` carries the one outcome that is neither success nor
+/// failure: the rename made the bytes visible and they re-hash to
+/// `digest`, and only the directory `fsync` after it failed. Reporting
+/// that as "never wrote" would be false, so it travels beside the result
+/// rather than replacing it — the same judgement
+/// `PreparedProjection::commit` already makes, and the same one
+/// [`store_claimed_bytes`] expresses through
+/// [`OutputWriteError::DurabilityUncertain`] for a caller that has the
+/// digest already.
+#[derive(Debug)]
+pub struct StoredClaim {
+    pub path: PathBuf,
+    pub digest: String,
+    pub bytes: u64,
+    pub durability: Option<String>,
+}
+
+/// Copies every byte of `reader` into `writer`, returning the sha256 of
+/// what passed through and how much did. The `std::io::copy` shape with
+/// the hash taken on the way past, because `copy` alone cannot tell the
+/// caller what it moved. One reused buffer: this function's memory is
+/// its buffer, not its content.
+fn copy_hashing<R: std::io::Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> std::io::Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        hasher.update(&buffer[..read]);
+        writer.write_all(&buffer[..read])?;
+        total = total.saturating_add(read as u64);
+    }
+    Ok((crate::hex_lower(&hasher.finalize()), total))
+}
+
+/// The two addressing rules every claimed snapshot passes, and the
+/// directory and final path they resolve to.
+fn claimed_destination(
+    estate_root: &Path,
+    work_id: &crate::WorkId,
+    claim_id: &crate::ClaimId,
+    name: &str,
+) -> Result<(PathBuf, PathBuf), OutputWriteError> {
     if let Err(err) = check_output_name(name) {
         return Err(OutputWriteError::Unaddressable(err.detail().to_string()));
     }
@@ -558,8 +665,21 @@ pub fn store_claimed_bytes(
         ));
     }
     let dir = root.join("claims").join(&claim_id.0);
-    fs::create_dir_all(&dir)?;
     let final_path = dir.join(name);
+    Ok((dir, final_path))
+}
+
+/// Write-once publication: `fill` writes the content into a fresh temp
+/// file and returns its digest, then that file is fsynced, renamed into
+/// place, and the directory fsynced. The one place both snapshot paths
+/// get their durability and their write-once rule from.
+fn publish(
+    dir: &Path,
+    final_path: &Path,
+    name: &str,
+    fill: impl FnOnce(&mut File) -> std::io::Result<String>,
+) -> Result<(PathBuf, String, Option<String>), OutputWriteError> {
+    fs::create_dir_all(dir)?;
     // `fs::rename` replaces its destination, so `create_new` on the temp
     // file alone does not make the *final* path write-once.
     if final_path.try_exists().unwrap_or(true) {
@@ -571,25 +691,37 @@ pub fn store_claimed_bytes(
     // A retried snapshot after a crash could find its own temp behind;
     // `create_new` would then fail forever on a name nothing references.
     let _ = fs::remove_file(&temp);
-    {
+    let digest = {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&temp, &final_path)?;
-    File::open(&dir)
+        match fill(&mut file) {
+            Ok(digest) => {
+                file.sync_all()?;
+                digest
+            }
+            Err(err) => {
+                // A half-copied temp file references nothing and must
+                // not be left where a retry would find it.
+                drop(file);
+                let _ = fs::remove_file(&temp);
+                return Err(OutputWriteError::Io(err));
+            }
+        }
+    };
+    fs::rename(&temp, final_path)?;
+    let durability = File::open(dir)
         .and_then(|directory| directory.sync_all())
-        .map_err(|err| {
-            OutputWriteError::DurabilityUncertain(format!(
+        .err()
+        .map(|err| {
+            format!(
                 "the managed output {} was renamed into place but its directory fsync failed: \
                  {err}",
                 final_path.display()
-            ))
-        })?;
-    Ok(final_path)
+            )
+        });
+    Ok((final_path.to_path_buf(), digest, durability))
 }
 
 #[cfg(test)]

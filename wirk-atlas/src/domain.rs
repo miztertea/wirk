@@ -150,6 +150,101 @@ pub struct ResolvedEvidence {
     pub bytes: Vec<u8>,
 }
 
+/// The integrity record for one generation's `resources.ndjson`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRows {
+    /// SHA-256, domain-separated, over the file's bytes in written
+    /// order.
+    pub digest: String,
+    pub count: u64,
+}
+
+/// How many of one generation's resources landed in each coverage
+/// disposition.
+///
+/// This is what an acquisition can report about itself without holding
+/// the whole collection's resource list in memory: the sink that writes
+/// `resources.ndjson` counts each record as it streams past, and the
+/// counts are all any caller of `acquire`/`refresh` has ever needed.
+/// The records themselves stay where they were written — the immutable
+/// generation directory — and a caller that wants them reads that
+/// generation back ([`crate::AtlasStore::generation`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageSummary {
+    pub total: u64,
+    pub indexed: u64,
+    pub excluded: u64,
+    pub unsupported: u64,
+    pub unavailable: u64,
+    pub error: u64,
+}
+
+impl CoverageSummary {
+    pub fn count(&mut self, disposition: CoverageDisposition) {
+        self.total += 1;
+        let field = match disposition {
+            CoverageDisposition::Indexed => &mut self.indexed,
+            CoverageDisposition::Excluded => &mut self.excluded,
+            CoverageDisposition::Unsupported => &mut self.unsupported,
+            CoverageDisposition::Unavailable => &mut self.unavailable,
+            CoverageDisposition::Error => &mut self.error,
+        };
+        *field += 1;
+    }
+
+    pub fn of(resources: &[ResourceRecord]) -> Self {
+        let mut summary = Self::default();
+        for resource in resources {
+            summary.count(resource.disposition);
+        }
+        summary
+    }
+}
+
+/// What one `acquire`/`refresh` reports about the generation it staged:
+/// the generation's identity, its origin disclosure where it has one,
+/// and its [`CoverageSummary`] — deliberately **not** its resource
+/// list, and not its locator or requested ref either — those are facts
+/// about the membership the caller passed in, restating them here only
+/// grew the value every acquisition returns.
+///
+/// Rulings 0401/0403: an acquisition that builds the whole collection's
+/// `ResourceRecord`s in memory just to hand them back is retaining the
+/// derived index of the entire collection for the length of the
+/// acquisition, on top of the document it is extracting. Streaming each
+/// record into the generation directory as it is produced is what makes
+/// residency a function of one document rather than of the collection,
+/// and this type is the shape of the answer that is left. A caller that
+/// genuinely wants the records reads the immutable generation back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedGeneration {
+    pub id: GenerationId,
+    pub source: SourceId,
+    pub revision: String,
+    pub content: String,
+    pub extractor_set: String,
+    pub acquisition_policy: String,
+    pub origin: Option<Box<HttpOrigin>>,
+    pub coverage: CoverageSummary,
+}
+
+impl StagedGeneration {
+    /// The report for a generation that was already staged by an earlier
+    /// acquisition and has just been read back, rather than written now.
+    pub fn read_back(generation: &SourceGeneration) -> Self {
+        Self {
+            id: generation.id.clone(),
+            source: generation.source.clone(),
+            revision: generation.revision.clone(),
+            content: generation.content.clone(),
+            extractor_set: generation.extractor_set.clone(),
+            acquisition_policy: generation.acquisition_policy.clone(),
+            origin: generation.origin.clone(),
+            coverage: CoverageSummary::of(&generation.resources),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceGeneration {
     pub id: GenerationId,
@@ -160,7 +255,39 @@ pub struct SourceGeneration {
     pub acquisition_policy: String,
     pub locator: String,
     pub requested_ref: String,
+    /// The generation's complete resource list, **read back** from its
+    /// own `resources.ndjson` and never written into `manifest.json`.
+    ///
+    /// `skip_serializing` is the whole point: the rows are already
+    /// written, one at a time, by the sink that produced them
+    /// (`AtlasStore`'s staging session), so serializing them a second
+    /// time inside the manifest would mean holding the entire
+    /// collection's derived index in memory at publication —
+    /// precisely the retention rulings 0401/0403 asked to end. A
+    /// manifest written before this change still carries the field and
+    /// still deserializes; `read_generation` replaces it with the rows
+    /// either way, so the two sources can never disagree.
+    #[serde(default, skip_serializing)]
     pub resources: Vec<ResourceRecord>,
+    /// The SHA-256 of `resources.ndjson`'s bytes, folded as they were
+    /// written, and the number of rows that went past.
+    ///
+    /// This is what replaced the manifest's duplicate resource array as
+    /// the generation's *row-set* integrity. Validating each row's
+    /// shape, identity and sort order says nothing about whether the set
+    /// is the one that was staged: a whole line removed from the file
+    /// leaves the survivors individually valid and uniquely sorted, so
+    /// without this a truncated or hand-edited `resources.ndjson` would
+    /// read back as a smaller generation with nothing marking it
+    /// incomplete. Thirty-two bytes and a count, folded in the same pass
+    /// that produced the rows — no second copy of the collection, no
+    /// index and no archive.
+    ///
+    /// `#[serde(default)]` so a manifest written before this field
+    /// deserializes; such a generation still carries its own resource
+    /// array, and `read_generation` checks it against that instead.
+    #[serde(default)]
+    pub rows: Option<ResourceRows>,
     /// What one `http-source-policy/v1` fetch actually observed about
     /// its origin — set only by `crate::http_source::capture`, `None`
     /// for every other policy. `#[serde(default)]`: a generation
@@ -244,6 +371,13 @@ pub enum AtlasError {
     /// their own request, not about their estate.
     #[error("request cannot be run as asked: {0}")]
     InvalidRequest(String),
+    /// This estate's own `.wirk/resources.json` exists and cannot be
+    /// used, so the bounds it configures are not in force. Ruling 0402:
+    /// a configuration failure that only printed a warning let an estate
+    /// run every operation that file was supposed to bound. Opening the
+    /// store refuses instead, and this is what it refuses with.
+    #[error("estate resource policy is unusable: {0}")]
+    UnusablePolicy(String),
     #[error("catalog is malformed or has an unsupported version: {0}")]
     Catalog(String),
     #[error("generation is incomplete or absent: {0}")]

@@ -54,6 +54,7 @@ fn event(id: &str, run_id: Option<&str>, kind: EventKind) -> Event {
 
 fn actor_world(repository: &str, branch: &str, base_sha: &str, worktree: &str) -> World {
     World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: repository.to_string(),
         worktree_path: worktree.into(),
         branch: branch.to_string(),
@@ -1158,6 +1159,7 @@ fn an_unknown_basis_world_carrying_review_targets_hashes_its_targets() {
     };
     let world = |targets: Vec<ReviewTarget>| {
         World::Actor(ActorWorld {
+            doctrine: Vec::new(),
             repository: "/repo".to_string(),
             worktree_path: PathBuf::from("/estate"),
             branch: "wirk/work-1".to_string(),
@@ -1258,6 +1260,7 @@ fn an_unknown_basis_world_carrying_review_targets_hashes_its_targets() {
 fn a_reserved_worker_contract_binds_into_the_world_hash_and_no_historical_hash_moves() {
     let world = |contract: Option<WorkerContractRef>| {
         World::Actor(ActorWorld {
+            doctrine: Vec::new(),
             repository: "/repo".to_string(),
             worktree_path: PathBuf::from("/estate"),
             branch: "wirk/work-1".to_string(),
@@ -1279,7 +1282,7 @@ fn a_reserved_worker_contract_binds_into_the_world_hash_and_no_historical_hash_m
             boundary: Boundary(vec!["**".to_string()]),
             review_targets: Vec::new(),
             evidence: None,
-            contract,
+            contract: contract.map(Box::new),
         })
     };
     let reference = |version: &str, digest: &str| WorkerContractRef {
@@ -1355,6 +1358,7 @@ fn the_contract_delivery_folds_from_run_launched_and_absent_means_unrecorded() {
     };
 
     let delivery = wirk_core::ContractDelivery {
+        composed: None,
         version: "wirk.worker-contract/v1".to_string(),
         digest: "abc".to_string(),
         mode: wirk_core::ContractDeliveryMode::Prompt,

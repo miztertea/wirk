@@ -126,7 +126,7 @@ fn main() -> ExitCode {
         Some("browser") => browser::browser_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path> | --kind actor --source-basis output-only] | --kind deterministic --command <argv...>) | wirk work list --estate <root> [--requesting-work <id>] [--admin] [--json] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init [--estate <root>] [--harness <kind>] [--harness-arg <arg>]... [--clear-harness-args] | wirk plugin show | wirk plugin harnesses [--socket <path>] [--json] | wirk atlas acquire|refresh|publish|remove|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json] | wirk artifact read|export --claim <id> --name <name> [--to <path>] | wirk artifact read --estate <root> --work <id> (--admin | --requesting-work <id>) --claim <id> --name <name> | wirk estate storage|clean --estate <root> ... | wirk browser view --estate <root> [--work <id>] [--requesting-work <id> | --admin] --out <path.html> | wirk browser serve --estate <root> --work <id> [--requesting-work <id> | --admin] [--open] [--idle-timeout <secs>]"
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path> | --kind actor --source-basis output-only] | --kind deterministic --command <argv...>) | wirk work list --estate <root> [--requesting-work <id>] [--admin] [--json] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init [--estate <root>] [--harness <kind>] [--harness-arg <arg>]... [--clear-harness-args] | wirk plugin show | wirk plugin harnesses [--socket <path>] [--json] | wirk atlas acquire|refresh|publish|remove|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json] | wirk artifact read|export --claim <id> --name <name> [--to <path>] | wirk artifact read --estate <root> --work <id> (--admin | --requesting-work <id>) --claim <id> --name <name> | wirk estate storage|clean|doctrine --estate <root> ... | wirk browser view --estate <root> [--work <id>] [--requesting-work <id> | --admin] --out <path.html> | wirk browser serve --estate <root> --work <id> [--requesting-work <id> | --admin] [--open] [--idle-timeout <secs>]"
             );
             ExitCode::FAILURE
         }
@@ -1419,6 +1419,27 @@ fn print_world_show(result: &serde_json::Value) {
     // that its context has a history, how long it is, and which revision
     // the document below is — and, when there is more than one, the
     // exact command that reads any earlier one.
+    // P6.7 (ruling 0393): the estate doctrine this Run is bound to,
+    // before anything about its orientation — a Waypoint that declared
+    // no `orient` block still operates under the estate's own rules, and
+    // this line is the bound public answer to "what am I under?". Names
+    // the owner's id and version and the digest of the exact bytes, so a
+    // reader can check that what arrived is what was reserved.
+    if let Some(documents) = result.get("doctrine").and_then(|v| v.as_array()) {
+        println!("estate doctrine {} document(s)", documents.len());
+        for document in documents {
+            println!(
+                "      {} version {} sha256 {} ({})",
+                document["id"].as_str().unwrap_or(""),
+                document["version"].as_str().unwrap_or(""),
+                document["digest"].as_str().unwrap_or(""),
+                document["repository"].as_str().map_or_else(
+                    || "estate-wide".to_string(),
+                    |name| format!("repository {name}")
+                ),
+            );
+        }
+    }
     if let Some(revisions) = result.get("revisions").and_then(|v| v.as_array()) {
         let latest = result
             .get("latest_revision")
@@ -1579,14 +1600,56 @@ fn wirkd_command(rest: &[String]) -> ExitCode {
                     }
                     let policy = &resources["policy"];
                     println!(
-                        "resources: expensive {}/{} (host {}), materialization {}, deadline {}s",
+                        "resources: expensive {}/{} (host {}), materialization {}, {}",
                         policy["effective_estate_slots"]
                             .as_u64()
                             .unwrap_or_default(),
                         policy["max_expensive"].as_u64().unwrap_or_default(),
                         policy["max_host_expensive"].as_u64().unwrap_or_default(),
                         policy["max_materialization"].as_u64().unwrap_or_default(),
-                        policy["job_deadline_secs"].as_u64().unwrap_or_default(),
+                        // An absent deadline is printed as an absence, in
+                        // words. `deadline 0s` would read as a bound that
+                        // is in force and expires instantly, which is the
+                        // opposite of what `null` here means — and a
+                        // configured `0` really does mean that, so the two
+                        // must not print the same way.
+                        match policy["job_deadline_secs"].as_u64() {
+                            Some(secs) => format!("deadline {secs}s"),
+                            None => "no job deadline".to_string(),
+                        },
+                    );
+                    // The bounds that refuse nothing unless an operator
+                    // asked them to. Printed either way: an operator
+                    // needs to know a bound is absent as much as they
+                    // need its number, and silence here reads as "in
+                    // force".
+                    let bound = |key: &str, unit: &str| -> String {
+                        match policy[key].as_u64() {
+                            Some(value) => format!("{key} {value}{unit}"),
+                            None => format!("{key} unset"),
+                        }
+                    };
+                    println!(
+                        "resources: {}, {}, {}, {}, {}",
+                        bound("document_max_file_bytes", "B"),
+                        bound("document_max_total_bytes", "B"),
+                        bound("document_max_entries", ""),
+                        bound("document_max_entries_depth", ""),
+                        bound("artifact_max_bytes", "B"),
+                    );
+                    println!(
+                        "resources: {}, {}, {}",
+                        bound("http_max_response_bytes", "B"),
+                        bound("http_timeout_secs", "s"),
+                        bound("http_max_redirects", ""),
+                    );
+                    println!(
+                        "resources: admission refuses on memory only where configured — {}, {}",
+                        match policy["memory_pressure_avg10_max"].as_f64() {
+                            Some(max) => format!("memory_pressure_avg10_max {max:.2}"),
+                            None => "memory_pressure_avg10_max unset".to_string(),
+                        },
+                        bound("min_available_memory_bytes", "B"),
                     );
                     if let Some(note) = policy["capacity_note"].as_str() {
                         println!("resources: {note}");
@@ -2085,6 +2148,16 @@ fn wirkd_watch_command(
             return ExitCode::from(2);
         }
     };
+    // Ruling 0394: the operator's unfiltered estate watch — no `--work`,
+    // no actor's own Work, no named requester — is dialed once and stays
+    // live across Works submitted after the dial. The per-Work listing
+    // below can only name the Works present when it lists, so the
+    // unfiltered surface has its own single stream rather than a fan-out
+    // of per-Work watches that could never see a Work that does not yet
+    // exist.
+    if work_filter.is_none() && scope.default_target.is_none() && scope.requesting.is_none() {
+        return estate_watch_command(&pointer.socket, json);
+    }
     let work_ids: Vec<String> = match (work_filter, &scope.default_target) {
         (Some(id), _) => vec![id],
         // An actor asking with no target watches its own Work. The
@@ -2229,6 +2302,51 @@ fn wirkd_watch_command(
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// The operator's unfiltered estate watch (ruling 0394): one `watch` dial
+/// over the estate-wide stream (`WatchPayload::estate`), printed one line
+/// per event. There is no per-Work fan-out and no refusal to reflect — a
+/// Work directory with no journal is simply absent from the stream, and a
+/// Work submitted after the dial arrives through the daemon's estate
+/// fan-out — so the command prints as long as the stream is open and exits
+/// zero on a clean `EOF` (wirkd stopping), nonzero only when it could not
+/// dial the socket or the stream itself failed.
+fn estate_watch_command(socket: &Path, json: bool) -> ExitCode {
+    let events = match wirkd::client::watch(socket, wirkd::WatchPayload::estate()) {
+        Ok(events) => events,
+        Err(err) => {
+            eprintln!("wirk wirkd watch: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    // The daemon confirmed this estate subscription before `watch` returned
+    // (ruling 0404 F2): a real barrier on the stream, surfaced once on
+    // stderr so a scripted consumer can wait on it — never a sleep. stdout
+    // stays reserved for `Event` lines.
+    eprintln!("wirk wirkd watch: subscribed");
+    for event in events {
+        match event {
+            Ok(event) => {
+                let line = serde_json::to_string(&event)
+                    .unwrap_or_else(|_| "<unserializable event>".to_string());
+                // The event carries its own `work` identity, so the human
+                // shape's prefix reads straight off it — no per-Work loop
+                // variable to keep in step, which is what lets one stream
+                // serve every Work at once.
+                if json {
+                    println!("{line}");
+                } else {
+                    println!("{} {line}", event.work.0);
+                }
+            }
+            Err(err) => {
+                eprintln!("wirk wirkd watch: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Milliseconds since the Unix epoch (`wirk_core::Timestamp`, the wire

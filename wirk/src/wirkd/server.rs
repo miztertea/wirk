@@ -53,7 +53,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -197,6 +197,22 @@ struct WirkdState {
     /// time `append_event` tries to send to it and gets `Err` — no
     /// separate deregistration path, no timer.
     watchers: Mutex<HashMap<WorkId, Vec<std::sync::mpsc::Sender<Event>>>>,
+    /// One coalesced wake per live estate-wide `watch` connection
+    /// (ruling 0394/0404), the operator's unfiltered stream. Registered in
+    /// `handle_estate_watch_connection` *before* that connection's own disk
+    /// replay, and signalled by `append_event` for **every** Work — so an
+    /// estate watcher reaches a Work's events even when that Work was
+    /// submitted after the watcher dialed. The wake is a dirty flag, not a
+    /// queue of `Event`s: each connection re-reads every Work's durable
+    /// journal from its own per-Work cursor, so a slow or late reader
+    /// re-reads exactly the delta it has not delivered and neither a slow
+    /// subscriber nor `append_event` holds a second copy of the event
+    /// history in memory. Pruned lazily the way a dead receiver is
+    /// everywhere else: when a connection's `Arc` drops, the next
+    /// `append_event`'s `retain` (run on a clone, after the daemon's own
+    /// copy is still counted) drops the daemon's copy too — no separate
+    /// deregistration, no timer.
+    estate_wakes: Mutex<Vec<Arc<EstateWaker>>>,
     /// P3 W3: one Atlas owner for this daemon's one canonical estate
     /// (`estate_root`, already canonicalized before this state is
     /// built) — `wirk_atlas::AtlasStore` is itself a single-writer,
@@ -537,6 +553,32 @@ fn append_event(
     if let Some(senders) = watchers.get_mut(work_id) {
         senders.retain(|tx| tx.send(persisted.clone()).is_ok());
     }
+    drop(watchers);
+    // Estate-wide wake (ruling 0394/0404): every estate watcher is woken
+    // for this event, regardless of which Work it names — so a Work
+    // submitted after a watcher dialed still reaches that watcher. The
+    // wake is coalesced and carries no `Event`: each connection re-reads
+    // the durable journals from its own per-Work cursor, so neither a slow
+    // reader nor this line holds a copy of the event history, and this
+    // path never blocks on a reader. `watchers`' guard is released first;
+    // the estate list is a separate lock. The clone is dropped before the
+    // `retain` so the liveness count sees the daemon's copy plus the live
+    // connections only, never the clone itself.
+    {
+        let wakes = state
+            .estate_wakes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        for wake in &wakes {
+            wake.signal();
+        }
+    }
+    state
+        .estate_wakes
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .retain(|wake| Arc::strong_count(wake) > 1);
     Ok(())
 }
 
@@ -571,6 +613,20 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
     })?;
     let wirk_dir = estate_root.join(".wirk");
     let socket_path = wirk_dir.join("wirkd.sock");
+    // Before the socket, the pointer and the atlas directory, because an
+    // unusable `resources.json` means this daemon must not run the work
+    // that file was supposed to bound (ruling 0402) — and refusing after
+    // binding would leave a socket and a pointer behind for a daemon
+    // that never served. `AtlasStore::open` refuses on the same
+    // condition; this is the earliest point the same fact is knowable.
+    let (resource_policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(&estate_root)
+        .map_err(|unusable| WirkdError::Bind {
+            socket: socket_path.clone(),
+            source: io::Error::other(unusable.to_string()),
+        })?;
+    if let Some(note) = policy_note {
+        eprintln!("wirkd: {note}");
+    }
     let listener = bind_socket(&socket_path).map_err(|source| WirkdError::Bind {
         socket: socket_path.clone(),
         source,
@@ -591,10 +647,6 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
             socket: socket_path.clone(),
             source,
         })?;
-    let (resource_policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(&estate_root);
-    if let Some(note) = policy_note {
-        eprintln!("wirkd: {note}");
-    }
     if let Some(note) = resource_policy.capacity_note() {
         eprintln!("wirkd: {note}");
     }
@@ -605,6 +657,7 @@ pub fn run(estate_root: PathBuf) -> Result<(), WirkdError> {
         estate_root,
         journals: Mutex::new(HashMap::new()),
         watchers: Mutex::new(HashMap::new()),
+        estate_wakes: Mutex::new(Vec::new()),
         atlas: Mutex::new(atlas),
         resource_policy,
         job_registry,
@@ -986,7 +1039,30 @@ fn handle_connection(stream: UnixStream, state: &Arc<WirkdState>, socket_path: &
     // this process exits (ruling 0044: no read timeout, no poll).
     if request.verb == Verb::Watch {
         match serde_json::from_value::<super::WatchPayload>(request.payload) {
-            Ok(payload) => handle_watch_connection(stream, state, payload),
+            Ok(payload) => {
+                // Administrative and naming no Work: the estate-wide stream
+                // (ruling 0394) — a different shape than one named Work's
+                // journal, which it cannot answer from a single journal lock.
+                if payload.admin && payload.work_id.is_none() {
+                    handle_estate_watch_connection(stream, state, payload)
+                } else if !payload.admin && payload.work_id.is_none() {
+                    // `work_id` became optional to carry the estate-wide
+                    // stream above, which requires `admin`. A non-admin
+                    // payload naming no Work names neither shape and must
+                    // be refused here, before `handle_watch_connection`,
+                    // which treats an absent `work_id` as an invariant of
+                    // reaching it (ruling 0425 F2).
+                    write_one_reply(
+                        &stream,
+                        &err_reply(
+                            "BadRequest",
+                            "a watch that names no work must be administrative",
+                        ),
+                    );
+                } else {
+                    handle_watch_connection(stream, state, payload)
+                }
+            }
             Err(err) => write_one_reply(&stream, &err_reply("BadRequest", &err.to_string())),
         }
         return;
@@ -1616,6 +1692,12 @@ fn dispatch(
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
+        Verb::EstateDoctrine => {
+            match serde_json::from_value::<super::EstateDoctrinePayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_estate_doctrine(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::EstateClean => {
             match serde_json::from_value::<super::EstateCleanPayload>(request.payload.clone()) {
                 Ok(payload) => Outcome::Reply(handle_estate_clean(state, payload)),
@@ -1699,7 +1781,9 @@ fn handle_watch_connection(
     state: &Arc<WirkdState>,
     payload: super::WatchPayload,
 ) {
-    let work_id = payload.work_id;
+    // The estate-wide stream is branched away in `handle_connection`, so
+    // a `WatchPayload` reaching here always names its Work.
+    let work_id = payload.work_id.expect("a non-estate watch names its Work");
     // The launch review's F-C, applied to `status`'s own sibling: this
     // streams raw journal events, so it reaches strictly more than
     // `status` does and cannot be answered unscoped either. Admitted or
@@ -1818,6 +1902,213 @@ fn handle_watch_connection(
     // drops the map's own copy) — the connection ends the same as a
     // client hangup: the socket simply closes when this function
     // returns.
+}
+
+/// One coalesced wake per live estate-watch connection (ruling 0394/0404).
+/// A dirty flag, never a queue of `Event`s: `append_event` sets it without
+/// blocking and without retaining anything, and the connection's drain
+/// re-reads the durable journals from its own per-Work cursor. A slow or
+/// late reader therefore re-reads exactly the delta it has not delivered,
+/// and the journal on disk is the single source of truth — no second copy
+/// of the event history in memory, no slow subscriber stalling a mutation.
+struct EstateWaker {
+    ready: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl EstateWaker {
+    fn new() -> Self {
+        Self {
+            ready: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Coalescing signal: many appends between drains set the flag once and
+    /// wake at most one sleeper, so a retained wake is a flag, never an
+    /// event, and its count is bounded by the number of live connections.
+    fn signal(&self) {
+        let mut ready = self
+            .ready
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *ready = true;
+        self.cv.notify_one();
+    }
+
+    /// Blocks until signalled, then clears the flag. The flag is guarded by
+    /// this same lock, so a signal cannot land between the check and the
+    /// block (the classic lost wakeup), and a spurious wake is harmless:
+    /// the drain re-reads the journals and delivers nothing new when every
+    /// cursor is current, because the journal, not the flag, is the source
+    /// of truth.
+    fn wait(&self) {
+        let mut ready = self
+            .ready
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while !*ready {
+            ready = match self.cv.wait(ready) {
+                Ok(guard) => guard,
+                Err(poison) => poison.into_inner(),
+            };
+        }
+        *ready = false;
+    }
+}
+
+/// The estate-wide `watch` stream (ruling 0394/0404): the operator's
+/// unfiltered administrative surface, dialed once. It has no single Work
+/// to replay under one journal lock, so it applies `handle_watch_connection`'s
+/// no-missed-append discipline to the whole estate: it registers its wake
+/// *before* any barrier or replay, re-reads every journal under `works/`
+/// from its per-Work cursor, then loops on the coalesced wake `append_event`
+/// sets for the rest of the daemon's life. A journal that appears after one
+/// read is reached by the next wake (the journal, not the flag, is the
+/// source of truth); a Work with **no** journal is skipped — there is no
+/// admission to refuse at the estate level — while a journal that is present
+/// but fails to read is a real error, surfaced on the stream rather than read
+/// as an empty history or a clean `EOF`.
+fn handle_estate_watch_connection(
+    stream: UnixStream,
+    state: &Arc<WirkdState>,
+    payload: super::WatchPayload,
+) {
+    // Administrative by the branch in `handle_connection`; the payload is
+    // held only to document that no requester scope applies to the estate
+    // stream (there is no single Work to name one for).
+    debug_assert!(payload.admin && payload.work_id.is_none());
+    let waker = Arc::new(EstateWaker::new());
+    // Registered before the barrier line and the replay below: an append
+    // landing after this registration either sets the wake (drained on the
+    // next pass) or is already in the durable journal the replay reads — so
+    // no append is lost in the interval between the dial and the first read,
+    // and one that lands mid-drain is caught by the next wake.
+    state
+        .estate_wakes
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push(Arc::clone(&waker));
+
+    // The subscription barrier (ruling 0404 F2): one control line, written
+    // after the wake is registered and before a single `Event`, so a client
+    // that has read it holds a dial that cannot miss the first Work appended
+    // on this estate. `client::watch` consumes it for this stream, so it
+    // never reaches stdout.
+    if write_estate_ack(&stream).is_err() {
+        return;
+    }
+
+    // Per-Work cursor: how many of each Work's journal events this
+    // connection has already written. Bounded by the number of Works, not
+    // the number of events — the old `seen` id-set is gone, and the journal
+    // on disk is the source of truth, so a slow reader re-reads the delta it
+    // has not delivered rather than holding the whole history.
+    let mut delivered: HashMap<WorkId, usize> = HashMap::new();
+    let mut writer = &stream;
+
+    // Initial replay of every journal that exists right now (an empty estate
+    // has none). A Work with no journal is skipped; a journal that is present
+    // but fails to open or replay is a real error, surfaced below — never a
+    // silent empty history, and never a clean `EOF`.
+    if let Err(err) = estate_drain(state, &mut delivered, &mut writer) {
+        write_one_reply(&stream, &err_reply("JournalError", &err.to_string()));
+        return;
+    }
+
+    // Live: coalesced wake, then re-read each journal from its cursor.
+    // `waker` is dropped on every return path, which is what makes the next
+    // `append_event`'s `retain` drop the daemon's copy — no separate
+    // deregistration, no timer, no retained thread.
+    loop {
+        waker.wait();
+        if let Err(err) = estate_drain(state, &mut delivered, &mut writer) {
+            // A history that fails to read mid-stream is a real failure of
+            // the stream, not a clean stop: report it and end, so the CLI
+            // does not exit zero on a stream it could not fully read.
+            write_one_reply(&stream, &err_reply("JournalError", &err.to_string()));
+            return;
+        }
+    }
+}
+
+/// The estate stream's subscription barrier, written once before any
+/// `Event` line (ruling 0404 F2). The same `Reply::Ok` envelope the scoped
+/// scope-ack uses, carrying no scope — just the fact that this estate
+/// subscription is established and the caller's first append will reach it.
+fn write_estate_ack(stream: &UnixStream) -> io::Result<()> {
+    let reply = ok_reply(json!({"scope": "estate"}));
+    let mut bytes = serde_json::to_vec(&reply).expect("Reply always serializes");
+    bytes.push(b'\n');
+    let mut writer = stream;
+    writer.write_all(&bytes)?;
+    writer.flush()
+}
+
+/// One estate drain pass: for every Work directory under `works/`, read its
+/// durable journal from this connection's cursor and write the delta.
+/// `journal_for` separates the two cases the old `unwrap_or_default` folded
+/// together — a Work with no journal (`Ok(None)`, skipped: it contributes
+/// nothing) and a journal that is present but fails to open or replay
+/// (`Err`, returned to the caller so a corrupt history never reads as an
+/// empty one, and never ends the stream as a clean `EOF`). A `works/` that
+/// cannot be listed, or an entry that cannot be read, is the same: a real
+/// I/O failure, not a silently-empty estate.
+fn estate_drain(
+    state: &Arc<WirkdState>,
+    delivered: &mut HashMap<WorkId, usize>,
+    writer: &mut &UnixStream,
+) -> io::Result<()> {
+    let works_dir = state.estate_root.join("works");
+    // An estate with no Work yet has no `works/` directory at all — it is
+    // created when the first Work's journal lands (ruling 0394: a watch
+    // dialed on an empty estate must stay open for the first Work). A
+    // missing directory means "nothing to deliver", not a failure; any
+    // other read error does.
+    let entries = match std::fs::read_dir(&works_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(io::Error::other(format!(
+                "estate watch cannot list works: {err}"
+            )));
+        }
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| io::Error::other(format!("estate watch: {err}")))?;
+        if !entry.path().is_dir() {
+            continue;
+        }
+        ids.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    ids.sort();
+    for id in ids {
+        let work_id = WorkId(id);
+        match journal_for(state, &work_id) {
+            Ok(None) => {} // no journal for this Work: it contributes nothing
+            Ok(Some(journal)) => {
+                let events = {
+                    let journal = lock_journal(&journal);
+                    journal.replay().map_err(|err| {
+                        io::Error::other(format!("estate watch replay: work {}: {err}", work_id.0))
+                    })?
+                };
+                let from = delivered.get(&work_id).copied().unwrap_or(0);
+                for event in &events[from..] {
+                    write_event_line(writer, event)?;
+                }
+                delivered.insert(work_id, events.len());
+            }
+            Err(err) => {
+                return Err(io::Error::other(format!(
+                    "estate watch journal: work {}: {err}",
+                    work_id.0
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The scoped `watch` stream's opening line: one ordinary `Reply::Ok`
@@ -1940,6 +2231,18 @@ fn handle_ping(state: &Arc<WirkdState>, payload: super::PingPayload) -> Reply {
                 "min_available_memory_bytes": policy.min_available_memory_bytes,
                 "job_memory_max_bytes": policy.job_memory_max_bytes,
                 "artifact_max_bytes": policy.artifact_max_bytes,
+                // The bounds that default to absent. `null` is the
+                // absence itself — never a stand-in number — and every
+                // one of them is reported whether set or not, because an
+                // operator reading this needs to know which of their
+                // configured bounds are actually in force.
+                "document_max_file_bytes": policy.document_max_file_bytes,
+                "document_max_total_bytes": policy.document_max_total_bytes,
+                "document_max_entries": policy.document_max_entries,
+                "document_max_entries_depth": policy.document_max_entries_depth,
+                "http_max_response_bytes": policy.http_max_response_bytes,
+                "http_timeout_secs": policy.http_timeout_secs,
+                "http_max_redirects": policy.http_max_redirects,
                 "host_pool_capacity_authority": policy.host_pool_capacity_authority,
                 "configured_in": wirk_core::jobs::ResourcePolicy::config_path(&state.estate_root)
                     .display()
@@ -2507,6 +2810,12 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                         Ok(contract) => contract,
                         Err(detail) => return err_reply("ValidationUnavailable", &detail),
                     },
+                    // P6.7: and the estate owner's own doctrine, scoped
+                    // by this Work's declared bindings.
+                    doctrine: match reserve_estate_doctrine(state, &payload.repositories) {
+                        Ok(doctrine) => doctrine,
+                        Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                    },
                 })
             } else {
                 let Some(repo_path) = payload.repo_path.clone() else {
@@ -2567,6 +2876,12 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                     // the identical bytes.
                     contract: match reserve_worker_contract(state) {
                         Ok(contract) => contract,
+                        Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                    },
+                    // P6.7: and the estate owner's own doctrine, scoped
+                    // by this Work's declared bindings.
+                    doctrine: match reserve_estate_doctrine(state, &payload.repositories) {
+                        Ok(doctrine) => doctrine,
                         Err(detail) => return err_reply("ValidationUnavailable", &detail),
                     },
                 })
@@ -2633,6 +2948,12 @@ fn handle_submit(state: &Arc<WirkdState>, payload: SubmitPayload) -> Reply {
                 // the field existing; a World reserved *now* binds it.
                 contract: match reserve_worker_contract(state) {
                     Ok(contract) => contract,
+                    Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                },
+                // P6.7: and the estate owner's own doctrine, scoped by
+                // this Work's declared bindings.
+                doctrine: match reserve_estate_doctrine(state, &payload.repositories) {
+                    Ok(doctrine) => doctrine,
                     Err(detail) => return err_reply("ValidationUnavailable", &detail),
                 },
             })
@@ -4256,7 +4577,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     // declared, and an entry in the staging area that is not a plain
     // regular file contained in it (a symlink out is the case that
     // matters).
-    let mut managed_bytes: Vec<(String, Vec<u8>, String)> = Vec::new();
+    let mut managed_bytes: Vec<(String, ManagedContent)> = Vec::new();
     if matches!(verdict, ClaimVerdict::Validated) {
         // Addressability and declaration were settled above, before
         // `validate_claim`; what is left is the state of the actual
@@ -4316,7 +4637,10 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                 }
             };
             let digest = sha256_hex(&bytes);
-            managed_bytes.push((artifact.name.clone(), bytes, digest));
+            managed_bytes.push((
+                artifact.name.clone(),
+                ManagedContent::Bytes { bytes, digest },
+            ));
         }
         if !matches!(verdict, ClaimVerdict::Validated) {
             managed_bytes.clear();
@@ -4374,12 +4698,18 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             let custody =
                 snapshot_custody && wirk_core::outputs::check_output_name(&artifact.name).is_ok();
             if custody {
-                let bytes = match read_claimed_bytes(
-                    &worktree_path,
-                    &relative,
-                    state.resource_policy.artifact_max_bytes,
-                ) {
-                    Ok(bytes) => bytes,
+                // The *descriptor*, not the content. What follows is a
+                // streamed copy into the immutable store that hashes as
+                // it writes, so the digest recorded is still the digest
+                // of exactly the bytes stored and the peak memory is one
+                // buffer rather than one artifact. That is what makes an
+                // artifact's size unable to refuse a Claim that has
+                // already validated.
+                match open_claimed_file(&worktree_path, &relative) {
+                    Ok((file, len)) => {
+                        managed_bytes
+                            .push((artifact.name.clone(), ManagedContent::File { file, len }));
+                    }
                     Err((_, detail)) => {
                         verdict =
                             ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
@@ -4391,9 +4721,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                         managed_bytes.clear();
                         break;
                     }
-                };
-                let digest = ArtifactReceipt::digest_of_bytes(&bytes);
-                managed_bytes.push((artifact.name.clone(), bytes, digest));
+                }
                 continue;
             }
             let resolved = worktree_path.join(&artifact.path);
@@ -4495,22 +4823,50 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
     // Last, after every refusal check including the worktree receipts'
     // own: a Claim that is going to be refused writes nothing here.
     if matches!(verdict, ClaimVerdict::Validated) && !managed_bytes.is_empty() {
-        for (name, bytes, digest) in &managed_bytes {
-            match wirk_core::outputs::store_claimed_bytes(
-                &state.estate_root,
-                &work_id,
-                &claim_id,
-                name,
-                bytes,
-            ) {
-                Ok(_) => {}
-                // The rename made it visible; only the directory fsync
-                // failed. The bytes are there and re-hash to `digest`,
-                // so reporting this as "never wrote" would be false —
-                // `PreparedProjection::commit`'s own judgement, reused.
-                Err(wirk_core::outputs::OutputWriteError::DurabilityUncertain(detail)) => {
-                    eprintln!("wirkd: {detail}");
+        for (name, content) in managed_bytes {
+            // Both arms write through the same write-once, durable-
+            // before-referenced publication; they differ only in whether
+            // the content is already in hand (a staged output, read and
+            // digested above) or is streamed out of the descriptor this
+            // Claim opened.
+            // The rename made it visible; only the directory fsync
+            // failed. The bytes are there and re-hash to the digest, so
+            // reporting that as "never wrote" would be false — it is
+            // logged and the receipt is still recorded, which is
+            // `PreparedProjection::commit`'s own judgement, reused.
+            let stored: Result<(String, Option<(u64, u64)>), _> = match content {
+                ManagedContent::Bytes { bytes, digest } => {
+                    match wirk_core::outputs::store_claimed_bytes(
+                        &state.estate_root,
+                        &work_id,
+                        &claim_id,
+                        &name,
+                        &bytes,
+                    ) {
+                        Ok(_) => Ok((digest, None)),
+                        Err(wirk_core::outputs::OutputWriteError::DurabilityUncertain(detail)) => {
+                            eprintln!("wirkd: {detail}");
+                            Ok((digest, None))
+                        }
+                        Err(err) => Err(err),
+                    }
                 }
+                ManagedContent::File { file, len } => wirk_core::outputs::store_claimed_stream(
+                    &state.estate_root,
+                    &work_id,
+                    &claim_id,
+                    &name,
+                    file,
+                )
+                .map(|stored| {
+                    if let Some(detail) = stored.durability {
+                        eprintln!("wirkd: {detail}");
+                    }
+                    (stored.digest, Some((len, stored.bytes)))
+                }),
+            };
+            let (digest, streamed) = match stored {
+                Ok(stored) => stored,
                 Err(err) => {
                     verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
                         "the managed output {name} could not be stored durably: {err}"
@@ -4518,12 +4874,27 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
                     artifact_receipts.clear();
                     break;
                 }
+            };
+            // A streamed artifact that was a different length when it
+            // was opened than when it was read is being written while it
+            // is being claimed: no single content identity describes it,
+            // so none is recorded. This is an inconsistency, not a size.
+            if let Some((opened, written)) = streamed
+                && opened != written
+            {
+                verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
+                    "the claimed artifact {name} was {opened} bytes when it was opened and \
+                     {written} bytes when it was read; it is being written while it is being \
+                     claimed, so no single content identity describes it"
+                )));
+                artifact_receipts.clear();
+                break;
             }
             // `stored_relative` re-checks the same two rules
             // `store_claimed_bytes` just enforced, so it cannot be
             // `None` here; a defensive `None` is an explicit
             // unavailability rather than a receipt naming nothing.
-            let Some(path) = wirk_core::outputs::stored_relative(&claim_id, name) else {
+            let Some(path) = wirk_core::outputs::stored_relative(&claim_id, &name) else {
                 verdict = ClaimVerdict::Refused(ClaimRefusal::ValidationUnavailable(format!(
                     "no managed output address could be recorded for {name}"
                 )));
@@ -4533,7 +4904,7 @@ fn handle_claim_inner(state: &Arc<WirkdState>, payload: ClaimPayload) -> Reply {
             artifact_receipts.push(ArtifactReceipt {
                 name: name.clone(),
                 path,
-                digest: digest.clone(),
+                digest,
                 store: wirk_core::ArtifactStore::WorkOutputs,
             });
         }
@@ -5112,6 +5483,11 @@ fn reserve_next_leaf(
                     // first one.
                     contract: reserve_worker_contract(state)
                         .map_err(|detail| ("ValidationUnavailable", detail))?,
+                    // P6.7: every Actor reservation resolves the
+                    // estate's doctrine as it stands now, for the same
+                    // reason the contract is re-reserved here.
+                    doctrine: reserve_estate_doctrine(state, &fold(&events).repositories)
+                        .map_err(|detail| ("ValidationUnavailable", detail))?,
                 }))
             }
             // `waypoints` (`route_waypoints`) names only executable
@@ -5218,15 +5594,46 @@ fn reserve_next_leaf(
 /// silently.
 fn reserve_worker_contract(
     state: &Arc<WirkdState>,
-) -> Result<Option<wirk_core::WorkerContractRef>, String> {
+) -> Result<Option<Box<wirk_core::WorkerContractRef>>, String> {
     wirk_herdr::worker_contract::reserve(&state.estate_root)
-        .map(Some)
+        .map(|reference| Some(Box::new(reference)))
         .map_err(|error| {
             format!(
                 "the shared worker contract could not be written under {}: {error}",
                 state.estate_root.display()
             )
         })
+}
+
+/// P6.7 (ruling 0393): the estate doctrine an Actor reservation binds.
+///
+/// Resolved from the estate's own declaration **at every reservation**,
+/// so an owner who changes what they have selected changes what the next
+/// applicable reservation binds — and cannot reach back into a World a
+/// Run is already bound to, whose references were fixed here and are
+/// hashed into its `WorldHash`.
+///
+/// Scoped by this Work's own declared repository bindings: a document an
+/// owner scoped to a repository this Work holds no binding for is not
+/// resolved for it, not stored against it, and not disclosed to it.
+///
+/// Written durably before the World that references it is built, the
+/// ordering the contract and the projection already have. An estate that
+/// declared no doctrine gets an empty list and does no work at all — the
+/// reservation is byte-identical to what it was before this existed. A
+/// declared document that cannot be read refuses the reservation for the
+/// same reason `reserve_worker_contract` does: an actor silently
+/// operating without rules its owner believes are in force is worse than
+/// a submit that says which document is broken.
+fn reserve_estate_doctrine(
+    state: &Arc<WirkdState>,
+    repositories: &[wirk_core::RepositoryBinding],
+) -> Result<Vec<wirk_core::EstateDoctrineRef>, String> {
+    let names: Vec<String> = repositories
+        .iter()
+        .map(|binding| binding.name.clone())
+        .collect();
+    wirk_herdr::estate_doctrine::reserve(&state.estate_root, &names)
 }
 
 fn reservation_evidence(
@@ -6187,6 +6594,15 @@ fn handle_retry_inner(
                 // before the reference is written.
                 contract: match reserve_worker_contract(state) {
                     Ok(contract) => contract,
+                    Err(detail) => return err_reply("ValidationUnavailable", &detail),
+                },
+                // P6.7: a retry re-resolves the estate's doctrine too.
+                // A retry is its own reservation — the prior Run's World
+                // keeps the references it was reserved with, readable on
+                // disk, and this one binds what the owner has selected
+                // now.
+                doctrine: match reserve_estate_doctrine(state, &work.repositories) {
+                    Ok(doctrine) => doctrine,
                     Err(detail) => return err_reply("ValidationUnavailable", &detail),
                 },
                 ..actor.clone()
@@ -8938,17 +9354,39 @@ fn work_facts(
         runs: Vec::new(),
         projected_generations: BTreeSet::new(),
         contract_digests: BTreeSet::new(),
+        doctrine_digests: BTreeSet::new(),
         validated_managed_paths: BTreeSet::new(),
         claim_evidence_in_checkout: false,
     };
     for event in events {
         match &event.kind {
             EventKind::RunOpened { run, .. } => facts.runs.push(run.0.clone()),
-            EventKind::WaypointReserved { world, .. } => {
-                if let World::Actor(actor) = world
-                    && let Some(contract) = &actor.contract
-                {
+            EventKind::WaypointReserved {
+                world: World::Actor(actor),
+                ..
+            } => {
+                if let Some(contract) = &actor.contract {
                     facts.contract_digests.insert(contract.digest.clone());
+                }
+                // P6.7: the selected documents this World names.
+                for document in &actor.doctrine {
+                    facts.doctrine_digests.insert(document.digest.clone());
+                }
+            }
+            // P6.7: and the composed transport document a launch
+            // actually delivered, which lives in the same store and is
+            // re-read on every prompt of a fallback delivery — so a
+            // running Work needs its bytes as much as it needs the
+            // documents that went into it.
+            EventKind::RunLaunched {
+                contract: Some(delivery),
+                ..
+            } => {
+                if let Some(composed) = &delivery.composed {
+                    facts.doctrine_digests.insert(composed.digest.clone());
+                    for document in &composed.documents {
+                        facts.doctrine_digests.insert(document.digest.clone());
+                    }
                 }
             }
             EventKind::ClaimRecorded {
@@ -9153,6 +9591,15 @@ fn derive_retention(
                 },
             );
         }
+        for digest in &work.doctrine_digests {
+            super::inventory::Retention::retain(
+                &mut retention.doctrine,
+                digest,
+                super::inventory::RetentionHolder::Reservation {
+                    work: work.id.clone(),
+                },
+            );
+        }
     }
 
     // An unsettled finding was recorded against a generation, and the
@@ -9250,6 +9697,202 @@ fn handle_estate_storage(state: &Arc<WirkdState>, payload: super::EstateStorageP
 
 /// `wirk estate clean` — explicit, guarded, `--dry-run`-able removal of
 /// optional derivations.
+/// `wirk estate doctrine` (P6.7, ruling 0393): the estate owner's own
+/// explicit selection of scoped doctrine documents.
+///
+/// Three rules decide every branch below, and they are the whole
+/// authority model:
+///
+/// * **Mutation is the owner's.** `set` and `remove` change what every
+///   future actor in this estate operates under, so a Work-scoped caller
+///   is refused by name rather than silently answered administratively —
+///   the posture `estate clean` already takes for assets the estate owns.
+///   An actor that could rewrite its own doctrine is not under doctrine.
+/// * **A listing discloses only what applies.** A scoped caller is
+///   answered with the documents that would actually be resolved for its
+///   own Work, by its own declared repository bindings, and without the
+///   owner's filesystem paths — which say where an owner keeps things
+///   and are no part of what a Work needs to know.
+/// * **Changing the declaration changes the next reservation.** Nothing
+///   here touches a World that has already been reserved. Those carry
+///   their own `doctrine` references, hashed into their `WorldHash`, and
+///   are read back through `wirk world show`.
+fn handle_estate_doctrine(state: &Arc<WirkdState>, payload: super::EstateDoctrinePayload) -> Reply {
+    use wirk_herdr::estate_doctrine as doctrine;
+
+    let mut declaration = match doctrine::read_declaration(&state.estate_root) {
+        Ok(declaration) => declaration,
+        Err(detail) => return err_reply("ValidationUnavailable", &detail),
+    };
+
+    match payload.action {
+        super::DoctrineAction::List => {
+            let scoped = match &payload.work {
+                None => None,
+                Some(work) => {
+                    let Some(events) = replay_events(state, work) else {
+                        return err_reply("NotFound", "no such work");
+                    };
+                    if events.is_empty() {
+                        return err_reply("NotFound", "no such work");
+                    }
+                    Some(fold(&events).repositories)
+                }
+            };
+            let documents: Vec<Value> = match &scoped {
+                // Scoped: only what this Work's own bindings admit, and
+                // no path. What it is, which edition, and why it applies.
+                Some(bindings) => {
+                    let names: Vec<String> = bindings
+                        .iter()
+                        .map(|binding| binding.name.clone())
+                        .collect();
+                    declaration
+                        .applicable(&names)
+                        .into_iter()
+                        .map(|document| {
+                            json!({
+                                "id": document.id,
+                                "version": document.version.clone().unwrap_or_else(|| {
+                                    doctrine::UNDECLARED_VERSION.to_string()
+                                }),
+                                "repository": document.repository,
+                            })
+                        })
+                        .collect()
+                }
+                // Administrative: the owner's whole selection, paths
+                // included — it is the owner's own declaration.
+                None => declaration
+                    .documents
+                    .iter()
+                    .map(|document| {
+                        json!({
+                            "id": document.id,
+                            "path": document.path.display().to_string(),
+                            "version": document.version.clone().unwrap_or_else(|| {
+                                doctrine::UNDECLARED_VERSION.to_string()
+                            }),
+                            "repository": document.repository,
+                        })
+                    })
+                    .collect(),
+            };
+            ok_reply(json!({
+                "estate": state.estate_root.display().to_string(),
+                "scope": if scoped.is_some() { "requester" } else { "administrative" },
+                "documents": documents,
+                "note": "this is what is declared now. What a Run was actually reserved with is \
+                         read with `wirk world show`, and does not change when this declaration \
+                         does",
+            }))
+        }
+        super::DoctrineAction::Set { .. } | super::DoctrineAction::Remove { .. }
+            if payload.work.is_some() =>
+        {
+            err_reply(
+                "AdministrativeOnly",
+                "estate doctrine is the estate owner's own selection, not any Work's, so a \
+                 Work-scoped caller has no authority to change it; name --admin to change it \
+                 deliberately as the owner. A Work reads what applies to it with `wirk estate \
+                 doctrine list`, and what it was actually reserved with with `wirk world show`",
+            )
+        }
+        super::DoctrineAction::Set {
+            id,
+            path,
+            version,
+            repository,
+        } => {
+            if id.trim().is_empty() {
+                return err_reply("BadRequest", "--id names the document and cannot be empty");
+            }
+            let path = PathBuf::from(&path);
+            if !path.is_absolute() {
+                return err_reply(
+                    "BadRequest",
+                    &format!(
+                        "--path must be absolute: {} would be resolved against whatever \
+                         directory a later reservation happened to run in",
+                        path.display()
+                    ),
+                );
+            }
+            let document = wirk_herdr::estate_doctrine::DeclaredDocument {
+                id: id.clone(),
+                path,
+                version,
+                repository,
+            };
+            // Read it now, under the owner's own eyes, rather than
+            // letting an unreadable or oversized document first surface
+            // as a refused submit later. This is the same bytes the next
+            // applicable reservation will read.
+            let bytes = match doctrine::read_declared(&document) {
+                Ok(bytes) => bytes,
+                Err(detail) => return err_reply("ValidationUnavailable", &detail),
+            };
+            let digest = wirk_herdr::content_store::sha256_hex(&bytes);
+            let replaced = declaration
+                .documents
+                .iter()
+                .any(|existing| existing.id == id);
+            declaration.documents.retain(|existing| existing.id != id);
+            declaration.documents.push(document.clone());
+            if let Err(error) = doctrine::write_declaration(&state.estate_root, &declaration) {
+                return err_reply(
+                    "ValidationUnavailable",
+                    &format!(
+                        "this estate's doctrine declaration at {} could not be written: {error}",
+                        doctrine::declaration_path(&state.estate_root).display()
+                    ),
+                );
+            }
+            ok_reply(json!({
+                "estate": state.estate_root.display().to_string(),
+                "id": id,
+                "replaced": replaced,
+                "version": document
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| doctrine::UNDECLARED_VERSION.to_string()),
+                "repository": document.repository,
+                "path": document.path.display().to_string(),
+                "digest": digest,
+                "bytes": bytes.len(),
+                "note": "applies to reservations made from now on; Worlds already reserved keep \
+                         what they were reserved with",
+            }))
+        }
+        super::DoctrineAction::Remove { id } => {
+            let before = declaration.documents.len();
+            declaration.documents.retain(|existing| existing.id != id);
+            if declaration.documents.len() == before {
+                return err_reply(
+                    "NotFound",
+                    &format!("this estate declares no doctrine document named `{id}`"),
+                );
+            }
+            if let Err(error) = doctrine::write_declaration(&state.estate_root, &declaration) {
+                return err_reply(
+                    "ValidationUnavailable",
+                    &format!(
+                        "this estate's doctrine declaration at {} could not be written: {error}",
+                        doctrine::declaration_path(&state.estate_root).display()
+                    ),
+                );
+            }
+            ok_reply(json!({
+                "estate": state.estate_root.display().to_string(),
+                "id": id,
+                "removed": true,
+                "note": "applies to reservations made from now on; Worlds already reserved keep \
+                         what they were reserved with, and their stored bytes stay readable",
+            }))
+        }
+    }
+}
+
 fn handle_estate_clean(state: &Arc<WirkdState>, payload: super::EstateCleanPayload) -> Reply {
     // These assets belong to the estate, not to any Work, so there is no
     // Work whose authority could scope their removal. Refused with that
@@ -9554,45 +10197,75 @@ fn membership_json(membership: &wirk_atlas::Membership) -> Value {
     })
 }
 
-fn generation_json(generation: &wirk_atlas::SourceGeneration) -> Value {
-    let mut coverage = std::collections::BTreeMap::from([
-        ("indexed", 0u64),
-        ("excluded", 0u64),
-        ("unsupported", 0u64),
-        ("unavailable", 0u64),
-        ("error", 0u64),
-    ]);
-    for resource in &generation.resources {
-        let key = match resource.disposition {
-            wirk_atlas::CoverageDisposition::Indexed => "indexed",
-            wirk_atlas::CoverageDisposition::Excluded => "excluded",
-            wirk_atlas::CoverageDisposition::Unsupported => "unsupported",
-            wirk_atlas::CoverageDisposition::Unavailable => "unavailable",
-            wirk_atlas::CoverageDisposition::Error => "error",
-        };
-        *coverage.get_mut(key).expect("all five keys pre-seeded") += 1;
-    }
+/// The reply for a generation an acquisition just staged.
+///
+/// The counts come from the [`wirk_atlas::CoverageSummary`] the
+/// acquisition's own streaming sink accumulated as each record was
+/// written, rather than from a resource list held in memory to be
+/// counted afterwards — the same numbers, from the pass that produced
+/// them.
+fn generation_json(generation: &wirk_atlas::StagedGeneration) -> Value {
+    let coverage = generation.coverage;
+    generation_json_parts(
+        &generation.id.0,
+        &generation.source.0,
+        &generation.revision,
+        &generation.content,
+        &generation.extractor_set,
+        &generation.acquisition_policy,
+        coverage,
+        generation.origin.as_deref(),
+    )
+}
+
+/// The same reply for a generation **read back** from its own immutable
+/// directory, where the resource rows are in hand and the counts are
+/// derived from them.
+fn published_generation_json(generation: &wirk_atlas::SourceGeneration) -> Value {
+    generation_json_parts(
+        &generation.id.0,
+        &generation.source.0,
+        &generation.revision,
+        &generation.content,
+        &generation.extractor_set,
+        &generation.acquisition_policy,
+        wirk_atlas::CoverageSummary::of(&generation.resources),
+        generation.origin.as_deref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generation_json_parts(
+    id: &str,
+    source: &str,
+    revision: &str,
+    content: &str,
+    extractor_set: &str,
+    acquisition_policy: &str,
+    coverage: wirk_atlas::CoverageSummary,
+    origin: Option<&wirk_atlas::HttpOrigin>,
+) -> Value {
     json!({
-        "generation": generation.id.0,
-        "source": generation.source.0,
-        "revision": generation.revision,
-        "content": generation.content,
-        "extractor_set": generation.extractor_set,
-        "acquisition_policy": generation.acquisition_policy,
+        "generation": id,
+        "source": source,
+        "revision": revision,
+        "content": content,
+        "extractor_set": extractor_set,
+        "acquisition_policy": acquisition_policy,
         "coverage": {
-            "indexed": coverage["indexed"],
-            "excluded": coverage["excluded"],
-            "unsupported": coverage["unsupported"],
-            "unavailable": coverage["unavailable"],
-            "error": coverage["error"],
-            "total": generation.resources.len(),
+            "indexed": coverage.indexed,
+            "excluded": coverage.excluded,
+            "unsupported": coverage.unsupported,
+            "unavailable": coverage.unavailable,
+            "error": coverage.error,
+            "total": coverage.total,
         },
         // `Some` only for an `http-source-policy/v1` generation: what
         // that fetch actually observed about its origin, disclosed
         // rather than folded into `revision`/`content` — see
         // `wirk_atlas::HttpOrigin`'s own doc for why this is evidence, not
         // identity.
-        "origin": generation.origin.as_ref().map(|origin| json!({
+        "origin": origin.map(|origin| json!({
             "requested_url": origin.requested_url,
             "final_url": origin.final_url,
             "status": origin.status,
@@ -10607,7 +11280,7 @@ fn handle_atlas_status(state: &Arc<WirkdState>, payload: super::AtlasStatusPaylo
         };
         sources.push(json!({
             "membership": membership_json(membership),
-            "published_generation": current.as_ref().map(generation_json),
+            "published_generation": current.as_ref().map(published_generation_json),
             "recent_attempts": attempts,
             "semantic": semantic,
         }));
@@ -19934,6 +20607,7 @@ mod projection_tests {
             estate_root: dir.path().to_path_buf(),
             journals: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
+            estate_wakes: Mutex::new(Vec::new()),
             atlas: Mutex::new(
                 wirk_atlas::AtlasStore::open(dir.path(), dir.path().display().to_string())
                     .expect("atlas"),
@@ -20011,6 +20685,7 @@ mod projection_tests {
             estate_root: dir.path().to_path_buf(),
             journals: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
+            estate_wakes: Mutex::new(Vec::new()),
             atlas: Mutex::new(
                 wirk_atlas::AtlasStore::open(dir.path(), dir.path().display().to_string())
                     .expect("atlas"),
@@ -20197,13 +20872,18 @@ mod tests {
             .join("draft.md")
             .display()
             .to_string();
-        let bytes = read_claimed_bytes(&linked, &recorded, 4096).expect("the artifact resolves");
-        assert_eq!(bytes, b"# Draft\n");
+        let (file, len) = open_claimed_file(&linked, &recorded).expect("the artifact resolves");
+        let (digest, read) = digest_claimed_file(file, len).expect("the artifact reads back");
+        assert_eq!(read, b"# Draft\n".len() as u64);
+        assert_eq!(
+            digest,
+            wirk_core::ArtifactReceipt::digest_of_bytes(b"# Draft\n")
+        );
 
         // Absolute and outside the anchor: unresolved, never joined.
         let outside = dir.path().join("outside.md");
         std::fs::write(&outside, b"not ours\n").unwrap();
-        let (code, _) = read_claimed_bytes(&linked, &outside.display().to_string(), 4096)
+        let (code, _) = open_claimed_file(&linked, &outside.display().to_string())
             .expect_err("an absolute path outside the anchor does not resolve");
         assert_eq!(code, "ArtifactUnresolved");
 
@@ -20216,7 +20896,7 @@ mod tests {
             .join("link.md")
             .display()
             .to_string();
-        let (code, _) = read_claimed_bytes(&linked, &through_link, 4096)
+        let (code, _) = open_claimed_file(&linked, &through_link)
             .expect_err("a symlinked artifact is not followed");
         assert_eq!(code, "ArtifactUnresolved");
     }
@@ -20395,6 +21075,7 @@ mod tests {
             estate_root: estate_root.to_path_buf(),
             journals: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
+            estate_wakes: Mutex::new(Vec::new()),
             atlas: Mutex::new(atlas),
             // These in-file tests build a daemon state directly; the
             // default policy is the one that changes no behaviour.
@@ -24976,15 +25657,23 @@ fn receipt_components(relative: &str) -> Option<Vec<String>> {
 ///
 /// So: one anchor, one component at a time with `O_NOFOLLOW`
 /// (`open_no_follow`, R2 — no ancestor left in any lookup for a rename
-/// to retarget), `fstat` on the descriptor that survives, an explicit
-/// size refusal against `ResourcePolicy::artifact_max_bytes`, and a read
-/// bounded by that same number. Check and read address the same open
-/// file object.
-fn read_claimed_bytes(
+/// to retarget), and an `fstat` on the descriptor that survives. The
+/// descriptor is what is returned, so every caller reads the same open
+/// file object this function checked, never a second lookup of the same
+/// name.
+///
+/// **No size decides anything here.** Both consumers stream: custody
+/// copies-and-hashes into the immutable store, and `wirk artifact`
+/// hashes to verify and answers with the digest and the length rather
+/// than the content. Neither holds an artifact in memory, so neither
+/// has a reason to refuse one for being large — and a Claim that
+/// validated is never turned into a refusal by a byte count (ruling
+/// 0401; the field's own doc comment always said this was a bound on a
+/// read and not a policy about what may be claimed).
+fn open_claimed_file(
     anchor: &Path,
     relative: &str,
-    cap: u64,
-) -> Result<Vec<u8>, (&'static str, String)> {
+) -> Result<(std::fs::File, u64), (&'static str, String)> {
     let unresolved = || {
         (
             "ArtifactUnresolved",
@@ -25076,7 +25765,7 @@ fn read_claimed_bytes(
             });
         }
     };
-    let mut file = std::fs::File::from(opened);
+    let file = std::fs::File::from(opened);
     let Ok(meta) = file.metadata() else {
         return Err((
             "ArtifactAbsent",
@@ -25086,44 +25775,55 @@ fn read_claimed_bytes(
     if !meta.file_type().is_file() {
         return Err(unresolved());
     }
-    if meta.len() > cap {
+    Ok((file, meta.len()))
+}
+
+/// The digest and length of a claimed artifact, taken by streaming the
+/// one open file object [`open_claimed_file`] resolved.
+///
+/// The `fstat` length is compared against the length that actually
+/// streamed, and a disagreement is refused. That check is about
+/// *consistency*, not size: a file another process is still writing
+/// would otherwise be vouched for under a digest of however much of it
+/// happened to exist, which is a different artifact reported under the
+/// Claim's identity. It refuses the inconsistency and names it as one.
+fn digest_claimed_file(
+    file: std::fs::File,
+    expected_len: u64,
+) -> Result<(String, u64), (&'static str, String)> {
+    let (digest, read) = wirk_core::ArtifactReceipt::digest_of_stream(file).map_err(|err| {
+        (
+            "ArtifactAbsent",
+            format!("the claimed bytes could not be read: {err}"),
+        )
+    })?;
+    if read != expected_len {
         return Err((
-            "ArtifactTooLarge",
+            "ArtifactBytesChanged",
             format!(
-                "the claimed artifact is {} bytes, above this estate's artifact_max_bytes of \
-                 {cap}; nothing was read (raise it in .wirk/resources.json)",
-                meta.len()
+                "the claimed artifact was {expected_len} bytes when it was opened and {read} \
+                 bytes when it was read; it is being written while it is being claimed, so no \
+                 single content identity describes it"
             ),
         ));
     }
-    let mut bytes = Vec::new();
-    // Bounded even though `fstat` already agreed: a file can grow
-    // between the two, and a truncated answer reported under a Claim's
-    // digest would be a different artifact. One byte over the cap is
-    // read deliberately, so growth is *detected* rather than silently
-    // cut at the boundary.
-    match io::Read::read_to_end(
-        &mut io::Read::take(&mut file, cap.saturating_add(1)),
-        &mut bytes,
-    ) {
-        Ok(_) => {}
-        Err(err) => {
-            return Err((
-                "ArtifactAbsent",
-                format!("the claimed bytes could not be read: {err}"),
-            ));
-        }
-    }
-    if bytes.len() as u64 > cap {
-        return Err((
-            "ArtifactTooLarge",
-            format!(
-                "the claimed artifact grew past this estate's artifact_max_bytes of {cap} while \
-                 it was being read; nothing is reported"
-            ),
-        ));
-    }
-    Ok(bytes)
+    Ok((digest, read))
+}
+
+/// What a validated Claim is about to take into custody, before it is
+/// written: either content already in hand, or the one open file object
+/// the artifact was resolved to.
+///
+/// The two exist because they arrive differently and must not be made
+/// to look alike. A staged managed output was read and digested while
+/// its boundary was being checked, so its bytes are already here. A
+/// worktree artifact is resolved to a descriptor and never read into
+/// memory at all — it is copied into the store and hashed in the same
+/// pass — which is what keeps an artifact's size out of the question of
+/// whether a Claim validates.
+enum ManagedContent {
+    Bytes { bytes: Vec<u8>, digest: String },
+    File { file: std::fs::File, len: u64 },
 }
 
 /// Removes the `.tmp-` files a crash between a projection's temp write
@@ -25315,17 +26015,20 @@ fn resolve_validated_artifact(
             "the recorded path no longer addresses a file inside the area that owns it",
         );
     };
-    let bytes = match read_claimed_bytes(
-        &anchor,
-        &receipt.path,
-        state.resource_policy.artifact_max_bytes,
-    ) {
-        Ok(bytes) => bytes,
+    // Streamed, not read whole: this answer is the digest and the length,
+    // never the content, so establishing it costs one buffer and an
+    // artifact's size decides nothing about whether it can be verified.
+    let (file, expected_len) = match open_claimed_file(&anchor, &receipt.path) {
+        Ok(opened) => opened,
         Err((code, detail)) => return err_reply(code, &detail),
     };
-    // The digest of the buffer that was actually read, not of a second
-    // lookup of the same path.
-    if wirk_core::ArtifactReceipt::digest_of_bytes(&bytes) != receipt.digest {
+    let (digest, bytes_read) = match digest_claimed_file(file, expected_len) {
+        Ok(digested) => digested,
+        Err((code, detail)) => return err_reply(code, &detail),
+    };
+    // The digest of the bytes that actually streamed past, not of a
+    // second lookup of the same path.
+    if digest != receipt.digest {
         return err_reply(
             "ArtifactBytesChanged",
             "what is at that address no longer hashes to the digest this Claim was validated \
@@ -25338,7 +26041,7 @@ fn resolve_validated_artifact(
         "name": receipt.name,
         "store": receipt.store.label(),
         "digest": receipt.digest,
-        "bytes": bytes.len(),
+        "bytes": bytes_read,
         "path": anchor.join(&receipt.path).display().to_string(),
     }))
 }
@@ -25719,6 +26422,36 @@ fn handle_world_show(state: &Arc<WirkdState>, payload: super::WorldShowPayload) 
         "waypoint": run.waypoint.0,
         "current": current,
     });
+
+    // P6.7 (ruling 0393): what this Run is actually bound to operate
+    // under, read from the reserved World itself rather than from the
+    // estate's current declaration — which is the whole point. An owner
+    // who changes the declaration changes the next applicable
+    // reservation; this answer does not move underneath a bound Run.
+    //
+    // Answered on every reply, before the orientation branches below
+    // return: doctrine and orientation are independent, and a Waypoint
+    // that declared no `orient` block still operates under the estate's
+    // rules. Identities only — id, the owner's version, the digest of
+    // the exact bytes — because that is what makes "the same document"
+    // checkable. The bytes themselves already reached the actor through
+    // its launch.
+    let doctrine = binding.world.doctrine();
+    if !doctrine.is_empty() {
+        result["doctrine"] = Value::Array(
+            doctrine
+                .iter()
+                .map(|document| {
+                    json!({
+                        "id": document.id,
+                        "version": document.version,
+                        "digest": document.digest,
+                        "repository": document.repository,
+                    })
+                })
+                .collect(),
+        );
+    }
 
     // The whole chain this Run was delivered, oldest first: the reserved
     // World's initial projection, then each revision its own actor

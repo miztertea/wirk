@@ -26,10 +26,15 @@ use wirk_atlas::{
     QueryScope, SearchRequest, SemanticRequest, search,
 };
 
-fn staged(outcome: AcquireOutcome) -> wirk_atlas::SourceGeneration {
+/// The acquisition reports identity and coverage; the generation's own
+/// resource list lives in the immutable generation directory, which is
+/// what these checks read it back from.
+fn read_staged(atlas: &AtlasStore, outcome: AcquireOutcome) -> wirk_atlas::SourceGeneration {
     match outcome {
-        AcquireOutcome::Staged(generation) => generation,
-        other => panic!("{other:?}"),
+        AcquireOutcome::Staged(staged) => atlas
+            .generation(&staged.id)
+            .expect("the generation just staged reads back"),
+        other => panic!("expected Staged, got {other:?}"),
     }
 }
 
@@ -67,15 +72,16 @@ fn publish_document_tree(
     let membership = atlas
         .register_document_tree(alias, docs_dir, DOCUMENT_TREE_CURRENT_OBSERVATION)
         .unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire_document_tree(
                 &membership,
                 DOCUMENT_TREE_CURRENT_OBSERVATION,
                 ExtractorPolicy::default(),
             )
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(atlas, outcome)
+    };
     atlas.publish(&membership, &generation.id).unwrap();
     (membership, generation.id)
 }

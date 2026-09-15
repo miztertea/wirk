@@ -586,7 +586,15 @@ pub fn run_command(rest: &[String]) -> ExitCode {
     // object store and may be larger or smaller than the tree it checks
     // out. Herdr is untouched — no agent and no pane is counted here.
     let worktree_path = wirk_core::owned_execution_address(&estate_path, &work_id);
-    let (policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(&estate_path);
+    // An unusable `resources.json` refuses the materialization rather
+    // than running it under bounds that are not in force (ruling 0402).
+    let (policy, policy_note) = match wirk_core::jobs::ResourcePolicy::load(&estate_path) {
+        Ok(loaded) => loaded,
+        Err(unusable) => {
+            eprintln!("wirk run: {unusable}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Some(note) = policy_note {
         eprintln!("wirk run: {note}");
     }

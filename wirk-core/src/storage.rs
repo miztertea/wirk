@@ -81,6 +81,7 @@ pub const CLASSES: &[&str] = &[
     "run-pins",
     "runtime-images",
     "contracts",
+    "doctrine",
     "atlas-generations",
     "atlas-editions",
     "atlas-index",
@@ -97,6 +98,7 @@ pub const CLEANABLE_CLASSES: &[&str] = &[
     "outputs-staging",
     "runtime-images",
     "contracts",
+    "doctrine",
     "atlas-generations",
     "atlas-editions",
 ];

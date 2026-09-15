@@ -25,6 +25,7 @@ pub(crate) fn estate_command(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("storage") => storage_command(&rest[1..]),
         Some("clean") => clean_command(&rest[1..]),
+        Some("doctrine") => doctrine_command(&rest[1..]),
         _ => usage(),
     }
 }
@@ -33,10 +34,167 @@ pub(crate) fn usage() -> ExitCode {
     eprintln!(
         "usage: wirk estate storage --estate <root> [--requesting-work <id> | --admin] [--json] \
          | wirk estate clean --estate <root> --class <{}> (--id <id>... | --all-unreferenced) \
-         [--dry-run] [--admin] [--json]",
+         [--dry-run] [--admin] [--json] \
+         | wirk estate doctrine list --estate <root> [--requesting-work <id> | --admin] [--json] \
+         | wirk estate doctrine set --estate <root> --id <id> --path <file> [--version <label>] \
+         [--repository <name>] --admin [--json] \
+         | wirk estate doctrine remove --estate <root> --id <id> --admin [--json]",
         wirk_core::storage::CLEANABLE_CLASSES.join("|")
     );
     ExitCode::from(1)
+}
+
+/// `wirk estate doctrine` — the estate owner's explicit selection of the
+/// scoped doctrine documents every applicable actor is reserved with.
+///
+/// Deliberately small, and deliberately explicit: one document at a
+/// time, named by the owner, with the owner's own version label and the
+/// owner's own scope. Wirk does not search for doctrine, does not
+/// promote a nearby file into it, and does not turn something a source
+/// retrieval surfaced into governing rules. Silence means no doctrine.
+fn doctrine_command(rest: &[String]) -> ExitCode {
+    match rest.first().map(String::as_str) {
+        Some("list") => doctrine_call("list", &rest[1..]),
+        Some("set") => doctrine_call("set", &rest[1..]),
+        Some("remove") => doctrine_call("remove", &rest[1..]),
+        _ => usage(),
+    }
+}
+
+fn doctrine_call(action: &str, rest: &[String]) -> ExitCode {
+    let verb = format!("wirk estate doctrine {action}");
+    let mut allowed = vec![
+        ESTATE,
+        JSON,
+        ("--requesting-work", true),
+        ("--admin", false),
+    ];
+    match action {
+        "set" => allowed.extend([
+            ("--id", true),
+            ("--path", true),
+            ("--version", true),
+            ("--repository", true),
+        ]),
+        "remove" => allowed.push(("--id", true)),
+        _ => {}
+    }
+    if let Err(code) = check_flags(&verb, rest, &allowed) {
+        return code;
+    }
+    let Some(estate) = flag_value(rest, "--estate") else {
+        return usage();
+    };
+    let scope = match crate::resolve_scope(
+        &verb,
+        &estate,
+        flag_value(rest, "--requesting-work"),
+        rest.iter().any(|arg| arg == "--admin"),
+    ) {
+        Ok(scope) => scope,
+        Err(refusal) => {
+            eprintln!("{verb}: {refusal}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = &scope.note {
+        eprintln!("{verb}: {note}");
+    }
+    let json = rest.iter().any(|arg| arg == "--json");
+
+    let action = match action {
+        "list" => wirkd::DoctrineAction::List,
+        "set" => {
+            let (Some(id), Some(path)) = (flag_value(rest, "--id"), flag_value(rest, "--path"))
+            else {
+                eprintln!("{verb}: --id <id> and --path <file> are both required");
+                return ExitCode::from(1);
+            };
+            // Resolved here, in the caller's own shell, because that is
+            // where a relative path means what the person typing it
+            // meant. The daemon is a different process in a different
+            // directory and must never be the one to guess.
+            let path = match std::path::Path::new(&path).canonicalize() {
+                Ok(resolved) => resolved.display().to_string(),
+                Err(error) => {
+                    eprintln!("{verb}: --path {path} could not be resolved: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            wirkd::DoctrineAction::Set {
+                id,
+                path,
+                version: flag_value(rest, "--version"),
+                repository: flag_value(rest, "--repository"),
+            }
+        }
+        _ => {
+            let Some(id) = flag_value(rest, "--id") else {
+                eprintln!("{verb}: --id <id> is required");
+                return ExitCode::from(1);
+            };
+            wirkd::DoctrineAction::Remove { id }
+        }
+    };
+
+    crate::wirkd_client_call(
+        &estate,
+        &Request::estate_doctrine(wirkd::EstateDoctrinePayload {
+            work: scope.requesting.clone(),
+            action,
+        }),
+        |result| {
+            if json {
+                println!("{result}");
+                return;
+            }
+            render_doctrine(result);
+        },
+    )
+}
+
+fn render_doctrine(result: &serde_json::Value) {
+    let text = |key: &str| result[key].as_str().unwrap_or("").to_string();
+    if let Some(documents) = result["documents"].as_array() {
+        println!("estate {} ({} scope)", text("estate"), text("scope"));
+        if documents.is_empty() {
+            println!("no estate doctrine is declared");
+        }
+        for document in documents {
+            let scope = document["repository"].as_str().map_or_else(
+                || "estate-wide".to_string(),
+                |name| format!("repository {name}"),
+            );
+            println!(
+                "{:<24} version {:<16} {}",
+                document["id"].as_str().unwrap_or(""),
+                document["version"].as_str().unwrap_or(""),
+                scope
+            );
+            if let Some(path) = document["path"].as_str() {
+                println!("{:<24}   {path}", "");
+            }
+        }
+    } else if result["removed"].as_bool().unwrap_or(false) {
+        println!("removed {}", text("id"));
+    } else {
+        println!(
+            "{} {} (version {}, sha256 {}, {} bytes)",
+            if result["replaced"].as_bool().unwrap_or(false) {
+                "replaced"
+            } else {
+                "declared"
+            },
+            text("id"),
+            text("version"),
+            text("digest"),
+            result["bytes"].as_u64().unwrap_or(0)
+        );
+        println!("  {}", text("path"));
+    }
+    if !text("note").is_empty() {
+        println!("{}", text("note"));
+    }
 }
 
 /// `wirk estate storage` — what this estate owns, what still needs it,

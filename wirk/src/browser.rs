@@ -761,7 +761,7 @@ fn do_focus_action(scope: &Scope, work_id: &str, run: Option<&str>) -> FocusOutc
                     runs.iter()
                         .find(|entry| entry["run"]["id"].as_str() == Some(run_id.as_str()))
                 })
-                .map(|entry| entry["run"]["state"].clone())
+                .map(|entry| entry["run"].clone())
                 .unwrap_or(serde_json::Value::Null),
         )
     };
@@ -1445,7 +1445,7 @@ fn render_progress(result: &serde_json::Value, token: Option<&str>) -> String {
         let run = &entry["run"];
         let id = run["id"].as_str().unwrap_or("?");
         let is_current = current.as_deref() == Some(id);
-        let state = describe_run_state(&run["state"]);
+        let state = describe_run_state(run);
         // Every stage, not only the current one, is one click from the
         // context it was actually given. Served pages only: a written
         // file has no server to answer for the other stages.
@@ -1489,10 +1489,40 @@ fn render_progress(result: &serde_json::Value, token: Option<&str>) -> String {
     out
 }
 
-fn describe_run_state(state: &serde_json::Value) -> String {
+/// How one attempt actually went, in a person's words.
+///
+/// Takes the whole Run, not only its `state`, because `Open` alone does
+/// not say what happened. `Open` is the state a Run is in from the
+/// moment it is opened — before any launch is requested, and it stays
+/// `Open` if the Work is canceled before one ever is. Rendering every
+/// `Open` Run as "running or waiting" told a reader that a Work which
+/// was canceled before launch had something in flight, which is the one
+/// thing a progress table must not get wrong.
+///
+/// The Run's own journal already carries the distinction and wirkd
+/// already reports it: `launched` folds from this Run's `RunLaunched`,
+/// `launch_requested` from its `RunLaunchRequested`, and
+/// `launch_requested && !launched` is deliberately not collapsed into
+/// either neighbour (`wirk_core::Run`'s own doc) — so this reads those
+/// three facts rather than inventing a fourth.
+fn describe_run_state(run: &serde_json::Value) -> String {
+    let state = &run["state"];
     if let Some(name) = state.as_str() {
         return match name {
-            "Open" => "running or waiting".to_string(),
+            "Open" => match (
+                run["launched"].as_bool().unwrap_or(false),
+                run["launch_requested"].as_bool().unwrap_or(false),
+            ) {
+                (true, _) => "running or waiting".to_string(),
+                // The honest middle: a launch for this exact request was
+                // admitted and what Herdr did with it is not recorded
+                // here. A daemon loss in the launch window leaves this.
+                (false, true) => {
+                    "launch admitted, no launch recorded — what became of it is not known here"
+                        .to_string()
+                }
+                (false, false) => "opened, never launched".to_string(),
+            },
             "Vanished" => "vanished without a Claim".to_string(),
             other => other.to_lowercase(),
         };

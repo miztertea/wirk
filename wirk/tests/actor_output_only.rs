@@ -900,6 +900,105 @@ fn output_only_actor_refuses_a_declared_checkout_boundary() {
 
 // ---- owned execution directory ------------------------------------------
 
+/// A Claim that validated is not turned into a refusal by how large its
+/// artifact is.
+///
+/// An output-only Run's claimed worktree artifact is taken into custody
+/// — snapshotted, write-once, into this Work's own immutable claim store
+/// — and that snapshot used to read the whole file into memory to hash
+/// it, which meant a byte count could flip an already-`Validated`
+/// verdict to `Refused` at the completion boundary, after all the work
+/// was spent. The snapshot now streams: it copies and hashes in one
+/// pass, so its memory is one buffer whatever the artifact's size, and
+/// the digest recorded is still the digest of exactly the bytes stored
+/// (ruling 0401; the field's own doc comment always said a size was a
+/// bound on a read and never a policy about what may be claimed).
+///
+/// Watched failing against the previous default: this Claim came back
+/// `ValidationUnavailable` — "the claimed artifact ... could not be
+/// read to record its content identity: the claimed artifact is
+/// 67108865 bytes, above this estate's artifact_max_bytes of 67108864".
+///
+/// 64 MiB + 1 is the *stimulus* that makes the old refusal reachable,
+/// not a threshold this asserts anything about: what is asserted is
+/// that the Claim validates, that the custody snapshot exists, and that
+/// reading it back gives exactly the bytes that were claimed.
+#[test]
+fn a_large_claimed_artifact_is_taken_into_custody_rather_than_refused_for_its_size() {
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = output_only_actor_route(estate);
+    let (work_id, run_id, waypoint) =
+        submit_output_only_actor(estate, &route, "doc-set-1").expect("admitted");
+    let worktree =
+        materialize_output_only_run(estate, &pointer.socket, &work_id, &run_id, &waypoint);
+
+    // Written into the Run's own execution directory and claimed by
+    // path, which is what reaches the custody snapshot. Real bytes, not
+    // a sparse hole: the daemon copies and hashes every one of them.
+    let body = vec![b'w'; 64 * 1024 * 1024 + 1];
+    let artifact = worktree.join("draft.md");
+    fs::write(&artifact, &body).expect("the actor writes a large artifact");
+
+    let output = wirk_cli()
+        .args(["claim", "--artifact"])
+        .arg(format!(
+            "draft.md={}",
+            artifact.to_str().expect("utf-8 artifact path")
+        ))
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", &run_id)
+        .output()
+        .expect("wirk claim runs");
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a large artifact must not refuse a Claim: {stdout} {stderr}"
+    );
+    assert_eq!(stdout, "Validated");
+
+    // The custody snapshot exists, holds the claimed bytes, and the
+    // receipt names their digest — the identity taken in the same pass
+    // that wrote them.
+    let claim_id = validated_claim_id(estate, &work_id, &run_id);
+    let snapshot = estate
+        .join("works")
+        .join(&work_id)
+        .join("outputs")
+        .join("claims")
+        .join(&claim_id)
+        .join("draft.md");
+    assert!(
+        snapshot.is_file(),
+        "the validated artifact was snapshotted into the Work's own claim store"
+    );
+    assert_eq!(
+        fs::metadata(&snapshot).expect("stat the snapshot").len(),
+        body.len() as u64,
+        "the whole artifact was stored, not a bounded prefix"
+    );
+    let (code, read_out, read_err) = artifact_verb(
+        estate,
+        &work_id,
+        &run_id,
+        &["read", "--claim", &claim_id, "--name", "draft.md"],
+    );
+    assert_eq!(code, Some(0), "wirk artifact read failed: {read_err}");
+    assert_eq!(
+        read_out.len(),
+        body.len(),
+        "the readback delivers exactly the claimed bytes"
+    );
+    assert_eq!(read_out, body, "byte-for-byte, not merely the same length");
+
+    stop_wirkd(estate, wirkd_child);
+}
+
 #[test]
 fn output_only_actor_materializes_an_owned_directory_and_claims_a_managed_output() {
     let estate_dir = tempfile::tempdir().expect("estate tempdir");

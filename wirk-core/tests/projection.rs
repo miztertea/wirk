@@ -81,6 +81,7 @@ fn triple() -> ExecutionTriple {
 
 fn actor_world(evidence: Option<EvidenceProjectionRef>) -> World {
     World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: "/repo".to_string(),
         worktree_path: PathBuf::from("/estate/worktrees/work-1"),
         branch: "wirk/work-1".to_string(),

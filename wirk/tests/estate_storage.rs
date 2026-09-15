@@ -853,7 +853,8 @@ fn a_storage_soft_limit_is_disclosed_and_refuses_nothing() {
 /// `resources.json` defect established.
 #[test]
 fn a_soft_limit_for_a_class_that_does_not_exist_is_reported() {
-    let (policy, note) = wirk_core::jobs::ResourcePolicy::load(Path::new("/nonexistent-estate"));
+    let (policy, note) = wirk_core::jobs::ResourcePolicy::load(Path::new("/nonexistent-estate"))
+        .expect("an absent policy file is usable");
     assert!(policy.storage_soft_limits.is_empty());
     assert!(note.is_none(), "an absent file is the ordinary case");
 
@@ -864,7 +865,8 @@ fn a_soft_limit_for_a_class_that_does_not_exist_is_reported() {
         r#"{"storage_soft_limits": {"runtime-images": 10, "nonsense": 20}}"#,
     )
     .expect("write policy");
-    let (policy, note) = wirk_core::jobs::ResourcePolicy::load(dir.path());
+    let (policy, note) =
+        wirk_core::jobs::ResourcePolicy::load(dir.path()).expect("the file itself is usable");
     assert_eq!(policy.storage_soft_limits.get("runtime-images"), Some(&10));
     assert!(
         !policy.storage_soft_limits.contains_key("nonsense"),

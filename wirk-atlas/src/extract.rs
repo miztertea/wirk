@@ -1,8 +1,17 @@
 use crate::{ContentFamily, GenerationId, TextUnit, UnitId};
 use sha2::{Digest, Sha256};
 
-const MAX_TEXT_BYTES: usize = 1024 * 1024;
-const MAX_TEXT_UNITS: usize = 16 * 1024;
+/// The byte budget one retrieval unit is cut to, and the only number in
+/// this reader that survives rulings 0398/0401/0403's removal of
+/// size-derived refusal.
+///
+/// It refuses nothing. It is the unitizer's own chunk width — the
+/// "65536" every unitizer id here is literally named after
+/// (`UNITIZER_ID`, `MULTILINE_UNITIZER_ID`,
+/// `DOCUMENT_MARKDOWN_UNITIZER_ID`) — so it is part of what a staged
+/// generation recorded and what `AtlasStore::validate_generation`
+/// re-derives a unit's identity against, not a decision about whether
+/// admitted text may be read. Larger text simply becomes more units.
 const MAX_UNIT_BYTES: usize = 64 * 1024;
 const UNITIZER_ID: &str = "utf8-line-chunks-65536/v1";
 /// Edition v4's unitizer. `utf8-line-chunks-65536/v1` never packed more
@@ -862,9 +871,6 @@ impl ExtractorPolicy {
         if let Some(format) = self.edition.document_format(path, bytes) {
             return self.document_units(generation, path, object_id, bytes, format);
         }
-        if bytes.len() > MAX_TEXT_BYTES {
-            return Err("text blob exceeds bounded extractor size".to_string());
-        }
         let text = std::str::from_utf8(bytes).map_err(|_| "text blob is not valid UTF-8")?;
         let family = self
             .family(path, bytes)
@@ -892,31 +898,29 @@ impl ExtractorPolicy {
     /// converted text, not the original file
     /// (`ContentFamily::Document`'s doc comment).
     ///
-    /// Deliberately no raw-byte size gate ahead of conversion. The
-    /// original container's size is already bounded upstream, before
-    /// this ever runs, by the estate's own configurable
-    /// `document_max_file_bytes`/`document_max_total_bytes`
-    /// (`wirk_core::jobs::ResourcePolicy`, `doctree::CaptureLimits`) —
-    /// re-imposing a second, smaller, hard-coded ceiling on the same
-    /// raw bytes here double-charged that bound and, for a container
-    /// format (Office/OpenDocument/EPUB/PDF), charged it against the
-    /// wrong thing: those formats' raw bytes include compressed
-    /// embedded media that has nothing to do with how much text comes
-    /// out. A modest-text Office file with one ordinary embedded image
-    /// can comfortably exceed `MAX_TEXT_BYTES` in raw container bytes
-    /// while converting to a few hundred bytes of Markdown; gating on
-    /// the raw side would refuse it for a reason that never applied to
-    /// its actual content. `MAX_TEXT_BYTES` below, checked against the
-    /// *converted* Markdown, is the real rendered-context budget: how
-    /// much text this reader is willing to hand the index for one
-    /// document, independent of how large or media-heavy the source
-    /// container was. A hostile container (deep nesting, decompression
-    /// bombs, runaway entry counts) is still caught before it reaches
-    /// that check — by `anydoc`'s own `ConvertError::ResourceLimit`
-    /// inside `render`, native to the dependency and exercised by the
-    /// corpus's `06-hostile-entry-expansion.docx`/
-    /// `17-pptx-hostile-entry-expansion.pptx` fixtures — not by a raw
-    /// byte count this reader would otherwise have to guess at.
+    /// **No size gate on either side of the conversion, raw or
+    /// rendered** (rulings 0398/0401/0403). Neither was a boundary this
+    /// reader actually has. A raw-byte gate charged a container format
+    /// for its compressed embedded media, which has nothing to do with
+    /// how much text comes out — an image-heavy, text-light Office file
+    /// would have been refused for a reason that never applied to its
+    /// content. A gate on the *rendered* Markdown was a product-chosen
+    /// "rendered-context budget" that turned an admitted, perfectly
+    /// convertible document into a `CoverageDisposition::Error` with
+    /// zero retrievable units: acquired, identified, and not indexed.
+    ///
+    /// What genuinely bounds a conversion is `anydoc` 0.2.4's own fixed
+    /// safety limits (`anydoc::package::limits`, whose module doc states
+    /// they are "deliberately not configurable": decompression size,
+    /// entry count, XML depth and node count, grid slots, repeat
+    /// expansion, retained asset bytes). Those surface through `render`
+    /// as `ConvertError::ResourceLimit`, are exercised by the corpus's
+    /// `06-hostile-entry-expansion.docx`/
+    /// `17-pptx-hostile-entry-expansion.pptx` fixtures, and are reported
+    /// here truthfully as the dependency's own refusal — alongside its
+    /// malformed/encrypted/needs-OCR errors, which are equally real and
+    /// equally preserved. What this reader does not do any more is add a
+    /// number of its own on top of them.
     fn document_units(
         &self,
         generation: &GenerationId,
@@ -926,9 +930,6 @@ impl ExtractorPolicy {
         format: anydoc::Format,
     ) -> Result<Vec<TextUnit>, String> {
         let markdown = crate::document::render(format, bytes)?;
-        if markdown.len() > MAX_TEXT_BYTES {
-            return Err("converted document text exceeds bounded extractor size".to_string());
-        }
         chunk_units(
             generation,
             path,
@@ -1044,7 +1045,7 @@ fn chunk_units(
                 if let Some((cs, csl, ce, cel)) = chunk.take() {
                     push_unit(
                         &mut units, generation, path, object_id, family, unitizer, cs, ce, csl, cel,
-                    )?;
+                    );
                 }
                 push_line_chunks(
                     &mut units, text, line_start, line_end, line_no, generation, path, object_id,
@@ -1066,7 +1067,7 @@ fn chunk_units(
                         line_start,
                         csl,
                         line_no - 1,
-                    )?;
+                    );
                     (line_start, line_no, line_end, line_no)
                 }
                 Some((cs, csl, _, _)) => (cs, csl, line_end, line_no),
@@ -1075,7 +1076,7 @@ fn chunk_units(
         if let Some((cs, csl, ce, cel)) = chunk {
             push_unit(
                 &mut units, generation, path, object_id, family, unitizer, cs, ce, csl, cel,
-            )?;
+            );
         }
     } else {
         for (line_start, line_end, line_no) in lines {
@@ -1104,7 +1105,7 @@ fn push_line_chunks(
     if line_start == line_end {
         push_unit(
             units, generation, path, object_id, family, unitizer, 0, 0, line, line,
-        )?;
+        );
         return Ok(());
     }
     let mut start = line_start;
@@ -1118,7 +1119,7 @@ fn push_line_chunks(
         }
         push_unit(
             units, generation, path, object_id, family, unitizer, start, end, line, line,
-        )?;
+        );
         start = end;
     }
     Ok(())
@@ -1136,10 +1137,13 @@ fn push_unit(
     byte_end: usize,
     line_start: u64,
     line_end: u64,
-) -> Result<(), &'static str> {
-    if units.len() == MAX_TEXT_UNITS {
-        return Err("text blob exceeds bounded unit count");
-    }
+) {
+    // No unit-count ceiling. It was the same size-derived refusal
+    // `MAX_TEXT_BYTES` was, one step later and expressed in a different
+    // unit: crossing it produced exactly the empty-units
+    // `CoverageDisposition::Error` rulings 0402/0403 name, for admitted
+    // text whose only fault was being long. How many units a blob makes
+    // is a fact about the blob, not a capability of this reader.
     units.push(TextUnit {
         id: ExtractorPolicy::unit_id(
             generation,
@@ -1157,7 +1161,6 @@ fn push_unit(
         line_start,
         line_end,
     });
-    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {

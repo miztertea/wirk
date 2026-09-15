@@ -41,9 +41,14 @@ fn coordinate(member: &Membership, generation: &SourceGeneration, path: &[u8]) -
     }
 }
 
-fn staged(outcome: AcquireOutcome) -> SourceGeneration {
+/// The acquisition reports identity and coverage; the generation's own
+/// resource list lives in the immutable generation directory, which is
+/// what these checks read it back from.
+fn read_staged(atlas: &AtlasStore, outcome: AcquireOutcome) -> SourceGeneration {
     match outcome {
-        AcquireOutcome::Staged(generation) => generation,
+        AcquireOutcome::Staged(staged) => atlas
+            .generation(&staged.id)
+            .expect("the generation just staged reads back"),
         other => panic!("expected Staged, got {other:?}"),
     }
 }
@@ -103,11 +108,12 @@ fn a_document_tree_inside_an_ignored_directory_of_an_ambient_git_repository_is_a
     let membership = atlas
         .register_document_tree("client-docs", &docs, "current")
         .unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
 
     // Never the ambient repository's own identity.
     assert_ne!(generation.revision, ambient_head);
@@ -142,11 +148,12 @@ fn publish_and_resolve_exact_round_trip_a_document_tree_generation() {
     let membership = atlas
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     atlas.publish(&membership, &generation.id).unwrap();
     assert_eq!(
         atlas.current(&membership).unwrap().map(|g| g.id),
@@ -219,15 +226,16 @@ fn a_historical_edition_still_reads_its_own_txt_the_way_it_recorded_it() {
     let historical = atlas
         .register_document_tree("archive", source.path(), "current")
         .unwrap();
-    let v6 = staged(
-        atlas
+    let v6 = {
+        let outcome = atlas
             .acquire_document_tree(
                 &historical,
                 "current",
                 ExtractorPolicy::documents_detected_v6(),
             )
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     let recorded = v6
         .resources
         .iter()
@@ -269,11 +277,12 @@ fn a_historical_edition_still_reads_its_own_txt_the_way_it_recorded_it() {
     let current = atlas
         .register_document_tree("live", source.path(), "current")
         .unwrap();
-    let v7 = staged(
-        atlas
+    let v7 = {
+        let outcome = atlas
             .acquire_document_tree(&current, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     let now = v7
         .resources
         .iter()
@@ -337,11 +346,12 @@ Claim: how a Run's outcome becomes checkable.\n";
     let membership = atlas
         .register_document_tree("colleague-docs", source.path(), "current")
         .unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
 
     let glossary = generation
         .resources
@@ -409,11 +419,12 @@ fn resolving_an_unchanged_resource_survives_an_unrelated_edit_elsewhere_in_the_t
     let membership = atlas
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     atlas.publish(&membership, &generation.id).unwrap();
     let pinned = coordinate(&membership, &generation, b"stable.md");
 
@@ -449,20 +460,22 @@ fn refresh_yields_a_new_generation_and_the_old_one_discloses_unavailable_once_th
     let membership = atlas
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let old = staged(
-        atlas
+    let old = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     atlas.publish(&membership, &old.id).unwrap();
     let old_pinned = coordinate(&membership, &old, b"a.md");
 
     fs::write(source.path().join("a.md"), "# v2\n").unwrap();
-    let refreshed = staged(
-        atlas
+    let refreshed = {
+        let outcome = atlas
             .refresh_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     assert_ne!(refreshed.id, old.id, "content changed, so identity changed");
 
     // The old generation is still its own immutable, separately
@@ -502,20 +515,22 @@ fn a_deleted_resource_discloses_unavailable_after_refresh_and_publish() {
     let membership = atlas
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let old = staged(
-        atlas
+    let old = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     atlas.publish(&membership, &old.id).unwrap();
     let old_pinned = coordinate(&membership, &old, b"b.md");
 
     fs::remove_file(source.path().join("b.md")).unwrap();
-    let refreshed = staged(
-        atlas
+    let refreshed = {
+        let outcome = atlas
             .refresh_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     atlas.publish(&membership, &refreshed.id).unwrap();
 
     match atlas.resolve_exact(&membership, &old_pinned).unwrap() {
@@ -579,16 +594,18 @@ fn identical_files_in_two_document_tree_sources_do_not_collapse_identity() {
     let member_b = atlas
         .register_document_tree("source-b", b.path(), "current")
         .unwrap();
-    let generation_a = staged(
-        atlas
+    let generation_a = {
+        let outcome = atlas
             .acquire_document_tree(&member_a, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
-    let generation_b = staged(
-        atlas
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
+    let generation_b = {
+        let outcome = atlas
             .acquire_document_tree(&member_b, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     assert_ne!(member_a.source, member_b.source);
     assert_ne!(generation_a.id, generation_b.id);
     let coordinate_a = coordinate(&member_a, &generation_a, b"readme.md");
@@ -598,29 +615,37 @@ fn identical_files_in_two_document_tree_sources_do_not_collapse_identity() {
     assert!(error.to_string().contains("outside this membership"));
 }
 
-/// A generation-scale bounded input is reported `Unsupported` with a
-/// disclosed reason rather than read unboundedly, and this estate's
-/// `resolve_exact` never touches it (its disposition alone answers a
-/// coordinate request for it).
+/// An input over a bound **this estate configured** is reported
+/// `Unsupported` with a disclosed reason rather than read unboundedly,
+/// and this estate's `resolve_exact` never touches it (its disposition
+/// alone answers a coordinate request for it).
+///
+/// The bound is written into the estate's own `resources.json` here.
+/// Since ruling 0401 there is no built-in per-file bound to inherit: a
+/// collection an operator admitted is read as admitted unless they
+/// asked for otherwise, and this is the "asked for otherwise" case.
 #[test]
 fn an_oversize_file_is_disclosed_bounded_and_never_indexed() {
     let source = TempDir::new().unwrap();
     fs::write(source.path().join("normal.md"), "# ok\n").unwrap();
+    fs::write(source.path().join("huge.md"), vec![b'x'; 4_097]).unwrap();
+    let estate = TempDir::new().unwrap();
+    fs::create_dir_all(estate.path().join(".wirk")).unwrap();
     fs::write(
-        source.path().join("huge.md"),
-        vec![b'x'; 8 * 1024 * 1024 + 1],
+        estate.path().join(".wirk").join("resources.json"),
+        r#"{ "document_max_file_bytes": 4096 }"#,
     )
     .unwrap();
-    let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
     let membership = atlas
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     let huge = generation
         .resources
         .iter()
@@ -655,11 +680,12 @@ fn remove_source_unregisters_the_catalog_and_leaves_generation_bytes_and_origina
     let membership = atlas
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     atlas.publish(&membership, &generation.id).unwrap();
 
     let outcome = atlas.remove_source(&membership).unwrap();
@@ -733,22 +759,24 @@ fn the_same_relative_path_in_two_estates_resolves_independently() {
     let member_a = atlas_a
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let generation_a = staged(
-        atlas_a
+    let generation_a = {
+        let outcome = atlas_a
             .acquire_document_tree(&member_a, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas_a, outcome)
+    };
 
     let estate_b = TempDir::new().unwrap();
     let mut atlas_b = AtlasStore::open(estate_b.path(), "estate-b").unwrap();
     let member_b = atlas_b
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let generation_b = staged(
-        atlas_b
+    let generation_b = {
+        let outcome = atlas_b
             .acquire_document_tree(&member_b, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas_b, outcome)
+    };
 
     let coordinate_a = coordinate(&member_a, &generation_a, b"readme.md");
     assert_eq!(
@@ -794,7 +822,10 @@ fn acquisition_stages_despite_one_unreadable_document() {
         .unwrap();
     let result = atlas.acquire_document_tree(&membership, "current", ExtractorPolicy::default());
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o644)).unwrap();
-    let generation = staged(result.unwrap());
+    let generation = {
+        let outcome = result.unwrap();
+        read_staged(&atlas, outcome)
+    };
 
     let blocked_record = generation
         .resources
@@ -816,28 +847,70 @@ fn acquisition_stages_despite_one_unreadable_document() {
     );
 }
 
-/// A document tree nested deeper than
-/// the bounded traversal depth is refused outright, not silently
-/// truncated into a generation reported as complete.
+/// A document tree nested deeper than the 128 directories that used to
+/// be the built-in traversal depth is **acquired**, through the real
+/// public acquisition path, and the file at the bottom is indexed.
+///
+/// A depth number never proved the thing it was written for. What it
+/// stood in for is a directory that is its own ancestor, which the walk
+/// now detects by identity; what depth actually costs is one open
+/// descriptor per level, which the operating system reports as its own
+/// limit. Refusing an operator's real collection for being 129 deep was
+/// a product-chosen threshold refusing admitted work (ruling 0401).
+///
+/// Watched failing against the previous default, where this acquisition
+/// returned "exceeds the 128-directory bounded traversal depth".
+///
+/// A depth an operator *does* configure still refuses outright, not
+/// silently truncated into a generation reported as complete — the
+/// second half of this check.
 #[test]
-fn a_document_tree_nested_past_the_bounded_depth_is_refused_not_truncated() {
+fn a_deeply_nested_document_tree_is_acquired_and_a_configured_depth_still_refuses() {
     let source = TempDir::new().unwrap();
     let mut path = source.path().to_path_buf();
     for i in 0..200 {
         path.push(format!("d{i}"));
         fs::create_dir(&path).unwrap();
     }
-    fs::write(path.join("deep.md"), "# too deep\n").unwrap();
+    fs::write(path.join("deep.md"), "# deep but ordinary\n").unwrap();
 
     let estate = TempDir::new().unwrap();
     let mut atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
     let membership = atlas
         .register_document_tree("docs", source.path(), "current")
         .unwrap();
-    let error = atlas
-        .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
+    let generation = {
+        let outcome = atlas
+            .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
+            .expect("a deep collection is acquired, not refused for its depth");
+        read_staged(&atlas, outcome)
+    };
+    let deep = generation
+        .resources
+        .iter()
+        .find(|r| r.path.ends_with(b"deep.md"))
+        .expect("the file at the bottom is in the generation");
+    assert_eq!(deep.disposition, wirk_atlas::CoverageDisposition::Indexed);
+
+    // The same tree, against an estate that asked for a depth bound.
+    let bounded_estate = TempDir::new().unwrap();
+    fs::create_dir_all(bounded_estate.path().join(".wirk")).unwrap();
+    fs::write(
+        bounded_estate.path().join(".wirk").join("resources.json"),
+        r#"{ "document_max_entries_depth": 8 }"#,
+    )
+    .unwrap();
+    let mut bounded = AtlasStore::open(bounded_estate.path(), "estate-b").unwrap();
+    let bounded_membership = bounded
+        .register_document_tree("docs", source.path(), "current")
+        .unwrap();
+    let error = bounded
+        .acquire_document_tree(&bounded_membership, "current", ExtractorPolicy::default())
         .unwrap_err();
-    assert!(error.to_string().contains("bounded traversal depth"));
+    assert!(
+        error.to_string().contains("bounded traversal depth"),
+        "a configured depth still refuses by name: {error}"
+    );
 }
 
 /// An old catalog written before `Membership::policy` existed still
@@ -1013,7 +1086,10 @@ fn worker_captures_a_document_collection() {
         .register_document_tree("docs", Path::new(&docs), "current")
         .unwrap();
     match atlas.acquire_document_tree(&membership, "current", ExtractorPolicy::default()) {
-        Ok(AcquireOutcome::Staged(generation)) => {
+        Ok(AcquireOutcome::Staged(staged)) => {
+            let generation = atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back");
             for record in &generation.resources {
                 println!(
                     "ENTRY={} DISPOSITION={:?} DETAIL={:?}",
@@ -1204,11 +1280,12 @@ fn a_resolved_document_that_becomes_a_fifo_at_the_open_window_is_unavailable_and
         let membership = atlas
             .register_document_tree("docs", &docs, "current")
             .unwrap();
-        let generation = staged(
-            atlas
+        let generation = {
+            let outcome = atlas
                 .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-                .unwrap(),
-        );
+                .unwrap();
+            read_staged(&atlas, outcome)
+        };
         atlas.publish(&membership, &generation.id).unwrap();
     }
 

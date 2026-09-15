@@ -2595,21 +2595,15 @@ fn bound_artifact(projection: &Value, arm: &str) -> Value {
 
 // ---- source coverage the World is honest about ---------------------------
 
-/// Real, valid UTF-8 Rust text past `wirk-atlas/src/extract.rs`'s
-/// `MAX_TEXT_BYTES` (1 MiB). The extractor reads it, measures it and
-/// refuses it exactly as it refuses any other oversize blob — the same
-/// budget the actual product file `wirk/src/wirkd/server.rs` (902,199
-/// bytes at `73d6d2d`) is approaching.
-fn oversize_source_text() -> String {
-    let mut text = String::with_capacity(1_200_000);
-    let mut line = 0u32;
-    while text.len() <= 1024 * 1024 {
-        text.push_str(&format!(
-            "pub fn oversize_{line}(argument: u32) -> u32 {{ argument.wrapping_add({line}) }}\n"
-        ));
-        line += 1;
-    }
-    text
+/// A file this estate genuinely cannot extract: a real `.pdf` path whose
+/// content is not a PDF at all, so `anydoc`'s own parser runs and
+/// genuinely fails. It replaced an over-1 MiB source file, which stopped
+/// being an extraction failure when rulings 0402/0403 removed the
+/// extractor's own size ceiling — large admitted text is indexed now, so
+/// a malformed document is what is left that really cannot be turned
+/// into retrieval units.
+fn unconvertible_document() -> String {
+    "not really a pdf, just text pretending to be one\n".to_string()
 }
 
 fn expand_world(estate: &Path, work: &str, run: &str, question: &str, reason: &str) -> Value {
@@ -2659,7 +2653,7 @@ fn a_world_over_a_generation_that_failed_to_extract_a_resource_discloses_it_as_a
     fs::create_dir_all(&holed).expect("holed repo dir");
     init_repo(&holed);
     write_file(&holed, "engine.rs", "pub fn holedmarker() -> u8 { 7 }\n");
-    write_file(&holed, "quarantinedhuge.rs", &oversize_source_text());
+    write_file(&holed, "quarantined.pdf", &unconvertible_document());
     commit_all(&holed);
 
     // Positive control, from the estate's own acquisition reply: this is
@@ -2728,7 +2722,7 @@ fn a_world_over_a_generation_that_failed_to_extract_a_resource_discloses_it_as_a
     // Not a leak, and not the extractor's own diagnostic either: the
     // reason text carries a budget number no scope admitted.
     let rendered = shown.to_string();
-    for needle in ["quarantinedhuge", "exceeds bounded", "holed-repo"] {
+    for needle in ["quarantined.pdf", "conversion failed", "holed-repo"] {
         assert!(
             !rendered.contains(needle),
             "the failing resource leaked {needle:?} into the delivered World"
@@ -2757,7 +2751,7 @@ fn a_world_over_a_generation_that_failed_to_extract_a_resource_discloses_it_as_a
     // A real refresh of the source: a new commit with no blob past the
     // extractor's budget, acquired and published as a new generation.
     // Nothing already recorded is edited.
-    fs::remove_file(holed.join("quarantinedhuge.rs")).expect("remove the oversize blob");
+    fs::remove_file(holed.join("quarantined.pdf")).expect("remove the unconvertible document");
     commit_all(&holed);
     let repaired = publish_reporting(&estate.root, "holed", &holed);
     let repaired_coverage = &repaired["generation"]["coverage"];

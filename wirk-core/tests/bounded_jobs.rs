@@ -43,8 +43,8 @@ fn estate() -> TempDir {
 /// the check about this code rather than about what else is running.
 fn permissive() -> ResourcePolicy {
     ResourcePolicy {
-        memory_pressure_avg10_max: f64::MAX,
-        min_available_memory_bytes: 0,
+        memory_pressure_avg10_max: None,
+        min_available_memory_bytes: None,
         host_pool_dir: Some(host_pool()),
         ..ResourcePolicy::default()
     }
@@ -361,6 +361,39 @@ fn materialization_is_bounded_separately_from_expensive_work() {
 // Pressure and space: refusal, and recovery from it
 // ---------------------------------------------------------------------
 
+/// With no floor and no pressure ceiling configured — the default since
+/// ruling 0401 — the host's memory is *observed and disclosed*, and
+/// admission proceeds. Observing that a machine is busy is not a
+/// statement about what this job needs, and turning admitted work away
+/// on it was a product-chosen threshold refusing work nobody had asked
+/// it to refuse.
+///
+/// Watched failing before the observation notes existed: the figures
+/// were read and then either refused on or dropped, so a default-policy
+/// admission said nothing about memory at all.
+#[test]
+fn default_policy_observes_memory_and_refuses_nothing_on_it() {
+    let estate = estate();
+    let policy = ResourcePolicy {
+        host_pool_dir: Some(host_pool()),
+        ..ResourcePolicy::default()
+    };
+    assert_eq!(policy.min_available_memory_bytes, None);
+    assert_eq!(policy.memory_pressure_avg10_max, None);
+    let admission = jobs::admit(estate.path(), &policy, &JobRequest::new("build", "a"))
+        .expect("nothing in the default policy refuses on observed host memory");
+    let observed = jobs::sample_pressure();
+    if observed.available_bytes.is_some() {
+        assert!(
+            admission.notes.iter().any(
+                |note| note.contains("memory available") && note.contains("refuses nothing on")
+            ),
+            "the figure is still reported, as an observation: {:?}",
+            admission.notes
+        );
+    }
+}
+
 /// Provoked by configuring the floor above what this box has, never by
 /// consuming the box's memory. The refusal must also say what it is: an
 /// advisory sample, not a statement about global allocation safety.
@@ -379,7 +412,7 @@ fn memory_pressure_refuses_advisedly_and_admits_again_when_it_clears() {
         return;
     };
     let refusing = ResourcePolicy {
-        min_available_memory_bytes: available.saturating_add(1 << 40),
+        min_available_memory_bytes: Some(available.saturating_add(1 << 40)),
         ..permissive()
     };
     let refusal = jobs::admit(estate.path(), &refusing, &JobRequest::new("build", "a"))
@@ -393,7 +426,7 @@ fn memory_pressure_refuses_advisedly_and_admits_again_when_it_clears() {
     // Recovery: the same estate admits once the configured floor is
     // satisfiable again. The refusal left nothing behind that blocks it.
     let cleared = ResourcePolicy {
-        min_available_memory_bytes: 0,
+        min_available_memory_bytes: None,
         ..permissive()
     };
     assert!(
@@ -492,7 +525,7 @@ fn a_deadline_kills_the_child_and_its_escaped_grandchild_where_the_host_supports
     let script = escaping_child(scratch.path());
     let capabilities = jobs::capabilities();
     let policy = ResourcePolicy {
-        job_deadline_secs: 1,
+        job_deadline_secs: Some(1),
         ..permissive()
     };
 
@@ -583,7 +616,7 @@ fn a_cancel_ends_a_running_child_promptly_and_is_not_reported_as_a_backend_failu
     let estate = estate();
     let script = escaping_child(scratch.path());
     let policy = ResourcePolicy {
-        job_deadline_secs: 600,
+        job_deadline_secs: Some(600),
         ..permissive()
     };
     let cancel = CancelToken::new();
@@ -770,7 +803,7 @@ fn a_cancel_returns_when_an_escaped_descendant_holds_the_job_pipes_open() {
     let script = escaping_child(scratch.path());
     let capabilities = without_strong_containment();
     let policy = ResourcePolicy {
-        job_deadline_secs: 600,
+        job_deadline_secs: Some(600),
         ..permissive()
     };
     let cancel = CancelToken::new();
@@ -827,7 +860,7 @@ fn a_deadline_returns_when_an_escaped_descendant_holds_the_job_pipes_open() {
     let script = escaping_child(scratch.path());
     let capabilities = without_strong_containment();
     let policy = ResourcePolicy {
-        job_deadline_secs: 1,
+        job_deadline_secs: Some(1),
         ..permissive()
     };
 
@@ -885,7 +918,7 @@ fn a_blocked_input_write_is_released_when_the_job_ends() {
     let script = escaping_child(scratch.path());
     let capabilities = without_strong_containment();
     let policy = ResourcePolicy {
-        job_deadline_secs: 1,
+        job_deadline_secs: Some(1),
         ..permissive()
     };
 
@@ -1040,7 +1073,7 @@ sys.stdout.buffer.flush()
     )
     .unwrap();
     let policy = ResourcePolicy {
-        job_deadline_secs: 120,
+        job_deadline_secs: Some(120),
         ..permissive()
     };
 
@@ -1112,7 +1145,7 @@ fn an_input_write_that_fails_is_reported_and_not_papered_over_as_success() {
     let script = scratch.path().join("deaf.py");
     fs::write(&script, "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n").unwrap();
     let policy = ResourcePolicy {
-        job_deadline_secs: 30,
+        job_deadline_secs: Some(30),
         ..permissive()
     };
 
@@ -1283,11 +1316,11 @@ fn a_configured_policy_is_actually_applied_whatever_the_whitespace() {
         }"#,
     )
     .unwrap();
-    let (policy, note) = ResourcePolicy::load(estate.path());
+    let (policy, note) = ResourcePolicy::load(estate.path()).expect("a valid file is usable");
     assert!(note.is_none(), "a valid file must not complain: {note:?}");
-    assert_eq!(policy.job_deadline_secs, 1);
+    assert_eq!(policy.job_deadline_secs, Some(1));
     assert_eq!(policy.max_expensive, 3);
-    assert_eq!(policy.memory_pressure_avg10_max, 12.5);
+    assert_eq!(policy.memory_pressure_avg10_max, Some(12.5));
     assert_eq!(policy.job_memory_max_bytes, Some(67_108_864));
     // Untouched fields keep their defaults.
     assert_eq!(
@@ -1296,47 +1329,201 @@ fn a_configured_policy_is_actually_applied_whatever_the_whitespace() {
     );
 }
 
-/// A file that cannot be read must say so loudly. Running on defaults
-/// while an operator believes their file is in force is the same failure
-/// as above, one step further along.
+/// A file that cannot be parsed is a **refusal**, not a note. Running on
+/// defaults while an operator believes their file is in force is the
+/// failure above, one step further along — and since ruling 0401 the
+/// defaults bound nothing at all, so falling back means every bound that
+/// file set is gone.
+///
+/// Watched failing against `16840cf`, where this returned
+/// `(ResourcePolicy::default(), Some(note))` and both callers
+/// `eprintln!`'d it and carried on.
 #[test]
-fn a_malformed_policy_is_reported_rather_than_silently_ignored() {
+fn a_malformed_policy_refuses_rather_than_running_on_defaults() {
     let estate = estate();
     fs::write(
         ResourcePolicy::config_path(estate.path()),
         "{ \"max_expensive\": ",
     )
     .unwrap();
-    let (policy, note) = ResourcePolicy::load(estate.path());
-    let note = note.expect("a malformed policy file must be reported");
+    let unusable = ResourcePolicy::load(estate.path())
+        .expect_err("a malformed policy file must refuse, not fall back");
     assert!(
-        note.contains("NOT on the values in that file"),
-        "the report must say the file is not in force: {note}"
+        unusable
+            .detail
+            .contains("is not readable as resource policy"),
+        "the refusal must name what actually happened: {unusable}"
     );
-    assert_eq!(
-        policy.max_expensive,
-        ResourcePolicy::default().max_expensive
+    assert!(
+        unusable.detail.contains("not in force"),
+        "the refusal must say the operator's bounds are gone: {unusable}"
     );
+    assert_eq!(unusable.path, ResourcePolicy::config_path(estate.path()));
 
-    // And a key nobody recognises is a mistake worth reporting too — a
+    // And a key nobody recognises is the same kind of mistake: a
     // misspelled bound is a bound that is not in force.
     fs::write(
         ResourcePolicy::config_path(estate.path()),
         r#"{ "max_expensiv": 4 }"#,
     )
     .unwrap();
-    let (_, note) = ResourcePolicy::load(estate.path());
     assert!(
-        note.is_some(),
+        ResourcePolicy::load(estate.path()).is_err(),
         "a misspelled key must not be silently dropped"
     );
+}
+
+/// A policy file that *exists* and cannot be read refuses for the same
+/// reason a malformed one does. Silence here would be an estate running
+/// unbounded while its operator reads their own `resources.json` and
+/// believes otherwise.
+#[test]
+fn a_policy_file_that_cannot_be_read_refuses_rather_than_being_treated_as_absent() {
+    let estate = estate();
+    let path = ResourcePolicy::config_path(estate.path());
+    fs::write(&path, r#"{ "job_deadline_secs": 600 }"#).unwrap();
+    // Unreadable for a real reason the operating system reports, not a
+    // simulated one: the mode says this process may not read it.
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o000);
+    fs::set_permissions(&path, permissions).unwrap();
+    if fs::read_to_string(&path).is_ok() {
+        // Running as a user the mode does not bind (root in a container
+        // is the ordinary case). The condition this check is about
+        // cannot be created here, and pretending otherwise would be
+        // worse than saying so.
+        eprintln!("skipped: this process can read a mode-000 file, so the case is unreachable");
+        return;
+    }
+    let unusable = ResourcePolicy::load(estate.path())
+        .expect_err("an unreadable policy file must refuse, not fall back");
+    assert!(
+        unusable.detail.contains("exists but could not be read"),
+        "the refusal must name what actually happened: {unusable}"
+    );
+}
+
+/// A bound an operator wrote is applied as written, including `0`.
+///
+/// Ruling 0402: the loader used to replace an explicit `0` with `None`
+/// after printing a complaint, which turned the most restrictive value
+/// an operator can write into the least restrictive state the field
+/// has. `0` on a byte bound has one coherent reading — admit nothing
+/// over zero bytes — and the same comparison every other value takes
+/// enforces it.
+///
+/// Watched failing against `16840cf`, where both fields came back
+/// `None` with a note nobody had to act on.
+#[test]
+fn an_explicit_zero_bound_is_applied_as_written_not_replaced_by_no_bound() {
+    let estate = estate();
+    fs::write(
+        ResourcePolicy::config_path(estate.path()),
+        r#"{ "document_max_file_bytes": 0, "artifact_max_bytes": 0,
+             "http_max_response_bytes": 0, "document_max_entries": 0,
+             "document_max_entries_depth": 0, "document_max_total_bytes": 0,
+             "http_timeout_secs": 0 }"#,
+    )
+    .unwrap();
+    let (policy, note) = ResourcePolicy::load(estate.path()).expect("0 is a value, not a fault");
+    assert!(
+        note.is_none(),
+        "a written value is not a complaint: {note:?}"
+    );
+    assert_eq!(policy.document_max_file_bytes, Some(0));
+    assert_eq!(policy.artifact_max_bytes, Some(0));
+    assert_eq!(policy.http_max_response_bytes, Some(0));
+    assert_eq!(policy.document_max_entries, Some(0));
+    assert_eq!(policy.document_max_entries_depth, Some(0));
+    assert_eq!(policy.document_max_total_bytes, Some(0));
+    assert_eq!(policy.http_timeout_secs, Some(0));
+    // And each stays distinguishable from "no bound configured", which
+    // is the whole reason these fields are `Option`.
+    assert_eq!(ResourcePolicy::default().document_max_file_bytes, None);
+}
+
+/// The one class the loader cannot apply as written: admission offers at
+/// least one expensive slot whatever the file says
+/// (`offered.max(1)` in `admit`), so a written `0` is a value the
+/// machinery does not honour. It is refused rather than replaced with a
+/// number nobody chose.
+#[test]
+fn a_concurrency_count_of_zero_is_refused_rather_than_quietly_replaced() {
+    let estate = estate();
+    fs::write(
+        ResourcePolicy::config_path(estate.path()),
+        r#"{ "max_expensive": 0 }"#,
+    )
+    .unwrap();
+    let unusable = ResourcePolicy::load(estate.path())
+        .expect_err("a concurrency count this product cannot honour must refuse");
+    assert!(
+        unusable.detail.contains("max_expensive 0"),
+        "the refusal names the field: {unusable}"
+    );
+}
+
+/// `job_deadline_secs: 0` is deliberately *not* rejected: it means a
+/// deadline that has already passed, which is an exactly reproducible
+/// stop with no clock in it, and it is what this suite uses in place of
+/// waiting. Rejecting it would remove a control rather than a mistake.
+#[test]
+fn a_zero_deadline_is_a_control_not_a_mistake_and_is_kept() {
+    let estate = estate();
+    fs::write(
+        ResourcePolicy::config_path(estate.path()),
+        r#"{ "job_deadline_secs": 0 }"#,
+    )
+    .unwrap();
+    let (policy, note) = ResourcePolicy::load(estate.path()).expect("0 is usable here");
+    assert!(
+        note.is_none(),
+        "0 is usable here, so nothing complains: {note:?}"
+    );
+    assert_eq!(policy.job_deadline_secs, Some(0));
+    // And it is distinguishable from "no deadline configured", which is
+    // the whole reason the field is an `Option`: one stops the job at
+    // its next checkpoint, the other never stops it at all.
+    assert_ne!(
+        policy.job_deadline_secs,
+        ResourcePolicy::default().job_deadline_secs
+    );
+}
+
+/// What the defaults actually are, stated once as a contract rather
+/// than left to be inferred from behaviour: the fields that could
+/// refuse, kill or truncate admitted work impose nothing unless an
+/// operator asks (ruling 0398, applied to existing behaviour by 0401).
+///
+/// Watched failing against the previous defaults, which set every one
+/// of these to a number.
+#[test]
+fn nothing_an_operator_did_not_ask_for_bounds_admitted_work() {
+    let policy = ResourcePolicy::default();
+    assert_eq!(policy.job_deadline_secs, None, "no elapsed-time kill");
+    assert_eq!(policy.document_max_file_bytes, None);
+    assert_eq!(policy.document_max_total_bytes, None);
+    assert_eq!(policy.document_max_entries, None);
+    assert_eq!(policy.document_max_entries_depth, None);
+    assert_eq!(policy.http_max_response_bytes, None);
+    assert_eq!(policy.http_timeout_secs, None);
+    assert_eq!(policy.http_max_redirects, None);
+    assert_eq!(policy.artifact_max_bytes, None);
+    assert_eq!(policy.memory_pressure_avg10_max, None);
+    assert_eq!(policy.min_available_memory_bytes, None);
+    // The mechanisms this process actually operates keep real defaults:
+    // they describe its own concurrency, not the operator's work.
+    assert_eq!(policy.max_expensive, 1);
+    assert_eq!(policy.max_materialization, 4);
+    assert_eq!(policy.store_ownership_wait_millis, 2_000);
 }
 
 /// An absent file is ordinary, and must be silent.
 #[test]
 fn an_absent_policy_file_is_not_an_error() {
     let estate = estate();
-    let (policy, note) = ResourcePolicy::load(estate.path());
+    let (policy, note) =
+        ResourcePolicy::load(estate.path()).expect("an absent file is the ordinary case");
     assert!(note.is_none());
     assert_eq!(policy.max_expensive, 1, "the default changes no behaviour");
 }
@@ -1768,7 +1955,7 @@ fn a_real_observation_either_resolves_a_scope_or_discloses_why_not() {
 fn cancelling_one_job_does_not_poison_the_next_one() {
     let estate = estate();
     let policy = ResourcePolicy {
-        job_deadline_secs: 30,
+        job_deadline_secs: Some(30),
         ..permissive()
     };
     let registry = jobs::JobRegistry::new();

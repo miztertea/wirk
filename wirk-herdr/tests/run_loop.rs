@@ -89,6 +89,7 @@ fn fixture_estate_root() -> std::path::PathBuf {
 
 fn actor_world(run: &Run, worktree_path: &std::path::Path) -> World {
     World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: "wirk".to_string(),
         worktree_path: worktree_path.to_path_buf(),
         branch: "p1/herdr-executor".to_string(),
@@ -3104,6 +3105,7 @@ fn actor_world_with_estate(
     estate_root: &std::path::Path,
 ) -> World {
     World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: "wirk".to_string(),
         worktree_path: worktree_path.to_path_buf(),
         branch: "p1/herdr-executor".to_string(),
@@ -4274,7 +4276,7 @@ fn world_with_contract(run: &Run, worktree: &std::path::Path, text: &str) -> Wor
     let World::Actor(mut actor) = actor_world(run, worktree) else {
         unreachable!()
     };
-    actor.contract = Some(reserved_contract(text));
+    actor.contract = Some(Box::new(reserved_contract(text)));
     World::Actor(actor)
 }
 
@@ -4900,6 +4902,7 @@ fn an_ordinary_continuation_nudge_repeats_neither_the_world_nor_the_fallback_con
         "which function decides boundary refusal?",
     );
     let contract = wirk_core::ContractDelivery {
+        composed: None,
         version: "v1".to_string(),
         digest: "deadbeef".to_string(),
         mode: wirk_core::ContractDeliveryMode::Prompt,

@@ -251,6 +251,11 @@ pub enum Verb {
     /// guarded, `--dry-run`-able removal of optional derivations this
     /// estate owns. Never automatic, never age-based, never global.
     EstateClean,
+    /// `wirk estate doctrine` (P6.7, ruling 0393): the estate owner's
+    /// explicit selection of scoped doctrine documents — `set`, `remove`
+    /// and `list`. Mutation is administrative only; a listing is scoped
+    /// to what the asking Work would actually be reserved with.
+    EstateDoctrine,
 }
 
 /// One NDJSON-framed request line: `{"verb": "<name>", "payload": {...}}`
@@ -343,6 +348,14 @@ impl Request {
         Request {
             verb: Verb::EstateStorage,
             payload: serde_json::to_value(payload).expect("EstateStoragePayload always serializes"),
+        }
+    }
+
+    pub fn estate_doctrine(payload: EstateDoctrinePayload) -> Self {
+        Self {
+            verb: Verb::EstateDoctrine,
+            payload: serde_json::to_value(payload)
+                .expect("EstateDoctrinePayload always serializes"),
         }
     }
 
@@ -803,7 +816,12 @@ pub struct WorkFailPayload {
 /// is always both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchPayload {
-    pub work_id: WorkId,
+    /// The Work this stream reads. `None` is the estate-wide stream
+    /// (ruling 0394) — every Work, dialed once and live across Works
+    /// submitted after the dial — rather than one named Work; a
+    /// single-Work stream always names its Work here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<WorkId>,
     #[serde(default)]
     pub requester: Option<WorkId>,
     #[serde(default)]
@@ -811,10 +829,21 @@ pub struct WatchPayload {
 }
 
 impl WatchPayload {
-    /// The explicitly administrative stream: any Work's raw journal.
+    /// The explicitly administrative stream: one named Work's raw journal.
     pub fn admin(work_id: WorkId) -> Self {
         Self {
-            work_id,
+            work_id: Some(work_id),
+            requester: None,
+            admin: true,
+        }
+    }
+
+    /// The estate-wide administrative stream (ruling 0394): every Work's
+    /// raw journal, dialed once and live across Works submitted after the
+    /// dial — no single Work is named, so `work_id` is `None`.
+    pub fn estate() -> Self {
+        Self {
+            work_id: None,
             requester: None,
             admin: true,
         }
@@ -823,7 +852,7 @@ impl WatchPayload {
     /// The scoped stream: `requester` is the caller's own Work.
     pub fn scoped(work_id: WorkId, requester: WorkId) -> Self {
         Self {
-            work_id,
+            work_id: Some(work_id),
             requester: Some(requester),
             admin: false,
         }
@@ -909,6 +938,51 @@ pub struct EstateCleanPayload {
     /// with no mutation at all.
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// `estate doctrine`'s payload (P6.7, ruling 0393).
+///
+/// `work` carries the meaning it carries on `estate storage`: present,
+/// this is a scoped call and the answer is restricted to what that Work
+/// would actually be reserved with — an owner's document scoped to a
+/// repository binding this Work does not hold is not named to it, and
+/// neither is any document's location on the owner's disk. Absent, this
+/// is estate administration.
+///
+/// Mutation (`set`, `remove`) is administrative only, for the reason
+/// `estate clean` gives: the selection belongs to the estate's owner,
+/// not to any Work, so there is no Work whose authority could change it.
+/// An actor that could rewrite the doctrine it operates under would not
+/// be operating under doctrine at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EstateDoctrinePayload {
+    #[serde(default)]
+    pub work: Option<WorkId>,
+    pub action: DoctrineAction,
+}
+
+/// What an `estate doctrine` call is asking for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum DoctrineAction {
+    /// Declare a document, or replace the declaration with this `id`.
+    Set {
+        id: String,
+        /// Absolute path to the owner's own file. Read at every
+        /// applicable reservation, never copied into the declaration.
+        path: String,
+        #[serde(default)]
+        version: Option<String>,
+        /// The repository binding name this applies to; absent is
+        /// estate-wide.
+        #[serde(default)]
+        repository: Option<String>,
+    },
+    /// Undeclare the document with this `id`. Already-bound Worlds keep
+    /// what they were reserved with.
+    Remove { id: String },
+    /// What is declared, and — for a scoped caller — what of it applies.
+    List,
 }
 
 // ---- Atlas (P3 W3) -------------------------------------------------------

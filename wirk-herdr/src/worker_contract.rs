@@ -45,11 +45,11 @@
 //! written into the worktree, into `~/`, or into any file the user or
 //! the repository owns.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use wirk_core::{ContractDelivery, ContractDeliveryMode, WorkerContractRef};
+
+use crate::content_store::{self, sha256_hex};
 
 /// The contract's shape identifier. Bumped when the text changes in a
 /// way a reader should notice; the digest changes on every byte.
@@ -57,16 +57,6 @@ pub const WORKER_CONTRACT_VERSION: &str = "wirk.worker-contract/v1";
 
 /// The shipped contract text, embedded at compile time.
 pub const WORKER_CONTRACT: &str = include_str!("worker-contract.md");
-
-/// Lowercase hex SHA-256, the same encoding `WorldHash` uses.
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
 
 /// This build's own contract digest.
 pub fn digest() -> String {
@@ -85,7 +75,7 @@ pub fn contracts_dir(estate_root: &Path) -> PathBuf {
 /// the digest, so the file can never disagree with the reference that
 /// names it without the mismatch being detectable.
 pub fn contract_path(estate_root: &Path, digest: &str) -> PathBuf {
-    contracts_dir(estate_root).join(format!("{digest}.md"))
+    content_store::path_in(&contracts_dir(estate_root), digest)
 }
 
 /// Writes this build's contract under `estate_root` if it is not
@@ -104,25 +94,7 @@ pub fn contract_path(estate_root: &Path, digest: &str) -> PathBuf {
 /// durability discipline itself (temp file, fsync, rename, directory
 /// fsync) is `write_new`'s, reused rather than reinvented.
 pub fn reserve(estate_root: &Path) -> std::io::Result<WorkerContractRef> {
-    let digest = digest();
-    let path = contract_path(estate_root, &digest);
-    if std::fs::read(&path).is_ok_and(|bytes| sha256_hex(&bytes) == digest) {
-        return Ok(WorkerContractRef {
-            version: WORKER_CONTRACT_VERSION.to_string(),
-            digest,
-        });
-    }
-
-    let dir = contracts_dir(estate_root);
-    std::fs::create_dir_all(&dir)?;
-    let temp = dir.join(format!(".tmp-{digest}-{}", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(WORKER_CONTRACT.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&temp, &path)?;
-    std::fs::File::open(&dir).and_then(|directory| directory.sync_all())?;
+    let digest = content_store::store(&contracts_dir(estate_root), WORKER_CONTRACT.as_bytes())?;
     Ok(WorkerContractRef {
         version: WORKER_CONTRACT_VERSION.to_string(),
         digest,
@@ -191,6 +163,7 @@ pub fn delivery(
     reference: &WorkerContractRef,
     mode: ContractDeliveryMode,
     fallback_reason: Option<String>,
+    composed: Option<wirk_core::ComposedDelivery>,
 ) -> ContractDelivery {
     debug_assert_eq!(
         mode == ContractDeliveryMode::Prompt,
@@ -202,6 +175,7 @@ pub fn delivery(
         digest: reference.digest.clone(),
         mode,
         fallback_reason,
+        composed,
     }
 }
 
@@ -211,9 +185,14 @@ pub fn delivery(
 /// told *that* this is ordinary prompt text rather than harness-native
 /// instructions, and why, so it can weigh the contract against its own
 /// configuration knowing where it came from.
-pub fn prompt_disclosure(kind: &str, reason: &str) -> String {
+pub fn prompt_disclosure(kind: &str, reason: &str, with_doctrine: bool) -> String {
+    let what = if with_doctrine {
+        "The shared Wirk worker contract and this estate's own doctrine below are"
+    } else {
+        "The shared Wirk worker contract below is"
+    };
     format!(
-        "The shared Wirk worker contract below is delivered as ordinary prompt text rather \
+        "{what} delivered as ordinary prompt text rather \
          than as {kind}'s own native instructions, because {reason}. It is additive: it does \
          not replace this repository's instruction files, your own configuration, or the \
          assignment that follows."

@@ -892,6 +892,7 @@ fn legacy_unscoped_materialization_replays_for_its_exact_run() {
         ],
     );
     let initial = World::Actor(ActorWorld {
+        doctrine: Vec::new(),
         repository: repo.display().to_string(),
         worktree_path: PathBuf::new(),
         branch: "legacy-identity".to_string(),

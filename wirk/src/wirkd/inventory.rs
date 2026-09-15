@@ -81,6 +81,9 @@ pub(crate) struct WorkFacts {
     pub(crate) projected_generations: BTreeSet<String>,
     /// Worker contract digests this Work's reserved Worlds name.
     pub(crate) contract_digests: BTreeSet<String>,
+    /// P6.7: estate doctrine digests this Work's reserved Worlds name,
+    /// plus the composed documents its launches actually delivered.
+    pub(crate) doctrine_digests: BTreeSet<String>,
     /// Stored managed paths recorded by this Work's **validated** Claims,
     /// relative to its outputs directory.
     pub(crate) validated_managed_paths: BTreeSet<String>,
@@ -110,6 +113,8 @@ pub(crate) const RUNTIME_IMAGE: &str = "a runtime image";
 pub(crate) const RUNTIME_IMAGES_ROOT: &str = "this estate's runtime image directory";
 pub(crate) const WORKER_CONTRACT: &str = "a worker contract";
 pub(crate) const CONTRACTS_ROOT: &str = "this estate's worker contract directory";
+pub(crate) const ESTATE_DOCTRINE: &str = "an estate doctrine document";
+pub(crate) const DOCTRINE_ROOT: &str = "this estate's doctrine directory";
 pub(crate) const ATLAS_GENERATION: &str = "an atlas generation";
 pub(crate) const ATLAS_GENERATIONS_ROOT: &str = "this estate's atlas generation directory";
 pub(crate) const ATLAS_EDITION: &str = "an atlas semantic edition";
@@ -130,6 +135,11 @@ pub(crate) struct Retention {
     pub(crate) editions: BTreeMap<String, Vec<RetentionHolder>>,
     /// contract digest -> the concrete consumers that retain it.
     pub(crate) contracts: BTreeMap<String, Vec<RetentionHolder>>,
+    /// P6.7: estate doctrine digest -> the concrete consumers that
+    /// retain it. Both the selected documents a World names and the
+    /// composed transport document a launch actually delivered live in
+    /// one content-addressed store, so one map covers both.
+    pub(crate) doctrine: BTreeMap<String, Vec<RetentionHolder>>,
     /// Every Work this estate holds a journal for.
     pub(crate) works: Vec<WorkFacts>,
     /// Each registered source's alias and locator — named so a reader can
@@ -793,6 +803,49 @@ pub(crate) fn survey(
              digest. A finished Work's journal still names its digest afterwards and stays \
              readable: the reference is a name, not a byte requirement",
         soft_limit_bytes: policy.storage_soft_limits.get("contracts").copied(),
+    });
+
+    // ---- Estate doctrine --------------------------------------------
+    let doctrine_root = wirk_herdr::estate_doctrine::store_dir(estate_root);
+    let mut doctrine_items = Vec::new();
+    let mut doctrine = Measured::absent();
+    match read_dir_names(&doctrine_root) {
+        Ok(names) => {
+            for name in names {
+                let path = doctrine_root.join(&name);
+                let this =
+                    wirk_core::storage::measure(&path, ESTATE_DOCTRINE, &mut dedup, &mut budget);
+                let digest = name.strip_suffix(".md").unwrap_or(&name).to_string();
+                doctrine_items.push(Item {
+                    retained_by: Retention::holders(&retention.doctrine, &digest),
+                    id: digest,
+                    path,
+                    measured: this.clone(),
+                });
+                accumulate(&mut doctrine, this);
+            }
+        }
+        Err(Some(reason)) => {
+            doctrine
+                .unreadable
+                .push(Unreadable::at(DOCTRINE_ROOT, &doctrine_root, reason))
+        }
+        Err(None) => {}
+    }
+    classes.push(ClassReport {
+        class: "doctrine",
+        path: doctrine_root,
+        what: "the content-addressed estate doctrine documents reserved Actor Worlds name, and \
+               the composed documents launches actually delivered",
+        measured: doctrine,
+        items: doctrine_items,
+        cleanable: true,
+        retention_rule:
+            "retained while a non-terminal Work reserves it, or while a non-terminal Work's \
+             launch delivered it. A finished Work's journal still names its digest afterwards \
+             and stays readable: the reference is a name, not a byte requirement. The owner's \
+             own declared file is never touched — only wirk's copy of the bytes it resolved",
+        soft_limit_bytes: policy.storage_soft_limits.get("doctrine").copied(),
     });
 
     // ---- Atlas ------------------------------------------------------

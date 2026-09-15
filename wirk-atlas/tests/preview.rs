@@ -159,7 +159,9 @@ fn a_malformed_document_previews_as_candidate_not_error() {
         .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
         .unwrap()
     {
-        AcquireOutcome::Staged(generation) => generation,
+        AcquireOutcome::Staged(staged) => atlas
+            .generation(&staged.id)
+            .expect("the generation just staged reads back"),
         other => panic!("expected Staged, got {other:?}"),
     };
     let record = generation
@@ -264,7 +266,9 @@ fn git_preview_classifies_from_tree_metadata_without_reading_a_blob() {
         .acquire(&membership, "HEAD", ExtractorPolicy::default())
         .unwrap()
     {
-        AcquireOutcome::Staged(generation) => generation,
+        AcquireOutcome::Staged(staged) => atlas
+            .generation(&staged.id)
+            .expect("the generation just staged reads back"),
         other => panic!("expected Staged, got {other:?}"),
     };
     assert_eq!(generation.resources.len(), 2);

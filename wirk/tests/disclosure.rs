@@ -3606,7 +3606,7 @@ fn watch_answers_the_same_named_scopes_as_status() {
     let message = watch_refusal(
         socket,
         wirkd::WatchPayload {
-            work_id: WorkId(family.parent.work_id.clone()),
+            work_id: Some(WorkId(family.parent.work_id.clone())),
             requester: None,
             admin: false,
         },

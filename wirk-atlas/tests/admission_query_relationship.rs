@@ -75,7 +75,9 @@ fn acquire_and_publish(
         .acquire(&membership, rev, ExtractorPolicy::default())
         .unwrap()
     {
-        AcquireOutcome::Staged(generation) => generation,
+        AcquireOutcome::Staged(staged) => atlas
+            .generation(&staged.id)
+            .expect("the generation just staged reads back"),
         other => panic!("{other:?}"),
     };
     atlas.publish(&membership, &generation.id).unwrap();
@@ -724,11 +726,14 @@ fn real_query_timings_are_recorded_as_scoped_evidence_not_parity() {
         .acquire(&membership, &head, ExtractorPolicy::default())
         .unwrap()
     {
-        AcquireOutcome::Staged(generation) => generation,
+        AcquireOutcome::Staged(staged) => staged,
         other => panic!("{other:?}"),
     };
     let acquire_elapsed = acquire_start.elapsed();
     atlas.publish(&membership, &generation.id).unwrap();
+    let generation = atlas
+        .generation(&generation.id)
+        .expect("the generation just staged reads back");
     let indexed_resources = generation
         .resources
         .iter()

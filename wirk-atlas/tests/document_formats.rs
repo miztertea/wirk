@@ -34,9 +34,14 @@ fn corpus_root() -> PathBuf {
         .join("anydoc_corpus")
 }
 
-fn staged(outcome: AcquireOutcome) -> SourceGeneration {
+/// The acquisition reports identity and coverage; the generation's own
+/// resource list lives in the immutable generation directory, which is
+/// what these checks read it back from.
+fn read_staged(atlas: &AtlasStore, outcome: AcquireOutcome) -> SourceGeneration {
     match outcome {
-        AcquireOutcome::Staged(generation) => generation,
+        AcquireOutcome::Staged(staged) => atlas
+            .generation(&staged.id)
+            .expect("the generation just staged reads back"),
         other => panic!("expected Staged, got {other:?}"),
     }
 }
@@ -141,16 +146,14 @@ fn build_tree(dir: &Path) {
     )
     .unwrap();
 
-    // Large: past `MAX_TEXT_BYTES` (1 MiB) but under the document-tree
-    // per-file capture bound (8 MiB default), so it is actually read and
-    // actually reaches the extractor rather than being refused at
-    // capture time — a distinct, real bound from the capture-time one
-    // `doctree.rs`'s own tests already cover.
+    // Large: over a megabyte of real delimited text, which used to be
+    // past the extractor's own rendered-text ceiling and is now simply
+    // a large document. It is read, converted and indexed whole.
     let mut large = String::from("name,quantity\n");
     for i in 0..200_000u32 {
         large.push_str(&format!("Item{i},{}\n", i % 100));
     }
-    assert!(large.len() > 1024 * 1024 && large.len() < 8 * 1024 * 1024);
+    assert!(large.len() > 1024 * 1024);
     fs::write(dir.join("large.csv"), large).unwrap();
 
     // Non-A1 origin + text repeated across sheets: real precision-gap
@@ -190,16 +193,16 @@ fn build_tree(dir: &Path) {
 
     // The raw-container-vs-rendered-text-budget fixture: a real DOCX
     // with one ordinary embedded image, deliberately padded so the
-    // *original* file is comfortably past `MAX_TEXT_BYTES` (1 MiB) in
-    // raw bytes while its actual document text stays a few short
-    // paragraphs — the modest-text, image-heavy shape completion
-    // guidance 0313 asks this reader not to reject on container size
-    // alone. Still well inside the document-tree's own configurable
-    // `document_max_file_bytes` (8 MiB default).
+    // *original* file is comfortably over a megabyte in raw bytes while
+    // its actual document text stays a few short paragraphs — the
+    // modest-text, image-heavy shape completion guidance 0313 asks this
+    // reader not to reject on container size alone. No built-in bound
+    // refuses either half now; what this pins is that the two are still
+    // told apart.
     let padded = build_docx_with_embedded_image();
     assert!(
-        padded.len() > 1024 * 1024 && padded.len() < 8 * 1024 * 1024,
-        "fixture must sit strictly between the two distinct bounds this test tells apart: {}",
+        padded.len() > 1024 * 1024,
+        "fixture must be genuinely large in raw container bytes: {}",
         padded.len()
     );
     fs::write(dir.join("image_heavy_modest_text.docx"), padded).unwrap();
@@ -378,11 +381,12 @@ fn open_and_acquire(
     let membership = atlas
         .register_document_tree("docs", dir, "current")
         .unwrap();
-    let generation = staged(
-        atlas
+    let generation = {
+        let outcome = atlas
             .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
-            .unwrap(),
-    );
+            .unwrap();
+        read_staged(&atlas, outcome)
+    };
     (estate, atlas, membership, generation)
 }
 
@@ -493,27 +497,37 @@ fn the_admitted_matrix_indexes_real_content_and_names_every_real_failure() {
         Some(ContentFamily::Knowledge)
     );
 
-    // -- Large: past the *rendered-Markdown* budget, refused by name,
-    // -- not truncated into a partial success. For CSV the converted
-    // -- Markdown table is roughly the same size as the raw text (plus
-    // -- table-syntax overhead), so this is the same real refusal as
-    // -- before — but now charged against the actual converted text a
-    // -- reader would receive, not a second, stricter raw-byte gate
-    // -- that would also have wrongly caught an image-heavy, text-light
-    // -- Office file (see `image_heavy_modest_text.docx` below).
+    // -- Large: indexed, whole, like any other admitted document.
+    // -- Rulings 0402/0403 removed the rendered-Markdown ceiling this
+    // -- case used to be refused by: it was a product-chosen size
+    // -- policy, and refusing a perfectly convertible table for being
+    // -- long produced an `Error` with nothing retrievable behind it.
+    // -- `large_content_indexing.rs` holds the searchable/resolvable
+    // -- half of the same requirement; here the point is that the
+    // -- matrix's own large member is a success, not a named failure.
     let large = resource(&generation, "large.csv");
-    assert_eq!(large.disposition, CoverageDisposition::Error);
     assert_eq!(
-        large.detail.as_deref(),
-        Some("converted document text exceeds bounded extractor size")
+        large.disposition,
+        CoverageDisposition::Indexed,
+        "a large convertible table is indexed, not refused: {:?}",
+        large.detail
+    );
+    let large_markdown_len: u64 = large
+        .units
+        .iter()
+        .map(|unit| unit.byte_end)
+        .max()
+        .unwrap_or_default();
+    assert!(
+        large_markdown_len > 1024 * 1024,
+        "the converted Markdown actually indexed runs past the former ceiling:          {large_markdown_len}"
     );
 
     // -- The distinguishing case completion guidance 0313 named: raw
-    // -- container bytes comfortably past `MAX_TEXT_BYTES` (an embedded
-    // -- image inflates the file), but the actual document text is a
-    // -- few short paragraphs — well under the rendered-text budget —
-    // -- so it must index, not be refused for a reason that never
-    // -- applied to its real content.
+    // -- container bytes comfortably over a megabyte (an embedded image
+    // -- inflates the file), but the actual document text is a few short
+    // -- paragraphs. Its units index the converted text, so the reader
+    // -- must not be describing the container's size as its content.
     let image_heavy = resource(&generation, "image_heavy_modest_text.docx");
     assert_eq!(
         image_heavy.disposition,
@@ -524,8 +538,8 @@ fn the_admitted_matrix_indexes_real_content_and_names_every_real_failure() {
     );
     assert!(
         image_heavy.byte_len.is_some_and(|len| len > 1024 * 1024),
-        "the fixture's own original size must genuinely exceed MAX_TEXT_BYTES for this case to \
-         mean anything: {:?}",
+        "the fixture's own original size must genuinely be large for this case to mean \
+         anything: {:?}",
         image_heavy.byte_len
     );
     let image_heavy_markdown_len: u64 = image_heavy
@@ -1224,7 +1238,7 @@ fn the_structured_reader_describes_a_document_and_hands_back_its_real_embedded_i
     // The bytes, on demand and only on demand — and exactly the ones that
     // went into the package.
     let asset = atlas
-        .document_asset(&membership, &coordinate, descriptor.id, 1024 * 1024)
+        .document_asset(&membership, &coordinate, descriptor.id, Some(1024 * 1024))
         .unwrap()
         .expect("the inventory listed this asset");
     assert_eq!(asset.bytes, image);
@@ -1238,14 +1252,14 @@ fn the_structured_reader_describes_a_document_and_hands_back_its_real_embedded_i
     // asset's bytes.
     assert!(
         atlas
-            .document_asset(&membership, &coordinate, 99, 1024 * 1024)
+            .document_asset(&membership, &coordinate, 99, Some(1024 * 1024))
             .unwrap()
             .is_none()
     );
 
     // A caller's own bound is honoured before anything is handed back.
     let refused = atlas
-        .document_asset(&membership, &coordinate, descriptor.id, 8)
+        .document_asset(&membership, &coordinate, descriptor.id, Some(8))
         .unwrap_err();
     assert!(
         refused.to_string().contains("past the 8-byte bound"),

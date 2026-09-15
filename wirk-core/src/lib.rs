@@ -157,6 +157,7 @@ impl WorldHash {
             && !world.carries_review_targets()
             && !world.carries_evidence()
             && !world.carries_contract()
+            && !world.carries_doctrine()
         {
             return Self::legacy(world);
         }
@@ -235,6 +236,27 @@ impl WorldHash {
                     hasher.update([0x04]);
                     hash_string(&mut hasher, &contract.version);
                     hash_string(&mut hasher, &contract.digest);
+                }
+                // P6.7: the estate doctrine this stage was reserved
+                // with, same precedent and same reason as the contract
+                // above — it is governing guidance the stage was
+                // actually given, and binding it here is what makes an
+                // owner's later change of declaration affect the *next*
+                // reservation rather than the World a Run is already
+                // bound to. Presence-gated behind its own marker byte,
+                // so no World reserved without doctrine moves. The
+                // owner's id and version are hashed beside the digest: a
+                // document re-declared under a new version with
+                // coincidentally equal bytes is a different selection.
+                if !actor.doctrine.is_empty() {
+                    hasher.update([0x05]);
+                    hash_len(&mut hasher, actor.doctrine.len());
+                    for document in &actor.doctrine {
+                        hash_string(&mut hasher, &document.id);
+                        hash_string(&mut hasher, &document.version);
+                        hash_string(&mut hasher, &document.digest);
+                        hash_string(&mut hasher, document.repository.as_deref().unwrap_or(""));
+                    }
                 }
             }
             World::Deterministic(det) => {
@@ -1592,8 +1614,66 @@ pub struct ActorWorld {
     /// `WorldHash::of` hashes it **only when present**, so neither the
     /// journal bytes nor the hash of any historical World moves because
     /// this field exists.
+    ///
+    /// `Box`ed for the reason `evidence` above gives, made load-bearing
+    /// by `doctrine` below: `World` is an enum whose two variants must
+    /// not drift far apart in size (`clippy::large_enum_variant`), and
+    /// the pair of `String`s this reference is made of costs forty-eight
+    /// bytes on every `World` ever moved. A `Box` serializes
+    /// transparently, so nothing on the wire or in a journal sees it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contract: Option<WorkerContractRef>,
+    pub contract: Option<Box<WorkerContractRef>>,
+    /// P6.7: the estate doctrine documents this stage was reserved
+    /// with — the references, never the content, exactly as `contract`
+    /// is. The bytes live at `<estate_root>/.wirk/doctrine/<digest>.md`,
+    /// written and fsynced *before* this World is built.
+    ///
+    /// Separate from `contract` on purpose. The worker contract is
+    /// product-shipped protocol, static per build and identical in every
+    /// estate; these are the *estate owner's* own documents, chosen
+    /// explicitly, carrying the owner's declared id and version beside
+    /// the digest of the exact bytes selected. Composing them into one
+    /// transport document at launch does not merge the two identities:
+    /// what each stage was reserved with stays separately named here.
+    ///
+    /// Selection is resolved once, at reservation, from the estate's own
+    /// declaration — so an owner who changes that declaration changes
+    /// what the *next* applicable reservation binds, and cannot rewrite
+    /// what an already-reserved World says a bound Run operates under.
+    ///
+    /// Empty for every World reserved without doctrine, which is every
+    /// World written before this wave. `#[serde(default)]` with
+    /// `skip_serializing_if`, and `WorldHash::of` hashes it **only when
+    /// non-empty**, so neither the journal bytes nor the hash of any
+    /// historical World moves because this field exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doctrine: Vec<EstateDoctrineRef>,
+}
+
+/// P6.7: one estate doctrine document a stage was reserved with.
+///
+/// `id` and `version` are the estate owner's own declaration — what the
+/// owner calls this document and which edition of it they selected.
+/// `digest` is wirk's: the SHA-256 of the exact bytes read at
+/// reservation, which is what makes "the same document" checkable rather
+/// than asserted. An owner who edits the file without touching the
+/// declared version still gets a different digest, and the next
+/// reservation binds it; the bound one does not move.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EstateDoctrineRef {
+    /// The owner's own name for this document, unique in the estate.
+    pub id: String,
+    /// The owner's declared edition, or `undeclared` when they named
+    /// none. Never inferred from the bytes.
+    pub version: String,
+    /// Lowercase hex SHA-256 of the exact bytes selected.
+    pub digest: String,
+    /// The repository binding name this document is scoped to, or `None`
+    /// for estate-wide. Carried so a reader of the World can see *why*
+    /// this document applied here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
 }
 
 /// P4.1: which shared worker contract a stage was reserved with. The
@@ -1637,6 +1717,36 @@ pub struct ContractDelivery {
     /// mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// P6.7: when this Run's World also reserved estate doctrine, the
+    /// contract is delivered inside one composed transport document
+    /// rather than on its own, and this says which document that was and
+    /// what else rode in it.
+    ///
+    /// `version`/`digest` above still name the shared worker contract
+    /// itself, unchanged — the composed document is the envelope, not a
+    /// new contract. `None` for every launch that delivered the contract
+    /// alone, which is every launch written before this wave, so no
+    /// historical `RunLaunched` line moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composed: Option<ComposedDelivery>,
+}
+
+/// P6.7: the one document a launch actually put in front of the actor
+/// when the reserved contract and reserved estate doctrine travelled
+/// together.
+///
+/// It is content-addressed in the estate's own doctrine store, so the
+/// exact bytes an actor was given stay checkable after the fact — and so
+/// a prompt-delivered fallback can re-read and re-prove them on every
+/// prompt, the way a contract-only fallback already does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComposedDelivery {
+    /// Lowercase hex SHA-256 of the composed document's exact bytes.
+    pub digest: String,
+    /// The estate doctrine documents composed into it, in delivery
+    /// order. Their own identities, not the envelope's.
+    pub documents: Vec<EstateDoctrineRef>,
 }
 
 /// The delivery mechanisms wirk has actually verified, plus the
@@ -1778,10 +1888,28 @@ impl World {
         }
     }
 
+    /// Whether this World carries estate doctrine — the fourth fact that
+    /// disqualifies it from the pre-v2 `WorldHash::legacy` encoding.
+    pub fn carries_doctrine(&self) -> bool {
+        match self {
+            World::Actor(actor) => !actor.doctrine.is_empty(),
+            World::Deterministic(_) => false,
+        }
+    }
+
+    /// The estate doctrine this World was reserved with. Empty for every
+    /// World reserved without any.
+    pub fn doctrine(&self) -> &[EstateDoctrineRef] {
+        match self {
+            World::Actor(actor) => &actor.doctrine,
+            World::Deterministic(_) => &[],
+        }
+    }
+
     /// The shared worker contract this World was reserved with, if any.
     pub fn contract(&self) -> Option<&WorkerContractRef> {
         match self {
-            World::Actor(actor) => actor.contract.as_ref(),
+            World::Actor(actor) => actor.contract.as_deref(),
             World::Deterministic(_) => None,
         }
     }
@@ -2306,6 +2434,43 @@ impl ArtifactReceipt {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         hex_lower(&hasher.finalize())
+    }
+
+    /// The same digest as [`Self::digest_of_bytes`], taken from a reader
+    /// without ever holding the whole content, together with the number
+    /// of bytes it actually hashed.
+    ///
+    /// This is what lets an artifact be *vouched for* without being
+    /// materialized. A consumer that only has to establish "these bytes
+    /// still hash to what the Claim recorded" — `wirk artifact`'s
+    /// verification is exactly that, and answers with the digest and the
+    /// length rather than the content — reads through this and costs one
+    /// buffer whatever the artifact's size. It is the same hasher over
+    /// the same byte sequence, so it cannot disagree with
+    /// `digest_of_bytes` on the same content.
+    ///
+    /// The reader must be the *one open file object* the caller
+    /// inspected, not a second lookup of a path: this hashes what it is
+    /// given and makes no claim about where it came from.
+    pub fn digest_of_stream<R: std::io::Read>(mut reader: R) -> std::io::Result<(String, u64)> {
+        let mut hasher = Sha256::new();
+        // 64 KiB: the ordinary copy buffer size, large enough that the
+        // read syscall is not the cost and small enough to be nothing
+        // beside the process. It bounds this function's memory and
+        // nothing else — it is not a bound on the content.
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            };
+            hasher.update(&buffer[..read]);
+            total = total.saturating_add(read as u64);
+        }
+        Ok((hex_lower(&hasher.finalize()), total))
     }
 }
 

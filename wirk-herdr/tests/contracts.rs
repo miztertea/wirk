@@ -195,6 +195,7 @@ fn selection_args_without_claim_hook(args: &[String], run_id: &str) -> Vec<Strin
 
 fn actor_world(run: &Run) -> wirk_core::World {
     wirk_core::World::Actor(wirk_core::ActorWorld {
+        doctrine: Vec::new(),
         repository: "wirk".to_string(),
         worktree_path: "/var/tmp/w1".into(),
         branch: "p1/executor-design".to_string(),

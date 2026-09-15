@@ -90,6 +90,14 @@ commands exist today. Don't invent commands, and don't route ordinary
 tool calls through another model dispatch just to make them look more
 official — `wirk` is a CLI, not a ceremony.
 
+If a Waypoint's intent promises the actor prepared context, author its
+`orient` field to match: a real question naming what this stage
+actually needs answered, and the source aliases to answer it from.
+Those aliases only filter what the Work already bound — a repository
+binding is not a request, and naming an unbound alias admits nothing.
+No blanket default: a Waypoint that needs no source context asks for
+no `orient`.
+
 Herdr runs and presents you — pane lifecycle, launch, harness. Wirk
 owns Work semantics, the assembled World, the evidence, and the
 Claims. For admitted Work, that distinction matters: a Herdr pane

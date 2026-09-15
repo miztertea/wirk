@@ -136,7 +136,7 @@ fn classify_path(
         // Checked from the size Git already reported, before the object
         // is read: the bound refuses the read rather than complaining
         // about one that already happened.
-        _ if size.is_some_and(|size| size > limits.max_file_bytes) => {
+        _ if size.is_some_and(|size| limits.file_over(size)) => {
             PathVerdict::Unsupported("blob exceeds the bounded source read size")
         }
         crate::extract::PathAdmission::Family(_) => PathVerdict::Family,
@@ -147,15 +147,17 @@ fn classify_path(
 /// Every committed path of `commit`, classified and — where admitted —
 /// extracted, under this estate's own source input bounds.
 ///
-/// **The bounds are this policy's, not the extractor's.** A blob larger
-/// than `limits.max_file_bytes` is reported `Unsupported` from the size
-/// `ls-tree -l` already returned, without being read at all, and the
-/// aggregate of everything actually read is charged against
-/// `limits.max_total_bytes` before each read it bounds. Both come from the
-/// estate's configurable `ResourcePolicy`, so a Git source is bounded by
-/// the same operator-visible numbers a document collection is rather than
-/// by whatever the extractor happens to refuse after the bytes are already
-/// in memory.
+/// **The bounds are the operator's, where the operator set any.** Both
+/// come from the estate's configurable `ResourcePolicy` and both default
+/// to absent, so by default a repository's committed content is read as
+/// committed. Where `limits.max_file_bytes` *is* configured, a larger
+/// blob is reported `Unsupported` from the size `ls-tree -l` already
+/// returned, without being read at all; where `limits.max_total_bytes`
+/// is configured, the aggregate of everything actually read is charged
+/// against it before each read it bounds. One blob is resident at a
+/// time either way — read, extracted, dropped — so the aggregate
+/// charge bounds the operator's own budget rather than this process's
+/// residency.
 ///
 /// **Two passes, because detection needs bytes and bounds do not.** The
 /// first decides everything a path settles on its own. Paths the name
@@ -168,7 +170,8 @@ pub(crate) fn resources(
     generation: &GenerationId,
     policy: &ExtractorPolicy,
     limits: &crate::doctree::CaptureLimits,
-) -> Result<Vec<ResourceRecord>, AtlasError> {
+    sink: &mut dyn FnMut(ResourceRecord) -> Result<(), AtlasError>,
+) -> Result<(), AtlasError> {
     let raw = git(
         repo,
         &[
@@ -238,9 +241,15 @@ pub(crate) fn resources(
     // decision is remembered per object id, so a second path naming an
     // object already screened negative is refused without reading it
     // again and without charging for it.
+    // Sorted before the reads rather than after them, because records
+    // now leave this function one at a time and their order is part of
+    // what a generation records (`AtlasStore::validate_generation`
+    // refuses a resource list that is not uniquely sorted, and
+    // `publish_verify_git` zips it against `tree_entries`, which sorts
+    // the same way).
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
     let mut screened: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
     let mut total_bytes: u64 = 0;
-    let mut records = Vec::with_capacity(entries.len());
     for Entry {
         path,
         mode,
@@ -268,12 +277,14 @@ pub(crate) fn resources(
                 // by a complaint. A candidate's screening read is charged
                 // here too, because it is the same read.
                 total_bytes = total_bytes.saturating_add(size.unwrap_or(0));
-                if total_bytes > limits.max_total_bytes {
+                if let Some(max_total) = limits.max_total_bytes
+                    && total_bytes > max_total
+                {
                     return Err(AtlasError::InvalidRequest(format!(
-                        "git source exceeds the {}-byte bounded aggregate read budget for one \
-                         capture; raise document_max_total_bytes in this estate's \
-                         .wirk/resources.json to admit a larger tree",
-                        limits.max_total_bytes
+                        "git source reached {total_bytes} bytes, over the {max_total}-byte \
+                         bounded aggregate read budget this estate configured for one capture; \
+                         raise document_max_total_bytes in this estate's .wirk/resources.json to \
+                         admit a larger tree"
                     )));
                 }
                 match git(repo, &["cat-file".into(), "blob".into(), oid.clone()]) {
@@ -314,7 +325,9 @@ pub(crate) fn resources(
                 }
             }
         };
-        records.push(ResourceRecord {
+        // Handed over and dropped here: one blob's bytes and one
+        // record's units at a time, never the whole tree's.
+        sink(ResourceRecord {
             path,
             mode,
             object_id: Some(oid),
@@ -322,10 +335,9 @@ pub(crate) fn resources(
             disposition,
             detail,
             units,
-        });
+        })?;
     }
-    records.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(records)
+    Ok(())
 }
 /// `atlas acquire --dry-run`'s Git half: the same `git ls-tree -l`
 /// listing `resources` reads, classified by path/mode/size alone — no
@@ -826,6 +838,24 @@ mod batched_read_tests {
         (dir, head)
     }
 
+    /// `resources` streams its records to a sink; a check that wants the
+    /// whole list collects them here, which is exactly what production
+    /// no longer does.
+    fn resources_to_vec(
+        repo: &Path,
+        commit: &str,
+        generation: &GenerationId,
+        policy: &ExtractorPolicy,
+        limits: &crate::doctree::CaptureLimits,
+    ) -> Result<Vec<ResourceRecord>, AtlasError> {
+        let mut records = Vec::new();
+        resources(repo, commit, generation, policy, limits, &mut |record| {
+            records.push(record);
+            Ok(())
+        })?;
+        Ok(records)
+    }
+
     fn record<'a>(records: &'a [ResourceRecord], name: &str) -> &'a ResourceRecord {
         records
             .iter()
@@ -846,10 +876,11 @@ mod batched_read_tests {
         let generation = GenerationId("g-test".into());
 
         let tight = crate::doctree::CaptureLimits {
-            max_file_bytes: 4_096,
+            max_file_bytes: Some(4_096),
             ..Default::default()
         };
-        let records = resources(dir.path(), &head, &generation, &policy, &tight).expect("capture");
+        let records =
+            resources_to_vec(dir.path(), &head, &generation, &policy, &tight).expect("capture");
         let refused = record(&records, "big.md");
         assert_eq!(refused.disposition, CoverageDisposition::Unsupported);
         assert_eq!(
@@ -862,8 +893,9 @@ mod batched_read_tests {
         );
 
         let mut raised = tight;
-        raised.max_file_bytes = 1_000_000;
-        let records = resources(dir.path(), &head, &generation, &policy, &raised).expect("capture");
+        raised.max_file_bytes = Some(1_000_000);
+        let records =
+            resources_to_vec(dir.path(), &head, &generation, &policy, &raised).expect("capture");
         assert_eq!(
             record(&records, "big.md").disposition,
             CoverageDisposition::Indexed
@@ -880,10 +912,10 @@ mod batched_read_tests {
         let policy = ExtractorPolicy::default();
         let generation = GenerationId("g-test".into());
         let tight = crate::doctree::CaptureLimits {
-            max_total_bytes: 6_000,
+            max_total_bytes: Some(6_000),
             ..Default::default()
         };
-        match resources(dir.path(), &head, &generation, &policy, &tight) {
+        match resources_to_vec(dir.path(), &head, &generation, &policy, &tight) {
             Err(AtlasError::InvalidRequest(detail)) => {
                 assert!(detail.contains("document_max_total_bytes"), "{detail}");
             }
@@ -910,10 +942,10 @@ mod batched_read_tests {
         let policy = ExtractorPolicy::default();
         let generation = GenerationId("g-test".into());
         let tight = crate::doctree::CaptureLimits {
-            max_total_bytes: 6_000,
+            max_total_bytes: Some(6_000),
             ..Default::default()
         };
-        match resources(dir.path(), &head, &generation, &policy, &tight) {
+        match resources_to_vec(dir.path(), &head, &generation, &policy, &tight) {
             Err(AtlasError::InvalidRequest(detail)) => {
                 assert!(detail.contains("document_max_total_bytes"), "{detail}");
             }
@@ -924,10 +956,11 @@ mod batched_read_tests {
         // is admitted -- and still reported unsupported, because neither
         // body is a document.
         let raised = crate::doctree::CaptureLimits {
-            max_total_bytes: 100_000,
+            max_total_bytes: Some(100_000),
             ..Default::default()
         };
-        let records = resources(dir.path(), &head, &generation, &policy, &raised).expect("capture");
+        let records =
+            resources_to_vec(dir.path(), &head, &generation, &policy, &raised).expect("capture");
         for name in ["one.unknown", "two.unknown"] {
             assert_eq!(
                 record(&records, name).disposition,
@@ -949,10 +982,10 @@ mod batched_read_tests {
         // Room for exactly one of the two reads. Reading the same object
         // twice would exceed it.
         let tight = crate::doctree::CaptureLimits {
-            max_total_bytes: 6_000,
+            max_total_bytes: Some(6_000),
             ..Default::default()
         };
-        let records = resources(dir.path(), &head, &generation, &policy, &tight)
+        let records = resources_to_vec(dir.path(), &head, &generation, &policy, &tight)
             .expect("one object is read and charged once");
         for name in ["one.unknown", "two.unknown"] {
             let found = record(&records, name);
@@ -981,10 +1014,10 @@ mod batched_read_tests {
         let generation = GenerationId("g-test".into());
         // Enough for one read of this blob, not two.
         let tight = crate::doctree::CaptureLimits {
-            max_total_bytes: (rtf.len() as u64) + 1,
+            max_total_bytes: Some((rtf.len() as u64) + 1),
             ..Default::default()
         };
-        let records = resources(dir.path(), &head, &generation, &policy, &tight)
+        let records = resources_to_vec(dir.path(), &head, &generation, &policy, &tight)
             .expect("a screened-and-extracted blob is charged once");
         let found = record(&records, "brief");
         assert_eq!(
@@ -1008,7 +1041,8 @@ mod batched_read_tests {
         let policy = ExtractorPolicy::default();
         let generation = GenerationId("g-test".into());
         let limits = crate::doctree::CaptureLimits::default();
-        let records = resources(dir.path(), &head, &generation, &policy, &limits).expect("capture");
+        let records =
+            resources_to_vec(dir.path(), &head, &generation, &policy, &limits).expect("capture");
 
         let detected = record(&records, "brief");
         assert_eq!(

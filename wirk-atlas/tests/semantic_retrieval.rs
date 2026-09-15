@@ -476,6 +476,11 @@ fn estate_with_alias(repo: TempDir, alias: &str) -> Estate {
         .acquire(&membership, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            store
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     store.publish(&membership, &staged.id).unwrap();
     let model = model_dir(temporary.path());
@@ -1166,6 +1171,12 @@ fn p2_a_continuation_over_a_surviving_subset_is_still_refused() {
         .acquire(&other, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            estate
+                .store
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     estate.store.publish(&other, &staged_other.id).unwrap();
 
@@ -1283,6 +1294,12 @@ fn q_colliding_relative_paths_are_distinct_ranking_documents() {
         .acquire(&other, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            estate
+                .store
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     estate.store.publish(&other, &staged_other.id).unwrap();
 
@@ -2522,6 +2539,12 @@ fn add_colliding_source(estate: &mut Estate) {
         .acquire(&other, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            estate
+                .store
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     estate.store.publish(&other, &staged_other.id).unwrap();
     let backend = chunk_backend(&estate.directory, "chunk-tie-collide.py", "honest");
@@ -3207,6 +3230,11 @@ fn tied_estate_with_alias(repo_path: &Path, alias: &str) -> TiedEstate {
         .acquire(&membership, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            store
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     store.publish(&membership, &staged.id).unwrap();
     TiedEstate {
@@ -3996,6 +4024,12 @@ fn u3_a_continuation_follows_its_pinned_edition_past_a_later_selection() {
         .acquire(&membership, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            estate
+                .store
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     estate
         .store

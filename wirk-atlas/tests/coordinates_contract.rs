@@ -99,6 +99,11 @@ fn utf8_rust_and_markdown_units_have_exact_committed_byte_and_line_coordinates()
         .acquire(&member, "HEAD", ExtractorPolicy::content_families_v3())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     let code = generation
         .resources
@@ -142,6 +147,11 @@ fn exact_resolution_keeps_terminal_coverage_types_and_refuses_forged_scope() {
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     assert!(matches!(
         atlas
@@ -182,11 +192,21 @@ fn attempts_are_timestamped_diagnostic_and_do_not_change_generation_identity() {
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     let two = atlas
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     assert_eq!(one.id, two.id);
     assert_eq!(atlas.attempts().len(), 2);
@@ -212,35 +232,101 @@ fn attempts_are_timestamped_diagnostic_and_do_not_change_generation_identity() {
     );
 }
 
+/// A staged generation's `resources.ndjson` is the only copy of its
+/// resource list, so what is on disk has to be shown to be the set that
+/// was staged — not merely a set of individually valid rows.
+///
+/// Three tampers, because they fail for three different reasons and only
+/// the first was ever covered: a duplicated row breaks unique sort
+/// order, a **deleted** row does not (the survivors stay valid and
+/// sorted, which is exactly how a truncated tail or a partial restore
+/// looks), and a row altered in a way that is still structurally valid
+/// does not either.
+///
+/// The deletion and alteration arms were watched failing against
+/// `967870c`, where `read_generation` assigned the parsed rows and
+/// validated only their shape: both read back successfully, the
+/// deletion as a silently smaller generation.
 #[test]
 fn corrupt_or_unaccounted_resource_rows_are_not_claimed_as_a_generation() {
-    let repo = fixture();
-    let estate = TempDir::new().unwrap();
-    let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
-    let member = atlas.register_git("source", repo.path(), "HEAD").unwrap();
-    let generation = atlas
-        .acquire(&member, "HEAD", ExtractorPolicy::default())
-        .unwrap()
-        .staged()
-        .unwrap();
-    atlas.publish(&member, &generation.id).unwrap();
-    drop(atlas);
-    let rows = estate
-        .path()
-        .join("atlas/generations")
-        .join(&generation.id.0)
-        .join("resources.ndjson");
-    let original = fs::read(&rows).unwrap();
-    let first = original
-        .split_inclusive(|byte| *byte == b'\n')
-        .next()
-        .unwrap()
-        .to_vec();
-    let mut forged = original;
-    forged.extend_from_slice(&first);
-    fs::write(rows, forged).unwrap();
-    let atlas = AtlasStore::open(estate.path(), "estate").unwrap();
-    assert!(atlas.current(&member).is_err());
+    for tamper in ["duplicate", "delete", "alter"] {
+        let repo = fixture();
+        let estate = TempDir::new().unwrap();
+        let mut atlas = AtlasStore::open(estate.path(), "estate").unwrap();
+        let member = atlas.register_git("source", repo.path(), "HEAD").unwrap();
+        let generation = atlas
+            .acquire(&member, "HEAD", ExtractorPolicy::default())
+            .unwrap()
+            .staged()
+            .map(|staged| {
+                atlas
+                    .generation(&staged.id)
+                    .expect("the generation just staged reads back")
+            })
+            .unwrap();
+        atlas.publish(&member, &generation.id).unwrap();
+        let staged_resources = generation.resources.len();
+        assert!(
+            staged_resources > 1,
+            "the fixture must hold more than one row for a deletion to be interesting"
+        );
+        drop(atlas);
+        let rows = estate
+            .path()
+            .join("atlas/generations")
+            .join(&generation.id.0)
+            .join("resources.ndjson");
+        let original = fs::read(&rows).unwrap();
+        let lines: Vec<Vec<u8>> = original
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        let forged: Vec<u8> = match tamper {
+            // Breaks unique sort order.
+            "duplicate" => original
+                .iter()
+                .copied()
+                .chain(lines[0].iter().copied())
+                .collect(),
+            // Leaves every surviving row valid and still sorted. This
+            // is a tail truncated on a newline boundary, or a restore
+            // that lost a line.
+            "delete" => lines[..lines.len() - 1].concat(),
+            // Still parses, still sorted, still the right shape: only
+            // the recorded length of one resource changed.
+            "alter" => {
+                // Only one recorded length changes: the row still
+                // parses, still sorts where it did, and still has the
+                // shape its edition demands.
+                let mut text = String::from_utf8(original.clone()).expect("rows are utf-8");
+                let at = text
+                    .find("\"byte_len\":")
+                    .expect("the fixture must carry a byte_len to alter");
+                let start = at + "\"byte_len\":".len();
+                let end = start
+                    + text[start..]
+                        .find([',', '}'])
+                        .expect("the value ends somewhere");
+                let replacement = if &text[start..end] == "1" { "2" } else { "1" };
+                text.replace_range(start..end, replacement);
+                text.into_bytes()
+            }
+            other => panic!("unknown tamper {other}"),
+        };
+        assert_ne!(
+            forged, original,
+            "{tamper}: the tamper must change the file"
+        );
+        fs::write(&rows, forged).unwrap();
+        let atlas = AtlasStore::open(estate.path(), "estate").unwrap();
+        let error = atlas.current(&member).expect_err(&format!(
+            "{tamper}: a tampered row set must not be claimed as the staged generation"
+        ));
+        assert!(
+            matches!(error, wirk_atlas::AtlasError::Generation(_)),
+            "{tamper}: {error:?}"
+        );
+    }
 }
 
 #[test]
@@ -253,6 +339,11 @@ fn forged_manifest_identity_is_refused_before_resolution() {
         .acquire(&member, "HEAD", ExtractorPolicy::default())
         .unwrap()
         .staged()
+        .map(|staged| {
+            atlas
+                .generation(&staged.id)
+                .expect("the generation just staged reads back")
+        })
         .unwrap();
     atlas.publish(&member, &generation.id).unwrap();
     drop(atlas);

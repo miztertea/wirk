@@ -5,24 +5,26 @@ use crate::extract::ExtractorPolicy;
 use crate::git;
 use crate::http_source;
 use crate::{
-    AcquisitionAttempt, AtlasError, ContentFamily, CoverageDisposition, EstateScope,
-    ExactCoordinate, FORMAT_VERSION, GenerationId, Membership, MembershipId, Relationship,
-    ResolveOutcome, ResolvedEvidence, SourceGeneration, SourceId,
+    AcquisitionAttempt, AtlasError, ContentFamily, CoverageDisposition, CoverageSummary,
+    EstateScope, ExactCoordinate, FORMAT_VERSION, GenerationId, Membership, MembershipId,
+    Relationship, ResolveOutcome, ResolvedEvidence, ResourceRecord, SourceGeneration, SourceId,
+    StagedGeneration,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use ulid::Ulid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcquireOutcome {
-    Staged(SourceGeneration),
+    Staged(StagedGeneration),
     Unavailable(String),
 }
 impl AcquireOutcome {
-    pub fn staged(self) -> Option<SourceGeneration> {
+    pub fn staged(self) -> Option<StagedGeneration> {
         match self {
             Self::Staged(g) => Some(g),
             Self::Unavailable(_) => None,
@@ -167,9 +169,10 @@ impl Drop for RequesterBinding {
 }
 
 impl JobContext {
-    pub fn detect(estate_root: &Path) -> Self {
-        let (policy, _) = wirk_core::jobs::ResourcePolicy::load(estate_root);
-        Self::with_policy(estate_root, policy)
+    pub fn detect(estate_root: &Path) -> Result<Self, AtlasError> {
+        let (policy, _) = wirk_core::jobs::ResourcePolicy::load(estate_root)
+            .map_err(|unusable| AtlasError::UnusablePolicy(unusable.to_string()))?;
+        Ok(Self::with_policy(estate_root, policy))
     }
 
     pub fn with_policy(estate_root: &Path, policy: wirk_core::jobs::ResourcePolicy) -> Self {
@@ -344,6 +347,128 @@ fn content_bin(generation_dir: &Path) -> PathBuf {
     generation_dir.join("content.bin")
 }
 
+/// One generation directory under construction, and the cleanup of a
+/// construction that never finished.
+///
+/// A generation becomes visible by exactly one act — the `rename` of
+/// this directory onto its content-addressed name — so everything
+/// written here before that is invisible to every reader, and a
+/// generation interrupted part way through (a failed extraction, a
+/// cancelled walk, a write error, a panic) must leave nothing behind.
+/// `Drop` is what guarantees that on every one of those paths without
+/// each of them having to remember: the temporary directory is removed
+/// unless [`Self::commit`] has already renamed it away.
+struct Staging {
+    dir: PathBuf,
+    /// Set only once the directory has been renamed into place, after
+    /// which there is nothing here to remove.
+    published: bool,
+}
+
+impl Staging {
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Where a generation's `ResourceRecord`s go as they are produced:
+/// straight down a buffered writer into the staging directory's own
+/// `resources.ndjson`, one line each, counted as they pass.
+///
+/// This is the whole of rulings 0401/0403's "incremental staging" for
+/// the derived index. Nothing accumulates a collection's records: the
+/// producer (`doctree::finish`, `git::resources`, `http_source::finish`)
+/// hands over one record, it is serialized, written and dropped, and
+/// what is left in memory is a [`CoverageSummary`] of six integers.
+/// `BufWriter` is the standard buffered writer, not a new mechanism, and
+/// the file is `create_new`'d and `sync_all`'d exactly as
+/// `AtlasStore::write_sync` does it for every other staged file.
+struct ResourceSink {
+    writer: BufWriter<File>,
+    coverage: CoverageSummary,
+    /// Folded over exactly the bytes written below, in the order they
+    /// are written, so the finished digest identifies the row *set* this
+    /// generation was staged with. One hasher, no copy of the rows.
+    rows: Sha256,
+    /// The first `Unavailable` resource's detail, kept because Git's
+    /// acquisition refuses a whole generation over one unreadable
+    /// object and needs to say which. One string, not a list.
+    first_unavailable: Option<String>,
+}
+
+impl ResourceSink {
+    fn create(path: &Path) -> Result<Self, AtlasError> {
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+            coverage: CoverageSummary::default(),
+            rows: rows_hasher(),
+            first_unavailable: None,
+        })
+    }
+
+    fn push(&mut self, record: ResourceRecord) -> Result<(), AtlasError> {
+        self.coverage.count(record.disposition);
+        if record.disposition == CoverageDisposition::Unavailable
+            && self.first_unavailable.is_none()
+        {
+            self.first_unavailable = Some(
+                record
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "a required source object is unavailable".into()),
+            );
+        }
+        // Serialized once, into the bytes that are both written and
+        // hashed — so the digest is of the file, not of a second
+        // rendering that might differ from it.
+        let mut line = serde_json::to_vec(&record)?;
+        line.push(b'\n');
+        self.rows.update(&line);
+        self.writer.write_all(&line)?;
+        Ok(())
+    }
+
+    /// Flushes and fsyncs the rows, then reports what streamed past.
+    fn close(self) -> Result<(CoverageSummary, String, Option<String>), AtlasError> {
+        let file = self
+            .writer
+            .into_inner()
+            .map_err(|error| AtlasError::Io(error.into_error()))?;
+        file.sync_all()?;
+        Ok((
+            self.coverage,
+            hex(&self.rows.finalize()),
+            self.first_unavailable,
+        ))
+    }
+}
+
+/// The hasher both the staging sink and `read_generation` fold
+/// `resources.ndjson`'s bytes through.
+///
+/// Domain-separated like every other identity in this crate, so a row
+/// digest can never be mistaken for a content digest, and shared by the
+/// two sides on purpose: the check is only worth anything if the bytes
+/// written and the bytes read back are folded the same way.
+fn rows_hasher() -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"wirk-atlas-resource-rows/v1");
+    hasher
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 impl AtlasStore {
     pub fn open(
         estate_root: impl AsRef<Path>,
@@ -356,7 +481,12 @@ impl AtlasStore {
         // B1: ownership BEFORE the sweep. Everything below this point
         // assumes no other live store holds this estate's atlas; that
         // assumption is only sound because the claim was taken first.
-        let (policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(estate_root);
+        // An unusable policy file refuses the store rather than opening
+        // one that runs unbounded (ruling 0402): every acquisition,
+        // publication and custody read below would otherwise proceed
+        // with whatever bounds that file set silently not in force.
+        let (policy, policy_note) = wirk_core::jobs::ResourcePolicy::load(estate_root)
+            .map_err(|unusable| AtlasError::UnusablePolicy(unusable.to_string()))?;
         if let Some(note) = &policy_note {
             eprintln!("wirk: {note}");
         }
@@ -780,8 +910,10 @@ impl AtlasStore {
             .unwrap_or_else(wirk_core::jobs::JobStop::unbounded);
         let result = (|| {
             // A document tree's identity and its resources come from
-            // the same file bytes, so both are taken from one walk and
-            // one bounded read per file (`doctree::capture`), never two.
+            // the same file bytes, and the walk folds each file's
+            // identity from a streamed read (`doctree::capture`);
+            // `doctree::finish` then reads back the one file it is
+            // extracting, against that identity.
             // Git's identity (`git ls-tree`) is cheap and structurally
             // independent of its resource walk, so that path stays two
             // operations.
@@ -804,56 +936,85 @@ impl AtlasStore {
                 kind.policy_label(),
             ));
             let destination = self.generation_dir(&id)?;
-            let generation = if destination.exists() {
-                self.read_generation(&id)?
-            } else {
-                let resources = match (kind, doctree_captured) {
-                    (AcquisitionKind::Git, _) => {
-                        git::resources(repo, &revision, &id, &policy, &self.capture_limits())?
-                    }
-                    (AcquisitionKind::DocumentTree, Some(captured)) => {
-                        doctree::finish(&id, &policy, captured, &stop)?
-                    }
-                    (AcquisitionKind::DocumentTree, None) => {
-                        unreachable!("DocumentTree always produces captured resources above")
-                    }
-                };
-                // A single unavailable document does not refuse the
-                // whole document-tree generation: every other readable
-                // document stays usable, and the unavailable one's own
-                // disposition discloses it. Git's behaviour is
-                // deliberately different and unchanged — a missing or
-                // unreadable Git object still fails the whole
-                // acquisition, because a committed object that cannot be
-                // read means the object store itself is incomplete.
-                if kind == AcquisitionKind::Git
-                    && let Some(unavailable) = resources
-                        .iter()
-                        .find(|resource| resource.disposition == CoverageDisposition::Unavailable)
-                {
-                    return Err(AtlasError::SourceBytesUnavailable(
-                        unavailable
-                            .detail
-                            .clone()
-                            .unwrap_or_else(|| "a required source object is unavailable".into()),
-                    ));
+            if destination.exists() {
+                return Ok::<_, AtlasError>(StagedGeneration::read_back(
+                    &self.read_generation(&id)?,
+                ));
+            }
+            // Opened before extraction, because extraction writes into
+            // it: every resource record goes straight down the sink
+            // into this directory's own `resources.ndjson` as it is
+            // produced, and nothing accumulates the collection's
+            // records to hand over at the end. An interrupted
+            // acquisition — a cancelled walk, a failed read, an error
+            // below — drops `staging` and takes the partial directory
+            // with it, so a half-written generation is never visible
+            // and never left behind.
+            let staging = self.begin_stage()?;
+            let mut sink = ResourceSink::create(&staging.path("resources.ndjson"))?;
+            match (kind, doctree_captured) {
+                (AcquisitionKind::Git, _) => git::resources(
+                    repo,
+                    &revision,
+                    &id,
+                    &policy,
+                    &self.capture_limits(),
+                    &mut |record| sink.push(record),
+                )?,
+                (AcquisitionKind::DocumentTree, Some(captured)) => doctree::finish(
+                    repo,
+                    &id,
+                    &policy,
+                    captured,
+                    &self.capture_limits(),
+                    &stop,
+                    &mut |record| sink.push(record),
+                )?,
+                (AcquisitionKind::DocumentTree, None) => {
+                    unreachable!("DocumentTree always produces captured resources above")
                 }
-                let generation = SourceGeneration {
-                    id: id.clone(),
-                    source: membership.source.clone(),
-                    revision,
-                    content,
-                    extractor_set: policy.id().into(),
-                    acquisition_policy: kind.policy_label().into(),
-                    locator: membership.locator.clone(),
-                    requested_ref: requested_ref.into(),
-                    resources,
-                    origin: None,
-                };
-                self.stage(&generation, None)?;
-                generation
+            }
+            let (coverage, rows_digest, first_unavailable) = sink.close()?;
+            // A single unavailable document does not refuse the
+            // whole document-tree generation: every other readable
+            // document stays usable, and the unavailable one's own
+            // disposition discloses it. Git's behaviour is
+            // deliberately different and unchanged — a missing or
+            // unreadable Git object still fails the whole
+            // acquisition, because a committed object that cannot be
+            // read means the object store itself is incomplete.
+            if kind == AcquisitionKind::Git
+                && let Some(detail) = first_unavailable
+            {
+                return Err(AtlasError::SourceBytesUnavailable(detail));
+            }
+            let generation = SourceGeneration {
+                id: id.clone(),
+                source: membership.source.clone(),
+                revision,
+                content,
+                extractor_set: policy.id().into(),
+                acquisition_policy: kind.policy_label().into(),
+                locator: membership.locator.clone(),
+                requested_ref: requested_ref.into(),
+                resources: Vec::new(),
+                rows: Some(crate::ResourceRows {
+                    digest: rows_digest,
+                    count: coverage.total,
+                }),
+                origin: None,
             };
-            Ok::<_, AtlasError>(generation)
+            self.commit_stage(staging, &generation)?;
+            Ok::<_, AtlasError>(StagedGeneration {
+                id: generation.id,
+                source: generation.source,
+                revision: generation.revision,
+                content: generation.content,
+                extractor_set: generation.extractor_set,
+                acquisition_policy: generation.acquisition_policy,
+                origin: None,
+                coverage,
+            })
         })();
         match result {
             Ok(generation) => {
@@ -994,42 +1155,69 @@ impl AtlasStore {
             &self.jobs,
             &membership.alias,
         )
-        .and_then(|(revision, content, origin, bytes)| {
+        .and_then(|fetched| {
             let id = GenerationId(ExtractorPolicy::generation_id(
                 &membership.source.0,
-                &revision,
-                &content,
+                &fetched.revision,
+                &fetched.content,
                 policy.id(),
                 http_source::ACQUISITION_POLICY,
             ));
             let destination = self.generation_dir(&id)?;
-            let generation = if destination.exists() {
-                self.read_generation(&id)?
-            } else {
-                let resource = http_source::finish(
-                    &id,
-                    &policy,
-                    &membership.locator,
-                    &revision,
-                    &bytes,
-                    origin.content_type.as_deref(),
-                );
-                let generation = SourceGeneration {
-                    id: id.clone(),
-                    source: membership.source.clone(),
-                    revision,
-                    content,
-                    extractor_set: policy.id().into(),
-                    acquisition_policy: http_source::ACQUISITION_POLICY.into(),
-                    locator: membership.locator.clone(),
-                    requested_ref: requested_ref.into(),
-                    resources: vec![resource],
-                    origin: Some(Box::new(origin)),
-                };
-                self.stage(&generation, Some(&bytes))?;
-                generation
+            if destination.exists() {
+                return Ok::<_, AtlasError>(StagedGeneration::read_back(
+                    &self.read_generation(&id)?,
+                ));
+            }
+            let staging = self.begin_stage()?;
+            // Streamed from where `curl` wrote it into where this
+            // generation keeps it. The response is never a second
+            // allocation on the way through.
+            self.stage_content_from(&staging, fetched.body())?;
+            let mut sink = ResourceSink::create(&staging.path("resources.ndjson"))?;
+            // The one place the whole body genuinely has to be resident:
+            // both `anydoc::to_markdown_bytes` and the text unitizer
+            // take `&[u8]`, so extraction of one document costs that
+            // document. Read here, extracted, and dropped before the
+            // generation is published.
+            let bytes = fs::read(fetched.body())?;
+            sink.push(http_source::finish(
+                &id,
+                &policy,
+                &membership.locator,
+                &fetched.revision,
+                &bytes,
+                fetched.origin.content_type.as_deref(),
+            ))?;
+            drop(bytes);
+            let (coverage, rows_digest, _) = sink.close()?;
+            let generation = SourceGeneration {
+                id: id.clone(),
+                source: membership.source.clone(),
+                revision: fetched.revision.clone(),
+                content: fetched.content.clone(),
+                extractor_set: policy.id().into(),
+                acquisition_policy: http_source::ACQUISITION_POLICY.into(),
+                locator: membership.locator.clone(),
+                requested_ref: requested_ref.into(),
+                resources: Vec::new(),
+                rows: Some(crate::ResourceRows {
+                    digest: rows_digest,
+                    count: coverage.total,
+                }),
+                origin: Some(Box::new(fetched.origin.clone())),
             };
-            Ok::<_, AtlasError>(generation)
+            self.commit_stage(staging, &generation)?;
+            Ok::<_, AtlasError>(StagedGeneration {
+                id: generation.id,
+                source: generation.source,
+                revision: generation.revision,
+                content: generation.content,
+                extractor_set: generation.extractor_set,
+                acquisition_policy: generation.acquisition_policy,
+                origin: generation.origin,
+                coverage,
+            })
         });
         match result {
             Ok(generation) => {
@@ -1227,8 +1415,29 @@ impl AtlasStore {
                     .into(),
             ));
         }
-        let current = doctree::finish(&staged.id, &policy, captured, stop)?;
-        if current != staged.resources {
+        // Compared one record at a time against the staged list, as each
+        // is re-derived, so revalidation costs one document's extraction
+        // rather than a second whole copy of the collection's index.
+        let mut next = staged.resources.iter();
+        let mut matched = 0usize;
+        doctree::finish(
+            root,
+            &staged.id,
+            &policy,
+            captured,
+            &limits,
+            stop,
+            &mut |record| match next.next() {
+                Some(expected) if *expected == record => {
+                    matched += 1;
+                    Ok(())
+                }
+                _ => Err(AtlasError::Generation(
+                    "document tree resources do not exactly match the staged generation".into(),
+                )),
+            },
+        )?;
+        if matched != staged.resources.len() {
             return Err(AtlasError::Generation(
                 "document tree resources do not exactly match the staged generation".into(),
             ));
@@ -1526,21 +1735,26 @@ impl AtlasStore {
     /// `AssetId`, the selector the document model already uses, rather
     /// than a second coordinate vocabulary invented for assets.
     ///
-    /// `max_bytes` bounds what this will hand back: an asset larger than
-    /// the caller's own limit is refused by name and size rather than
-    /// read into a reply. `Ok(None)` means this document defines no asset
-    /// with that id — never some other asset's bytes.
+    /// `max_bytes`, where the caller has one, bounds what this will hand
+    /// back: an asset larger than that limit is refused by name and size
+    /// rather than read into a reply. `None` is no such limit, and the
+    /// asset the caller asked for by id is returned — the inventory it
+    /// chose that id from already disclosed the asset's length and
+    /// digest, so the size is something the caller decided about rather
+    /// than something this refuses on its behalf. `Ok(None)` means this
+    /// document defines no asset with that id — never some other asset's
+    /// bytes.
     pub fn document_asset(
         &self,
         membership: &Membership,
         coordinate: &ExactCoordinate,
         id: usize,
-        max_bytes: u64,
+        max_bytes: Option<u64>,
     ) -> Result<Option<crate::document::ResolvedAsset>, AtlasError> {
         let (edition, bytes) = self.source_bytes_for(membership, coordinate)?;
         let found = document::asset(edition, &coordinate.path, &bytes, id)
             .map_err(AtlasError::SourceBytesUnavailable)?;
-        if let Some(found) = &found
+        if let (Some(found), Some(max_bytes)) = (&found, max_bytes)
             && found.descriptor.byte_len > max_bytes
         {
             return Err(AtlasError::InvalidRequest(format!(
@@ -1629,37 +1843,74 @@ impl AtlasStore {
             bytes: bytes[coordinate.byte_start as usize..coordinate.byte_end as usize].to_vec(),
         }))
     }
-    /// `raw` is `Some` only for an `http-source-policy/v1` generation:
-    /// the fetched response bytes, persisted once as `content.bin`
-    /// beside `manifest.json`/`resources.ndjson` — this policy's whole
-    /// working cache, immutable and removable through the same
-    /// generation-directory lifecycle every other policy's already is
-    /// (`http_source`'s own top-level doc). Every other policy reads its
-    /// bytes live from its own source and passes `None`.
-    fn stage(&self, generation: &SourceGeneration, raw: Option<&[u8]>) -> Result<(), AtlasError> {
-        let temp = self.root.join(format!(".tmp-{}", Ulid::generate()));
-        fs::create_dir(&temp)?;
+    /// Opens a generation directory under construction.
+    ///
+    /// Nothing about the generation has to be known yet: the identity is
+    /// content-addressed and already settled by the time an acquisition
+    /// gets here, but the resource rows are written *into* this
+    /// directory as they are produced, so it must exist before
+    /// extraction starts rather than after it finishes.
+    fn begin_stage(&self) -> Result<Staging, AtlasError> {
+        let dir = self.root.join(format!(".tmp-{}", Ulid::generate()));
+        fs::create_dir(&dir)?;
+        Ok(Staging {
+            dir,
+            published: false,
+        })
+    }
+
+    /// Copies an already-staged response body into this generation's own
+    /// `content.bin`, through one reused buffer rather than one
+    /// allocation the size of the response.
+    ///
+    /// `std::io::copy` over a `BufWriter` is the standard reader/writer
+    /// pair (R3), and it is the same shape
+    /// `wirk_core::outputs::copy_hashing` already uses for artifact
+    /// custody: whatever the response's size, what is resident is the
+    /// copy buffer.
+    fn stage_content_from(&self, staging: &Staging, body: &Path) -> Result<(), AtlasError> {
+        let mut source = File::open(body)?;
+        let destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(content_bin(&staging.dir))?;
+        let mut writer = BufWriter::new(destination);
+        std::io::copy(&mut source, &mut writer)?;
+        let destination = writer
+            .into_inner()
+            .map_err(|error| AtlasError::Io(error.into_error()))?;
+        destination.sync_all()?;
+        checkpoint("stage-content-synced");
+        Ok(())
+    }
+
+    /// Publishes a staged generation directory: writes its manifest,
+    /// fsyncs, and makes the whole directory visible in one `rename`.
+    ///
+    /// `manifest.json` carries the generation's identity and **not** its
+    /// resource list (see `SourceGeneration::resources`): the rows are
+    /// already in `resources.ndjson`, written one at a time by the sink
+    /// that produced them. Atomicity is unchanged — one rename, then the
+    /// parent directory fsync — and so is the ordering: nothing is
+    /// visible until every file inside is on disk.
+    fn commit_stage(
+        &self,
+        mut staging: Staging,
+        generation: &SourceGeneration,
+    ) -> Result<(), AtlasError> {
         self.write_sync(
-            &temp.join("manifest.json"),
+            &staging.path("manifest.json"),
             &serde_json::to_vec_pretty(generation)?,
         )?;
         checkpoint("stage-manifest-synced");
-        let mut resources = Vec::new();
-        for resource in &generation.resources {
-            resources.extend_from_slice(&serde_json::to_vec(resource)?);
-            resources.push(b'\n');
-        }
-        self.write_sync(&temp.join("resources.ndjson"), &resources)?;
-        if let Some(bytes) = raw {
-            self.write_sync(&content_bin(&temp), bytes)?;
-            checkpoint("stage-content-synced");
-        }
-        File::open(&temp)?.sync_all()?;
+        File::open(&staging.dir)?.sync_all()?;
         checkpoint("stage-directory-synced");
-        fs::rename(&temp, self.generation_dir(&generation.id)?)?;
+        fs::rename(&staging.dir, self.generation_dir(&generation.id)?)?;
+        staging.published = true;
         File::open(self.root.join("generations"))?.sync_all()?;
         Ok(())
     }
+
     fn persist_catalog(&self, catalog: &Catalog) -> Result<(), AtlasError> {
         let temporary = self.root.join(format!(".tmp-catalog-{}", Ulid::generate()));
         self.write_sync(&temporary, &serde_json::to_vec_pretty(catalog)?)?;
@@ -1751,25 +2002,68 @@ impl AtlasStore {
         // variants and still abort their callers.
         let bytes = fs::read(&path)
             .map_err(|error| AtlasError::Generation(format!("manifest is unreadable: {error}")))?;
-        let g: SourceGeneration = serde_json::from_slice(&bytes)
+        let mut g: SourceGeneration = serde_json::from_slice(&bytes)
             .map_err(|error| AtlasError::Generation(format!("manifest is malformed: {error}")))?;
         if g.id != *id {
             return Err(AtlasError::Generation("forged manifest identifier".into()));
         }
-        self.validate_generation(&g, id)?;
+        // `resources.ndjson` holds the generation's resource list, and
+        // `manifest.json` no longer carries a second copy of it (see
+        // `SourceGeneration::resources`). What the manifest carries
+        // instead is the row set's own identity, and it is checked here
+        // *before* the rows are trusted: per-row shape, unit identity
+        // and sort order — which is all `validate_generation` can see —
+        // stay satisfied when a whole valid row is deleted, so without
+        // this a truncated file would read back as a smaller generation
+        // and say nothing.
         let resource_path = generation_dir.join("resources.ndjson");
-        let serialized = fs::read_to_string(resource_path)
+        let serialized = fs::read(resource_path)
             .map_err(|_| AtlasError::Generation("missing immutable resource manifest".into()))?;
+        let text = std::str::from_utf8(&serialized).map_err(|error| {
+            AtlasError::Generation(format!("resource manifest is not valid UTF-8: {error}"))
+        })?;
         let rows: Result<Vec<crate::ResourceRecord>, _> =
-            serialized.lines().map(serde_json::from_str).collect();
+            text.lines().map(serde_json::from_str).collect();
         let rows = rows.map_err(|error| {
             AtlasError::Generation(format!("resource manifest row is malformed: {error}"))
         })?;
-        if rows != g.resources {
-            return Err(AtlasError::Generation(
-                "resource manifest is inconsistent with generation".into(),
-            ));
+        match g.rows.take() {
+            Some(staged) => {
+                let mut hasher = rows_hasher();
+                hasher.update(&serialized);
+                let digest = hex(&hasher.finalize());
+                if digest != staged.digest || rows.len() as u64 != staged.count {
+                    return Err(AtlasError::Generation(format!(
+                        "resource manifest is not the row set this generation staged ({} row(s) \
+                         staged, {} read back); it has been truncated, edited or partially \
+                         restored",
+                        staged.count,
+                        rows.len()
+                    )));
+                }
+                g.rows = Some(staged);
+            }
+            // A generation staged before the row digest existed carries
+            // its own resource array in the manifest, which is exactly
+            // the comparison this replaced. Checked against that rather
+            // than trusted, and rather than migrated.
+            None if !g.resources.is_empty() => {
+                if rows != g.resources {
+                    return Err(AtlasError::Generation(
+                        "resource manifest is inconsistent with generation".into(),
+                    ));
+                }
+            }
+            None => {
+                return Err(AtlasError::Generation(
+                    "generation carries no record of the resource rows it was staged with, so \
+                     what is on disk cannot be shown to be complete"
+                        .into(),
+                ));
+            }
         }
+        g.resources = rows;
+        self.validate_generation(&g, id)?;
         Ok(g)
     }
     fn validate_generation(

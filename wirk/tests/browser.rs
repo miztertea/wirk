@@ -1505,3 +1505,63 @@ fn a_related_reader_is_admitted_to_the_work_and_still_refused_its_sources() {
     );
     stop_wirkd(&estate, daemon);
 }
+
+// ---- 9. an attempt that never launched is not presented as running -----
+
+/// **Ruling 0395.** A Work canceled before anything launched leaves a
+/// Run in `Open` — the state a Run is in from the moment it is opened.
+/// The progress table used to render every `Open` Run as "running or
+/// waiting", so the page told a reader that a canceled Work had an
+/// attempt in flight. It never did: no launch was requested, no pane was
+/// created, nothing ran.
+///
+/// Watched red at `afd0cc0c`: this page said `running or waiting` for
+/// that attempt, beside a headline that said the Work was canceled. The
+/// two facts are read from the same journal, and they disagreed.
+///
+/// What it must say instead is what the journal actually carries —
+/// `launched` and `launch_requested` are both false — rendered as a
+/// person would say it.
+#[test]
+fn a_canceled_work_s_never_launched_attempt_is_not_shown_as_running() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().to_path_buf();
+    let (daemon, _pointer) = start_wirkd(&estate);
+    let work = actor_work(
+        &estate,
+        "smoke",
+        "# Draft the client briefing\n\nTwo sources, prose, no code.",
+    );
+
+    let canceled = wirk_cli()
+        .args(["work", "cancel", "--estate"])
+        .arg(&estate)
+        .args(["--work", &work, "--reason", "scope narrowed"])
+        .output()
+        .expect("work cancel runs");
+    assert!(
+        canceled.status.success(),
+        "cancel failed: {}{}",
+        String::from_utf8_lossy(&canceled.stdout),
+        String::from_utf8_lossy(&canceled.stderr)
+    );
+
+    let out: PathBuf = dir.path().join("canceled.html");
+    let (ok, html) = view(&estate, &out, &["--work", &work, "--admin"]);
+    assert!(ok, "browser view failed: {html}");
+
+    assert!(
+        html.contains("This Work is canceled"),
+        "the page does not say the Work is canceled: {html}"
+    );
+    assert!(
+        !html.contains("running or waiting"),
+        "a Work canceled before any launch has nothing running or waiting: {html}"
+    );
+    assert!(
+        html.contains("opened, never launched"),
+        "the page does not say what actually happened to the attempt: {html}"
+    );
+
+    stop_wirkd(&estate, daemon);
+}
