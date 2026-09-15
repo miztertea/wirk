@@ -7,8 +7,12 @@
 # manifest lives at the repository root, so `plugin/*.sh` resolves
 # there and `$HERDR_PLUGIN_ROOT` is the repository root.
 #
-# Binary resolution, in every entry below: `WIRK_BIN_PATH` if set, else
-# `${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk`.
+# Binary resolution happens in exactly one place, `plugin/wirk-bin.sh`,
+# which every entry below sources: an explicit `WIRK_BIN_PATH`, else the
+# release binary this manifest's own `[[build]]` step produces, else a
+# `wirk` on `PATH`, else a local debug build. When none of those exist
+# the same helper prints what to do about it, so a missing binary reads
+# the same whichever surface hit it.
 
 id = "wirk"
 name = "Wirk"
@@ -24,6 +28,19 @@ version = "0.1.0"
 min_herdr_version = "0.8.2"
 description = "Durable work engine: talk to Wirk, watch and claim Work"
 platforms = ["linux"]
+
+# How an installation gets a runnable `wirk` of its own.
+#
+# Herdr runs `[[build]]` once inside the fresh checkout during
+# `herdr plugin install`, after the operator has confirmed it -- and
+# never on `herdr plugin link`, so a developer's linked checkout is
+# still built by hand. wirk publishes no prebuilt binaries, so this
+# compiles from source with cargo and needs a Rust toolchain;
+# `plugin/build.sh` says so before it starts and stops with that
+# explanation when cargo is absent, rather than registering a plugin
+# whose every action would fail later.
+[[build]]
+command = ["bash", "plugin/build.sh"]
 
 [[startup]]
 command = ["bash", "plugin/startup.sh"]
@@ -46,21 +63,49 @@ title = "Talk to Wirk"
 contexts = ["workspace"]
 command = ["bash", "plugin/assistant.sh"]
 
+# Choosing this installation's estate and harness, without editing a
+# file by hand or knowing where that file is. A plugin action takes no
+# arguments and has no terminal, so `plugin/configure.sh` opens a pane
+# of its own and asks there; the harness list it offers is Herdr's own
+# structured one, read over the session socket rather than scraped out
+# of help text.
+[[actions]]
+id = "configure"
+title = "Configure Wirk"
+contexts = ["workspace"]
+command = ["bash", "plugin/configure.sh"]
+
 [[actions]]
 id = "claim"
 title = "File a claim"
 contexts = ["pane"]
 command = ["bash", "-c", '''
-WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
+set -eu
+. "$HERDR_PLUGIN_ROOT/plugin/wirk-bin.sh"
+WIRK_BIN="$(wirk_resolve_bin)" || { wirk_bin_explain_missing; exit 1; }
 exec "$WIRK_BIN" claim
 ''']
+
+# A browser view of the Work whose pane this action was chosen from:
+# what it is for, how far it has got, the World it was given, the
+# evidence its Claims rest on, and a button that focuses its pane back
+# here. `plugin/browser.sh` runs the bridge and points the operator's
+# already-configured browser at it; the server is loopback-only and no
+# URL scheme is registered.
+[[actions]]
+id = "browser"
+title = "Browser view"
+contexts = ["pane"]
+command = ["bash", "plugin/browser.sh"]
 
 [[actions]]
 id = "wirkd-status"
 title = "wirkd status"
 contexts = ["workspace"]
 command = ["bash", "-c", '''
-WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
+set -eu
+. "$HERDR_PLUGIN_ROOT/plugin/wirk-bin.sh"
+WIRK_BIN="$(wirk_resolve_bin)" || { wirk_bin_explain_missing; exit 1; }
 ESTATE="$(cat "$HERDR_PLUGIN_CONFIG_DIR/estate" 2>/dev/null || true)"
 if [ -z "$ESTATE" ]; then
     echo "wirk wirkd-status: no estate configured"
@@ -85,7 +130,9 @@ id = "status"
 title = "Work status"
 placement = "split"
 command = ["bash", "-c", '''
-WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
+set -eu
+. "$HERDR_PLUGIN_ROOT/plugin/wirk-bin.sh"
+WIRK_BIN="$(wirk_resolve_bin)" || { wirk_bin_explain_missing; exit 1; }
 ESTATE="$(cat "$HERDR_PLUGIN_CONFIG_DIR/estate" 2>/dev/null || true)"
 if [ -z "$ESTATE" ]; then
     echo "wirk status: no estate configured"

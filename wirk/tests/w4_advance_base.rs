@@ -31,6 +31,38 @@ fn wirk_bin() -> &'static str {
     env!("CARGO_BIN_EXE_wirk")
 }
 
+/// `wirk run-deterministic --executor child` with the `wirk` binary
+/// under test on `PATH`.
+///
+/// `ChildExecutor::launch` passes its own environment through to the
+/// deterministic child untouched apart from the injected triple, so a
+/// Route whose command calls `wirk output dir` — the public command a
+/// real deterministic stage uses to find where to write — needs that
+/// binary reachable by name. `CARGO_BIN_EXE_wirk`'s own directory is
+/// prepended rather than replacing `PATH`, so `sh` and everything else
+/// the command needs still resolve.
+fn run_deterministic_with_wirk_on_path(estate: &Path, work_id: &str) -> std::process::Output {
+    let bin_dir = Path::new(wirk_bin())
+        .parent()
+        .expect("the test binary has a directory")
+        .to_path_buf();
+    let path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut dirs = vec![bin_dir];
+            dirs.extend(std::env::split_paths(&existing));
+            std::env::join_paths(dirs).expect("PATH joins")
+        }
+        None => bin_dir.into_os_string(),
+    };
+    wirk_cli()
+        .args(["run-deterministic", "--estate"])
+        .arg(estate)
+        .args(["--work", work_id, "--executor", "child"])
+        .env("PATH", path)
+        .output()
+        .expect("run-deterministic runs")
+}
+
 fn wait_for_wirkd(estate: &Path) -> WirkdPointer {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -513,12 +545,7 @@ fn deterministic_waypoint_after_a_committing_actor_validates() {
     }
 
     // verify's own command writes only its own declared output.
-    let run_det = wirk_cli()
-        .args(["run-deterministic", "--estate"])
-        .arg(estate)
-        .args(["--work", &work_id, "--executor", "child"])
-        .output()
-        .expect("run-deterministic runs");
+    let run_det = run_deterministic_with_wirk_on_path(estate, &work_id);
     assert!(
         run_det.status.success(),
         "run-deterministic (verify) failed: {}",
@@ -533,6 +560,207 @@ fn deterministic_waypoint_after_a_committing_actor_validates() {
          completed, got: {final_status}"
     );
     let _ = run3;
+
+    stop_wirkd(estate, wirkd_child);
+}
+
+/// `wirk output dir`/`list` used to always answer with this Run's
+/// managed staging area, even for a Deterministic Waypoint
+/// whose own bare Claim (`ContractNames::Checkout`, `main.rs`) reaches
+/// into its checkout instead — so the guidance sent an actor to write
+/// where its own automatic Claim would never look. **Red before this
+/// correction**: `verify`'s `dir` printed a managed-staging path under
+/// `works/<work>/outputs/staging/<run>`, not the shared worktree
+/// `det.cwd` names, and a `verify.log` written there was invisible to
+/// `verify`'s own bare Claim.
+///
+/// Reuses the exact three-Waypoint chain
+/// `deterministic_waypoint_after_a_committing_actor_validates` drives up
+/// to `verify`'s reservation, then exercises the guidance and the real
+/// bare Claim it must agree with, against the real `wirkd` and a real
+/// child process.
+#[test]
+fn deterministic_output_guidance_names_the_checkout_not_managed_staging() {
+    let (repo_dir, base_sha) = scratch_repo();
+    let repo = repo_dir.path();
+    let estate_dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = estate_dir.path();
+    let (wirkd_child, pointer) = start_wirkd(estate);
+
+    let route = fixture(estate, "w4_orient_build_verify.json");
+    let (work_id, run1) = submit_actor(estate, &route, repo, &base_sha);
+    let worktree = create_worktree_for_run(
+        estate,
+        &pointer.socket,
+        &work_id,
+        &run1,
+        "w4-orient-build-verify/orient",
+    );
+    fs::write(worktree.join("orient.md"), b"# orient\n").expect("write orient.md");
+    let (code1, stdout1) = claim(estate, &work_id, &run1, &[("orient.md", "orient.md")]);
+    assert_eq!(code1, Some(0), "orient claim stdout: {stdout1}");
+
+    let after_orient = status(&pointer.socket, &work_id);
+    let run2 = after_orient["run_id"]
+        .as_str()
+        .expect("run_id for build")
+        .to_string();
+    fs::write(worktree.join("src/lib.rs"), b"// lib\n// edited by build\n")
+        .expect("edit src/lib.rs");
+    git_commit_all(&worktree, "build: edit src/lib.rs");
+    fs::write(worktree.join("build.md"), b"# build\n").expect("write build.md");
+    let (code2, stdout2) = claim(estate, &work_id, &run2, &[("build.md", "build.md")]);
+    assert_eq!(code2, Some(0), "build claim stdout: {stdout2}");
+
+    let after_build = status(&pointer.socket, &work_id);
+    assert_eq!(
+        after_build["current_waypoint"].as_str(),
+        Some("w4-orient-build-verify/verify")
+    );
+    let run3 = after_build["run_id"]
+        .as_str()
+        .expect("run_id for verify")
+        .to_string();
+
+    // The decisive check: `wirk output dir`, run exactly as `verify`'s
+    // own actor runs it (the injected triple, no argument), must name
+    // the same directory `verify`'s own reserved World's `cwd` names —
+    // the shared worktree — never managed staging.
+    let dir_out = wirk_cli()
+        .args(["output", "dir"])
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", &run3)
+        .output()
+        .expect("wirk output dir runs");
+    assert!(
+        dir_out.status.success(),
+        "wirk output dir: {}",
+        String::from_utf8_lossy(&dir_out.stderr)
+    );
+    let advertised = PathBuf::from(String::from_utf8_lossy(&dir_out.stdout).trim().to_string());
+    assert_eq!(
+        advertised, worktree,
+        "a Deterministic Waypoint's advertised output destination must be its own checkout, \
+         not managed staging"
+    );
+
+    // `wirk output list --json` must agree: the declared `verify.log`
+    // resolves to that same checkout path, and is not yet staged.
+    let list_out = wirk_cli()
+        .args(["output", "list", "--json"])
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", &run3)
+        .output()
+        .expect("wirk output list runs");
+    assert!(
+        list_out.status.success(),
+        "wirk output list --json: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let listing: serde_json::Value =
+        serde_json::from_slice(&list_out.stdout).expect("wirk output list emits json");
+    assert_eq!(listing["kind"].as_str(), Some("deterministic"));
+    assert_eq!(
+        listing["staging"].as_str(),
+        Some(worktree.display().to_string().as_str()),
+        "the reported destination must be the checkout: {listing:#}"
+    );
+    let outputs = listing["outputs"].as_array().expect("outputs array");
+    let verify_log = outputs
+        .iter()
+        .find(|o| o["name"].as_str() == Some("verify.log"))
+        .expect("verify.log is declared");
+    assert_eq!(verify_log["addressable"].as_bool(), Some(true));
+    assert_eq!(
+        verify_log["path"].as_str(),
+        Some(worktree.join("verify.log").display().to_string().as_str())
+    );
+    assert_eq!(
+        verify_log["staged"].as_bool(),
+        Some(false),
+        "verify has not run yet"
+    );
+
+    // The human guidance `list` prints has to name the addressing this
+    // Run's own Claim actually resolves through
+    // (`ContractNames::Checkout` for a Deterministic Run), not
+    // `--output NAME`, which reaches into managed staging and would
+    // find nothing here.
+    let text_out = wirk_cli()
+        .args(["output", "list"])
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", &run3)
+        .output()
+        .expect("wirk output list runs");
+    let text = String::from_utf8_lossy(&text_out.stdout).into_owned();
+    assert!(
+        text.contains(&format!("execution {}", worktree.display())),
+        "the destination line must name this Run's own execution directory: {text}"
+    );
+    assert!(
+        !text.contains("--output NAME"),
+        "a Deterministic Run must not be told to claim through managed-output addressing: {text}"
+    );
+    assert!(
+        text.contains("--artifact NAME=NAME"),
+        "the by-hand form must be the checkout addressing its own Claim uses: {text}"
+    );
+
+    // The same surface for a Run the Work has already moved past: the
+    // first (Actor) Run still answers with *its own* bound addressing —
+    // managed staging — rather than being re-pointed at whatever
+    // Waypoint the Work has since reached. `current` is *not* the
+    // discriminator here: it reports whether this Run is the latest
+    // attempt of its **own** Waypoint (`latest_run_for_waypoint`), and
+    // `orient` was never retried, so it stays `true` while the Work
+    // itself is two Waypoints further on.
+    let superseded = wirk_cli()
+        .args(["output", "list", "--json"])
+        .env("WIRK_ESTATE_ROOT", estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", &run1)
+        .output()
+        .expect("wirk output list runs");
+    let superseded: serde_json::Value =
+        serde_json::from_slice(&superseded.stdout).expect("wirk output list emits json");
+    assert_eq!(superseded["kind"].as_str(), Some("actor"));
+    assert_eq!(superseded["current"].as_bool(), Some(true));
+    assert_ne!(
+        superseded["staging"].as_str(),
+        Some(worktree.display().to_string().as_str()),
+        "a superseded Actor Run keeps its managed staging, not the current Waypoint's \
+         execution directory: {superseded:#}"
+    );
+
+    // Now `verify`'s own real child command runs. It resolves its
+    // destination the way a real deterministic stage does — `wirk
+    // output dir` inside the child itself, the public command this
+    // guidance is — writes its declared output there, exits, and its
+    // executor files its Claim automatically
+    // (`ChildExecutor::file_claim`) against that same directory. That
+    // agreement, end to end through the advertised command, is what
+    // this correction is for.
+    let run_det = run_deterministic_with_wirk_on_path(estate, &work_id);
+    assert!(
+        run_det.status.success(),
+        "run-deterministic (verify) failed: {}",
+        String::from_utf8_lossy(&run_det.stderr)
+    );
+    assert!(
+        worktree.join("verify.log").exists(),
+        "verify's own child must have written into the directory `wirk output dir` named it"
+    );
+
+    let final_status = status(&pointer.socket, &work_id);
+    assert_eq!(
+        final_status["state"].as_str(),
+        Some("completed"),
+        "verify's own automatic Claim must Validate against the guidance's own destination: \
+         {final_status:#}"
+    );
 
     stop_wirkd(estate, wirkd_child);
 }
@@ -726,6 +954,43 @@ fn deterministic_retry_carries_the_branch_tip_as_base() {
         }
         World::Actor(_) => panic!("expected a Deterministic World"),
     }
+
+    // The superseded Run is still answerable on its own terms. `wirk
+    // output` resolves a Deterministic destination through this Run's
+    // own bound reservation, so a Run a retry has replaced is answered
+    // rather than refused, and is told it is no longer the current one.
+    // This retry reserves the same `cwd` for both attempts (this Work's
+    // own worktree), so the path alone does not distinguish the bound
+    // reservation from the latest one — what it pins is that the
+    // superseded Run keeps an answer at all, and that its currentness is
+    // reported truthfully.
+    let superseded = wirk_cli()
+        .args(["output", "list", "--json"])
+        .env("WIRK_ESTATE_ROOT", repo)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", &run_id)
+        .output()
+        .expect("wirk output list runs");
+    assert!(
+        superseded.status.success(),
+        "a superseded Deterministic Run still has its own bound destination: {}",
+        String::from_utf8_lossy(&superseded.stderr)
+    );
+    let superseded: serde_json::Value =
+        serde_json::from_slice(&superseded.stdout).expect("wirk output list emits json");
+    assert_eq!(superseded["kind"].as_str(), Some("deterministic"));
+    assert_eq!(superseded["current"].as_bool(), Some(false));
+    assert_eq!(
+        superseded["staging"].as_str(),
+        Some(
+            repo.join("worktrees")
+                .join(&work_id)
+                .display()
+                .to_string()
+                .as_str()
+        ),
+        "the destination is the one this Run's own reservation names: {superseded:#}"
+    );
 
     stop_wirkd(repo, wirkd_child);
 }

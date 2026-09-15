@@ -273,6 +273,7 @@ fn request_params_by_method() -> Vec<(&'static str, Value)> {
 
     vec![
         ("ping", json!({})),
+        ("server.agent_manifests", json!({})),
         (
             "workspace.create",
             wirk_herdr::socket::params::workspace_create(&CreateWorkspace {

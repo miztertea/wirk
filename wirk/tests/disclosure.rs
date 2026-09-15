@@ -3367,6 +3367,24 @@ fn status_answers_named_scopes_and_never_falls_through_to_the_unscoped_one() {
         scoped["state"], "active",
         "the Work's own state is journal identity and survives: {scoped}"
     );
+    // The Route-authored intent of the Waypoint this Work is on is
+    // content, not journal identity: it reaches an admitted reader
+    // inside the compiled `world` (an Actor World *is* repository,
+    // base, boundary and intent), and the same Waypoint definition's
+    // `selection` is withheld beside it. A status field carrying that
+    // same authored text at the top level, outside every narrowing
+    // rule, would publish to a narrowed requester exactly what the
+    // withheld half is withholding — so no part of this reply may
+    // carry it.
+    let authored_intent = "run the actor whose launch metadata is under test";
+    let mut scoped_strings = Vec::new();
+    all_strings(&scoped, &mut scoped_strings);
+    assert!(
+        !scoped_strings
+            .iter()
+            .any(|text| text.contains(authored_intent)),
+        "a narrowed requester must not be handed this Waypoint's authored intent: {scoped}"
+    );
 
     // 2. The parent asks about itself: fully admitted, nothing withheld.
     let (code, own) = status_wire(socket, &family.parent.work_id, Some(&family.parent.work_id));
@@ -3388,6 +3406,11 @@ fn status_answers_named_scopes_and_never_falls_through_to_the_unscoped_one() {
     assert!(
         strings.iter().any(|text| text.contains(&destination)),
         "the named operator surface still returns the attempt destination: {admin}"
+    );
+    assert!(
+        strings.iter().any(|text| text.contains(authored_intent)),
+        "the administrative read still carries the authored intent the narrowed one may not, so \
+         the assertion above is about narrowing and not about an absent fixture: {admin}"
     );
 
     // 4. An unrelated Work is off the requester's lineage entirely, and

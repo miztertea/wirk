@@ -463,16 +463,16 @@ fn a_head_that_no_longer_descends_from_the_reserved_base_is_refused() {
     stop_wirkd(&m.estate);
 }
 
-/// **Adverse control: the wrong destination.** The same estate reached
-/// by a different path computes a different reusable checkout than the
-/// one this Run is bound to. The binding is the reserved
-/// `worktree_path`, not "whatever this invocation computed".
+/// A symlink alias names the same bound checkout as the canonical
+/// estate path, so the run must reach the same deliberately
+/// unavailable Herdr endpoint the canonical spelling does, not a
+/// foreign-checkout refusal.
 #[test]
-fn a_reusable_checkout_at_a_different_path_than_the_binding_is_refused() {
+fn a_reusable_checkout_reached_through_a_symlink_alias_is_not_refused_as_foreign() {
     let m = materialize();
     // A second name for the very same estate directory. Everything
-    // about the Run is unchanged; only the path this invocation
-    // computes its worktree from differs.
+    // about the Run is unchanged, including the canonical path this
+    // invocation computes its worktree from.
     let alias_parent = tempfile::tempdir().expect("alias tempdir");
     let alias = alias_parent.path().join("estate-by-another-name");
     #[cfg(unix)]
@@ -480,13 +480,18 @@ fn a_reusable_checkout_at_a_different_path_than_the_binding_is_refused() {
 
     let (stdout, stderr) = wirk_run(&alias, &m.work_id);
     assert!(
-        stderr.contains(REFUSAL),
-        "a computed checkout that is not this Run's own bound one must be refused: \
-         {stderr} / {stdout}"
+        !stderr.contains(REFUSAL),
+        "a symlink alias of this Run's own estate canonicalizes to the same reusable checkout \
+         and must not be refused as a foreign one: {stderr} / {stdout}"
+    );
+    assert!(
+        stderr.contains("no-such-herdr.sock"),
+        "with the same checkout reached, the alias must hit the same deliberately absent \
+         Herdr socket the canonical spelling does: {stderr}"
     );
     assert!(
         !stdout.contains("recovering in-Work progress"),
-        "and never recovered: {stdout}"
+        "no new commits were made on this Run's branch, so there is nothing to recover: {stdout}"
     );
     stop_wirkd(&m.estate);
 }

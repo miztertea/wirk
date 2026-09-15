@@ -25,10 +25,24 @@
 //! surfaces `AtlasError::SourceBytesUnavailable` for the caller to
 //! report as an unavailable resource.
 
+use crate::extract::ExtractorEdition;
 use crate::{AtlasError, GenerationId, doctree, document, git, http_source};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+
+/// The one recorded resource a single read names: the path it was
+/// recorded at, and the object identity recorded for it.
+///
+/// A pair rather than two arguments because it is already a pair
+/// everywhere else — [`blobs`] takes a slice of exactly it, and
+/// `document::resource_key` keys on both halves precisely because one
+/// without the other addresses the wrong bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordedResource<'a> {
+    pub path: &'a [u8],
+    pub object_id: &'a str,
+}
 
 /// Where one HTTP generation's staged response bytes live — the same
 /// join `AtlasStore` itself uses to write `content.bin`
@@ -105,6 +119,7 @@ fn raw_blobs(
 /// and a cache keyed by object id alone can hold only one of them,
 /// silently handing the other's callers the wrong content.
 pub(crate) fn blobs(
+    edition: ExtractorEdition,
     acquisition_policy: &str,
     locator: &Path,
     atlas_root: &Path,
@@ -120,7 +135,7 @@ pub(crate) fn blobs(
         wanted,
         limits,
     )?;
-    Ok(render_documents(wanted, raw))
+    Ok(render_documents(edition, wanted, raw))
 }
 
 /// `blobs`'/`blob`'s shared last step: a document resource's raw bytes
@@ -142,6 +157,7 @@ pub(crate) fn blobs(
 /// `document::hydration_key`, rather than one interpretation winning and
 /// silently standing in for the other's callers.
 fn render_documents(
+    edition: ExtractorEdition,
     wanted: &[(Vec<u8>, String)],
     raw: BTreeMap<String, Vec<u8>>,
 ) -> BTreeMap<Vec<u8>, Arc<Vec<u8>>> {
@@ -158,13 +174,13 @@ fn render_documents(
         let Some(bytes) = raw.get(object_id.as_str()) else {
             continue;
         };
-        let interpretation = match document::resolved_format(path, bytes) {
+        let interpretation = match document::resolved_format(edition, path, bytes) {
             Some(format) => format!("{format:?}"),
             None => "raw".to_string(),
         };
         let shared = match rendered.get(&(object_id.clone(), interpretation.clone())) {
             Some(shared) => Some(shared.clone()),
-            None => match document::render_if_document(path, bytes.clone()) {
+            None => match document::render_if_document(edition, path, bytes.clone()) {
                 Ok(bytes) => {
                     let shared = Arc::new(bytes);
                     rendered.insert((object_id.clone(), interpretation), shared.clone());
@@ -184,12 +200,12 @@ fn render_documents(
 /// [`blobs`] renders its batch. `atlas_root`/`generation` are the HTTP
 /// arm's own staged-response address, mirroring [`blobs`]'s.
 pub(crate) fn blob(
+    edition: ExtractorEdition,
     acquisition_policy: &str,
     locator: &Path,
     atlas_root: &Path,
     generation: &GenerationId,
-    path: &[u8],
-    object_id: &str,
+    resource: RecordedResource<'_>,
     limits: &doctree::CaptureLimits,
 ) -> Result<Vec<u8>, AtlasError> {
     let raw = raw_blob(
@@ -197,11 +213,11 @@ pub(crate) fn blob(
         locator,
         atlas_root,
         generation,
-        path,
-        object_id,
+        resource,
         limits,
     )?;
-    document::render_if_document(path, raw).map_err(AtlasError::SourceBytesUnavailable)
+    document::render_if_document(edition, resource.path, raw)
+        .map_err(AtlasError::SourceBytesUnavailable)
 }
 
 /// [`blob`] without the document rendering: exactly the bytes the source
@@ -214,10 +230,10 @@ pub(crate) fn raw_blob(
     locator: &Path,
     atlas_root: &Path,
     generation: &GenerationId,
-    path: &[u8],
-    object_id: &str,
+    resource: RecordedResource<'_>,
     limits: &doctree::CaptureLimits,
 ) -> Result<Vec<u8>, AtlasError> {
+    let RecordedResource { path, object_id } = resource;
     match acquisition_policy {
         doctree::ACQUISITION_POLICY => doctree::blob(locator, path, object_id, limits),
         git::ACQUISITION_POLICY => git::blob(locator, object_id),

@@ -3013,6 +3013,236 @@ fn wirk_run_resuming_a_question_filed_after_a_resolved_block_never_prompts() {
     assert_eq!(opened, 1, "no resume opened a second Run");
 }
 
+/// J3/0374 regression (ruling 0316): a relative `--estate` must resolve
+/// against *this process's own* cwd, not whatever cwd `git` happens to
+/// run `worktree_add` from (the actor's own repository). Unfixed,
+/// `estate_path = PathBuf::from(&estate)` stays relative and
+/// `wirk_herdr::git::worktree_add` spawns `git` with `current_dir` set
+/// to the repository, so the checkout lands at
+/// `<repo>/estate/worktrees/<work_id>` instead of
+/// `<estate>/worktrees/<work_id>`. Real `wirkd`, real Git, no model: a
+/// deliberately dead Herdr socket is the stopping point, since
+/// materialization is journaled (`WorktreeCreated`, `WaypointReserved`)
+/// well before `SocketClient::connect` is ever reached in
+/// `executor.rs`. Also exercises same-Run reattachment through the
+/// canonical and a symlink spelling of the same estate (no duplicate
+/// checkout either way) and a genuinely missing `--estate`'s refusal.
+#[test]
+fn wirk_run_materializes_a_relative_estate_under_the_requested_root_not_the_repository() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let caller_cwd = workspace.path().to_path_buf();
+    let estate = caller_cwd.join("estate");
+    fs::create_dir_all(&estate).expect("create estate dir");
+    let repo = caller_cwd.join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
+    init_repo(&repo);
+    let base_sha = git_rev_parse(&repo, "HEAD");
+
+    let mut guard = KillOnDrop(Vec::new());
+    guard.0.push(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    wait_for_pointer(&estate);
+
+    let (work_id, _run_id, _waypoint) = submit_actor(
+        &estate,
+        &repo,
+        "materialize a relative-estate regression fixture",
+    );
+
+    // Deliberately never started: `SocketClient::connect` fails cleanly
+    // on it, well after worktree materialization has already journaled.
+    // No pane, no actor, no model leaf is needed to observe this
+    // boundary.
+    let dead_socket = estate.join(".wirk").join("no-owned-herdr.sock");
+
+    let relative_worktree = repo.join("estate").join("worktrees").join(&work_id);
+    let requested_worktree = estate.join("worktrees").join(&work_id);
+    assert!(
+        !relative_worktree.exists() && !requested_worktree.exists(),
+        "neither candidate location exists before the run"
+    );
+
+    let output = wirk_cli()
+        .current_dir(&caller_cwd)
+        .args(["run", "--estate", "estate"])
+        .args(["--work", &work_id, "--session", "unused-no-launch-reached"])
+        .args(["--herdr-socket"])
+        .arg(&dead_socket)
+        .output()
+        .expect("run wirk run");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the dead Herdr socket is the deliberate stopping point, after materialization:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.trim().is_empty(),
+        "a Herdr connect failure must say so, not exit silently"
+    );
+
+    assert!(
+        !relative_worktree.exists(),
+        "must not materialize under the repository's own tree (git worktree_add's cwd) just \
+         because --estate was given relative: {}",
+        relative_worktree.display()
+    );
+    assert!(
+        requested_worktree.is_dir(),
+        "must materialize under the requested estate root: {}",
+        requested_worktree.display()
+    );
+    let head = git_rev_parse(&requested_worktree, "HEAD");
+    assert_eq!(head, base_sha, "the worktree checked out the reserved base");
+
+    let events = Journal::open(estate.join("works").join(&work_id))
+        .expect("open journal")
+        .replay()
+        .expect("journal replays cleanly");
+    let worktree_created = events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::WorktreeCreated { .. }))
+        .count();
+    assert_eq!(
+        worktree_created, 1,
+        "exactly one materialization was journaled"
+    );
+    let reserved_paths: Vec<PathBuf> = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::WaypointReserved {
+                world: wirk_core::World::Actor(actor),
+                ..
+            } if !actor.worktree_path.as_os_str().is_empty() => Some(actor.worktree_path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reserved_paths,
+        vec![requested_worktree.clone()],
+        "the World's own recorded worktree_path must be the requested-estate address"
+    );
+
+    // ---- reattachment: the canonical spelling, no duplicate checkout
+    let canonical_estate = std::fs::canonicalize(&estate).expect("estate canonicalizes");
+    let second = wirk_cli()
+        .args(["run", "--estate"])
+        .arg(&canonical_estate)
+        .args(["--work", &work_id, "--session", "unused-no-launch-reached"])
+        .args(["--herdr-socket"])
+        .arg(&dead_socket)
+        .output()
+        .expect("run wirk run (canonical spelling)");
+    assert_eq!(
+        second.status.code(),
+        Some(2),
+        "reattachment through the canonical spelling must reach the same dead-socket \
+         boundary:\n{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        !second_stderr.contains("does not match the reusable checkout"),
+        "the canonical spelling is the same estate root the checkout was made under and must \
+         reattach cleanly:\n{second_stderr}"
+    );
+
+    // ---- reattachment: a symlink spelling, no duplicate checkout ----
+    let symlink_estate = caller_cwd.join("estate-link");
+    std::os::unix::fs::symlink(&estate, &symlink_estate).expect("create symlink to estate");
+    let third = wirk_cli()
+        .args(["run", "--estate"])
+        .arg(&symlink_estate)
+        .args(["--work", &work_id, "--session", "unused-no-launch-reached"])
+        .args(["--herdr-socket"])
+        .arg(&dead_socket)
+        .output()
+        .expect("run wirk run (symlink spelling)");
+    assert_eq!(
+        third.status.code(),
+        Some(2),
+        "reattachment through a symlink spelling must reach the same dead-socket boundary:\n{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let third_stderr = String::from_utf8_lossy(&third.stderr);
+    assert!(
+        !third_stderr.contains("does not match the reusable checkout"),
+        "a symlink spelling of the same estate must canonicalize to the same root and reattach \
+         cleanly:\n{third_stderr}"
+    );
+
+    let events_after = Journal::open(estate.join("works").join(&work_id))
+        .expect("open journal")
+        .replay()
+        .expect("journal replays cleanly");
+    let worktree_created_after = events_after
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::WorktreeCreated { .. }))
+        .count();
+    assert_eq!(
+        worktree_created_after, 1,
+        "reattachment through two further spellings must not have materialized a second \
+         checkout"
+    );
+    let worktree_list = Command::new("git")
+        .current_dir(&repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("git worktree list runs");
+    let listed = String::from_utf8_lossy(&worktree_list.stdout);
+    let worktree_count = listed
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count();
+    assert_eq!(
+        worktree_count, 2,
+        "git itself must show exactly the main checkout plus one worktree, not a duplicate:\n\
+         {listed}"
+    );
+
+    // ---- a genuinely missing estate refuses truthfully --------------
+    let missing_estate = caller_cwd.join("no-such-estate");
+    let missing = wirk_cli()
+        .args(["run", "--estate"])
+        .arg(&missing_estate)
+        .args(["--work", &work_id, "--session", "unused-no-launch-reached"])
+        .args(["--herdr-socket"])
+        .arg(&dead_socket)
+        .output()
+        .expect("run wirk run (missing estate)");
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "a missing --estate must be refused, not treated as a fresh relative address"
+    );
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_stderr.contains("could not be resolved"),
+        "the refusal must say the estate could not be resolved, not fail some other way:\n\
+         {missing_stderr}"
+    );
+
+    let stop = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(
+        stop.status.success(),
+        "wirkd stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
 /// The `wirk` CLI with the *test runner's own* actor triple removed from
 /// the child's environment.
 ///

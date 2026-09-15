@@ -26,11 +26,16 @@ if [ -z "$ESTATE_ROOT" ]; then
     exit 0
 fi
 
-# 2. Binary location (orient/manifest.md §3, R4): an explicit override
-#    first, else cargo's own CARGO_TARGET_DIR convention, else the
-#    plugin root's own target/ dir (this manifest lives at the
-#    workspace root, so HERDR_PLUGIN_ROOT *is* that root).
-WIRK_BIN="${WIRK_BIN_PATH:-${CARGO_TARGET_DIR:-$HERDR_PLUGIN_ROOT/target}/debug/wirk}"
+# 2. Binary location, resolved by the one helper every entry point
+#    shares (plugin/wirk-bin.sh). A startup hook must not stop the
+#    server, so an unresolved binary is one printed line and exit 0 --
+#    the explanation belongs to the surfaces an operator invokes on
+#    purpose, not to a hook that fires on every session start.
+. "$HERDR_PLUGIN_ROOT/plugin/wirk-bin.sh"
+if ! WIRK_BIN="$(wirk_resolve_bin)"; then
+    echo "wirk startup: no wirk executable found; nothing to do (this plugin's Configure Wirk action explains how to get one)"
+    exit 0
+fi
 
 # 3. Idempotency (0032 D99): wirkd writes a copy of its pointer file to
 #    $HERDR_PLUGIN_STATE_DIR/wirkd.json whenever that variable is set
@@ -61,10 +66,6 @@ fi
 #    process group), stdio redirected to a state-dir log (never
 #    inherited -- a daemon must not hold the startup hook's log pipe
 #    open), no wait -- the hook returns immediately.
-if [ ! -x "$WIRK_BIN" ]; then
-    echo "wirk startup: $WIRK_BIN not found or not executable; nothing to do"
-    exit 0
-fi
 setsid nohup "$WIRK_BIN" wirkd start --estate "$ESTATE_ROOT" \
     >"$HERDR_PLUGIN_STATE_DIR/wirkd.out" 2>&1 </dev/null &
 disown

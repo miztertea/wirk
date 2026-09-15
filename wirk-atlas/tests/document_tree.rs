@@ -170,6 +170,229 @@ fn publish_and_resolve_exact_round_trip_a_document_tree_generation() {
     );
 }
 
+/// A `.txt` an older edition recorded as a **document** still validates
+/// and resolves byte-for-byte, under the edition that recorded it.
+///
+/// **Meaningful red before this change**, reproduced end to end on two
+/// real frozen binaries against a real `wirkd`, not only here. The
+/// earlier attempt at the glossary defect above added `.txt` to the
+/// content-family table itself. That table is the vocabulary editions v3
+/// through v6 all read, so the row rewrote what every one of them says a
+/// `.txt` is — including generations already published. A document
+/// collection holding a `notes.txt` whose bytes are real RTF acquires,
+/// under the pre-change binary, as `indexed`, `ContentFamily::Document`,
+/// units stamped with the document Markdown unitizer and offsets into
+/// the *rendering* (78 bytes) rather than into the 140-byte original.
+/// Pointed at that same estate, the post-change binary answered every
+/// read — `atlas search`, `atlas resolve`, and even `atlas status` for
+/// the whole estate — with
+///
+/// ```text
+/// AtlasError generation is incomplete or absent:
+///   derived retrieval unit identity or bounds are inconsistent
+/// ```
+///
+/// which is the *forgery* refusal: `recorded_shape` now answered
+/// `(Knowledge, text unitizer)` for a path the record says is a
+/// `Document`. A published generation became unreadable, and the reason
+/// it gave accused the record instead of naming the vocabulary that had
+/// moved under it.
+///
+/// So the correction belongs to an edition, which is what editions are
+/// for. `v6` keeps its own answer for `.txt` — sniff it, and read a real
+/// container as the document it is — and `v7` carries the widened
+/// vocabulary for everything acquired from here on. This test stages
+/// both over the identical tree and pins that they disagree, on purpose,
+/// each one internally consistent from admission through resolution.
+#[test]
+fn a_historical_edition_still_reads_its_own_txt_the_way_it_recorded_it() {
+    // A real RTF body, under a name that says nothing about it.
+    const RTF: &[u8] = b"{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0\\froman Times;}}\n\
+\\f0\\fs24 Waypoint admission is recorded under the edition that produced it.\\par\n}\n";
+    let source = TempDir::new().unwrap();
+    fs::write(source.path().join("notes.txt"), RTF).unwrap();
+
+    let estate = TempDir::new().unwrap();
+    let mut atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
+
+    // --- what the older edition recorded, and still reads back --------
+    let historical = atlas
+        .register_document_tree("archive", source.path(), "current")
+        .unwrap();
+    let v6 = staged(
+        atlas
+            .acquire_document_tree(
+                &historical,
+                "current",
+                ExtractorPolicy::documents_detected_v6(),
+            )
+            .unwrap(),
+    );
+    let recorded = v6
+        .resources
+        .iter()
+        .find(|record| record.path == b"notes.txt")
+        .expect("v6 captured the file");
+    assert_eq!(
+        recorded.disposition,
+        wirk_atlas::CoverageDisposition::Indexed,
+        "v6 sniffs an unrecognized name and finds the RTF"
+    );
+    let unit = recorded.units.first().unwrap();
+    assert_eq!(
+        unit.family,
+        wirk_atlas::ContentFamily::Document,
+        "v6 recorded this as a document, and that is what must be preserved"
+    );
+    assert!(
+        unit.byte_end < RTF.len() as u64,
+        "the unit indexes the Markdown rendering, which is shorter than the container"
+    );
+
+    // Publishing re-verifies the whole tree under the generation's own
+    // edition, and resolving reads its bytes back under that same one.
+    // Both would fail if the vocabulary had been widened in place.
+    atlas.publish(&historical, &v6.id).unwrap();
+    let pinned = coordinate(&historical, &v6, b"notes.txt");
+    let ResolveOutcome::Resolved(ResolvedEvidence { bytes, .. }) =
+        atlas.resolve_exact(&historical, &pinned).unwrap()
+    else {
+        panic!("a published v6 coordinate must still resolve");
+    };
+    assert_eq!(
+        String::from_utf8(bytes).unwrap().trim(),
+        "Waypoint admission is recorded under the edition that produced it.",
+        "the converted text the unit's offsets actually describe"
+    );
+
+    // --- and what the current edition does with the same file ---------
+    let current = atlas
+        .register_document_tree("live", source.path(), "current")
+        .unwrap();
+    let v7 = staged(
+        atlas
+            .acquire_document_tree(&current, "current", ExtractorPolicy::default())
+            .unwrap(),
+    );
+    let now = v7
+        .resources
+        .iter()
+        .find(|record| record.path == b"notes.txt")
+        .expect("v7 captured the file");
+    let unit = now.units.first().unwrap();
+    assert_eq!(
+        unit.family,
+        wirk_atlas::ContentFamily::Knowledge,
+        "under the current edition a .txt is the text its name claims"
+    );
+    atlas.publish(&current, &v7.id).unwrap();
+    let pinned = coordinate(&current, &v7, b"notes.txt");
+    let ResolveOutcome::Resolved(ResolvedEvidence { bytes, .. }) =
+        atlas.resolve_exact(&current, &pinned).unwrap()
+    else {
+        panic!("the current coordinate resolves too");
+    };
+    assert_eq!(
+        bytes,
+        RTF[pinned.byte_start as usize..pinned.byte_end as usize].to_vec(),
+        "and its offsets index the file's own bytes, not a rendering"
+    );
+
+    // The original is untouched by either reading.
+    assert_eq!(fs::read(source.path().join("notes.txt")).unwrap(), RTF);
+}
+
+/// The glossary a colleague actually dropped into a document collection.
+///
+/// **Meaningful red before this change** (reproduced against a real
+/// `wirkd` on a binary built before it, not only here): this exact
+/// 152-byte `glossary.txt` previewed and acquired as
+/// `unsupported`/`Unsupported("no extractor for path family")` beside an
+/// indexed `.md`, and searching for its own words returned no hits. The
+/// cause is not the document reader: the content-family extension
+/// vocabulary is an extension-to-*language* map, and a name that names
+/// no language carries no row in it. Ordinary text-family interpretation
+/// is supposed to be preserved, so that omission was the defect, and the
+/// current extraction edition carries the answer the shared table cannot.
+///
+/// A genuinely non-text neighbour in the same tree must keep its correct
+/// refusal, which is why `photo.png` is here: widening the text
+/// vocabulary must not become a catch-all that decodes binary as UTF-8.
+#[test]
+fn an_ordinary_plain_text_file_is_indexed_and_resolves_to_its_own_bytes() {
+    const GLOSSARY: &[u8] = b"Estate: the bounded domain a colleague is working in.\n\
+World: the assembled context for one piece of work.\n\
+Claim: how a Run's outcome becomes checkable.\n";
+    let source = TempDir::new().unwrap();
+    fs::write(source.path().join("glossary.txt"), GLOSSARY).unwrap();
+    fs::write(
+        source.path().join("onboarding.md"),
+        "# Onboarding\n\nHello.\n",
+    )
+    .unwrap();
+    fs::write(source.path().join("photo.png"), [0x89u8, b'P', b'N', b'G']).unwrap();
+
+    let estate = TempDir::new().unwrap();
+    let mut atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
+    let membership = atlas
+        .register_document_tree("colleague-docs", source.path(), "current")
+        .unwrap();
+    let generation = staged(
+        atlas
+            .acquire_document_tree(&membership, "current", ExtractorPolicy::default())
+            .unwrap(),
+    );
+
+    let glossary = generation
+        .resources
+        .iter()
+        .find(|record| record.path == b"glossary.txt")
+        .expect("the glossary is captured as a resource at all");
+    assert_eq!(
+        glossary.disposition,
+        wirk_atlas::CoverageDisposition::Indexed,
+        "an ordinary .txt is read, not refused"
+    );
+    assert!(
+        !glossary.units.is_empty(),
+        "indexed means it actually produced text units"
+    );
+
+    // The non-text neighbour keeps its truthful refusal.
+    let photo = generation
+        .resources
+        .iter()
+        .find(|record| record.path == b"photo.png")
+        .expect("the png is still reported, not dropped");
+    assert_eq!(
+        photo.disposition,
+        wirk_atlas::CoverageDisposition::Unsupported
+    );
+
+    // And the glossary's own bytes come back out of the published
+    // generation, byte for byte -- useful content, not just a count.
+    atlas.publish(&membership, &generation.id).unwrap();
+    let pinned = coordinate(&membership, &generation, b"glossary.txt");
+    let expected = GLOSSARY[pinned.byte_start as usize..pinned.byte_end as usize].to_vec();
+    assert!(
+        expected.starts_with(b"Estate: the bounded domain"),
+        "the resolved range is the glossary's own text"
+    );
+    assert_eq!(
+        atlas.resolve_exact(&membership, &pinned).unwrap(),
+        ResolveOutcome::Resolved(ResolvedEvidence {
+            coordinate: pinned,
+            bytes: expected,
+        })
+    );
+
+    // The original file on disk is untouched by any of it.
+    assert_eq!(
+        fs::read(source.path().join("glossary.txt")).unwrap(),
+        GLOSSARY
+    );
+}
+
 /// Pinned at the public `AtlasStore` level, not just at `doctree::blob`
 /// directly: an edit to a *different* file in the same collection must
 /// not invalidate a coordinate for a file that did not change. The

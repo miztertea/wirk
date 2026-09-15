@@ -684,6 +684,67 @@ impl AtlasStore {
         )
     }
 
+    /// `atlas acquire --dry-run`: the same walkers `acquire`/
+    /// `acquire_document_tree` use, stopped short of extraction and of
+    /// writing anything. Deliberately takes no `Membership` — a
+    /// pre-acquisition preview must work for a source that is not yet
+    /// registered — so nothing here reads or writes the catalog:
+    /// `source` names only the admission/cancellation scope a caller
+    /// asked under, never a registration.
+    ///
+    /// `kind` defaults to `"git"`, exactly like `acquire`'s own
+    /// unspecified `--kind`. `"document-tree"` is refused unless
+    /// `revision` is `doctree::CURRENT_OBSERVATION`, the identical rule
+    /// `acquire_document_tree` applies. `"http"` is named and refused
+    /// rather than silently attempted: no preview walker exists for it
+    /// yet.
+    pub fn preview(
+        &self,
+        source: &str,
+        repository: &str,
+        revision: &str,
+        kind: Option<&str>,
+        policy: &ExtractorPolicy,
+    ) -> Result<crate::preview::PreviewReport, AtlasError> {
+        let repo = Path::new(repository);
+        let effective_kind = kind.unwrap_or("git");
+        // Only the document-tree walk runs real I/O on this thread long
+        // enough to be worth `atlas cancel --source` reaching — Git's
+        // preview is one `ls-tree` call. Parallel to `acquire_kind`'s
+        // own `job` split.
+        let job = if effective_kind == "document-tree" {
+            Some(self.jobs.in_process("atlas acquire --dry-run", source))
+        } else {
+            None
+        };
+        let stop = job
+            .as_ref()
+            .map(|job| job.stop())
+            .unwrap_or_else(wirk_core::jobs::JobStop::unbounded);
+        match effective_kind {
+            "git" => {
+                let (commit, _content) = git::commit_and_tree(repo, revision)?;
+                Ok(git::preview(repo, &commit, policy, &self.capture_limits())?.finish())
+            }
+            "document-tree" => {
+                if revision != doctree::CURRENT_OBSERVATION {
+                    return Err(AtlasError::InvalidRequest(format!(
+                        "a document-tree source observes only its current state; pass {:?} \
+                         for --revision (or omit it) rather than {revision:?}",
+                        doctree::CURRENT_OBSERVATION
+                    )));
+                }
+                Ok(doctree::preview(repo, policy, &self.capture_limits(), &stop)?.finish())
+            }
+            "http" => Err(AtlasError::InvalidRequest(
+                "a pre-acquisition preview is not available for --kind http sources".into(),
+            )),
+            other => Err(AtlasError::InvalidRequest(format!(
+                "unknown source kind {other:?}; expected \"git\", \"document-tree\", or \"http\""
+            ))),
+        }
+    }
+
     fn acquire_kind(
         &mut self,
         verb: &str,
@@ -1296,6 +1357,9 @@ impl AtlasStore {
         generation: &SourceGeneration,
         coordinate: &ExactCoordinate,
     ) -> Result<ResolveOutcome, AtlasError> {
+        // This generation's own edition, never today's: its units index
+        // whatever string that edition's interpretation produced.
+        let edition = crate::extract::ExtractorEdition::recorded(&generation.extractor_set)?;
         let repo = Path::new(&membership.locator);
         let (_, content) = match git::commit_and_tree(repo, &generation.revision) {
             Ok(identity) => identity,
@@ -1322,7 +1386,7 @@ impl AtlasStore {
             Err(error) => return Err(error),
         }
         match git::blob(repo, &coordinate.object_id) {
-            Ok(bytes) => match document::render_if_document(&coordinate.path, bytes) {
+            Ok(bytes) => match document::render_if_document(edition, &coordinate.path, bytes) {
                 Ok(rendered) => {
                     Self::resolved_from_bytes(coordinate, &rendered, "committed Git bytes")
                 }
@@ -1362,6 +1426,7 @@ impl AtlasStore {
         generation: &SourceGeneration,
         coordinate: &ExactCoordinate,
     ) -> Result<ResolveOutcome, AtlasError> {
+        let edition = crate::extract::ExtractorEdition::recorded(&generation.extractor_set)?;
         let root = Path::new(&generation.locator);
         match doctree::blob(
             root,
@@ -1369,7 +1434,7 @@ impl AtlasStore {
             &coordinate.object_id,
             &self.capture_limits(),
         ) {
-            Ok(bytes) => match document::render_if_document(&coordinate.path, bytes) {
+            Ok(bytes) => match document::render_if_document(edition, &coordinate.path, bytes) {
                 Ok(rendered) => {
                     Self::resolved_from_bytes(coordinate, &rendered, "document-tree bytes")
                 }
@@ -1398,6 +1463,7 @@ impl AtlasStore {
         generation: &SourceGeneration,
         coordinate: &ExactCoordinate,
     ) -> Result<ResolveOutcome, AtlasError> {
+        let edition = crate::extract::ExtractorEdition::recorded(&generation.extractor_set)?;
         let path = content_bin(&self.generation_dir(&generation.id)?);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -1418,7 +1484,7 @@ impl AtlasStore {
         // through: a fetched response that this extractor admitted as a
         // document was unitized against its Markdown rendering, so the
         // span a coordinate names is a span of that rendering here too.
-        match document::render_if_document(&coordinate.path, bytes) {
+        match document::render_if_document(edition, &coordinate.path, bytes) {
             Ok(rendered) => {
                 Self::resolved_from_bytes(coordinate, &rendered, "staged HTTP response bytes")
             }
@@ -1451,8 +1517,8 @@ impl AtlasStore {
         membership: &Membership,
         coordinate: &ExactCoordinate,
     ) -> Result<crate::document::DocumentReading, AtlasError> {
-        let bytes = self.source_bytes_for(membership, coordinate)?;
-        Ok(document::inspect(&coordinate.path, &bytes))
+        let (edition, bytes) = self.source_bytes_for(membership, coordinate)?;
+        Ok(document::inspect(edition, &coordinate.path, &bytes))
     }
 
     /// One embedded asset's bytes, selected by the `id` a
@@ -1471,8 +1537,8 @@ impl AtlasStore {
         id: usize,
         max_bytes: u64,
     ) -> Result<Option<crate::document::ResolvedAsset>, AtlasError> {
-        let bytes = self.source_bytes_for(membership, coordinate)?;
-        let found = document::asset(&coordinate.path, &bytes, id)
+        let (edition, bytes) = self.source_bytes_for(membership, coordinate)?;
+        let found = document::asset(edition, &coordinate.path, &bytes, id)
             .map_err(AtlasError::SourceBytesUnavailable)?;
         if let Some(found) = &found
             && found.descriptor.byte_len > max_bytes
@@ -1495,9 +1561,10 @@ impl AtlasStore {
         &self,
         membership: &Membership,
         coordinate: &ExactCoordinate,
-    ) -> Result<Vec<u8>, AtlasError> {
+    ) -> Result<(crate::extract::ExtractorEdition, Vec<u8>), AtlasError> {
         self.check_membership(membership)?;
         let generation = self.read_generation(&coordinate.generation)?;
+        let edition = crate::extract::ExtractorEdition::recorded(&generation.extractor_set)?;
         if generation.source != coordinate.source {
             return Err(AtlasError::InvalidCoordinate(
                 "coordinate's generation belongs to another source".into(),
@@ -1522,15 +1589,18 @@ impl AtlasStore {
         // document-tree and HTTP arms re-hash what they read and refuse a
         // mismatch. Nothing here accepts bytes that are not the ones the
         // coordinate names.
-        crate::hydrate::raw_blob(
+        let bytes = crate::hydrate::raw_blob(
             &generation.acquisition_policy,
             Path::new(&generation.locator),
             self.root(),
             &generation.id,
-            &coordinate.path,
-            &coordinate.object_id,
+            crate::hydrate::RecordedResource {
+                path: &coordinate.path,
+                object_id: &coordinate.object_id,
+            },
             &self.capture_limits(),
-        )
+        )?;
+        Ok((edition, bytes))
     }
 
     /// Shared by every policy's final step: exact bytes have been read
@@ -1667,7 +1737,22 @@ impl AtlasStore {
         if !path.exists() {
             return Err(AtlasError::Generation(id.0.clone()));
         }
-        let g: SourceGeneration = serde_json::from_slice(&fs::read(path)?)?;
+        // Everything read here is *this generation's own* derived data,
+        // which this store wrote itself. A manifest that will not open,
+        // or will not parse, is therefore the same fact as the missing
+        // one just above — "generation is incomplete or absent" — and
+        // not a general I/O or JSON fault of the estate. Classifying it
+        // at the read is what lets every caller treat it as source-local
+        // (`query::search`'s per-membership walk, `handle_atlas_status`'s
+        // per-source row) instead of aborting an answer that other,
+        // healthy sources could still fill. Nothing outside this
+        // generation's own directory is reclassified: catalog,
+        // coordinate and store-ownership failures keep their own
+        // variants and still abort their callers.
+        let bytes = fs::read(&path)
+            .map_err(|error| AtlasError::Generation(format!("manifest is unreadable: {error}")))?;
+        let g: SourceGeneration = serde_json::from_slice(&bytes)
+            .map_err(|error| AtlasError::Generation(format!("manifest is malformed: {error}")))?;
         if g.id != *id {
             return Err(AtlasError::Generation("forged manifest identifier".into()));
         }
@@ -1677,7 +1762,10 @@ impl AtlasStore {
             .map_err(|_| AtlasError::Generation("missing immutable resource manifest".into()))?;
         let rows: Result<Vec<crate::ResourceRecord>, _> =
             serialized.lines().map(serde_json::from_str).collect();
-        if rows.map_err(AtlasError::Json)? != g.resources {
+        let rows = rows.map_err(|error| {
+            AtlasError::Generation(format!("resource manifest row is malformed: {error}"))
+        })?;
+        if rows != g.resources {
             return Err(AtlasError::Generation(
                 "resource manifest is inconsistent with generation".into(),
             ));

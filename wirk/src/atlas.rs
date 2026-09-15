@@ -48,14 +48,17 @@ pub fn atlas_command(rest: &[String]) -> ExitCode {
 
 fn atlas_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk atlas acquire --estate <root> --source <name> --repository <path-or-url> --revision <ref> [--kind git|document-tree|http] [--requesting-work <id> | --admin] [--json] \
+        "usage: wirk atlas acquire --estate <root> --source <name> --repository <path-or-url> --revision <ref> [--kind git|document-tree|http] [--requesting-work <id> | --admin] [--dry-run] [--json] \
          (--repository names a Git repository/subdirectory/worktree under --kind git, the default; \
           a plain local directory under --kind document-tree; one explicit public http:// or \
           https:// URL under --kind http, with no embedded credential and no \"..\" path segment. \
           --revision names the Git ref to acquire under --kind git, required; under --kind \
           document-tree or --kind http it can only mean the source's own last-observed current \
           state, so it is optional there, defaults to \"current\", and any other value is refused \
-          by name — neither policy has another revision to honour) \
+          by name — neither policy has another revision to honour. --dry-run classifies the same \
+          input the same walkers would see — candidate/excluded/unsupported/unclassified counts \
+          and bytes — and stages, embeds, downloads, publishes and registers nothing; not yet \
+          available under --kind http) \
          | wirk atlas refresh --estate <root> --source <name> [--revision <ref>] [--requesting-work <id> | --admin] [--json] \
          (--revision is optional: omitted, the source's own registered acquisition policy \
           supplies it — the ref a Git source was admitted to track, or a document tree's \
@@ -65,7 +68,12 @@ fn atlas_usage() -> ExitCode {
           can reach it — a document collection's walk, its extraction and a publish's \
           revalidation all run as registered, cancellable jobs) \
          | wirk atlas publish --estate <root> --source <name> --generation <id> [--requesting-work <id> | --admin] [--json] \
-         | wirk atlas remove --estate <root> --source <name> [--json] \
+         | wirk atlas remove --estate <root> --source <name> [--requesting-work <id> | --admin] [--json] \
+         (--requesting-work/--admin decide what this verb may reach, not merely which job it \
+          belongs to: a Work-scoped removal reaches only a source that Work's own bindings \
+          name, and a name it is not admitted to answers exactly as a name that is not \
+          registered. --admin is the operator's removal of any registered source, said out \
+          loud when the caller had a Work identity of its own) \
          | wirk atlas status --estate <root> [--source <name>] [--work <id>] [--json] \
          | wirk atlas cancel --estate <root> (--list | --job <id> | --source <name> | --all) [--reason <text>] [--wait <secs>] [--requesting-work <id> | --admin] [--json] \
          | wirk atlas resolve [--estate <root>] [--work <id> | --admin] --coordinate <encoded> [--json] \
@@ -240,6 +248,7 @@ fn acquire_command(rest: &[String]) -> ExitCode {
             ("--kind", true),
             ("--requesting-work", true),
             ("--admin", false),
+            ("--dry-run", false),
         ],
     ) {
         return code;
@@ -294,6 +303,7 @@ fn acquire_command(rest: &[String]) -> ExitCode {
         (None, _) => return atlas_usage(),
     };
     let json = is_json(rest);
+    let dry_run = rest.iter().any(|arg| arg == "--dry-run");
     call_expecting_outcome(
         &estate,
         &Request::atlas_acquire(AtlasAcquirePayload {
@@ -305,21 +315,86 @@ fn acquire_command(rest: &[String]) -> ExitCode {
             // by the same Work can reach it. `None` is an administrative
             // job.
             work: scope.requesting,
+            dry_run,
         }),
-        &["staged"],
+        &["staged", "previewed"],
         |result| {
             print_result(json, result, |result| {
-                println!(
-                    "outcome {} generation {} acquisition_policy {}",
-                    result["outcome"].as_str().unwrap_or("?"),
-                    result["generation"]["generation"].as_str().unwrap_or("-"),
-                    result["membership"]["acquisition_policy"]
-                        .as_str()
-                        .unwrap_or("?")
-                );
+                if result["outcome"].as_str() == Some("previewed") {
+                    print_preview(&result["preview"]);
+                } else {
+                    println!(
+                        "outcome {} generation {} acquisition_policy {}",
+                        result["outcome"].as_str().unwrap_or("?"),
+                        result["generation"]["generation"].as_str().unwrap_or("-"),
+                        result["membership"]["acquisition_policy"]
+                            .as_str()
+                            .unwrap_or("?")
+                    );
+                }
             });
         },
     )
+}
+
+/// `atlas acquire --dry-run`'s plain-text rendering. `--json` carries
+/// the same `PreviewReport` verbatim; this is the practical summary a
+/// human actually reads, same rule every other verb in this module
+/// follows.
+fn print_preview(preview: &serde_json::Value) {
+    let bucket = |name: &str| -> (u64, u64) {
+        (
+            preview[name]["count"].as_u64().unwrap_or(0),
+            preview[name]["bytes"].as_u64().unwrap_or(0),
+        )
+    };
+    let (candidate_n, candidate_b) = bucket("candidate");
+    let (excluded_n, excluded_b) = bucket("excluded");
+    let (unsupported_n, unsupported_b) = bucket("unsupported");
+    let (unclassified_n, unclassified_b) = bucket("unclassified");
+    let (unavailable_n, unavailable_b) = bucket("unavailable");
+    let (total_n, total_b) = bucket("total");
+    println!(
+        "preview {} kind {} at {}",
+        preview["repository"].as_str().unwrap_or("?"),
+        preview["kind"].as_str().unwrap_or("?"),
+        preview["revision"].as_str().unwrap_or("?"),
+    );
+    println!(
+        "  total {total_n} input(s), {total_b} byte(s): candidate {candidate_n} \
+         ({candidate_b}B) excluded {excluded_n} ({excluded_b}B) unsupported {unsupported_n} \
+         ({unsupported_b}B) unclassified {unclassified_n} ({unclassified_b}B) unavailable \
+         {unavailable_n} ({unavailable_b}B)"
+    );
+    println!(
+        "  candidate: this reader recognizes the input's family and a real acquisition would \
+         attempt to extract it; whether that attempt succeeds is not decided here. \
+         unclassified: the name alone does not decide it, and no content was read to check it \
+         — a real acquisition may find some of these extractable, some not"
+    );
+    if preview["content_sniffed"].as_bool().unwrap_or(false) {
+        println!(
+            "  this walk opened content only where classifying an input required it: a \
+             secret-like path is excluded before any open, a file over the per-file read \
+             bound is refused on its listed size without an open, a name no extractor family \
+             claims outright costs at most one open and a bounded leading prefix, and only an \
+             admitted input is read in full — the same bounded read a real acquisition performs, a \
+             real memory and I/O cost even though nothing was extracted, embedded, or \
+             written. The byte figures above are each input's size as the directory reports \
+             it, not bytes this preview read: only candidate inputs were read whole, and an \
+             unavailable input is one whose open or read was attempted and failed"
+        );
+    } else {
+        println!(
+            "  this walk classified every input from name, mode, and size alone and read no \
+             tracked content"
+        );
+    }
+    println!(
+        "  nothing was staged, embedded, or written: no membership, no generation, no \
+         catalog change; extraction time, embedding cost, and output disk use are not \
+         estimated by this preview — a real acquisition is the only way to observe them"
+    );
 }
 
 /// `wirk atlas remove`: unregisters a source's own catalog membership. Refused, by name,
@@ -334,17 +409,51 @@ fn acquire_command(rest: &[String]) -> ExitCode {
 /// --all-unreferenced` does that, re-deriving retention against every
 /// other source first.
 fn remove_command(rest: &[String]) -> ExitCode {
-    if let Err(code) = check_flags("remove", rest, &[ESTATE, JSON, ("--source", true)]) {
+    if let Err(code) = check_flags(
+        "remove",
+        rest,
+        &[
+            ESTATE,
+            JSON,
+            ("--source", true),
+            ("--requesting-work", true),
+            ("--admin", false),
+        ],
+    ) {
         return code;
     }
     let (Some(estate), Some(source)) = (flag_value(rest, "--estate"), flag_value(rest, "--source"))
     else {
         return atlas_usage();
     };
+    // The same resolution `refresh_command` runs, for a stronger
+    // reason: on those verbs the resolved Work is job origin, while
+    // here it is the admission scope the daemon decides against. This
+    // verb had no scope flag at all, so an actor inside a Work removed
+    // any source in its estate and the daemon never learned who asked;
+    // `--admin` is now how an operator says that is what they meant.
+    let scope = match crate::resolve_scope(
+        "wirk atlas remove",
+        &estate,
+        flag_value(rest, "--requesting-work"),
+        rest.iter().any(|arg| arg == "--admin"),
+    ) {
+        Ok(scope) => scope,
+        Err(refusal) => {
+            eprintln!("wirk atlas remove: {refusal}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Some(note) = &scope.note {
+        eprintln!("wirk atlas remove: {note}");
+    }
     let json = is_json(rest);
     call_expecting_outcome(
         &estate,
-        &Request::atlas_remove(AtlasRemovePayload { source }),
+        &Request::atlas_remove(AtlasRemovePayload {
+            source,
+            work: scope.requesting,
+        }),
         &["removed"],
         |result| {
             print_result(json, result, |result| {
@@ -642,15 +751,27 @@ fn status_command(rest: &[String]) -> ExitCode {
     if let Err(code) = check_flags(
         "status",
         rest,
-        &[ESTATE, JSON, ("--source", true), ("--work", true)],
+        &[
+            ESTATE,
+            JSON,
+            ("--source", true),
+            ("--work", true),
+            ("--admin", false),
+        ],
     ) {
         return code;
     }
-    let Some(estate) = flag_value(rest, "--estate") else {
-        return atlas_usage();
+    // The same scope resolution `search`/`document`/`resolve` use
+    // inside an actor's own context an omitted `--work`
+    // resolves to that actor's own Work, and only an explicit `--admin`
+    // reaches the estate-wide catalog from there. Reading `--work` from
+    // its own flag alone would make an omitted flag mean estate-wide
+    // administration even inside an actor.
+    let (estate, work) = match reading_scope("wirk atlas status", rest) {
+        Ok(resolved) => resolved,
+        Err(code) => return code,
     };
     let source = flag_value(rest, "--source");
-    let work = flag_value(rest, "--work").map(WorkId);
     let json = is_json(rest);
     wirkd_client_call(
         &estate,
@@ -666,13 +787,61 @@ fn status_command(rest: &[String]) -> ExitCode {
                     result["work_scoped"].as_bool().unwrap_or(false)
                 );
                 for source in sources {
+                    let alias = source["membership"]["alias"].as_str().unwrap_or("?");
+                    // A source-local `generation_error` (the published
+                    // generation itself could not be read back) is a
+                    // different fact from "no generation has ever been
+                    // published" — rendering both as `published none`
+                    // would make a broken source look merely unused.
+                    // The row carries nothing else useful (coverage,
+                    // semantic state) once this fires, so it is printed
+                    // on its own and the rest of this source's block is
+                    // skipped, exactly as `--json` has nothing else to
+                    // show for it either.
+                    if let Some(error) = source["generation_error"].as_str() {
+                        println!("  {alias} published unavailable: {error}");
+                        continue;
+                    }
                     println!(
                         "  {} published {}",
-                        source["membership"]["alias"].as_str().unwrap_or("?"),
+                        alias,
                         source["published_generation"]["generation"]
                             .as_str()
                             .unwrap_or("none")
                     );
+                    // P6.3-A: this generation's own indexed/excluded/
+                    // unsupported/unavailable/error split already exists
+                    // in `--json` (`generation_json`'s `coverage` field)
+                    // and was silently missing from the surface a human
+                    // actually reads — a source's real coverage gap
+                    // rendered identically to a fully-indexed one. Prints
+                    // only when a generation is actually published;
+                    // `None` here (no published generation) says nothing
+                    // this rendering can usefully add.
+                    if let Some(coverage) = source["published_generation"]["coverage"].as_object() {
+                        println!(
+                            "    coverage indexed {} excluded {} unsupported {} unavailable {} \
+                             error {} of {} total",
+                            coverage
+                                .get("indexed")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            coverage
+                                .get("excluded")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            coverage
+                                .get("unsupported")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            coverage
+                                .get("unavailable")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            coverage.get("error").and_then(|v| v.as_u64()).unwrap_or(0),
+                            coverage.get("total").and_then(|v| v.as_u64()).unwrap_or(0),
+                        );
+                    }
                     // P3 W4 A: staged/selected and each edition's actual
                     // verification state, in plain text as well as
                     // `--json` — the same honesty rule W3 applied to

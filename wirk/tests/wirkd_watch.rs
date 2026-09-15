@@ -581,6 +581,72 @@ fn recv_line(rx: &mpsc::Receiver<String>, what: &str) -> String {
         .unwrap_or_else(|_| panic!("never observed: {what}"))
 }
 
+/// Spawns the real `watch` CLI with `--json`, stdout and stderr each
+/// piped one line at a time into their own `mpsc` channel — the `--json`
+/// contract is a whole-line contract on stdout, so the diagnostics it
+/// must *not* appear in (stderr) need watching too.
+fn spawn_cli_watch_json(
+    estate: &Path,
+    work: Option<&str>,
+) -> (
+    std::process::Child,
+    mpsc::Receiver<String>,
+    mpsc::Receiver<String>,
+) {
+    let mut command = wirk_cli();
+    command.args(["wirkd", "watch", "--estate"]);
+    command.arg(estate);
+    if let Some(work) = work {
+        command.args(["--work", work]);
+    }
+    command.arg("--json");
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn watch --json");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (out_tx, out_rx) = mpsc::channel();
+    let (err_tx, err_rx) = mpsc::channel();
+    let out_thread = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => {
+                    if out_tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    let err_thread = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => {
+                    if err_tx.send(line).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    let _ = (out_thread, err_thread);
+    (child, out_rx, err_rx)
+}
+
+/// The `--json` contract is a whole-line one: a stdout line that does
+/// not parse as one JSON object on its own is not a parseable event, no
+/// matter what it contains.
+fn parse_whole_line(line: &str) -> serde_json::Value {
+    serde_json::from_str(line)
+        .unwrap_or_else(|err| panic!("stdout line is not one parseable Event: {err}: {line}"))
+}
+
 /// P3 (0069 correction, `FINAL-REFUSAL-CORRECTION.md` item 1): the real
 /// `wirk wirkd watch --work <id>` CLI — not just the client library's
 /// iterator shape — must exit nonzero when the daemon explicitly
@@ -756,4 +822,239 @@ fn wirk_cli() -> Command {
         .env_remove("WIRK_WORK_ID")
         .env_remove("WIRK_RUN_ID");
     command
+}
+
+/// The advertised `--json` mode: every stdout line is one complete,
+/// parseable `Event` object on its own — no `work_id` prefix, no prose —
+/// so a reader can hand each line straight to its JSON parser. The
+/// `work`/`run` identity the prefix used to carry is already fields of
+/// the event itself. Replay starts at the first journaled event, and a
+/// live append made after the dial arrives as one more such line.
+#[test]
+fn cli_watch_json_streams_one_parseable_event_per_line() {
+    let dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = dir.path().to_path_buf();
+    let mut wirkd_child = KillOnDrop(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let pointer = wait_for_pointer(&estate);
+    let (work_id, run_id) = submit(&estate, &pointer.socket, "json watch replay");
+
+    let (mut cli, out, err) = spawn_cli_watch_json(&estate, Some(work_id.0.as_str()));
+
+    // Replay: the first journaled event must be the first line, whole.
+    let first = parse_whole_line(&recv_line(&out, "the first json watch line"));
+    assert_eq!(
+        first["kind"]["kind"].as_str(),
+        Some("WorkSubmitted"),
+        "the first replayed line must be the first journaled event"
+    );
+    assert_eq!(
+        first["work"].as_str(),
+        Some(work_id.0.as_str()),
+        "the event must carry its own Work identity: {first}"
+    );
+
+    // A live append while the stream is open arrives as one more
+    // parseable line.
+    record(&pointer.socket, &work_id, &run_id, EventKind::RunVanished);
+    let mut saw_live = false;
+    for _ in 0..8 {
+        let event = parse_whole_line(&recv_line(&out, "the live RunVanished line"));
+        if event["kind"]["kind"].as_str() == Some("RunVanished") {
+            assert_eq!(
+                event["run"].as_str(),
+                Some(run_id.0.as_str()),
+                "the live event must carry its own Run identity: {event}"
+            );
+            saw_live = true;
+            break;
+        }
+    }
+    assert!(saw_live, "the live append must arrive as a parseable line");
+
+    let stop = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(stop.status.success());
+
+    let status = cli.wait().expect("watch exits on EOF");
+    assert!(
+        status.success(),
+        "an unrefused json stream ends clean when the daemon stops, got: {status:?}"
+    );
+    for line in err {
+        assert!(
+            !line.contains("refused"),
+            "an unrefused stream must not report a refusal: {line}"
+        );
+    }
+    let _ = wirkd_child.0.wait();
+    drop(wirkd_child);
+}
+
+/// In `--json` mode a refusal is not a stream line: stdout stays empty
+/// for the refused Work, the refusal reaches stderr naming the daemon's
+/// own code, and the exit still reflects it.
+#[test]
+fn cli_watch_json_of_unknown_work_refuses_on_stderr_and_prints_no_stdout() {
+    let dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = dir.path().to_path_buf();
+    let mut wirkd_child = KillOnDrop(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn wirkd"),
+    );
+    let _pointer = wait_for_pointer(&estate);
+
+    let output = wirk_cli()
+        .args(["wirkd", "watch", "--estate"])
+        .arg(&estate)
+        .args(["--work", "work-never-submitted"])
+        .arg("--json")
+        .output()
+        .expect("watch --json runs");
+
+    assert!(
+        !output.status.success(),
+        "a refused json watch must exit nonzero, got: {:?}, stdout: {}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused Work has no event to print; stdout must stay empty, got: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refused") && stderr.contains("NotFound"),
+        "the refusal must reach stderr naming the daemon's own code, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("malformed"),
+        "a valid daemon refusal must never be labeled malformed, got: {stderr}"
+    );
+
+    let stop = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(stop.status.success());
+    let _ = wirkd_child.0.wait();
+    drop(wirkd_child);
+}
+
+/// One Work's json refusal must not cut a sibling's parseable stream:
+/// every stdout line observed after the refusal still parses as one
+/// event of the admitted Work, the refusal itself reaches stderr only,
+/// live appends keep arriving, and the final exit still reflects the
+/// refusal.
+#[test]
+fn cli_watch_json_keeps_streaming_after_a_sibling_refusal_and_exits_nonzero() {
+    let dir = tempfile::tempdir().expect("estate tempdir");
+    let estate = dir.path().to_path_buf();
+    let mut wirkd_child = KillOnDrop(
+        wirk_cli()
+            .args(["wirkd", "start", "--estate"])
+            .arg(&estate)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn watch cli"),
+    );
+    let pointer = wait_for_pointer(&estate);
+    let (work_a, run_a) = submit(&estate, &pointer.socket, "json valid stream");
+    let work_b_id = "work-json-manufactured-never-submitted".to_string();
+    fs::create_dir_all(estate.join("works").join(&work_b_id))
+        .expect("create work_b's bare, journal-less directory");
+
+    let (mut cli, out, err) = spawn_cli_watch_json(&estate, None);
+
+    let mut saw_work_a = false;
+    for _ in 0..16 {
+        if saw_work_a {
+            break;
+        }
+        let line = recv_line(&out, "work_a's own event line");
+        let event = parse_whole_line(&line);
+        assert_eq!(
+            event["work"].as_str(),
+            Some(work_a.0.as_str()),
+            "stdout must carry only the admitted Work's events: {line}"
+        );
+        if event["kind"]["kind"].as_str() == Some("WorkSubmitted") {
+            saw_work_a = true;
+        }
+    }
+    assert!(
+        saw_work_a,
+        "work_a's own stream must keep serving despite work_b's refusal"
+    );
+
+    let mut saw_refusal = false;
+    for _ in 0..16 {
+        if saw_refusal {
+            break;
+        }
+        let line = err
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("work_b's refusal never reached stderr"));
+        if line.contains(&work_b_id) && line.contains("refused") {
+            assert!(line.contains("NotFound"), "expected NotFound, got: {line}");
+            assert!(
+                !line.contains("malformed"),
+                "must not be labeled malformed, got: {line}"
+            );
+            saw_refusal = true;
+        }
+    }
+    assert!(
+        saw_refusal,
+        "work_b's own watch must be refused, labeled as such, on stderr"
+    );
+
+    record(&pointer.socket, &work_a, &run_a, EventKind::RunVanished);
+    let mut saw_live = false;
+    for _ in 0..16 {
+        let line = recv_line(&out, "work_a's live RunVanished line");
+        let event = parse_whole_line(&line);
+        if event["kind"]["kind"].as_str() == Some("RunVanished") {
+            saw_live = true;
+            break;
+        }
+    }
+    assert!(
+        saw_live,
+        "work_a must keep delivering parseable live events after the sibling refusal"
+    );
+
+    let stop = wirk_cli()
+        .args(["wirkd", "stop", "--estate"])
+        .arg(&estate)
+        .output()
+        .expect("wirkd stop runs");
+    assert!(stop.status.success());
+
+    let status = cli.wait().expect("watch exits on its own");
+    assert!(
+        !status.success(),
+        "the whole command's exit must still reflect work_b's refusal, got: {status:?}"
+    );
+    let _ = wirkd_child.0.wait();
+    drop(wirkd_child);
 }

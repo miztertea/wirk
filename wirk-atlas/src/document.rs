@@ -15,7 +15,11 @@
 //! [`resolved_format`] is the one place that decides how a resource is
 //! read, and every other decision in this crate defers to it: what family
 //! admission assigns, which unitizer stamps the units, whether hydration
-//! renders or passes bytes through, and what the structured reader parses.
+//! renders or passes bytes through, and what the structured reader
+//! parses. It answers for one extraction edition at a time — the one the
+//! generation being read was recorded under — so widening the vocabulary
+//! changes what new generations capture without changing how an existing
+//! one is read back.
 //!
 //! PDF is the one format with no document-model form: `anydoc::to_document`
 //! is unsupported there and `to_markdown_bytes` is the only PDF path, so
@@ -74,9 +78,18 @@ pub(crate) fn format_for_path(path: &[u8]) -> Option<Format> {
     Format::from_extension(ext)
 }
 
-/// **The one interpretation authority.** How this resource is read:
-/// `Some(format)` to parse it through `anydoc` as that format, `None` to
-/// treat its bytes as ordinary text.
+/// **The one interpretation authority.** How this resource is read under
+/// `edition`: `Some(format)` to parse it through `anydoc` as that format,
+/// `None` to treat its bytes as ordinary text.
+///
+/// **Scoped to an edition, not to this binary.** A generation's units
+/// index whatever string this function chose when that generation was
+/// written — the original bytes, or the Markdown a container rendered to
+/// — so every later read has to reach the same answer or it slices a
+/// string the offsets do not describe. The edition each generation
+/// records is what makes that possible, and it is threaded to here from
+/// the record rather than re-derived from today's vocabulary
+/// (`crate::extract::ExtractorEdition`, ruling 0095).
 ///
 /// Three rules, in order, each answering a case the others get wrong:
 ///
@@ -86,7 +99,8 @@ pub(crate) fn format_for_path(path: &[u8]) -> Option<Format> {
 ///    fallback for a format that carries no signature to detect, which is
 ///    CSV's own case.
 /// 2. **The path names a text family** (`.md`, `.rs`, `.toml`, … — the
-///    extractor's own content-family vocabulary). Read as text, and the
+///    `edition`'s own content-family vocabulary, which is where `.txt`
+///    joined it). Read as text, and the
 ///    bytes are never sniffed. This is what keeps ordinary Markdown and
 ///    code interpretation intact, and in particular what keeps a
 ///    byte-identical CSV/Markdown pair two different resources: the `.csv`
@@ -100,11 +114,15 @@ pub(crate) fn format_for_path(path: &[u8]) -> Option<Format> {
 ///    An unrecognized extension is not exclusion authority; a path
 ///    `ExtractorPolicy::excluded` refuses is never opened at all, and that
 ///    check runs first, before any byte of any candidate is read.
-pub(crate) fn resolved_format(path: &[u8], bytes: &[u8]) -> Option<Format> {
+pub(crate) fn resolved_format(
+    edition: crate::extract::ExtractorEdition,
+    path: &[u8],
+    bytes: &[u8],
+) -> Option<Format> {
     if let Some(named) = format_for_path(path) {
         return Some(Format::from_bytes(bytes).unwrap_or(named));
     }
-    if crate::extract::path_names_text_family(path) {
+    if crate::extract::path_names_text_family(edition, path) {
         return None;
     }
     Format::from_bytes(bytes)
@@ -122,15 +140,26 @@ pub(crate) fn render(format: Format, bytes: &[u8]) -> Result<String, String> {
     })
 }
 
-/// Re-render a resource's bytes through [`render`] when [`resolved_format`]
-/// reads it as a document, otherwise pass the bytes through unchanged.
-/// The one place every byte-reading caller (`hydrate::blob`/`blobs`,
-/// `AtlasStore::resolve_exact_*`) routes through, so a `Document` unit is
-/// always resolved, re-indexed or embedded against the same Markdown text
-/// it was unitized from — never against the original binary the unit's
-/// offsets do not describe.
-pub(crate) fn render_if_document(path: &[u8], bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    match resolved_format(path, &bytes) {
+/// Re-render a resource's bytes through [`render`] when the generation's
+/// own `edition` reads it as a document, otherwise pass the bytes through
+/// unchanged. The one place every byte-reading caller
+/// (`hydrate::blob`/`blobs`, `AtlasStore::resolve_exact_*`) routes
+/// through, so a `Document` unit is always resolved, re-indexed or
+/// embedded against the same Markdown text it was unitized from — never
+/// against the original binary the unit's offsets do not describe.
+///
+/// `edition` is the recorded one
+/// (`SourceGeneration::extractor_set`/`ChunkerIdentity::extractor_set`),
+/// never today's default. Re-deriving it here is precisely how a
+/// vocabulary change turns into silently wrong bytes: the resource was
+/// unitized under the edition that captured it, and that is the only
+/// interpretation whose offsets mean anything.
+pub(crate) fn render_if_document(
+    edition: crate::extract::ExtractorEdition,
+    path: &[u8],
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    match resolved_format(edition, path, &bytes) {
         Some(format) => render(format, &bytes).map(String::into_bytes),
         None => Ok(bytes),
     }
@@ -260,8 +289,12 @@ pub struct ResolvedAsset {
 /// what it holds. Reads structure, not a string: this is the reader
 /// capability the Markdown serializer cannot offer, and it is what makes
 /// a document's embedded diagram reachable at all.
-pub(crate) fn inspect(path: &[u8], bytes: &[u8]) -> DocumentReading {
-    let Some(format) = resolved_format(path, bytes) else {
+pub(crate) fn inspect(
+    edition: crate::extract::ExtractorEdition,
+    path: &[u8],
+    bytes: &[u8],
+) -> DocumentReading {
+    let Some(format) = resolved_format(edition, path, bytes) else {
         return DocumentReading::NotADocument;
     };
     if format == Format::Pdf {
@@ -283,8 +316,13 @@ pub(crate) fn inspect(path: &[u8], bytes: &[u8]) -> DocumentReading {
 /// One embedded asset's bytes, selected by the `id` an [`inspect`]
 /// inventory listed. `None` for an id this document does not define —
 /// never a different asset's bytes.
-pub(crate) fn asset(path: &[u8], bytes: &[u8], id: usize) -> Result<Option<ResolvedAsset>, String> {
-    let Some(format) = resolved_format(path, bytes) else {
+pub(crate) fn asset(
+    edition: crate::extract::ExtractorEdition,
+    path: &[u8],
+    bytes: &[u8],
+    id: usize,
+) -> Result<Option<ResolvedAsset>, String> {
+    let Some(format) = resolved_format(edition, path, bytes) else {
         return Err("this resource is not read as a document".into());
     };
     if format == Format::Pdf {
@@ -430,6 +468,11 @@ fn scan(inlines: &[Inline], outline: &mut DocumentOutline) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::ExtractorEdition;
+
+    /// The edition new generations are captured under. Every assertion
+    /// below that does not deliberately name an older one asks this.
+    const CURRENT: ExtractorEdition = ExtractorEdition::DocumentsDetectedTextV7;
 
     #[test]
     fn recognizes_every_extension_anydoc_itself_documents() {
@@ -471,29 +514,85 @@ mod tests {
         // `resolved_format`, and the reason a byte-identical CSV/Markdown
         // pair remains two different readings.
         let rtf = b"{\\rtf1\\ansi hello}";
-        assert_eq!(resolved_format(b"notes.md", rtf), None);
-        assert_eq!(resolved_format(b"notes.rs", rtf), None);
+        assert_eq!(resolved_format(CURRENT, b"notes.md", rtf), None);
+        assert_eq!(resolved_format(CURRENT, b"notes.rs", rtf), None);
         // The same bytes under no recognized extension are read for what
         // they are.
-        assert_eq!(resolved_format(b"notes", rtf), Some(Format::Rtf));
-        assert_eq!(resolved_format(b"notes.rfp", rtf), Some(Format::Rtf));
+        assert_eq!(resolved_format(CURRENT, b"notes", rtf), Some(Format::Rtf));
+        assert_eq!(
+            resolved_format(CURRENT, b"notes.rfp", rtf),
+            Some(Format::Rtf)
+        );
     }
 
     #[test]
     fn content_overrides_a_misleading_document_extension() {
         let rtf = b"{\\rtf1\\ansi hello}";
-        assert_eq!(resolved_format(b"report.docx", rtf), Some(Format::Rtf));
+        assert_eq!(
+            resolved_format(CURRENT, b"report.docx", rtf),
+            Some(Format::Rtf)
+        );
         // CSV carries no signature, so its extension is what names it.
         assert_eq!(
-            resolved_format(b"rows.csv", b"a,b\n1,2\n"),
+            resolved_format(CURRENT, b"rows.csv", b"a,b\n1,2\n"),
             Some(Format::Csv)
+        );
+    }
+
+    /// `.txt` is the plainest text name there is, and the current
+    /// edition reads it as text rather than sniffing it as a container —
+    /// while `v6`, which has no answer for `.txt`, keeps the answer it
+    /// always gave.
+    ///
+    /// Both halves matter. The first is the preserved text-family
+    /// interpretation: before `v7` an ordinary glossary fell
+    /// to rule 3, was screened for a container, found none in prose and
+    /// was captured `Unsupported("no extractor for path family")`. The
+    /// second is why that correction is an edition and not a row in the
+    /// shared vocabulary: a `v6` generation whose `.txt` held real RTF
+    /// was recorded as a `Document` over its Markdown rendering, and its
+    /// units index that rendering. Answering `None` for it under `v6`
+    /// would hand every later reader the original container's bytes
+    /// against offsets describing a string those bytes never contained.
+    #[test]
+    fn an_ordinary_text_file_is_read_as_text_under_the_current_edition() {
+        const V6: ExtractorEdition = ExtractorEdition::DocumentsDetectedV6;
+        let prose = b"Estate: the bounded domain.\n";
+        let rtf = b"{\\rtf1\\ansi hello}";
+
+        // Prose is text either way: `v6` sniffed it and found nothing.
+        assert_eq!(resolved_format(CURRENT, b"glossary.txt", prose), None);
+        assert_eq!(resolved_format(V6, b"glossary.txt", prose), None);
+        assert!(crate::extract::path_names_text_family(
+            CURRENT,
+            b"glossary.txt"
+        ));
+        assert!(!crate::extract::path_names_text_family(V6, b"glossary.txt"));
+
+        // Container bytes under a `.txt` name are where the editions
+        // part, and each keeps its own answer.
+        assert_eq!(resolved_format(CURRENT, b"notes.txt", rtf), None);
+        assert_eq!(resolved_format(V6, b"notes.txt", rtf), Some(Format::Rtf));
+
+        // A genuinely non-text name is unaffected in both: still not
+        // text family, still decided by content.
+        assert!(!crate::extract::path_names_text_family(
+            CURRENT,
+            b"photo.png"
+        ));
+        assert_eq!(
+            resolved_format(CURRENT, b"report.pdf", b"%PDF-1.4\n"),
+            Some(Format::Pdf)
         );
     }
 
     #[test]
     fn plain_text_under_an_unknown_extension_is_not_a_document() {
-        assert_eq!(resolved_format(b"payload.bin", b"just words\n"), None);
-        assert_eq!(resolved_format(b"payload", b""), None);
+        assert_eq!(
+            resolved_format(CURRENT, b"payload.bin", b"just words\n"),
+            None
+        );
+        assert_eq!(resolved_format(CURRENT, b"payload", b""), None);
     }
 
     #[test]
@@ -535,7 +634,7 @@ mod tests {
 
     #[test]
     fn inspect_reports_the_pdf_model_limit_rather_than_an_empty_success() {
-        match inspect(b"a.pdf", b"%PDF-1.7\n") {
+        match inspect(CURRENT, b"a.pdf", b"%PDF-1.7\n") {
             DocumentReading::ModelUnavailable(detail) => {
                 assert!(detail.contains("no document model"), "{detail}");
             }
@@ -546,7 +645,7 @@ mod tests {
     #[test]
     fn inspect_names_a_non_document_rather_than_guessing_at_one() {
         assert_eq!(
-            inspect(b"notes.md", b"# hi\n"),
+            inspect(CURRENT, b"notes.md", b"# hi\n"),
             DocumentReading::NotADocument
         );
     }

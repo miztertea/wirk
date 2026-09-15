@@ -18,7 +18,7 @@
     {
       "id": "w4-orient-build-verify/verify",
       "kind": "Deterministic",
-      "command": ["sh", "-c", "echo verified > verify.log"],
+      "command": ["sh", "-c", "set -e; dir=$(wirk output dir); echo verified > \"$dir/verify.log\""],
       "declared_outputs": [{"name": "verify.log", "required": true}],
       "boundary": ["verify.log"]
     }

@@ -91,10 +91,29 @@ fn submit_adhoc(estate: &Path, command: &[&str]) -> (String, String) {
 }
 
 fn run_deterministic(estate: &Path, work: &str) -> (Option<i32>, String) {
+    // `ChildExecutor::launch` passes its own environment through to the
+    // deterministic child apart from the injected triple, so a Route
+    // whose command calls `wirk output dir` — the public command a real
+    // deterministic stage uses to find where to write — needs that
+    // binary reachable by name. Prepended rather than replacing `PATH`,
+    // so `sh`, `cat` and the rest still resolve.
+    let bin_dir = Path::new(harness::wirk_bin())
+        .parent()
+        .expect("the test binary has a directory")
+        .to_path_buf();
+    let path = match std::env::var_os("PATH") {
+        Some(existing) => {
+            let mut dirs = vec![bin_dir];
+            dirs.extend(std::env::split_paths(&existing));
+            std::env::join_paths(dirs).expect("PATH joins")
+        }
+        None => bin_dir.into_os_string(),
+    };
     let output = wirk_cli()
         .args(["run-deterministic", "--estate"])
         .arg(estate)
         .args(["--work", work, "--executor", "child"])
+        .env("PATH", path)
         .output()
         .expect("run-deterministic runs");
     (
@@ -901,11 +920,22 @@ fn atlas_json(estate: &Path, args: &[&str]) -> Value {
 /// A two-stage Route: a Deterministic stage that really collects the
 /// bytes of an admitted document, then an Actor stage that reads what
 /// it claimed.
+///
+/// The collect stage resolves its own destination through `wirk output
+/// dir` rather than relying on its cwd. That is the output-only
+/// counterpart of the Git-backed case
+/// (`w4_advance_base.rs`'s own guidance check): this World reserves no
+/// Git checkout at all, so the destination the public command advertises
+/// is this Work's own owned execution address — and the stage's
+/// automatic Claim has to find the file exactly there.
 fn collect_then_actor_route(estate: &Path, source_file: &Path) -> PathBuf {
     let dir = estate.join("routes");
     fs::create_dir_all(&dir).expect("routes dir");
     let path = dir.join("collect_then_actor.json");
-    let command = format!("cat {} > prepared.md", source_file.display());
+    let command = format!(
+        "set -e; dir=$(wirk output dir); cat {} > \"$dir/prepared.md\"",
+        source_file.display()
+    );
     fs::write(
         &path,
         serde_json::to_string_pretty(&serde_json::json!({
@@ -1043,6 +1073,34 @@ fn a_read_bound_deterministic_stage_hands_its_collected_bytes_to_the_actor_stage
         submit_route_output_only(&estate, &route, "doc-set-1", &["handbook:read"]);
     assert_eq!(waypoint, "collect-then-actor/collect");
 
+    // An output-only Deterministic World reserves no Git checkout, and
+    // the guidance used to answer that with "no destination". It has
+    // one: `handle_submit`'s own output-only arm reserves
+    // `owned_execution_address` as this World's `cwd`, which is where
+    // its automatic Claim looks. The public command has to name that,
+    // before the stage has run and created it.
+    let dir_out = wirk_cli()
+        .args(["output", "dir"])
+        .env("WIRK_ESTATE_ROOT", &estate)
+        .env("WIRK_WORK_ID", &work)
+        .env("WIRK_RUN_ID", &collect_run)
+        .output()
+        .expect("wirk output dir runs");
+    assert!(
+        dir_out.status.success(),
+        "an output-only Deterministic Run has an output destination: {}",
+        String::from_utf8_lossy(&dir_out.stderr)
+    );
+    assert_eq!(
+        PathBuf::from(String::from_utf8_lossy(&dir_out.stdout).trim().to_string()),
+        owned_dir(&estate, &work),
+        "the advertised destination is this Work's own owned execution address"
+    );
+
+    // The stage itself now resolves that same command inside its own
+    // child (`collect_then_actor_route`'s `set -e; dir=$(wirk output
+    // dir)`): a wrong or unavailable answer fails the child, and a right
+    // one has to be where its own automatic Claim then validates.
     let (code, log) = run_deterministic(&estate, &work);
     assert_eq!(code, Some(0), "the collect stage: {log}");
 

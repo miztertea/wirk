@@ -112,6 +112,7 @@ use crate::{
 /// (this item's fix).
 pub const METHODS: &[&str] = &[
     "ping",
+    "server.agent_manifests",
     "workspace.create",
     "pane.split",
     "worktree.open",
@@ -197,6 +198,34 @@ impl SocketClient {
     pub fn ping(&self) -> Result<(), HerdrError> {
         let result = self.call("ping", json!({}))?;
         expect_type(&result, "pong")
+    }
+
+    /// The interactive agent kinds this Herdr can start, in the order
+    /// it reports them.
+    ///
+    /// `server.agent_manifests` answers with one entry per kind Herdr
+    /// carries a detection manifest for, so this is Herdr's own
+    /// structured list rather than a scrape of its help output, and it
+    /// follows a Herdr that gains or drops a kind without an edit here.
+    ///
+    /// Two limits, both observed against a live 0.9.0 server and both
+    /// the caller's to respect. It is not the full set
+    /// `agent start --kind` accepts: a kind with no detection manifest
+    /// on this machine is startable and absent here, so this list
+    /// offers choices and never settles them. And nothing in it says
+    /// whether an agent is installed — the versions and update state
+    /// alongside each label describe Herdr's detection rules, not the
+    /// presence of an executable.
+    ///
+    /// Only each entry's `agent` label is taken.
+    ///
+    /// No `HerdrClient` trait row, for the same reason as `ping`: it is
+    /// a question about the server, not one of the executor verbs.
+    pub fn agent_manifests(&self) -> Result<Vec<String>, HerdrError> {
+        let result = self.call("server.agent_manifests", json!({}))?;
+        let manifests: Vec<AgentManifestEntry> =
+            extract(result, "agent_manifest_status", "manifests")?;
+        Ok(manifests.into_iter().map(|entry| entry.agent).collect())
     }
 
     // ---- wire plumbing ----------------------------------------------
@@ -520,6 +549,15 @@ fn subscription_json(sub: &EventSubscription) -> Value {
 /// Confirms a tagged result's `"type"` equals `expected`, discarding
 /// the rest — for verbs whose success carries no field the trait needs
 /// back (`Result<(), HerdrError>` rows).
+/// One row of `server.agent_manifests`' reply. Herdr sends several
+/// fields per row (the manifest's source, version and update state);
+/// only the agent label is read here, so only it is required — a Herdr
+/// that adds fields to this row keeps working.
+#[derive(serde::Deserialize)]
+struct AgentManifestEntry {
+    agent: String,
+}
+
 fn expect_type(result: &Value, expected: &str) -> Result<(), HerdrError> {
     let ty = result.get("type").and_then(Value::as_str).unwrap_or("");
     if ty != expected {

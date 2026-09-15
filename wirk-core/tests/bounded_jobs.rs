@@ -423,15 +423,25 @@ fn insufficient_space_names_the_estimate_and_the_measurement_and_calls_it_an_est
 // Containment: real children, including one that escapes its group
 // ---------------------------------------------------------------------
 
-/// A child that prints its own pid, `setsid()`s a grandchild that prints
-/// *its* pid, and then both sleep. The grandchild is the whole point: it
-/// leaves the process group, so `kill(-pgid)` cannot reach it.
+/// A child that records its own pid in its own directory, then prints
+/// its own pid, `setsid()`s a grandchild that prints *its* pid, and then
+/// both sleep. The grandchild is the whole point: it leaves the process
+/// group, so `kill(-pgid)` cannot reach it.
+///
+/// Recording the pid is the fixture's own job: it is the direct child of
+/// this process, running in a directory only this check uses, so it can
+/// name itself directly instead of a caller having to go looking for it
+/// in `/proc`.
 fn escaping_child(directory: &Path) -> PathBuf {
     let script = directory.join("escape.py");
+    let pid_file = own_pid_path(directory);
     fs::write(
         &script,
-        r#"#!/usr/bin/env python3
+        format!(
+            r#"#!/usr/bin/env python3
 import os, sys, time
+with open("{pid_file}", "w") as f:
+    f.write(str(os.getpid()))
 pid = os.fork()
 if pid == 0:
     os.setsid()
@@ -443,6 +453,8 @@ sys.stdout.write("child %d\n" % os.getpid())
 sys.stdout.flush()
 time.sleep(600)
 "#,
+            pid_file = pid_file.display(),
+        ),
     )
     .unwrap();
     let mut permissions = fs::metadata(&script).unwrap().permissions();
@@ -652,39 +664,86 @@ fn without_strong_containment() -> JobCapabilities {
     }
 }
 
-/// Children of this process that have exited and not been reaped.
-///
 /// A job whose direct child is killed but never `wait`ed for leaves a
 /// zombie, and "the bound returned promptly" is not the whole property:
 /// returning while leaking the one process this code unambiguously owns
 /// would be a different defect wearing the same green.
-fn own_zombies() -> Vec<i32> {
-    let me = std::process::id() as i32;
-    let mut found = Vec::new();
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return found;
-    };
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        // `comm` can contain spaces and parentheses, so the fields are
-        // read from after the last ')': state is the first, ppid the
-        // second.
-        let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
-            continue;
-        };
-        let mut fields = rest.split_whitespace();
-        let state = fields.next().unwrap_or_default();
-        let parent: i32 = fields.next().unwrap_or_default().parse().unwrap_or(0);
-        if parent == me && state == "Z" {
-            found.push(pid);
+///
+/// That property is about **one** process, so it is observed as one
+/// process: this check's own script records its own pid in its own
+/// directory (see `escaping_child`), and this reads that back directly
+/// rather than scanning `/proc` for it. The earlier form scanned `/proc`
+/// for any zombie whose parent was this process, which is not the same
+/// question: `libtest` runs every check in this file concurrently in
+/// this one process, several of them spawn real children, and a child
+/// of *another* check is a zombie for the ordinary moment between its
+/// exit and its owner's `wait`. That window satisfied "a zombie child
+/// of this process" and failed this check, while this check's own child
+/// had already been reaped correctly (ruling 0351).
+///
+/// The path a script records its pid to.
+fn own_pid_path(directory: &Path) -> PathBuf {
+    directory.join("own.pid")
+}
+
+/// Read the pid a script recorded for itself at `own_pid_path`. Fails
+/// loudly rather than returning nothing: a caller that treated a missing
+/// pid as "nothing to check" would assert nothing about reaping, which
+/// is the failure mode this check exists to catch.
+fn own_recorded_pid(directory: &Path) -> i32 {
+    let path = own_pid_path(directory);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = fs::read_to_string(&path)
+            && let Ok(pid) = contents.trim().parse()
+        {
+            return pid;
         }
+        assert!(
+            Instant::now() < deadline,
+            "this check must have actually observed its own direct child's pid, otherwise it \
+             asserts nothing about reaping"
+        );
+        std::thread::sleep(Duration::from_millis(5));
     }
-    found
+}
+
+/// Assert what this check owns: the given pid is no longer a child of
+/// this process — it was reaped, not left. A still-running child and an
+/// unreaped zombie are both leaks, and both are caught here. (A pid
+/// recycled into another child of this process within this window would
+/// be a false positive; that needs the host's whole pid space to wrap in
+/// the milliseconds between the reap and this read.)
+fn assert_child_reaped(pid: i32) {
+    let state = our_child_state(pid);
+    assert!(
+        state.is_none(),
+        "the direct child {pid} is this process's own and must be reaped, not left: it is \
+         still our child in state {state:?}"
+    );
+}
+
+/// The process state of `pid` if it is a child of this process, `None`
+/// if it is gone or belongs to someone else.
+fn our_child_state(pid: i32) -> Option<String> {
+    let me = std::process::id() as i32;
+    match stat_state_and_parent(pid) {
+        Some((state, parent)) if parent == me => Some(state),
+        _ => None,
+    }
+}
+
+/// State and parent from `/proc/<pid>/stat`.
+///
+/// `comm` can contain spaces and parentheses, so the fields are read
+/// from after the last ')': state is the first, ppid the second.
+fn stat_state_and_parent(pid: i32) -> Option<(String, i32)> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.to_string();
+    let parent = fields.next()?.parse().ok()?;
+    Some((state, parent))
 }
 
 /// Kill whatever this check's own script still has running. Owned by
@@ -756,11 +815,7 @@ fn a_cancel_returns_when_an_escaped_descendant_holds_the_job_pipes_open() {
         elapsed < Duration::from_secs(10),
         "the cancel must not wait on a descendant this host cannot kill, took {elapsed:?}"
     );
-    assert!(
-        own_zombies().is_empty(),
-        "the direct child is this process's own and must be reaped, not left: {:?}",
-        own_zombies()
-    );
+    assert_child_reaped(own_recorded_pid(scratch.path()));
 }
 
 /// The same property for a deadline, which is the other way a job ends
@@ -808,11 +863,7 @@ fn a_deadline_returns_when_an_escaped_descendant_holds_the_job_pipes_open() {
         elapsed < Duration::from_secs(10),
         "the deadline must bound the wait even where the grandchild survives, took {elapsed:?}"
     );
-    assert!(
-        own_zombies().is_empty(),
-        "the direct child is this process's own and must be reaped, not left: {:?}",
-        own_zombies()
-    );
+    assert_child_reaped(own_recorded_pid(scratch.path()));
 }
 
 /// Input production is the other descriptor an escaped descendant holds.
@@ -876,10 +927,88 @@ fn a_blocked_input_write_is_released_when_the_job_ends() {
         elapsed < Duration::from_secs(10),
         "a writer blocked on a pipe nothing will drain must be released, took {elapsed:?}"
     );
+    assert_child_reaped(own_recorded_pid(scratch.path()));
+}
+
+/// Reaps a pid on drop, so a control that leaks a zombie on purpose
+/// cleans it up even when an assertion between the leak and the normal
+/// cleanup panics.
+struct ReapOnDrop(i32);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: a plain `waitpid(2)` on a pid this check spawned.
+        let mut status = 0;
+        unsafe { libc::waitpid(self.0, &mut status, 0) };
+    }
+}
+
+/// The negative control for the check above: a genuinely unreaped
+/// direct child of *this* process must still fail it.
+///
+/// Narrowing the observation from "any zombie child of this process" to
+/// "this check's own direct child" is only correct if it still catches
+/// the defect the wide form was there to catch. So this check creates
+/// that defect deliberately — a real child, really killed, deliberately
+/// not `wait`ed for — and asserts that the same assertion reports it.
+/// The pid is this control's own spawn result, known directly, with
+/// nothing to poll for; `ReapOnDrop` reaps it even if an assertion below
+/// panics first, so the control leaves nothing behind either way.
+#[test]
+fn an_unreaped_direct_child_of_this_check_still_fails_the_owned_observation() {
+    let scratch = TempDir::new().unwrap();
+    let script = scratch.path().join("sleeper.py");
+    fs::write(&script, "import time\ntime.sleep(600)\n").unwrap();
+
+    let leaked = Command::new("python3")
+        .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("python3 is what every other check here runs too");
+    let pid = leaked.id() as i32;
+    // Deliberately not `wait`ed: dropping the handle is what leaves the
+    // zombie this control is about.
+    drop(leaked);
+    let _reap_guard = ReapOnDrop(pid);
+
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while our_child_state(pid).as_deref() != Some("Z") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        our_child_state(pid).as_deref(),
+        Some("Z"),
+        "the control's own child must actually be an unreaped zombie before the check is asked \
+         about it"
+    );
+
+    // The panic hook is left alone on purpose. It is process-global, and
+    // swapping it here would suppress the message of any *other* check
+    // that happened to fail in the same moment — the same class of
+    // cross-check interference this whole change is about. The expected
+    // panic's own message goes to this check's captured output, which is
+    // discarded while it passes.
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assert_child_reaped(pid)));
+
+    let panicked = outcome.expect_err("a leaked direct child must fail the owned observation");
+    let message = panicked
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        own_zombies().is_empty(),
-        "the direct child is this process's own and must be reaped, not left: {:?}",
-        own_zombies()
+        message.contains(&format!("the direct child {pid}")),
+        "the failure must name this check's own child, not some other check's: {message}"
+    );
+
+    drop(_reap_guard);
+    assert!(
+        our_child_state(pid).is_none(),
+        "the control reaps what it leaked"
     );
 }
 

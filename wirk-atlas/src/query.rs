@@ -417,16 +417,76 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
     // is a request that cannot be answered as asked, and saying so costs
     // no store read and asserts nothing about the estate (ruling 0171).
     let capacity = resolve_capacity(request).map_err(AtlasError::InvalidRequest)?;
+    // Under a Work scope, admission is decided from this Work's own
+    // grants before the registry is consulted at all. The
+    // aliases such a request can possibly reach are its grants, narrowed
+    // by `requested_source` when it named one; when that set is empty
+    // nothing this estate holds is reachable, and the answer is a denial
+    // reached without reading the catalog.
+    //
+    // Deciding it here rather than after the registry keeps two pairs of
+    // cases indistinguishable that a scoped caller must not be able to
+    // tell apart: an alias it named that is registered-but-withheld
+    // against one that does not exist at all, and an estate holding
+    // nothing against one holding only sources it was never granted.
+    // Both collapse to the same `denied` answer that `atlas remove`
+    // already gives. `QueryScope::EstateOrientation`
+    // consults no grants and is unaffected: administrative status keeps
+    // seeing the real catalog.
+    let reachable: Option<Vec<&str>> = match &request.scope {
+        QueryScope::Work(grants) => Some(
+            grants
+                .iter()
+                .map(|grant| grant.name.as_str())
+                .filter(|name| {
+                    request
+                        .requested_source
+                        .as_deref()
+                        .is_none_or(|wanted| *name == wanted)
+                })
+                .collect(),
+        ),
+        QueryScope::EstateOrientation => None,
+    };
+    if reachable.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(empty_answer(
+            store,
+            request,
+            capacity,
+            AdmissionSummary::default(),
+            AnswerCoverage {
+                denied: true,
+                ..AnswerCoverage::default()
+            },
+            match request.semantic {
+                SemanticRequest::Disabled => SemanticStatus::Disabled,
+                SemanticRequest::Requested => SemanticStatus::Unavailable(fallback_reason(
+                    "this scope was never granted the requested source, so no semantic \
+                     edition can be selected for it",
+                )),
+            },
+        ));
+    }
     // W3-CORRECTION.md item 3: a fresh estate (or a specifically
     // requested-but-unregistered source) has never had anything to admit
     // or deny — reported distinctly from both `denied` and `no_match`.
-    let registered_total = match &request.requested_source {
-        Some(wanted) => store
-            .memberships()
-            .filter(|membership| &membership.alias == wanted)
-            .count(),
-        None => store.memberships().count(),
-    };
+    //
+    // Counted over the reachable aliases resolved above, never over the
+    // whole catalog: under a Work scope this decides whether anything
+    // *this scope is granted* is registered, so a membership it was
+    // never granted can neither create nor suppress the `no_sources`
+    // answer it reads.
+    let registered_total = store
+        .memberships()
+        .filter(|membership| match &request.requested_source {
+            Some(wanted) => &membership.alias == wanted,
+            None => true,
+        })
+        .filter(|membership| match &reachable {
+            Some(names) => names.contains(&membership.alias.as_str()),
+            None => true,
+        })
+        .count();
     if registered_total == 0 {
         return Ok(empty_answer(
             store,
@@ -522,13 +582,28 @@ pub fn search(store: &AtlasStore, request: &SearchRequest) -> Result<SearchAnswe
                     continue;
                 }
             },
-            None => {
-                let Some(generation) = store.current(&source.membership)? else {
+            None => match store.current(&source.membership) {
+                Ok(Some(generation)) => generation,
+                Ok(None) => {
                     coverage.generation_unavailable = true;
                     continue;
-                };
-                generation
-            }
+                }
+                // Source-local, same as the pinned branch above:
+                // `AtlasError::Generation` means *this* membership's
+                // published generation could not be read back, not
+                // that the whole answer is unanswerable. Reusing
+                // `generation_unavailable` here is exactly the
+                // contract a pinned continuation already relies on for
+                // a generation that no longer resolves; the unpinned
+                // walk must not abort the entire multi-source answer
+                // over one broken membership when it already tolerates
+                // the identical condition on the pinned path.
+                Err(AtlasError::Generation(_)) => {
+                    coverage.generation_unavailable = true;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            },
         };
         generations.push((source.membership.id.clone(), generation.id.clone()));
         resolved.push((source.clone(), generation));
@@ -1004,6 +1079,7 @@ fn lexical_hits(
             }
         }
         let blob_cache = match crate::hydrate::blobs(
+            crate::extract::ExtractorEdition::recorded(&generation.extractor_set)?,
             &generation.acquisition_policy,
             Path::new(&source.membership.locator),
             store.root(),
@@ -1275,12 +1351,15 @@ pub fn resolve_path(
     }
     let object_id = record.object_id.clone().unwrap_or_default();
     let bytes = match crate::hydrate::blob(
+        crate::extract::ExtractorEdition::recorded(&generation.extractor_set)?,
         &generation.acquisition_policy,
         Path::new(&source.membership.locator),
         store.root(),
         &generation.id,
-        &record.path,
-        &object_id,
+        crate::hydrate::RecordedResource {
+            path: &record.path,
+            object_id: &object_id,
+        },
         &store.capture_limits(),
     ) {
         Ok(bytes) => bytes,

@@ -412,17 +412,43 @@ fn path_suffix_lowercase(path: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&name[dot..]).to_ascii_lowercase())
 }
 
+/// The one plain-text extension the generated vocabulary above does not
+/// name, and cannot: the reference answers "which language is this", and
+/// `.txt` names no language, so it has no row there. The question this
+/// module's callers actually ask the vocabulary is the different one —
+/// "is this plain text" — and for that question `.txt` is the plainest
+/// answer there is.
+///
+/// Kept out of `EXTENSION_FAMILY` and carried by the edition instead,
+/// because that table is the vocabulary editions v3 through v6 all read:
+/// a row added there widens every one of them retroactively, and a
+/// generation an older binary recorded under the old answer stops
+/// validating and stops resolving. Editions exist so a vocabulary can
+/// change without that happening, so this belongs to one edition rather
+/// than to the shared table.
+const PLAIN_TEXT_EXTENSION: (&str, ContentFamily) = (".txt", ContentFamily::Knowledge);
+
 /// Whether `path`'s extension names one of the plain-text content
-/// families (`Code`/`Knowledge`/`Config`). `crate::document` asks this to
-/// decide whether a resource's bytes may be sniffed at all: a path the
-/// text vocabulary already claims is read as text, and nothing about its
-/// content changes that. That is what keeps ordinary Markdown and code
-/// interpretation intact, and what keeps a byte-identical CSV/Markdown
-/// pair two different readings of one blob.
-pub(crate) fn path_names_text_family(path: &[u8]) -> bool {
+/// families (`Code`/`Knowledge`/`Config`) **in `edition`'s own
+/// vocabulary**. `crate::document` asks this to decide whether a
+/// resource's bytes may be sniffed at all: a path the text vocabulary
+/// already claims is read as text, and nothing about its content changes
+/// that. That is what keeps ordinary Markdown and code interpretation
+/// intact, and what keeps a byte-identical CSV/Markdown pair two
+/// different readings of one blob.
+///
+/// Asked of an edition rather than globally because the answer is part
+/// of what a generation recorded, not a property of today's binary: the
+/// same path can be a sniffable candidate under `v6` and plain text
+/// under `v7`, and each generation is read back under the one it was
+/// written with.
+pub(crate) fn path_names_text_family(edition: ExtractorEdition, path: &[u8]) -> bool {
     let Some(suffix) = path_suffix_lowercase(path) else {
         return false;
     };
+    if edition.names_plain_text() && suffix == PLAIN_TEXT_EXTENSION.0 {
+        return true;
+    }
     EXTENSION_FAMILY
         .binary_search_by_key(&suffix.as_str(), |(ext, _)| ext)
         .is_ok()
@@ -488,7 +514,32 @@ pub enum ExtractorEdition {
     /// extensionless or deliberately mislabeled document is read for what
     /// it is; a path the text vocabulary already claims is still read as
     /// text, and an excluded path is still never opened.
+    ///
+    /// Historical: its vocabulary has no answer for `.txt`, so an
+    /// ordinary plain-text file was screened as a possible container and
+    /// — finding no container signature in prose — recorded
+    /// `Unsupported`. `v7` is that correction.
     DocumentsDetectedV6,
+    /// Current. `v6`'s admission, detection and chunking exactly, with
+    /// one extension added to the text vocabulary: `.txt`.
+    ///
+    /// An ordinary glossary is read as the text it names rather than
+    /// sniffed for a container it was never going to be, which is the
+    /// text-family interpretation this reader is supposed to preserve.
+    /// The
+    /// widening is an edition and not a row in the shared table
+    /// (`PLAIN_TEXT_EXTENSION`) for the reason editions exist at all: a
+    /// generation `v6` recorded keeps validating and resolving exactly
+    /// as it was written, including one whose `.txt` held real container
+    /// bytes and was therefore recorded as a `Document` over its
+    /// Markdown rendering.
+    ///
+    /// The trade `v7` accepts, said plainly: under this edition a `.txt`
+    /// is text whatever its bytes hold, so a container deliberately
+    /// saved under that name is indexed as its own markup rather than
+    /// converted. That is the same rule `.md` and `.csv` have always
+    /// had, and the name is the operator's own statement about the file.
+    DocumentsDetectedTextV7,
 }
 
 impl ExtractorEdition {
@@ -508,7 +559,26 @@ impl ExtractorEdition {
             Self::DocumentsDetectedV6 => {
                 "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families+anydoc-0.2.4-detected-documents/v6"
             }
+            Self::DocumentsDetectedTextV7 => {
+                "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families+txt+anydoc-0.2.4-detected-documents/v7"
+            }
         }
+    }
+    /// The edition a *record* names — a generation's `extractor_set`, or
+    /// a semantic edition's `ChunkerIdentity::extractor_set` — as the
+    /// error a reader should report when this build does not know it.
+    ///
+    /// Every byte-reading path needs this before it can interpret a
+    /// recorded resource at all, and "unknown edition" is a refusal
+    /// rather than a fallback to today's rules: reading a generation
+    /// under a vocabulary that is not the one it was written with is
+    /// exactly the silent-wrong-bytes case editions exist to prevent.
+    pub(crate) fn recorded(extractor_set: &str) -> Result<Self, crate::AtlasError> {
+        Self::from_id(extractor_set).ok_or_else(|| {
+            crate::AtlasError::Generation(format!(
+                "recorded extraction edition {extractor_set} is not one this build can read"
+            ))
+        })
     }
     /// The inverse of `id`, for validating a generation against the
     /// edition it says produced it. An `extractor_set` naming no known
@@ -522,6 +592,7 @@ impl ExtractorEdition {
             Self::ContentFamiliesV4,
             Self::DocumentsAnyDocV5,
             Self::DocumentsDetectedV6,
+            Self::DocumentsDetectedTextV7,
         ]
         .into_iter()
         .find(|edition| edition.id() == id)
@@ -540,7 +611,7 @@ impl ExtractorEdition {
             // the name. Every historical edition keeps reading exactly the
             // paths it always did, so a generation staged under one still
             // re-verifies byte for byte.
-            Self::DocumentsDetectedV6 => PathAdmission::Candidate,
+            Self::DocumentsDetectedV6 | Self::DocumentsDetectedTextV7 => PathAdmission::Candidate,
             _ => PathAdmission::No,
         }
     }
@@ -572,11 +643,14 @@ impl ExtractorEdition {
                     .ok()
                     .map(|index| EXTENSION_FAMILY[index].1)
             }
-            Self::DocumentsAnyDocV5 | Self::DocumentsDetectedV6 => {
+            Self::DocumentsAnyDocV5 | Self::DocumentsDetectedV6 | Self::DocumentsDetectedTextV7 => {
                 if crate::document::format_for_path(path).is_some() {
                     return Some(ContentFamily::Document);
                 }
                 let suffix = path_suffix_lowercase(path)?;
+                if self.names_plain_text() && suffix == PLAIN_TEXT_EXTENSION.0 {
+                    return Some(PLAIN_TEXT_EXTENSION.1);
+                }
                 EXTENSION_FAMILY
                     .binary_search_by_key(&suffix.as_str(), |(ext, _)| ext)
                     .ok()
@@ -595,11 +669,19 @@ impl ExtractorEdition {
             return Some(family);
         }
         match self {
-            Self::DocumentsDetectedV6 => {
-                crate::document::resolved_format(path, bytes).map(|_| ContentFamily::Document)
-            }
+            Self::DocumentsDetectedV6 | Self::DocumentsDetectedTextV7 => self
+                .document_format(path, bytes)
+                .map(|_| ContentFamily::Document),
             _ => None,
         }
+    }
+    /// Whether this edition's text vocabulary carries
+    /// `PLAIN_TEXT_EXTENSION`. One place, because admission, the
+    /// byte-level interpretation rule and the read-back path all have to
+    /// give the same answer for one generation or its units index a
+    /// string nothing can reproduce.
+    pub(crate) fn names_plain_text(self) -> bool {
+        matches!(self, Self::DocumentsDetectedTextV7)
     }
     /// Whether this edition packs consecutive short lines into one unit
     /// (`v4`/`v5`/`v6`) or bounds each unit to exactly one line
@@ -609,7 +691,10 @@ impl ExtractorEdition {
     pub(crate) fn multiline(self) -> bool {
         matches!(
             self,
-            Self::ContentFamiliesV4 | Self::DocumentsAnyDocV5 | Self::DocumentsDetectedV6
+            Self::ContentFamiliesV4
+                | Self::DocumentsAnyDocV5
+                | Self::DocumentsDetectedV6
+                | Self::DocumentsDetectedTextV7
         )
     }
     pub(crate) fn unitizer_id(self) -> &'static str {
@@ -629,7 +714,9 @@ impl ExtractorEdition {
     pub(crate) fn document_format(self, path: &[u8], bytes: &[u8]) -> Option<anydoc::Format> {
         match self {
             Self::DocumentsAnyDocV5 => crate::document::format_for_path(path),
-            Self::DocumentsDetectedV6 => crate::document::resolved_format(path, bytes),
+            Self::DocumentsDetectedV6 | Self::DocumentsDetectedTextV7 => {
+                crate::document::resolved_format(self, path, bytes)
+            }
             _ => None,
         }
     }
@@ -683,7 +770,7 @@ pub struct ExtractorPolicy {
 impl Default for ExtractorPolicy {
     fn default() -> Self {
         Self {
-            edition: ExtractorEdition::DocumentsDetectedV6,
+            edition: ExtractorEdition::DocumentsDetectedTextV7,
         }
     }
 }
@@ -741,6 +828,16 @@ impl ExtractorPolicy {
     pub fn documents_anydoc_v5() -> Self {
         Self {
             edition: ExtractorEdition::DocumentsAnyDocV5,
+        }
+    }
+    /// The historical `v6` edition (documents detected from content, no
+    /// `.txt` in the text vocabulary), kept constructible for the same
+    /// reason `v5` is: a test stages one on purpose and proves it still
+    /// validates and resolves byte-for-byte under a binary whose current
+    /// edition answers `.txt` differently.
+    pub fn documents_detected_v6() -> Self {
+        Self {
+            edition: ExtractorEdition::DocumentsDetectedV6,
         }
     }
     pub(crate) fn admission(&self, path: &[u8]) -> PathAdmission {

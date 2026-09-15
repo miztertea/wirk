@@ -9623,22 +9623,24 @@ fn a_managed_receipt_never_attests_a_source_coordinate_that_collides_with_its_pa
     const REPORT: &str = "namespacecollisionprobe: the reviewed report\n";
 
     // ---- wp-1: a real managed-output Claim -------------------------
-    let staging = {
-        let out = wirk_cli()
-            .args(["output", "dir"])
-            .env("WIRK_ESTATE_ROOT", &estate)
-            .env("WIRK_WORK_ID", &work.work_id)
-            .env("WIRK_RUN_ID", &wp1_run)
-            .output()
-            .expect("wirk output dir runs");
-        assert_eq!(
-            out.status.code(),
-            Some(0),
-            "wirk output dir: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
+    //
+    // These Waypoints are Deterministic, and `wirk output dir` now
+    // answers a Deterministic Run with the execution directory its own
+    // *bare* Claim reaches into. What this check needs is the other
+    // addressing, the one `--output NAME` names explicitly and keeps
+    // regardless of kind: this Run's managed staging area. Addressed
+    // through `wirk_core::outputs`' own function rather than by
+    // rebuilding the path here, and created the same way
+    // `ensure_staging_dir` would — staging into the worktree instead
+    // would be an undeclared write the Claim refuses as `OutOfBoundary`
+    // before any receipt is minted.
+    let staging = wirk_core::outputs::staging_dir(
+        &estate,
+        &WorkId(work.work_id.clone()),
+        &RunId(wp1_run.clone()),
+    )
+    .expect("this Work and Run can name a staging directory");
+    fs::create_dir_all(&staging).expect("create the managed staging directory");
     fs::write(staging.join("REPORT.md"), REPORT).expect("stage the managed output");
     let (code, stdout) = claim(&estate, &work.work_id, &wp1_run, &["--output", "REPORT.md"]);
     assert_eq!(code, Some(0), "the managed Claim must validate: {stdout}");

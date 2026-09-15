@@ -79,6 +79,13 @@ mod finding;
 /// those are: one noun, its own verbs, its own rendering.
 mod estate;
 
+/// `wirk browser view|serve`: a browser view of a Work — what it is for,
+/// how far it has got, the World it was given and the evidence its
+/// Claims rest on — rendered from the same `status`, `world_show` and
+/// `work_artifact` replies the CLI already prints, plus one typed return
+/// to the Herdr pane running it.
+mod browser;
+
 use wirkd::{
     ClaimPayload, FailPayload, Reply, Request, RetryPayload, StatusPayload, SubmitPayload,
     WorkFailPayload,
@@ -116,9 +123,10 @@ fn main() -> ExitCode {
         Some("output") => output_command(&args[2..]),
         Some("artifact") => artifact_command(&args[2..]),
         Some("estate") => estate::estate_command(&args[2..]),
+        Some("browser") => browser::browser_command(&args[2..]),
         _ => {
             eprintln!(
-                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path> | --kind actor --source-basis output-only] | --kind deterministic --command <argv...>) | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init --estate <root> | wirk atlas acquire|refresh|publish|remove|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json] | wirk artifact read|export --claim <id> --name <name> [--to <path>] | wirk estate storage|clean --estate <root> ..."
+                "usage: wirk claim | wirk journal demo <dir> | wirk wirkd start|stop|ping|status|watch --estate <root> [--work <id>] [--requesting-work <id>] [--admin] [--json] | wirk work submit --estate <root> --repo <name>:<read|write> --base <ref> (--route <name> [--kind actor --repo-path <path> | --kind actor --source-basis output-only] | --kind deterministic --command <argv...>) | wirk work list --estate <root> [--requesting-work <id>] [--admin] [--json] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk run --estate <root> --work <id> --session <name> [--herdr-socket <path>] [--actor-kind <kind>] [--actor-model <model>] [--actor-effort <level>] | wirk run-deterministic --estate <root> --work <id> --executor child|docker | wirk plugin init [--estate <root>] [--harness <kind>] [--harness-arg <arg>]... [--clear-harness-args] | wirk plugin show | wirk plugin harnesses [--socket <path>] [--json] | wirk atlas acquire|refresh|publish|remove|status|cancel|search|resolve|relate|semantic build|semantic select|findings --estate <root> ... | wirk finding raise|assert|settle|applied|list ... | wirk world show [--revision N] [--json] | wirk world expand (--question TEXT | --reference HANDLE) [--reason TEXT] [--json] | wirk output [dir | list] [--json] | wirk artifact read|export --claim <id> --name <name> [--to <path>] | wirk artifact read --estate <root> --work <id> (--admin | --requesting-work <id>) --claim <id> --name <name> | wirk estate storage|clean --estate <root> ... | wirk browser view --estate <root> [--work <id>] [--requesting-work <id> | --admin] --out <path.html> | wirk browser serve --estate <root> --work <id> [--requesting-work <id> | --admin] [--open] [--idle-timeout <secs>]"
             );
             ExitCode::FAILURE
         }
@@ -415,11 +423,13 @@ fn fetch_output_contract_names(
 /// location is derived by wirkd from ids it already holds, so there is
 /// nothing for a caller to point somewhere else.
 ///
-/// `dir` prints the staging directory alone, for `$(wirk output dir)` in
-/// a shell. `list` (the default) prints one line per declared output.
-/// A declared name that cannot address a managed output is printed as
-/// `unaddressable` with the rule it breaks, so the actor learns that
-/// before producing the file rather than at its Claim.
+/// `dir` prints that destination alone, for `$(wirk output dir)` in a
+/// shell — this Run's managed staging area for an Actor Waypoint, and
+/// the execution directory its own World names for a Deterministic one.
+/// `list` (the default) prints one line per declared output. A declared
+/// name that cannot be addressed is printed as `unaddressable` with the
+/// rule it breaks, so the actor learns that before producing the file
+/// rather than at its Claim.
 fn output_command(rest: &[String]) -> ExitCode {
     let (mode, flags) = match rest.first().map(String::as_str) {
         Some("dir") => ("dir", &rest[1..]),
@@ -474,8 +484,18 @@ fn output_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let kind = result["kind"].as_str().unwrap_or("?");
     if mode == "dir" {
-        println!("{}", result["staging"].as_str().unwrap_or(""));
+        let Some(staging) = result["staging"].as_str() else {
+            eprintln!(
+                "wirk output dir: no destination for this Run: {}",
+                result["unavailable_reason"]
+                    .as_str()
+                    .unwrap_or("unavailable"),
+            );
+            return ExitCode::from(3);
+        };
+        println!("{staging}");
         return ExitCode::SUCCESS;
     }
     if json_out {
@@ -485,7 +505,22 @@ fn output_command(rest: &[String]) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    println!("staging {}", result["staging"].as_str().unwrap_or("?"));
+    // A Deterministic Waypoint's declared outputs land in its own
+    // execution directory, never in managed staging — said plainly here
+    // rather than always printing "staging", which used to be true only
+    // for an Actor Waypoint. `execution` rather than `checkout`: that
+    // directory is a Git worktree on a Git basis and this Work's own
+    // owned execution address on an output-only one.
+    match result["staging"].as_str() {
+        Some(path) if kind == "deterministic" => println!("execution {path}"),
+        Some(path) => println!("staging {path}"),
+        None => println!(
+            "no destination: {}",
+            result["unavailable_reason"]
+                .as_str()
+                .unwrap_or("unavailable"),
+        ),
+    }
     let empty = Vec::new();
     let outputs = result["outputs"].as_array().unwrap_or(&empty);
     if outputs.is_empty() {
@@ -515,7 +550,25 @@ fn output_command(rest: &[String]) -> ExitCode {
             );
         }
     }
-    println!("claim with: wirk claim --output NAME");
+    // Which flag actually addresses these names is this Run's own bound
+    // Waypoint kind, the same `ContractNames::Managed`/`::Checkout`
+    // split `fetch_output_contract_names` applies to a bare Claim.
+    // Printing `--output NAME` unconditionally named, for a
+    // Deterministic Run, the one form its own Claim never uses.
+    match kind {
+        "deterministic" => {
+            println!(
+                "claim with: wirk claim (its required declared outputs above are claimed at \
+                 their own names in this directory); by hand: wirk claim --artifact NAME=NAME"
+            );
+        }
+        _ => {
+            println!(
+                "claim with: wirk claim (its required declared outputs above are claimed from \
+                 this Run's managed staging); by hand: wirk claim --output NAME"
+            );
+        }
+    }
     ExitCode::SUCCESS
 }
 
@@ -553,6 +606,10 @@ fn artifact_command(rest: &[String]) -> ExitCode {
     let mut name: Option<String> = None;
     let mut destination: Option<String> = None;
     let mut force = false;
+    let mut estate: Option<String> = None;
+    let mut work: Option<String> = None;
+    let mut requesting: Option<String> = None;
+    let mut admin = false;
     let mut index = 1usize;
     while index < rest.len() {
         match rest[index].as_str() {
@@ -572,6 +629,22 @@ fn artifact_command(rest: &[String]) -> ExitCode {
                 force = true;
                 index += 1;
             }
+            "--estate" if index + 1 < rest.len() => {
+                estate = Some(rest[index + 1].clone());
+                index += 2;
+            }
+            "--work" if index + 1 < rest.len() => {
+                work = Some(rest[index + 1].clone());
+                index += 2;
+            }
+            "--requesting-work" if index + 1 < rest.len() => {
+                requesting = Some(rest[index + 1].clone());
+                index += 2;
+            }
+            "--admin" => {
+                admin = true;
+                index += 1;
+            }
             _ => return artifact_usage(),
         }
     }
@@ -587,6 +660,78 @@ fn artifact_command(rest: &[String]) -> ExitCode {
         // does nothing is a promise the verb does not keep: `read`
         // writes nothing, so there is nothing for it to force.
         return artifact_usage();
+    }
+
+    // `--estate`/`--work` (ruling 0339): the named-Work door, for a
+    // caller with no execution triple to present at all — an
+    // administrative shell — or one naming its own scope explicitly by
+    // id rather than by an injected environment. `export` keeps no such
+    // door: its destination-protection reasoning below is written in
+    // terms of *this Run's own* staging area and managed-storage
+    // boundary, which a caller with no Run has none of.
+    if estate.is_some() || work.is_some() || requesting.is_some() || admin {
+        if mode != "read" {
+            eprintln!(
+                "wirk artifact: --estate/--work/--requesting-work/--admin name a Work for \
+                 `read` only; `export` always reads this Run's own bound Work from its \
+                 injected execution triple"
+            );
+            return artifact_usage();
+        }
+        let (Some(estate), Some(work)) = (estate, work) else {
+            eprintln!(
+                "wirk artifact: --estate <root> and --work <id> are both required to read \
+                 without an execution triple"
+            );
+            return artifact_usage();
+        };
+        let scope = match resolve_scope("wirk artifact read", &estate, requesting, admin) {
+            Ok(scope) => scope,
+            Err(refusal) => {
+                eprintln!("wirk artifact read: {refusal}");
+                return ExitCode::from(1);
+            }
+        };
+        if let Some(note) = &scope.note {
+            eprintln!("wirk artifact read: {note}");
+        }
+        let pointer = match wirkd::client::locate(Path::new(&estate)) {
+            Ok(pointer) => pointer,
+            Err(err) => {
+                eprintln!("wirk artifact: {err}");
+                return ExitCode::from(2);
+            }
+        };
+        let payload = match scope.requesting {
+            Some(requester) => {
+                wirkd::WorkArtifactPayload::scoped(WorkId(work), ClaimId(claim), name, requester)
+            }
+            None => wirkd::WorkArtifactPayload::admin(WorkId(work), ClaimId(claim), name),
+        };
+        let result = match wirkd::client::call(&pointer.socket, &Request::work_artifact(payload)) {
+            Ok(Reply::Ok { result, .. }) => result,
+            Ok(Reply::Err { error, .. }) => {
+                eprintln!("wirk artifact: {} {}", error.code, error.message);
+                return ExitCode::from(3);
+            }
+            Err(err) => {
+                eprintln!("wirk artifact: {err}");
+                return ExitCode::from(2);
+            }
+        };
+        let bytes = match verify_claimed_bytes(&result) {
+            Ok(bytes) => bytes,
+            Err(code) => return code,
+        };
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        return match out.write_all(&bytes).and_then(|()| out.flush()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("wirk artifact: {err}");
+                ExitCode::from(2)
+            }
+        };
     }
 
     let triple = match world_triple() {
@@ -631,30 +776,10 @@ fn artifact_command(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let source = Path::new(result["path"].as_str().unwrap_or(""));
-    let digest = result["digest"].as_str().unwrap_or("").to_string();
-    let reported_len = result["bytes"].as_u64().unwrap_or(0);
-    // **One read, and the digest is of that read.** The previous shape
-    // hashed the path with `digest_of` and then called `std::fs::read`
-    // on it again: two lookups, two buffers, and the success line
-    // printed the Claim's digest for bytes nothing had verified. The
-    // daemon has already verified its own read and returned an address,
-    // so custody has to be re-established on *this* side — on the exact
-    // buffer that is about to be written to stdout or to a file.
-    let bytes = match read_regular_no_follow(source, reported_len.saturating_add(1)) {
+    let bytes = match verify_claimed_bytes(&result) {
         Ok(bytes) => bytes,
-        Err(err) => {
-            eprintln!("wirk artifact: the claimed bytes could not be read: {err}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
-    if wirk_core::ArtifactReceipt::digest_of_bytes(&bytes) != digest {
-        eprintln!(
-            "wirk artifact: the claimed bytes are no longer readable at the digest this Claim \
-             was validated against; nothing was written"
-        );
-        return ExitCode::from(3);
-    }
 
     if mode == "read" {
         use std::io::Write;
@@ -695,6 +820,7 @@ fn artifact_command(rest: &[String]) -> ExitCode {
     let estate = PathBuf::from(&caller.estate_root);
     let works_root = estate.join("works");
     let own_staging = wirk_core::outputs::staging_dir(&estate, &caller.work_id, &caller.run_id);
+    let source = Path::new(result["path"].as_str().unwrap_or(""));
     if let Some(reason) =
         managed_storage_conflict(&works_root, own_staging.as_deref(), source, &destination)
     {
@@ -809,6 +935,7 @@ fn artifact_command(rest: &[String]) -> ExitCode {
     // destination that is not what it looked like all surface here.
     match read_regular_no_follow(&destination, bytes.len() as u64 + 1) {
         Ok(written) if written == bytes => {
+            let digest = result["digest"].as_str().unwrap_or("");
             println!(
                 "exported {} ({} bytes, {digest}) to {}",
                 result["name"].as_str().unwrap_or("?"),
@@ -1014,10 +1141,37 @@ fn opened_destination_conflict(
 
 fn artifact_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk artifact read --claim <id> --name <name> | wirk artifact export --claim \
-         <id> --name <name> --to <path> [--force]"
+        "usage: wirk artifact read --claim <id> --name <name> | wirk artifact read --estate \
+         <root> --work <id> (--admin | --requesting-work <id>) --claim <id> --name <name> | \
+         wirk artifact export --claim <id> --name <name> --to <path> [--force]"
     );
     ExitCode::from(1)
+}
+
+/// **One read, and the digest is of that read.** The daemon has already
+/// verified its own read and returned an address; custody has to be
+/// re-established on *this* side, on the exact buffer about to be
+/// written to stdout or to a file, rather than trusting the daemon's
+/// digest for a second, separate lookup of the same path.
+pub(crate) fn verify_claimed_bytes(result: &serde_json::Value) -> Result<Vec<u8>, ExitCode> {
+    let source = Path::new(result["path"].as_str().unwrap_or(""));
+    let digest = result["digest"].as_str().unwrap_or("").to_string();
+    let reported_len = result["bytes"].as_u64().unwrap_or(0);
+    let bytes = match read_regular_no_follow(source, reported_len.saturating_add(1)) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("wirk artifact: the claimed bytes could not be read: {err}");
+            return Err(ExitCode::from(2));
+        }
+    };
+    if wirk_core::ArtifactReceipt::digest_of_bytes(&bytes) != digest {
+        eprintln!(
+            "wirk artifact: the claimed bytes are no longer readable at the digest this Claim \
+             was validated against; nothing was written"
+        );
+        return Err(ExitCode::from(3));
+    }
+    Ok(bytes)
 }
 
 // ---- wirk world (P3 W-C1) ------------------------------------------
@@ -1619,6 +1773,7 @@ fn wirkd_command(rest: &[String]) -> ExitCode {
             flag_value(&rest[1..], "--work"),
             flag_value(&rest[1..], "--requesting-work"),
             rest[1..].iter().any(|arg| arg == "--admin"),
+            rest[1..].iter().any(|arg| arg == "--json"),
         ),
         _ => wirkd_usage(),
     }
@@ -1844,7 +1999,11 @@ fn wirkd_usage() -> ExitCode {
           refused or failed single read prints no JSON; the
           administrative estate walk prints the rows that answered and
           reports the rest on stderr and in the exit code.
-  watch   that Work's journal appends, streamed as they land.
+  watch   that Work's journal appends, streamed as they land. --json
+          prints the events themselves, one complete parseable object
+          per stdout line, with no `work_id` prefix (the event carries
+          its own `work`/`run` identity); refusals and the other
+          diagnostics go to stderr, and the exit codes are unchanged.
 
 scope of status and watch:
   Inside an actor context (WIRK_ESTATE_ROOT, WIRK_WORK_ID and WIRK_RUN_ID
@@ -1891,11 +2050,21 @@ scope of status and watch:
 /// scope before its first event line, so a daemon that would have
 /// answered the narrow request with the raw journal is refused here
 /// rather than read. A Work watching itself is trivially admitted.
+///
+/// `--json` switches the stream from a human line to a machine line:
+/// every stdout line is the event's own serialization, one complete
+/// parseable object per line, with no `work_id` prefix — the event
+/// carries its own `work`/`run` identity. Refusals and the other
+/// diagnostics (a refused scope, an unacknowledged scope, a transport
+/// failure) go to stderr instead, and the exit codes are unchanged: a
+/// refused watch still exits nonzero, an unrefused stream still exits
+/// zero. Without the flag the human shape stands.
 fn wirkd_watch_command(
     estate: &str,
     work_filter: Option<String>,
     requesting: Option<String>,
     admin: bool,
+    json: bool,
 ) -> ExitCode {
     // Ruling 0117: the scope is settled before the daemon is located,
     // so a refused one costs no stream and no Work listing.
@@ -1974,7 +2143,11 @@ fn wirkd_watch_command(
             let events = match wirkd::client::watch(&socket, payload) {
                 Ok(events) => events,
                 Err(err) => {
-                    let _ = tx.send(format!("{work_id} watch_error {err}"));
+                    if json {
+                        eprintln!("{work_id} watch_error {err}");
+                    } else {
+                        let _ = tx.send(format!("{work_id} watch_error {err}"));
+                    }
                     return;
                 }
             };
@@ -1983,7 +2156,14 @@ fn wirkd_watch_command(
                     Ok(event) => {
                         let line = serde_json::to_string(&event)
                             .unwrap_or_else(|_| "<unserializable event>".to_string());
-                        if tx.send(format!("{work_id} {line}")).is_err() {
+                        // In `--json` mode the serialized event *is* the
+                        // line: no `work_id` prefix, because the event
+                        // carries its own `work`/`run` identity.
+                        if json {
+                            if tx.send(line).is_err() {
+                                return;
+                            }
+                        } else if tx.send(format!("{work_id} {line}")).is_err() {
                             return;
                         }
                     }
@@ -1996,10 +2176,14 @@ fn wirkd_watch_command(
                     // untouched.
                     Err(wirkd::client::ClientError::Refused(detail)) => {
                         any_refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                        let _ = tx.send(format!(
-                            "{work_id} refused {}: {}",
-                            detail.code, detail.message
-                        ));
+                        if json {
+                            eprintln!("{work_id} refused {}: {}", detail.code, detail.message);
+                        } else {
+                            let _ = tx.send(format!(
+                                "{work_id} refused {}: {}",
+                                detail.code, detail.message
+                            ));
+                        }
                         return;
                     }
                     // A named scope this daemon never established
@@ -2010,11 +2194,19 @@ fn wirkd_watch_command(
                     // did — the same silence this correction removes.
                     Err(err @ wirkd::client::ClientError::ScopeNotApplied(_)) => {
                         any_refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                        let _ = tx.send(format!("{work_id} refused scope: {err}"));
+                        if json {
+                            eprintln!("{work_id} refused scope: {err}");
+                        } else {
+                            let _ = tx.send(format!("{work_id} refused scope: {err}"));
+                        }
                         return;
                     }
                     Err(err) => {
-                        let _ = tx.send(format!("{work_id} watch_error {err}"));
+                        if json {
+                            eprintln!("{work_id} watch_error {err}");
+                        } else {
+                            let _ = tx.send(format!("{work_id} watch_error {err}"));
+                        }
                         return;
                     }
                 }
@@ -2037,6 +2229,114 @@ fn wirkd_watch_command(
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Milliseconds since the Unix epoch (`wirk_core::Timestamp`, the wire
+/// shape `WorkCleaned.at` carries) rendered as elapsed time from now —
+/// `"3m ago"`, `"2h ago"` — never a calendar date or time-of-day, which
+/// would need calendar arithmetic no dependency here provides. Integer
+/// bucketed duration only, reusing the already-imported `SystemTime`/
+/// `UNIX_EPOCH`. A timestamp at or after `now` (clock skew, or a caller
+/// reading mid-write) floors at zero rather than printing a negative
+/// duration.
+fn format_elapsed_ms(at_ms: i64) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_millis() as i64)
+        .unwrap_or(at_ms);
+    format_elapsed_from(now_ms, at_ms)
+}
+
+/// `format_elapsed_ms`'s pure half, `now_ms` taken as a parameter
+/// instead of read from the clock — a deterministic check pins this
+/// bucketing without a flaky sleep or a mocked clock.
+fn format_elapsed_from(now_ms: i64, at_ms: i64) -> String {
+    let elapsed_s = (now_ms - at_ms).max(0) / 1000;
+    if elapsed_s < 60 {
+        format!("{elapsed_s}s ago")
+    } else if elapsed_s < 3600 {
+        format!("{}m ago", elapsed_s / 60)
+    } else if elapsed_s < 86400 {
+        format!("{}h ago", elapsed_s / 3600)
+    } else {
+        format!("{}d ago", elapsed_s / 86400)
+    }
+}
+
+/// One shell word, single-quoted so that no character inside it is
+/// re-read by the shell — the printed retrieval command is meant to be
+/// copied and run, and a Work id, Claim id or output name is not this
+/// command's authority to expand, glob or substitute. An embedded
+/// single quote is closed, escaped and reopened, the only escape a
+/// single-quoted shell word admits.
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+/// The listing row's second line: the stage/attempt/Run/result facts a
+/// person scanning an estate walk needs to tell a Work that is waiting
+/// on someone from one that is still running or already finished.
+/// Every value is read out of the `status` reply this row already
+/// carries — no extra request, and no field this reply did not already
+/// publish.
+///
+/// Three different answers have to stay distinguishable in `outputs`:
+/// no validated Claim has recorded artifacts (`none`), some have and
+/// this reader is admitted to them (`<available>/<total> available`),
+/// and some have but this reader's own bindings do not cover this
+/// Work's (`withheld`). The third is what a narrowed requester sees:
+/// `withhold_status_content` replaces each entry's whole `artifacts`
+/// list with a marker object, so the count is not merely zero — it is
+/// unknown to this reader, and saying `none` there would be a claim
+/// this row cannot make.
+fn listing_summary(result: &serde_json::Value) -> String {
+    let attempt = match result["attempt"].as_u64() {
+        Some(attempt) => attempt.to_string(),
+        None => "-".to_string(),
+    };
+    let run = result["run_id"].as_str().unwrap_or("-");
+    // `run_state` is the folded state of that same Run — `failed`
+    // carries its own status word beside it, which is journal identity
+    // and survives narrowing (the cause's `detail` is the content half,
+    // and this line never reads it).
+    let run_state = match (
+        result["run_state"].as_str(),
+        result["failure_status"].as_str(),
+    ) {
+        (Some(state), Some(status)) => format!("{state}:{status}"),
+        (Some(state), None) => state.to_string(),
+        (None, _) => "-".to_string(),
+    };
+    let evidence = result["evidence"].as_array();
+    let outputs = match evidence {
+        None => "-".to_string(),
+        Some(entries) if entries.is_empty() => "none".to_string(),
+        Some(entries) => {
+            let mut total = 0usize;
+            let mut available = 0usize;
+            let mut withheld = false;
+            for entry in entries {
+                match entry["artifacts"].as_array() {
+                    None => withheld = true,
+                    Some(artifacts) => {
+                        total += artifacts.len();
+                        available += artifacts
+                            .iter()
+                            .filter(|artifact| artifact["available"].as_bool().unwrap_or(false))
+                            .count();
+                    }
+                }
+            }
+            if withheld {
+                "withheld".to_string()
+            } else if total == 0 {
+                "none".to_string()
+            } else {
+                format!("{available}/{total} available")
+            }
+        }
+    };
+    format!("attempt {attempt} run {run} {run_state} outputs {outputs}")
 }
 
 /// `wirk wirkd status --estate <root> [--work <id>]
@@ -2134,6 +2434,16 @@ fn wirkd_status_command(
             return ExitCode::from(2);
         }
     };
+    // `default_target` is `Some` only inside an actor context (an
+    // injected `WIRK_*` triple this process already has), and it names
+    // that actor's *own* Work: the one target for which printed
+    // retrieval guidance can safely say nothing about scope at all,
+    // because the reader's own shell already carries exactly it. Held
+    // as the id rather than as a bare "is an actor" flag — the guidance
+    // below is printed per Work, and a bound actor may legitimately ask
+    // about a related Work it covers, which its own triple does not
+    // read. Captured before `scope` is consumed below.
+    let own_work = scope.default_target.clone();
     let requesting = scope.requesting;
     // Which of the two `--json` shapes this request asks for, settled
     // here with the request itself: the estate walk is a listing and
@@ -2161,6 +2471,28 @@ fn wirkd_status_command(
     };
 
     let mut exit = ExitCode::SUCCESS;
+    // An estate with nothing in it used to answer the human surface with
+    // nothing at all: exit 0, not one byte printed, and no way to tell a
+    // fresh estate from a lookup that quietly found the wrong one. The
+    // Herdr plugin's `wirkd status` action is exactly this call, and what
+    // it opened was a blank pane.
+    //
+    // So the listing says what it looked at and what it found. Both
+    // facts, because either alone is the ambiguity: the estate, which is
+    // the thing an operator most often has wrong, and the scope it
+    // actually asked in, which decides what "none" even covers. It
+    // discloses nothing a Work row would not have — a scoped listing
+    // names the requester it was already given, and there is no Work to
+    // name. The machine surface is untouched: `--json` still prints its
+    // empty array, which is a complete answer already.
+    if !json && enumerated && work_ids.is_empty() {
+        let asked_as = match &requesting {
+            Some(requester) => format!("requester {}", requester.0),
+            None => "administrative".to_string(),
+        };
+        println!("estate {estate} scope {asked_as}");
+        println!("  no Work is recorded under this estate");
+    }
     // The estate walk's rows, held until every Work has answered: one
     // JSON document is printed, not a line per Work that a `json.load`
     // would choke on.
@@ -2235,6 +2567,24 @@ fn wirkd_status_command(
                     needs_input,
                     scope
                 );
+                // The second line of every Work, on both surfaces:
+                // which attempt of the current stage is live, what that
+                // Run's own state is, and whether this Work has a
+                // validated result to fetch. All of it is read off
+                // fields this reply already carried, and none of it
+                // appears anywhere else on the human verb — the per-Run
+                // lines below report checkout and pin presence, not
+                // attempt or Run state.
+                println!("  {}", listing_summary(&result));
+                // The estate walk is a *listing* and stops there, one
+                // Work per pair of lines, so a person scanning many
+                // Works is not handed every World's full stage, Run and
+                // evidence history at once. A single named Work
+                // (`--work <id>`, or an actor's own inherited target)
+                // goes on to the detail below.
+                if enumerated {
+                    continue;
+                }
                 // W-A: a held container's own reason, the container
                 // activations in force, and (W-A correction, F3) the
                 // artifact evidence each validated Claim rests on —
@@ -2334,10 +2684,20 @@ fn wirkd_status_command(
                                 .join(", ")
                         })
                         .unwrap_or_default();
+                    // `at` is a `wirk_core::Timestamp` (Unix ms, a bare
+                    // `i64`), so reading it as a string misses on every
+                    // real entry and reports the recorded cleanup time
+                    // as unknown regardless of when cleanup ran.
+                    // Rendered as an elapsed duration rather than a
+                    // calendar time: that is what this line is read for,
+                    // and it needs no calendar arithmetic.
+                    let at = match entry["at"].as_i64() {
+                        Some(ms) => format_elapsed_ms(ms),
+                        None => "?".to_string(),
+                    };
                     println!(
-                        "  clean at {} runs [{}] worktree_removed {} runtime_pins_removed [{}] \
+                        "  clean at {at} runs [{}] worktree_removed {} runtime_pins_removed [{}] \
                          complete {}",
-                        entry["at"].as_str().unwrap_or("?"),
                         runs,
                         entry["worktree_removed"].as_bool().unwrap_or(false),
                         pins_removed,
@@ -2346,7 +2706,8 @@ fn wirkd_status_command(
                 }
                 for entry in result["evidence"].as_array().unwrap_or(&Vec::new()) {
                     for artifact in entry["artifacts"].as_array().unwrap_or(&Vec::new()) {
-                        let availability = if artifact["available"].as_bool().unwrap_or(false) {
+                        let available = artifact["available"].as_bool().unwrap_or(false);
+                        let availability = if available {
                             "available".to_string()
                         } else {
                             format!(
@@ -2367,6 +2728,79 @@ fn wirkd_status_command(
                             entry["claim"].as_str().unwrap_or("?"),
                             entry["run"].as_str().unwrap_or("-"),
                         );
+                        // A validated result's retrieval command, printed
+                        // beside the evidence line that says its bytes
+                        // still check out — named in **this reply's own
+                        // scope**, ruling 0339: the scope that generated
+                        // the reply is the scope the guidance hands back,
+                        // never a different identity borrowed from the
+                        // Claim's producer.
+                        //
+                        // A bound actor already carries a triple whose
+                        // Work matches this one (`own_work`): its
+                        // own current-Run stays the caller `wirk artifact
+                        // read` checks, unchanged, so the guidance names
+                        // no scope at all rather than instructing it to
+                        // overwrite `WIRK_RUN_ID` with the Claim's
+                        // producing Run — which can since have been
+                        // superseded on its own Waypoint (0339) while the
+                        // Claim itself remains validated and readable by
+                        // *this* actor.
+                        //
+                        // *Matches this one* is the whole of it: the
+                        // bare form's door is `handle_run_artifact`
+                        // against the triple in the reader's own
+                        // environment, so it reads the actor's own Work
+                        // and no other. A bound actor asking about a
+                        // related Work it covers (`--work <other>`,
+                        // answered scoped as itself) is printing
+                        // guidance for *that* Work's evidence, and the
+                        // bare form would silently read somewhere else —
+                        // the same "never a different identity borrowed"
+                        // rule above, applied to the target rather than
+                        // to the producer. Such a reader takes the named
+                        // form below, exactly as any other non-own-Work
+                        // reader does. Every other reader — the
+                        // administrative surface, or a named
+                        // `--requesting-work` — has no Run to preserve,
+                        // and reads by naming the Work directly (`wirk
+                        // artifact read --estate/--work`, ruling 0339),
+                        // needing no producing Run at all. Offered only
+                        // for an artifact this same line just reported
+                        // available; every substituted word is
+                        // shell-quoted so the line can be copied and run
+                        // as printed.
+                        if available {
+                            let claim = entry["claim"].as_str().unwrap_or("?");
+                            let name = artifact["name"].as_str().unwrap_or("?");
+                            if own_work.as_deref() == Some(work_id.as_str()) {
+                                println!(
+                                    "    read with: wirk artifact read --claim {} --name {}",
+                                    shell_quote(claim),
+                                    shell_quote(name),
+                                );
+                            } else {
+                                match &requesting {
+                                    Some(requester) => println!(
+                                        "    read with: wirk artifact read --estate {} --work \
+                                         {} --requesting-work {} --claim {} --name {}",
+                                        shell_quote(estate),
+                                        shell_quote(&work_id),
+                                        shell_quote(&requester.0),
+                                        shell_quote(claim),
+                                        shell_quote(name),
+                                    ),
+                                    None => println!(
+                                        "    read with: wirk artifact read --estate {} --work \
+                                         {} --admin --claim {} --name {}",
+                                        shell_quote(estate),
+                                        shell_quote(&work_id),
+                                        shell_quote(claim),
+                                        shell_quote(name),
+                                    ),
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2397,7 +2831,7 @@ fn wirkd_status_command(
 /// own `journal_for` layout) — `wirkd_status_command`'s own listing
 /// source when `--work` is absent. An absent `works/` directory (no
 /// Work ever submitted) is an empty list, not an error.
-fn list_work_ids(estate: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn list_work_ids(estate: &Path) -> Result<Vec<String>, String> {
     let dir = estate.join("works");
     if !dir.exists() {
         return Ok(Vec::new());
@@ -2523,6 +2957,39 @@ fn wirkd_typed_call(
 fn work_command(rest: &[String]) -> ExitCode {
     match rest.first().map(String::as_str) {
         Some("submit") => work_submit_command(&rest[1..]),
+        // The estate walk under the name a person looks for it by.
+        // `wirk wirkd status --estate <root>` with no `--work` has
+        // always been the listing; nothing about that verb's name says
+        // so, and a reader wanting "what Work is there" had to know to
+        // ask the daemon's own status verb without an argument. This is
+        // that same call — same scope resolution, same refusals, same
+        // exit codes, same `--json` array — reached by the name the
+        // question has. It adds no request and no field: `--work <id>`
+        // is the one flag it does not take, because naming one Work is
+        // what `wirk work status` is for.
+        Some("list") => {
+            let Some(estate) = flag_value(&rest[1..], "--estate") else {
+                return work_usage();
+            };
+            // Refused rather than ignored: a caller who named one Work
+            // asked a different question than this verb answers, and
+            // silently handing back the whole estate instead would be
+            // the widest possible answer to the narrowest request.
+            if rest[1..].iter().any(|arg| arg == "--work") {
+                eprintln!(
+                    "wirk work list: --work names a single Work; that is wirk work status --work \
+                     <id>. This verb lists the estate and takes no --work"
+                );
+                return ExitCode::from(1);
+            }
+            wirkd_status_command(
+                &estate,
+                None,
+                flag_value(&rest[1..], "--requesting-work"),
+                rest[1..].iter().any(|arg| arg == "--admin"),
+                rest[1..].iter().any(|arg| arg == "--json"),
+            )
+        }
         // Item 8 (0035 follow-up, `orient/build-brief.md` §3 W1): an
         // alias for `wirk wirkd status --estate <root> --work <id>`,
         // named on the manifest's own `wirkd-status` action.
@@ -3129,7 +3596,7 @@ fn work_obligations_command(rest: &[String]) -> ExitCode {
 
 fn work_usage() -> ExitCode {
     eprintln!(
-        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path> | --kind actor --source-basis output-only] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json] | wirk work clean --estate <root> --work <id> [--dry-run] [--outputs-staging] [--json]"
+        "usage: wirk work submit --estate <root> --repo <name>:<read|write> [--repo <name>:<read|write> ...] [--execution-repo <name>] --base <ref> (--route <name> [--kind actor --repo-path <path> | --kind actor --source-basis output-only] | --kind deterministic [--source-basis git|output-only] [--repo-path <checkout>] --command <argv...>) [--parent-work <id> --parent-waypoint <id> --parent-run <id> --role <role> [--parent-attempt <n>]] | wirk work list --estate <root> [--requesting-work <id>] [--admin] [--json] | wirk work status --estate <root> --work <id> [--requesting-work <id>] [--admin] [--json] | wirk work retry --estate <root> --work <id> [--run <run-id>] | wirk work fail --estate <root> --work <id> --reason <text> | wirk work cancel --estate <root> --work <id> [--cascade] [--reason <text>] | wirk work obligations --estate <root> --work <id> (--requesting-work <id> | --admin) [--waypoint <id>] [--json] | wirk work clean --estate <root> --work <id> [--dry-run] [--outputs-staging] [--json]"
     );
     ExitCode::from(1)
 }
@@ -3189,53 +3656,436 @@ pub(crate) fn flag_values(args: &[String], flag: &str) -> Vec<String> {
 /// Returns the value following `flag` in `args`, or `None` if the flag
 /// is absent or has no following value (R6: the one shared parsing move
 /// every subcommand's `--estate`/`--intent`/`--base` needs).
-fn flag_value(args: &[String], flag: &str) -> Option<String> {
+pub(crate) fn flag_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
 
-// ---- plugin init (item 7 W1, herdr-plugin.toml's operator setup) -----
+// ---- plugin configuration (the Herdr plugin's own setup surface) -----
 
-/// Dispatches `wirk plugin <rest>`: `init --estate <root>` is the only
-/// subcommand. It writes `<root>` as one line into
-/// `$HERDR_PLUGIN_CONFIG_DIR/estate`, the file `plugin/startup.sh` and
-/// the manifest's `submit`/`wirkd-status` commands read (R6: one write,
-/// the operator-blocker fix named by this item's build brief §2 "the
-/// operator blocker dissolves by design"). Refuses to run outside a
-/// Herdr plugin invocation, where `HERDR_PLUGIN_CONFIG_DIR` is unset —
-/// there is nothing to configure otherwise.
+/// The files a Wirk plugin installation is configured by, all inside
+/// the per-plugin directory Herdr creates and names in
+/// `HERDR_PLUGIN_CONFIG_DIR`: `estate` (which estate this installation
+/// works in) and `harness` (which interactive agent kind the assistant
+/// action starts) hold one line each, and `harness-args` holds one
+/// argument per line. Every manifest entry and every script under
+/// `plugin/` reads these three names and no others.
+const ESTATE_FILE: &str = "estate";
+const HARNESS_FILE: &str = "harness";
+const HARNESS_ARGS_FILE: &str = "harness-args";
+
+/// Dispatches `wirk plugin <rest>`:
+///
+/// * `init [--estate <root>] [--harness <kind>] [--harness-arg <arg>]...
+///   [--clear-harness-args]` writes what it is given, one value per line
+///   per file. At least one is required — an `init` that was asked to
+///   write nothing is a mistake, not a no-op.
+/// * `show` prints where the configuration lives and what is in it.
+/// * `harnesses` prints the agent kinds Herdr itself reports.
+///
+/// All three need `HERDR_PLUGIN_CONFIG_DIR`, which Herdr sets for
+/// everything it launches on a plugin's behalf; outside that there is
+/// no per-plugin configuration directory to read or write.
 fn plugin_command(rest: &[String]) -> ExitCode {
-    if rest.first().map(String::as_str) != Some("init") {
+    match rest.first().map(String::as_str) {
+        Some("init") => plugin_init(&rest[1..]),
+        Some("show") => plugin_show(),
+        Some("harnesses") => plugin_harnesses(&rest[1..]),
+        _ => plugin_usage(),
+    }
+}
+
+/// `HERDR_PLUGIN_CONFIG_DIR`, or an explanation naming the one thing
+/// that supplies it.
+fn plugin_config_dir() -> Result<PathBuf, ExitCode> {
+    match env::var("HERDR_PLUGIN_CONFIG_DIR") {
+        Ok(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
+        _ => {
+            eprintln!(
+                "wirk plugin: HERDR_PLUGIN_CONFIG_DIR is not set. Herdr sets it for every\n\
+                 command it runs on a plugin's behalf, so run this from a Herdr plugin\n\
+                 action or pane (the plugin's 'Configure Wirk' action does exactly that).\n\
+                 'herdr plugin config-dir wirk' prints the directory it would be."
+            );
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// Reads one configuration file's single line, `None` when the file is
+/// absent or holds only whitespace.
+fn plugin_config_value(config_dir: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_dir.join(name)).ok()?;
+    let value = text.lines().next().unwrap_or("").trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Reads a one-value-per-line configuration file, each line taken
+/// exactly as written so an argument holding a space or a glob survives
+/// unchanged. Blank lines and `#` comments are skipped, so the file can
+/// say what it is; an absent file reads as no values at all. This is the
+/// same reading `plugin/assistant.sh` does, so both surfaces answer with
+/// the same list.
+fn plugin_config_lines(config_dir: &Path, name: &str) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(config_dir.join(name)) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Why a `--harness-arg` value cannot survive the one-line-per-argument
+/// file format, or `None` when it round-trips unchanged.
+///
+/// `plugin_config_lines` (the same reading `plugin/assistant.sh` does)
+/// skips a blank line and a line starting with `#`, because the file
+/// also carries comments; and a trailing `\r` on the line written just
+/// before this function's caller appends `\n` forms a `\r\n` terminator
+/// that `str::lines` strips on read, so an argument ending in `\r`
+/// would come back shorter than it was stored. All three are silent
+/// data loss, not a formatting nicety, so `plugin_init` refuses them
+/// before writing anything rather than storing bytes that later read
+/// back as "none" or as a different argument. A leading `-` is not
+/// checked here: `flag_values` already takes the token after
+/// `--harness-arg` verbatim regardless of what it starts with, and
+/// storage and read-back treat it like any other character.
+fn harness_arg_unrepresentable_reason(arg: &str) -> Option<&'static str> {
+    if arg.is_empty() {
+        Some("would be stored as a blank line, which reads back as no argument at all")
+    } else if arg.starts_with('#') {
+        Some(
+            "would be stored as a line starting with '#', which reads back as a comment, not an argument",
+        )
+    } else if arg.ends_with('\r') {
+        Some(
+            "ends with a carriage return, which merges with the stored line's own newline and is stripped on read",
+        )
+    } else {
+        None
+    }
+}
+
+/// `init`: writes the estate root, the harness kind, the harness's own
+/// arguments, or any combination of them.
+///
+/// The estate must already be a directory. A path that does not exist
+/// is refused here rather than written and discovered later by the
+/// startup hook, which would report it as "no wirkd" instead of "that
+/// is not a directory". The harness kind is checked for shape only —
+/// one bare token — because which kinds exist is Herdr's to say, and
+/// `wirk plugin harnesses` asks it.
+///
+/// `--harness-arg` is repeatable and each value becomes one line of
+/// `harness-args`, passed through to the harness by the assistant
+/// action exactly as written: spaces, globs and leading dashes all
+/// survive, because nothing re-splits or expands a line. `wirk` never
+/// supplies one of its own — which model or effort a conversation runs
+/// at is the operator's choice, and an installation that named none
+/// starts the harness with no extra arguments at all. An argument the
+/// one-line format cannot represent — empty, a `#` comment line, or
+/// one ending in `\r` — is refused outright by
+/// `harness_arg_unrepresentable_reason` rather than silently dropped;
+/// there is no escaping syntax or migration to a richer format here.
+///
+/// Repeating the flag replaces the whole list rather than appending to
+/// it: the file is what the operator last said in full, so a command
+/// naming three arguments and a later one naming two leaves two.
+/// `--clear-harness-args` is how "none" is said, and is distinct from
+/// not mentioning arguments at all, which leaves them as they were.
+///
+/// All of `--estate`, `--harness` and `--harness-arg`/
+/// `--clear-harness-args` are validated before any of the three
+/// configuration files is touched. Each file is an independent piece
+/// of state a later `show` or `assistant.sh` run reads on its own, so
+/// a command naming a valid `--estate` alongside an invalid `--harness`
+/// must fail as a whole, not write the estate and leave the harness
+/// error for the operator to notice separately.
+fn plugin_init(rest: &[String]) -> ExitCode {
+    let estate = flag_value(rest, "--estate");
+    let harness = flag_value(rest, "--harness");
+    let harness_args = flag_values(rest, "--harness-arg");
+    let clear_harness_args = rest.iter().any(|a| a == "--clear-harness-args");
+    if estate.is_none() && harness.is_none() && harness_args.is_empty() && !clear_harness_args {
         return plugin_usage();
     }
-    let rest = &rest[1..];
-    let Some(estate) = flag_value(rest, "--estate") else {
-        return plugin_usage();
-    };
-    let Ok(config_dir) = env::var("HERDR_PLUGIN_CONFIG_DIR") else {
+    if clear_harness_args && !harness_args.is_empty() {
         eprintln!(
-            "wirk plugin init: HERDR_PLUGIN_CONFIG_DIR is not set (run inside a Herdr plugin action)"
+            "wirk plugin init: --clear-harness-args and --harness-arg contradict each other.\n\
+             Give the arguments to set, or --clear-harness-args to set none."
         );
         return ExitCode::from(2);
+    }
+    // One argument per line is the whole format, so an argument that
+    // itself contains a newline cannot be stored and read back as the
+    // same argument. Refused at the point it is given rather than
+    // silently written as two.
+    if let Some(bad) = harness_args.iter().find(|arg| arg.contains('\n')) {
+        eprintln!(
+            "wirk plugin init: --harness-arg must not contain a newline; {bad:?} does.\n\
+             Arguments are stored one per line."
+        );
+        return ExitCode::from(2);
+    }
+    if let Some((bad, reason)) = harness_args
+        .iter()
+        .find_map(|arg| harness_arg_unrepresentable_reason(arg).map(|reason| (arg, reason)))
+    {
+        eprintln!(
+            "wirk plugin init: --harness-arg {bad:?} cannot be stored: {reason}.\n\
+             Nothing was written. The other door into the harness's arguments\n\
+             is WIRK_ASSISTANT_HARNESS_ARGS (read by plugin/assistant.sh):\n\
+             it is split on whitespace by read -a, so it cannot carry an\n\
+             empty argument at all, but it does carry the values this file\n\
+             cannot — an argument starting with '#' or one ending in a\n\
+             carriage return."
+        );
+        return ExitCode::from(2);
+    }
+    // The estate directory and the harness shape are also checked
+    // before any file is written, for the same reason: a rejected
+    // --harness must not leave a --estate given in the same command
+    // already on disk.
+    if let Some(estate) = estate.as_deref()
+        && !Path::new(estate).is_dir()
+    {
+        eprintln!(
+            "wirk plugin init: --estate {estate} is not an existing directory.\n\
+             An estate is a directory wirk works in; create it first, or name one\n\
+             that exists."
+        );
+        return ExitCode::from(2);
+    }
+    if let Some(harness) = harness.as_deref()
+        && (harness.is_empty() || harness.split_whitespace().count() != 1)
+    {
+        eprintln!(
+            "wirk plugin init: --harness must be one agent kind, with no spaces.\n\
+             'wirk plugin harnesses' lists the kinds this Herdr reports."
+        );
+        return ExitCode::from(2);
+    }
+
+    let config_dir = match plugin_config_dir() {
+        Ok(dir) => dir,
+        Err(code) => return code,
     };
-    let config_dir = PathBuf::from(config_dir);
     if let Err(err) = std::fs::create_dir_all(&config_dir) {
-        eprintln!("wirk plugin init: {err}");
+        eprintln!("wirk plugin init: {}: {err}", config_dir.display());
         return ExitCode::from(2);
     }
-    let path = config_dir.join("estate");
-    if let Err(err) = std::fs::write(&path, format!("{estate}\n")) {
-        eprintln!("wirk plugin init: {err}");
-        return ExitCode::from(2);
+
+    if let Some(estate) = estate.as_deref() {
+        // Stored as given rather than canonicalized: an operator who
+        // named a symlinked path meant that path, and every other
+        // surface prints this value back to them.
+        if let Err(err) = std::fs::write(config_dir.join(ESTATE_FILE), format!("{estate}\n")) {
+            eprintln!("wirk plugin init: writing {ESTATE_FILE}: {err}");
+            return ExitCode::from(2);
+        }
+        println!("estate  {estate}");
     }
-    println!("wrote estate root to {}", path.display());
+
+    if let Some(harness) = harness.as_deref() {
+        if let Err(err) = std::fs::write(config_dir.join(HARNESS_FILE), format!("{harness}\n")) {
+            eprintln!("wirk plugin init: writing {HARNESS_FILE}: {err}");
+            return ExitCode::from(2);
+        }
+        println!("harness {harness}");
+    }
+
+    if clear_harness_args {
+        match std::fs::remove_file(config_dir.join(HARNESS_ARGS_FILE)) {
+            Ok(()) => {}
+            // Nothing set is already the state asked for.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                eprintln!("wirk plugin init: removing {HARNESS_ARGS_FILE}: {err}");
+                return ExitCode::from(2);
+            }
+        }
+        println!("harness-args (none)");
+    } else if !harness_args.is_empty() {
+        let body: String = harness_args.iter().map(|arg| format!("{arg}\n")).collect();
+        if let Err(err) = std::fs::write(config_dir.join(HARNESS_ARGS_FILE), body) {
+            eprintln!("wirk plugin init: writing {HARNESS_ARGS_FILE}: {err}");
+            return ExitCode::from(2);
+        }
+        for arg in &harness_args {
+            println!("harness-arg {arg}");
+        }
+    }
+
+    println!("written to {}", config_dir.display());
     ExitCode::SUCCESS
 }
 
+/// `show`: the configuration as it stands, with each unset value named
+/// as unset and the command that sets it. Exits 0 whether or not
+/// anything is configured — nothing failed; this is a read.
+fn plugin_show() -> ExitCode {
+    let config_dir = match plugin_config_dir() {
+        Ok(dir) => dir,
+        Err(code) => return code,
+    };
+    println!("config dir {}", config_dir.display());
+    match plugin_config_value(&config_dir, ESTATE_FILE) {
+        Some(estate) => {
+            let exists = if Path::new(&estate).is_dir() {
+                ""
+            } else {
+                "   (no such directory)"
+            };
+            println!("estate     {estate}{exists}");
+        }
+        None => println!("estate     (not set)   wirk plugin init --estate <root>"),
+    }
+    match plugin_config_value(&config_dir, HARNESS_FILE) {
+        Some(harness) => println!("harness    {harness}"),
+        None => println!("harness    (not set)   wirk plugin init --harness <kind>"),
+    }
+    // One per line, each on its own row, because that is how they are
+    // stored and how they are passed: an argument holding a space is a
+    // single argument, and joining them for display would read as two.
+    let harness_args = plugin_config_lines(&config_dir, HARNESS_ARGS_FILE);
+    if harness_args.is_empty() {
+        println!("harness-args (none)    wirk plugin init --harness-arg <arg>");
+    } else {
+        for (index, arg) in harness_args.iter().enumerate() {
+            let label = if index == 0 {
+                "harness-args"
+            } else {
+                "            "
+            };
+            println!("{label} {arg}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `harnesses [--socket <path>] [--json]`: the interactive agent kinds
+/// Herdr reports, read from Herdr's own `server.agent_manifests`.
+///
+/// This is Herdr's structured answer, not a scrape of its help text, so
+/// a kind Herdr gains or drops is reflected without an edit here. The
+/// socket is `--socket`, else `HERDR_SOCKET_PATH`; `herdr status server`
+/// prints the path of the session it would talk to, which is how the
+/// plugin's own scripts supply it.
+///
+/// Two things it deliberately does not claim, both said in the footer
+/// it prints. Herdr reports the kinds it carries detection manifests
+/// for, which can be fewer than `agent start --kind` accepts, so this
+/// offers choices rather than settling them and nothing downstream
+/// treats it as a veto. And the `PATH` column looks for an executable
+/// named after the kind: Herdr chooses that executable and for a few
+/// kinds it is not the kind's own name, so a blank is a hint that
+/// something is missing, never a verdict that Herdr could not start
+/// it.
+fn plugin_harnesses(rest: &[String]) -> ExitCode {
+    let json = rest.iter().any(|a| a == "--json");
+    let socket = flag_value(rest, "--socket")
+        .or_else(|| env::var("HERDR_SOCKET_PATH").ok().filter(|s| !s.is_empty()));
+    let Some(socket) = socket else {
+        eprintln!(
+            "wirk plugin harnesses: no Herdr socket given. Pass --socket <path>, or set\n\
+             HERDR_SOCKET_PATH. 'herdr status server' prints the socket of the session\n\
+             it is talking to."
+        );
+        return ExitCode::from(2);
+    };
+
+    let client = match wirk_herdr::SocketClient::connect(PathBuf::from(&socket)) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("wirk plugin harnesses: cannot reach Herdr at {socket}: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let kinds = match client.agent_manifests() {
+        Ok(kinds) => kinds,
+        Err(err) => {
+            eprintln!("wirk plugin harnesses: Herdr did not report its agent kinds: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let rows: Vec<(String, Option<PathBuf>)> = kinds
+        .into_iter()
+        .map(|kind| {
+            let found = executable_on_path(&kind);
+            (kind, found)
+        })
+        .collect();
+
+    if json {
+        let payload: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(kind, found)| {
+                serde_json::json!({
+                    "kind": kind,
+                    "executable_named_kind_on_path": found
+                        .as_ref()
+                        .map(|p| p.display().to_string()),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "source": "herdr server.agent_manifests",
+                "socket": socket,
+                "harnesses": payload,
+            })
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    for (kind, found) in &rows {
+        match found {
+            Some(path) => println!("{kind:<12} {}", path.display()),
+            None => println!("{kind:<12} no '{kind}' on PATH"),
+        }
+    }
+    println!();
+    println!("Kinds come from Herdr itself (server.agent_manifests) at {socket}.");
+    println!(
+        "That is what Herdr carries a detection manifest for, which can be fewer than\n\
+         its 'agent start --kind' accepts, so this list offers choices rather than\n\
+         settling them. The PATH column looks for an executable named after the kind;\n\
+         Herdr picks the executable for each kind and for a few it differs from the\n\
+         kind name, so a blank there means 'probably not installed', not 'Herdr cannot\n\
+         start it'."
+    );
+    ExitCode::SUCCESS
+}
+
+/// The first executable named `name` on `PATH` (R3: `PATH` splitting is
+/// all this needs; nothing here wants a `which` dependency).
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 fn plugin_usage() -> ExitCode {
-    eprintln!("usage: wirk plugin init --estate <root>");
+    eprintln!(
+        "usage: wirk plugin init [--estate <root>] [--harness <kind>]\n\
+         \x20                       [--harness-arg <arg>]... | [--clear-harness-args]\n\
+         \x20      wirk plugin show\n\
+         \x20      wirk plugin harnesses [--socket <path>] [--json]"
+    );
     ExitCode::from(1)
 }
 
@@ -3986,5 +4836,72 @@ fn work_state_name(state: WorkState) -> &'static str {
         WorkState::Completed => "completed",
         WorkState::Failed => "failed",
         WorkState::Canceled => "canceled",
+    }
+}
+
+/// Deterministic checks on the pure rendering helpers behind the
+/// status lines: `format_elapsed_from`'s bucketing and its zero floor,
+/// and the shell quoting the printed retrieval command depends on.
+/// Neither stands in for a service — they are string functions, and the
+/// live service behaviour they feed is exercised against a real daemon
+/// in `tests/work_listing.rs`.
+#[cfg(test)]
+mod status_rendering_tests {
+    use super::{format_elapsed_from, listing_summary, shell_quote};
+
+    #[test]
+    fn format_elapsed_from_buckets_by_unit() {
+        let now = 1_700_000_000_000i64;
+        assert_eq!(format_elapsed_from(now, now), "0s ago");
+        assert_eq!(format_elapsed_from(now, now - 45_000), "45s ago");
+        assert_eq!(format_elapsed_from(now, now - 5 * 60_000), "5m ago");
+        assert_eq!(format_elapsed_from(now, now - 3 * 3_600_000), "3h ago");
+        assert_eq!(format_elapsed_from(now, now - 2 * 86_400_000), "2d ago");
+    }
+
+    #[test]
+    fn format_elapsed_from_never_prints_a_negative_duration() {
+        let now = 1_700_000_000_000i64;
+        // A timestamp after `now` (clock skew, or read mid-write) must
+        // floor at zero, never print a negative "-3s ago".
+        assert_eq!(format_elapsed_from(now, now + 5_000), "0s ago");
+    }
+
+    /// The retrieval command is printed to be copied into a shell, so
+    /// nothing substituted into it may survive as shell syntax.
+    #[test]
+    fn shell_quote_neutralizes_shell_syntax() {
+        assert_eq!(shell_quote("work-18d5-0"), "'work-18d5-0'");
+        assert_eq!(shell_quote("a b; rm -rf /"), "'a b; rm -rf /'");
+        assert_eq!(shell_quote("$HOME`id`"), "'$HOME`id`'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// A narrowed reader's `artifacts` arrive as a withheld marker
+    /// rather than a list. That is not the same fact as "this Work has
+    /// no validated outputs", and the row must not report it as one.
+    #[test]
+    fn listing_summary_separates_withheld_outputs_from_absent_ones() {
+        let none = serde_json::json!({"evidence": []});
+        assert!(listing_summary(&none).ends_with("outputs none"));
+
+        let withheld = serde_json::json!({
+            "evidence": [{"claim": "claim-1", "artifacts": {"withheld": true}}],
+        });
+        assert!(listing_summary(&withheld).ends_with("outputs withheld"));
+
+        let counted = serde_json::json!({
+            "attempt": 2,
+            "run_id": "run-1",
+            "run_state": "claimed",
+            "evidence": [{"claim": "claim-1", "artifacts": [
+                {"name": "a.md", "available": true},
+                {"name": "b.md", "available": false},
+            ]}],
+        });
+        assert_eq!(
+            listing_summary(&counted),
+            "attempt 2 run run-1 claimed outputs 1/2 available"
+        );
     }
 }

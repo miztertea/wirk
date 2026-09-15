@@ -67,8 +67,24 @@ pub fn require_herdr_or_skip(test_name: &str) -> bool {
 /// carry the same overrides or it silently falls back to the caller's
 /// ambient `$HOME/.config/herdr` and finds a different (or no) session.
 fn run_herdr(args: &[&str], env: &[(String, String)]) -> std::process::Output {
+    run_herdr_unset(args, env, &[])
+}
+
+/// `herdr <args>` with `env` applied and `unset` removed. Removal
+/// matters for a test whose subject is what a *fresh* installation
+/// does: a variable the developer's own shell exports (a shared
+/// `CARGO_TARGET_DIR`, say) is inherited by the session and by
+/// everything it launches, and would quietly change the answer.
+fn run_herdr_unset(
+    args: &[&str],
+    env: &[(String, String)],
+    unset: &[String],
+) -> std::process::Output {
     let mut cmd = Command::new("herdr");
     cmd.args(args);
+    for key in unset {
+        cmd.env_remove(key);
+    }
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -116,6 +132,7 @@ pub struct LiveHerdrSession {
     socket: PathBuf,
     scratch: PathBuf,
     env: Vec<(String, String)>,
+    unset: Vec<String>,
 }
 
 impl LiveHerdrSession {
@@ -143,6 +160,19 @@ impl LiveHerdrSession {
     /// for its pane, never a real actor's PATH and never under
     /// `/var/tmp/wirk-target`.
     pub fn start_with_env(test_name: &str, extra_env: &[(&str, &str)]) -> Option<Self> {
+        Self::start_with_env_unset(test_name, extra_env, &[])
+    }
+
+    /// Same as `start_with_env`, plus variables removed from the
+    /// environment of the session server and of every `herdr` call made
+    /// through this fixture — for a test whose subject is what a fresh
+    /// installation does on a machine where the developer's own shell
+    /// exports something the installation must not inherit.
+    pub fn start_with_env_unset(
+        test_name: &str,
+        extra_env: &[(&str, &str)],
+        unset: &[&str],
+    ) -> Option<Self> {
         if !require_herdr_or_skip(test_name) {
             return None;
         }
@@ -167,12 +197,16 @@ impl LiveHerdrSession {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        let unset: Vec<String> = unset.iter().map(|k| (*k).to_string()).collect();
 
         let sh = format!(
             "setsid herdr --session {name} server >/var/tmp/{name}-server.log 2>&1 & disown"
         );
         let mut spawn = Command::new("bash");
         spawn.arg("-c").arg(&sh);
+        for key in &unset {
+            spawn.env_remove(key);
+        }
         for (key, value) in &env {
             spawn.env(key, value);
         }
@@ -192,7 +226,7 @@ impl LiveHerdrSession {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        let snapshot = run_herdr(&["--session", &name, "api", "snapshot"], &env);
+        let snapshot = run_herdr_unset(&["--session", &name, "api", "snapshot"], &env, &unset);
         assert!(
             snapshot.status.success(),
             "session {name} did not answer api snapshot: {}",
@@ -204,6 +238,7 @@ impl LiveHerdrSession {
             socket,
             scratch,
             env,
+            unset,
         })
     }
 
@@ -213,7 +248,7 @@ impl LiveHerdrSession {
     /// `XDG_CONFIG_HOME`/`XDG_STATE_HOME`, since the CLI must read the
     /// same variables the server did to find its socket and config root.
     pub fn herdr(&self, args: &[&str]) -> std::process::Output {
-        run_herdr(args, &self.env)
+        run_herdr_unset(args, &self.env, &self.unset)
     }
 
     /// A fresh `SocketClient` dialed at this session's socket, with the
@@ -279,10 +314,10 @@ impl Drop for LiveHerdrSession {
             }
         }
 
-        let _ = run_herdr(&["session", "stop", &self.name], &self.env);
-        let _ = run_herdr(&["session", "delete", &self.name], &self.env);
+        let _ = run_herdr_unset(&["session", "stop", &self.name], &self.env, &self.unset);
+        let _ = run_herdr_unset(&["session", "delete", &self.name], &self.env, &self.unset);
 
-        let list = run_herdr(&["session", "list"], &self.env);
+        let list = run_herdr_unset(&["session", "list"], &self.env, &self.unset);
         let listing = String::from_utf8_lossy(&list.stdout);
         assert!(
             !listing.contains(&self.name),

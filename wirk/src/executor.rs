@@ -438,9 +438,20 @@ pub fn run_command(rest: &[String]) -> ExitCode {
     };
 
     let work_id = WorkId(work_id_arg);
-    let estate_path = PathBuf::from(&estate);
+    // Canonicalize `--estate` here: a relative path is later handed to
+    // `wirk_herdr::git::worktree_add`, which spawns `git` with `current_dir`
+    // set to the repository, not this process's cwd, so an unresolved
+    // relative path would be read back repository-relative instead of
+    // caller-relative.
+    let estate_path = match std::fs::canonicalize(&estate) {
+        Ok(root) => root,
+        Err(err) => {
+            eprintln!("wirk run: --estate {estate} could not be resolved: {err}");
+            return ExitCode::from(2);
+        }
+    };
 
-    let pointer = match wirkd::client::locate(Path::new(&estate)) {
+    let pointer = match wirkd::client::locate(&estate_path) {
         Ok(pointer) => pointer,
         Err(err) => {
             eprintln!("wirk run: {err}");

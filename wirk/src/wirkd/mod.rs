@@ -218,6 +218,17 @@ pub enum Verb {
     /// one line): a revision needs the bytes the Claim was validated
     /// against, and that is what this resolves.
     RunArtifact,
+    /// `wirk artifact read --work <id> --admin`/`--requesting-work <id>`
+    /// (ruling 0339): the same validated-artifact resolution as
+    /// `RunArtifact`, reached by a named `work_id` and the identical
+    /// `admin`/`requester` pair `Status` already carries, instead of an
+    /// execution triple. An administrative shell has no Run and cannot
+    /// pass `RunArtifact`'s currency check at all; a named `--requesting-
+    /// work` is admitted by the same lineage `Status` checks, not by a
+    /// borrowed Run identity. Journal ids are not authentication here any
+    /// more than they are for `Status` — the same same-uid socket answers
+    /// both.
+    WorkArtifact,
     /// `wirk world expand` (W-C3): the actor of the current Run adds a
     /// revision to the context it was delivered. Same triple-only door
     /// as `WorldShow` — nothing on this surface names a Work, a Run or a
@@ -547,6 +558,16 @@ impl Request {
         Request {
             verb: Verb::RunArtifact,
             payload: serde_json::to_value(payload).expect("RunArtifactPayload always serializes"),
+        }
+    }
+
+    /// `wirk artifact read --work <id> --admin`/`--requesting-work <id>`
+    /// (ruling 0339): the named-Work, non-triple door onto the same
+    /// validated-artifact resolution `run_artifact` reaches.
+    pub fn work_artifact(payload: WorkArtifactPayload) -> Self {
+        Request {
+            verb: Verb::WorkArtifact,
+            payload: serde_json::to_value(payload).expect("WorkArtifactPayload always serializes"),
         }
     }
 
@@ -935,6 +956,14 @@ pub struct AtlasAcquirePayload {
     /// administrative job, cancellable only administratively.
     #[serde(default)]
     pub work: Option<WorkId>,
+    /// P6.3-B: preview `repository` at `revision` the same way a real
+    /// acquisition would classify it, and write nothing — no
+    /// membership, no generation, no catalog change. `#[serde(default)]`
+    /// so an older client that never sends this field still gets the
+    /// unchanged, non-preview behaviour it always got; this is
+    /// additive, not a schema break.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// `atlas refresh`'s payload: reuses `source`'s existing registration
@@ -995,6 +1024,20 @@ pub struct AtlasPublishPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtlasRemovePayload {
     pub source: String,
+    /// The Work this removal is asked as, or `None` for the
+    /// administrative one.
+    ///
+    /// Unlike `refresh`/`publish`, where the same field is job origin
+    /// and explicitly *not* a grant, this one decides what the verb may
+    /// reach: a Work-scoped caller removes only a source its own
+    /// journaled bindings name, by the identical rule every Work-scoped
+    /// query already applies (`resolve_query_scope` /
+    /// `admitted_membership_for`). The daemon derives the grants from
+    /// the journal; the client supplies an identity, never a grant set.
+    /// `#[serde(default)]` so an older client that sends no field still
+    /// parses — as the administrative caller it always effectively was.
+    #[serde(default)]
+    pub work: Option<WorkId>,
 }
 
 /// `atlas semantic build`'s payload (P3 W4 A). Backend and model are
@@ -1560,6 +1603,57 @@ pub struct RunArtifactPayload {
     pub triple: wirk_core::ExecutionTriple,
     pub claim: wirk_core::ClaimId,
     pub name: String,
+}
+
+/// `wirk artifact read --work <id> [--requesting-work <id> | --admin]`'s
+/// payload (ruling 0339): the named Work and which validated artifact of
+/// it, plus the identical `requester`/`admin` pair `StatusPayload`
+/// already carries. Resolves the same validated-Claim/receipt/bytes path
+/// `RunArtifactPayload` does, but the caller names the Work directly
+/// instead of presenting an execution triple — the door an operator
+/// shell (no Run at all) and a named scoped reader (admitted by lineage,
+/// exactly as `Status` admits one) both need, and that `RunArtifactPayload`
+/// cannot express: it carries only a triple, a Claim and a name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkArtifactPayload {
+    pub work_id: WorkId,
+    pub claim: wirk_core::ClaimId,
+    pub name: String,
+    #[serde(default)]
+    pub requester: Option<WorkId>,
+    #[serde(default)]
+    pub admin: bool,
+}
+
+impl WorkArtifactPayload {
+    /// The explicitly administrative read: any Work id, no Run required.
+    pub fn admin(work_id: WorkId, claim: wirk_core::ClaimId, name: String) -> Self {
+        Self {
+            work_id,
+            claim,
+            name,
+            requester: None,
+            admin: true,
+        }
+    }
+
+    /// The scoped read: admitted only when `work_id` is in `requester`'s
+    /// own journal or its parent/child lineage (the same admission
+    /// `handle_status` computes).
+    pub fn scoped(
+        work_id: WorkId,
+        claim: wirk_core::ClaimId,
+        name: String,
+        requester: WorkId,
+    ) -> Self {
+        Self {
+            work_id,
+            claim,
+            name,
+            requester: Some(requester),
+            admin: false,
+        }
+    }
 }
 
 /// `world expand`'s request (W-C3): the injected triple, plus what the

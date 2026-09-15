@@ -1599,6 +1599,12 @@ fn dispatch(
                 Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
             }
         }
+        Verb::WorkArtifact => {
+            match serde_json::from_value::<super::WorkArtifactPayload>(request.payload.clone()) {
+                Ok(payload) => Outcome::Reply(handle_work_artifact(state, payload)),
+                Err(err) => Outcome::Reply(err_reply("BadRequest", &err.to_string())),
+            }
+        }
         Verb::Clean => match serde_json::from_value::<super::CleanPayload>(request.payload.clone())
         {
             Ok(payload) => Outcome::Reply(handle_clean(state, payload)),
@@ -9610,6 +9616,9 @@ fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePay
     if let Err(reply) = resolve_query_scope(state, &payload.work) {
         return reply;
     }
+    if payload.dry_run {
+        return handle_atlas_acquire_preview(state, payload);
+    }
     // B3: admission first, atlas second.
     let admission = match admit_expensive(state, "atlas acquire", &payload.source) {
         Ok(admission) => admission,
@@ -9663,6 +9672,47 @@ fn handle_atlas_acquire(state: &Arc<WirkdState>, payload: super::AtlasAcquirePay
         acquire_reply(&mut atlas, &membership, &payload.revision, false),
         notes,
     )
+}
+
+/// `atlas acquire --dry-run`: the same admitted queue slot a real
+/// acquisition takes and the same walkers it uses
+/// (`wirk_atlas::AtlasStore::preview`'s own doc says exactly what each
+/// source kind reads), stopped short of writing anything. No membership
+/// is registered and no generation is staged — `payload.source` names
+/// only the admission/cancellation scope, never a catalog entry.
+fn handle_atlas_acquire_preview(
+    state: &Arc<WirkdState>,
+    payload: super::AtlasAcquirePayload,
+) -> Reply {
+    let admission = match admit_expensive(state, "atlas acquire --dry-run", &payload.source) {
+        Ok(admission) => admission,
+        Err(refusal) => return refusal,
+    };
+    let notes = admission_notes(&admission);
+    let atlas = state
+        .atlas
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let policy = wirk_atlas::ExtractorPolicy::default();
+    let result = atlas.preview(
+        &payload.source,
+        &payload.repository,
+        &payload.revision,
+        payload.kind.as_deref(),
+        &policy,
+    );
+    drop(atlas);
+    match result {
+        Ok(report) => with_admission_notes(
+            ok_reply(json!({
+                "outcome": "previewed",
+                "preview": serde_json::to_value(&report)
+                    .expect("PreviewReport always serializes"),
+            })),
+            notes,
+        ),
+        Err(err) => atlas_err_reply(&err),
+    }
 }
 
 /// `handle_atlas_refresh`: reuses `source`'s existing registration and
@@ -10013,21 +10063,60 @@ fn foreign_holders_of_source(
 /// them stays with `wirk estate clean`, the estate's one cleanup owner,
 /// which re-derives retention against every remaining source before it
 /// removes anything.
+///
+/// **Whose removal it is.** This verb used to take no caller at all: it
+/// found the membership by alias and removed it, so an actor executing
+/// inside one Work invalidated any source registered in its estate,
+/// admitted to that Work or not, and every refusal it could produce was
+/// told at `Disclosure::Administrative` to whoever asked. The caller now
+/// travels (`AtlasRemovePayload::work`) and is resolved by
+/// `resolve_query_scope` — the journaled Work, never a client-supplied
+/// grant set — and admitted by `admitted_membership_for`, the same
+/// single rule `atlas status --work`, `search` and `resolve` already
+/// apply: `EstateOrientation` reaches everything, a `Work` reaches a
+/// membership some binding of its own names. A source this caller is not
+/// admitted to answers exactly as a source that is not registered, so
+/// the verb cannot be used to learn what the catalog holds.
+///
+/// Admission here looks at the alias only, the same as every other
+/// Work-scoped query; this handler deliberately applies that existing
+/// rule unchanged rather than inventing a stricter one for this one
+/// verb.
 fn handle_atlas_remove(state: &Arc<WirkdState>, payload: super::AtlasRemovePayload) -> Reply {
+    let scope = match resolve_query_scope(state, &payload.work) {
+        Ok(scope) => scope,
+        Err(reply) => return reply,
+    };
+    // A scoped caller is told what every other scoped caller is told:
+    // the category and the reason, never which record it was
+    // (ruling 0095).
+    let disclosure = if payload.work.is_some() {
+        wirk_core::storage::Disclosure::Requester
+    } else {
+        wirk_core::storage::Disclosure::Administrative
+    };
     let mut atlas = state
         .atlas
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
+    let unknown = || {
+        err_reply(
+            "UnknownSource",
+            &format!("no registered source named {}", payload.source),
+        )
+    };
     let Some(membership) = atlas
         .memberships()
         .find(|membership| membership.alias == payload.source)
         .cloned()
     else {
-        return err_reply(
-            "UnknownSource",
-            &format!("no registered source named {}", payload.source),
-        );
+        return unknown();
     };
+    // Identical answer for "no such source" and "not yours": the reply
+    // above is the whole disclosure either way.
+    if admitted_membership_for(&atlas, &scope, &membership.id).is_none() {
+        return unknown();
+    }
 
     let retention = derive_retention(state, &atlas);
     if !retention.complete() {
@@ -10035,10 +10124,7 @@ fn handle_atlas_remove(state: &Arc<WirkdState>, payload: super::AtlasRemovePaylo
             "RetentionIncomplete",
             "part of what this estate records could not be read, so it cannot be shown \
              that nothing still needs this source's evidence. Nothing was removed",
-            &wirk_core::storage::tell_unreadable(
-                &retention.unreadable,
-                wirk_core::storage::Disclosure::Administrative,
-            ),
+            &wirk_core::storage::tell_unreadable(&retention.unreadable, disclosure),
         );
     }
     let retained_by = match foreign_holders_of_source(&atlas, &membership, &retention) {
@@ -10053,6 +10139,17 @@ fn handle_atlas_remove(state: &Arc<WirkdState>, payload: super::AtlasRemovePaylo
         }
     };
     if !retained_by.is_empty() {
+        // `describe()` names the holding Work or finding. That is the
+        // operator's answer; a scoped caller learns that something
+        // still holds this source and how much, not whose it is.
+        let notes = match disclosure {
+            wirk_core::storage::Disclosure::Administrative => retained_by,
+            wirk_core::storage::Disclosure::Requester => vec![format!(
+                "{} record(s) of this estate still require this source's evidence; their \
+                 identities are withheld at this scope",
+                retained_by.len()
+            )],
+        };
         return err_reply_with_notes(
             "SourceRetained",
             &format!(
@@ -10060,7 +10157,7 @@ fn handle_atlas_remove(state: &Arc<WirkdState>, payload: super::AtlasRemovePaylo
                  once that evidence is settled or terminal. Nothing was removed",
                 payload.source
             ),
-            &retained_by,
+            &notes,
         );
     }
 
@@ -10098,9 +10195,15 @@ fn handle_atlas_remove(state: &Arc<WirkdState>, payload: super::AtlasRemovePaylo
 /// Item 3 also requires `--work` scoping: when given, a source this
 /// Work's own journaled bindings do not admit is dropped entirely,
 /// never disclosing its locator, revision or generation (VERDICT.md
-/// L4). Omitting `--work` remains estate-wide catalog administration —
-/// an explicit, distinct capability from Work-scoped retrieval, not a
-/// bug to close by removing it.
+/// L4). Omitting `--work` remains estate-wide catalog administration for
+/// the operator's own shell — an explicit, distinct capability from
+/// Work-scoped retrieval, not a bug to close by removing it. Which
+/// callers reach that is decided in the CLI, by the same
+/// `reading_scope`/`resolve_scope` every other reading verb uses
+/// inside an actor's own context an omitted
+/// `--work` is that actor's own Work, and only an explicit `--admin`
+/// reaches this disclosure from there. This handler acts on whatever
+/// `payload.work` it is given, scoping as below either way.
 /// `atlas cancel`: signal running expensive jobs, and report what is
 /// running.
 ///
@@ -10454,10 +10557,6 @@ fn handle_atlas_status(state: &Arc<WirkdState>, payload: super::AtlasStatusPaylo
         if !admitted {
             continue;
         }
-        let current = match atlas.current(membership) {
-            Ok(generation) => generation,
-            Err(err) => return err_reply("AtlasError", &err.to_string()),
-        };
         let attempts: Vec<Value> = atlas
             .attempts()
             .iter()
@@ -10472,9 +10571,39 @@ fn handle_atlas_status(state: &Arc<WirkdState>, payload: super::AtlasStatusPaylo
                 })
             })
             .collect();
+        // This source's published generation is read twice in this
+        // body: once here, and again inside `semantic_status_record`,
+        // which derives semantic availability from whatever generation
+        // the source publishes now. Nothing holds the filesystem still
+        // between them — the store's lock excludes another `AtlasStore`,
+        // not an operator or a cleanup job removing a generation
+        // directory mid-call — so the second read can fail where the
+        // first succeeded, and both get the same treatment.
+        //
+        // `AtlasError::Generation` is what a published generation's own
+        // derived data failing to read classifies as (`AtlasStore`'s
+        // `read_generation` maps its manifest and resource-row failures
+        // into it). It is a fact about *this one source*, not about the
+        // catalog: the loop keeps every other admitted source's healthy
+        // row and this membership's own row discloses the reason.
+        // Anything else — an invalid coordinate, a malformed catalog, a
+        // store already owned elsewhere — is not source-local and still
+        // aborts the whole call.
+        let current = match atlas.current(membership) {
+            Ok(generation) => generation,
+            Err(err @ wirk_atlas::AtlasError::Generation(_)) => {
+                sources.push(generation_error_row(membership, &err, attempts));
+                continue;
+            }
+            Err(err) => return err_reply("AtlasError", &err.to_string()),
+        };
         let semantic = match semantic_status_record(&atlas, membership) {
             Ok(semantic) => semantic,
-            Err(reply) => return reply,
+            Err(err @ wirk_atlas::AtlasError::Generation(_)) => {
+                sources.push(generation_error_row(membership, &err, attempts));
+                continue;
+            }
+            Err(err) => return err_reply("AtlasError", &err.to_string()),
         };
         sources.push(json!({
             "membership": membership_json(membership),
@@ -10958,19 +11087,45 @@ fn handle_atlas_semantic_select(
     }
 }
 
+/// One admitted source whose published generation did not read back
+/// during this call.
+///
+/// `published_generation` and `semantic` are both null, whatever an
+/// earlier read in the same call saw: this source cannot be shown to
+/// publish readable bytes now, and carrying a generation id or a
+/// semantic record beside the error would assert a capability that is
+/// not there. `recent_attempts` is kept — it is this membership's own
+/// acquisition history and does not depend on the generation reading
+/// back.
+fn generation_error_row(
+    membership: &wirk_atlas::Membership,
+    error: &wirk_atlas::AtlasError,
+    attempts: Vec<Value>,
+) -> Value {
+    json!({
+        "membership": membership_json(membership),
+        "published_generation": Value::Null,
+        "generation_error": error.to_string(),
+        "recent_attempts": attempts,
+        "semantic": Value::Null,
+    })
+}
+
 /// This source's semantic record for `atlas status`: every edition on
 /// disk, which one is selected, and what each one's bytes actually verify
 /// as right now. Under a `--work` scope this is only ever reached for a
 /// membership that scope already admits, so it discloses nothing the
 /// caller could not already see.
+///
+/// Errors reach the caller as the `AtlasError` they were, not as an
+/// already-rendered refusal: `handle_atlas_status` needs to tell a
+/// source-local generation failure from an estate-wide one, and a
+/// `Reply` has thrown that away.
 fn semantic_status_record(
     atlas: &wirk_atlas::AtlasStore,
     membership: &wirk_atlas::Membership,
-) -> Result<Value, Reply> {
-    let editions = match atlas.semantic_editions(membership) {
-        Ok(editions) => editions,
-        Err(err) => return Err(err_reply("AtlasError", &err.to_string())),
-    };
+) -> Result<Value, wirk_atlas::AtlasError> {
+    let editions = atlas.semantic_editions(membership)?;
     let selected = atlas.selected_semantic(membership);
     let rendered: Vec<Value> = editions
         .iter()
@@ -10991,10 +11146,7 @@ fn semantic_status_record(
     // A selection whose generation is superseded, whose bytes do not
     // verify, or whose record cannot be read, is `false` with the reason
     // beside it — never `true` because a record with that id exists.
-    let availability = match atlas.semantic_availability(membership) {
-        Ok(availability) => availability,
-        Err(err) => return Err(err_reply("AtlasError", &err.to_string())),
-    };
+    let availability = atlas.semantic_availability(membership)?;
     let mut availability_json = json!({"state": availability.label()});
     if let Some(detail) = availability.detail() {
         availability_json["detail"] = json!(detail);
@@ -25086,17 +25238,36 @@ fn handle_run_artifact(state: &Arc<WirkdState>, payload: super::RunArtifactPaylo
             },
         );
     }
+    resolve_validated_artifact(state, &events, &work_id, &payload.claim, &payload.name)
+}
+
+/// The claim/receipt/bytes resolution `handle_run_artifact` and
+/// `handle_work_artifact` share once each has settled *who may ask*:
+/// the named Claim must be this Work's own, `Validated` and `Done`; its
+/// receipt for `name` must carry a digest; the receipt's recorded path
+/// must still resolve inside the area that owns it; and the bytes there
+/// must still hash to that digest. None of this depends on how the
+/// caller was admitted — a triple's current-Run check and a named
+/// Work's admin/lineage check both hand it the same `events` and the
+/// same `work_id` once they are satisfied.
+fn resolve_validated_artifact(
+    state: &Arc<WirkdState>,
+    events: &[Event],
+    work_id: &WorkId,
+    claim: &wirk_core::ClaimId,
+    name: &str,
+) -> Reply {
     // The Claim must be this Work's own, Validated, and `Done`. Every
     // other recorded outcome is deliberately indistinguishable from an
     // unknown id here: none of them vouches for bytes.
     let found = events.iter().rev().find_map(|event| match &event.kind {
         EventKind::ClaimRecorded {
-            claim,
+            claim: recorded,
             claim_kind: ClaimKind::Done,
             verdict: ClaimVerdict::Validated,
             artifacts,
             ..
-        } if claim == &payload.claim && event.work == work_id => {
+        } if recorded == claim && &event.work == work_id => {
             Some((event.run.clone(), artifacts.clone()))
         }
         _ => None,
@@ -25107,10 +25278,7 @@ fn handle_run_artifact(state: &Arc<WirkdState>, payload: super::RunArtifactPaylo
             "this Work records no validated Done Claim with that id",
         );
     };
-    let Some(receipt) = artifacts
-        .iter()
-        .find(|receipt| receipt.name == payload.name)
-    else {
+    let Some(receipt) = artifacts.iter().find(|receipt| receipt.name == name) else {
         return err_reply(
             "NotFound",
             "that Claim was not validated against an artifact of that name",
@@ -25134,13 +25302,12 @@ fn handle_run_artifact(state: &Arc<WirkdState>, payload: super::RunArtifactPaylo
             // exactly `claims/<id>/<name>`, each component under its own
             // rule, and anything else resolves to nothing here rather
             // than being walked.
-            wirk_core::outputs::resolve_stored(&state.estate_root, &work_id, &receipt.path).and(
-                wirk_core::outputs::outputs_dir(&state.estate_root, &work_id),
-            )
+            wirk_core::outputs::resolve_stored(&state.estate_root, work_id, &receipt.path)
+                .and(wirk_core::outputs::outputs_dir(&state.estate_root, work_id))
         }
         wirk_core::ArtifactStore::Worktree => claimed_by
             .as_ref()
-            .and_then(|run| worktree_path_for_run(&events, run)),
+            .and_then(|run| worktree_path_for_run(events, run)),
     };
     let Some(anchor) = anchored else {
         return err_reply(
@@ -25167,13 +25334,115 @@ fn handle_run_artifact(state: &Arc<WirkdState>, payload: super::RunArtifactPaylo
     }
     ok_reply(json!({
         "work": work_id.0,
-        "claim": payload.claim.0,
+        "claim": claim.0,
         "name": receipt.name,
         "store": receipt.store.label(),
         "digest": receipt.digest,
         "bytes": bytes.len(),
         "path": anchor.join(&receipt.path).display().to_string(),
     }))
+}
+
+/// `wirk artifact read --work <id> --admin`/`--requesting-work <id>`
+/// (ruling 0339): the same validated-artifact resolution
+/// `handle_run_artifact` performs, reached by a named Work instead of an
+/// execution triple.
+///
+/// **An administrative shell has no Run**, so `RunArtifactPayload`'s
+/// current-unsuperseded-Run check is not a gate this caller can pass at
+/// all — not "usually fails", structurally absent, the same way `wirk
+/// wirkd status --admin` needs no Run either. `admin` is trusted exactly
+/// as `StatusPayload::admin` is: the identical same-uid socket, named
+/// out loud rather than silently defaulted to.
+///
+/// A named `--requesting-work` is admitted by the identical lineage
+/// `handle_status` computes — this Work's own journal or its
+/// parent/child lineage — never by a borrowed Run identity. A requester
+/// reading its own or an admitted Work's artifact needs no Run at all:
+/// the Claim it reads may have been produced by any Run of that Work,
+/// exactly as `RunArtifactPayload` already allows a current actor to
+/// read an earlier stage's Claim.
+fn handle_work_artifact(state: &Arc<WirkdState>, payload: super::WorkArtifactPayload) -> Reply {
+    let scoped: Option<(Work, Vec<Event>, HashSet<WorkId>)> = if payload.admin {
+        None
+    } else {
+        let Some(requester_id) = &payload.requester else {
+            return err_reply(
+                "BadRequest",
+                "a non-administrative artifact read requires --requesting-work",
+            );
+        };
+        let Some(requester_events) = replay_events(state, requester_id) else {
+            return err_reply("NotFound", "no such requesting work");
+        };
+        let requester = fold(&requester_events);
+        let lineage = lineage_of(state, &requester, &requester_events);
+        if !lineage.contains(&payload.work_id) {
+            return err_reply(
+                "InadmissibleEvidence",
+                "the named work is not the requesting work's own journal or its parent/child lineage",
+            );
+        }
+        Some((requester, requester_events, lineage))
+    };
+    if wirk_core::outputs::check_output_name(&payload.name).is_err() {
+        return err_reply("BadRequest", "that is not a declarable managed output name");
+    }
+    let journal = match journal_for(state, &payload.work_id) {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return err_reply("NotFound", "no such work"),
+        Err(err) => return err_reply("JournalError", &err.to_string()),
+    };
+    let events = {
+        let journal = lock_journal(&journal);
+        match journal.replay() {
+            Ok(events) => events,
+            Err(err) => return err_reply("JournalError", &err.to_string()),
+        }
+    };
+    if events.is_empty() {
+        return err_reply("NotFound", "no such work");
+    }
+    // Lineage admitted the *reference*; it has never admitted the
+    // target's checkout. `handle_status`, asked about this same Work by
+    // this same requester, builds a `DisclosureView` and withholds
+    // every checkout-derived part of its answer unless the requester's
+    // own bindings cover this Work's whole binding set — and an
+    // artifact's resolved path, digest and bytes are exactly that
+    // content (`admits_work_checkout`'s own doc: "an artifact path and
+    // digest"; `settlement_json_scoped` applies the identical rule to a
+    // Finding's artifact path). Without this the narrowed requester
+    // fetched in full what the sibling verb hands it back withheld.
+    //
+    // There is nothing partial to return here — the whole reply is that
+    // content — so this is a refusal rather than a withholding marker,
+    // named with the same `InadmissibleEvidence` the off-lineage arm
+    // above already answers with, and carrying no alias, path or byte
+    // of what it withheld.
+    //
+    // Ordering: the target's journal guard is released by the block
+    // above before the view is built, because `admits_work_checkout`
+    // re-reads that same Work's journal through `fold_work` and
+    // scoping under the guard would self-deadlock — the identical
+    // `drop(journal)`-before-the-view order `handle_status` states in
+    // its own comment.
+    if let Some((requester, requester_events, lineage)) = &scoped {
+        let view = DisclosureView::new(requester, requester_events, lineage);
+        if !view.admits_work_checkout(state, &payload.work_id) {
+            return err_reply(
+                "InadmissibleEvidence",
+                "the requesting work's own bindings do not cover the named work's, so its \
+                 claimed artifact is not disclosable to it",
+            );
+        }
+    }
+    resolve_validated_artifact(
+        state,
+        &events,
+        &payload.work_id,
+        &payload.claim,
+        &payload.name,
+    )
 }
 
 /// `wirk output` (ruling 0145): where this Run's actor writes its
@@ -25231,48 +25500,125 @@ fn handle_run_outputs(state: &Arc<WirkdState>, payload: super::RunOutputsPayload
             "this Run's Waypoint has no journaled definition",
         );
     };
-    let staging =
-        match wirk_core::outputs::ensure_staging_dir(&state.estate_root, &work_id, &run_id) {
-            Ok(dir) => dir,
-            Err(err) => {
-                return err_reply(
-                    "OutputsUnavailable",
-                    &format!("this Run's managed output area could not be prepared: {err}"),
-                );
+    // This Run's *actual* Claim addressing decides where its declared
+    // outputs are looked for — `main.rs`'s own
+    // `ContractNames::Managed`/`::Checkout` split (ruling 0235's doc,
+    // reused here rather than re-derived): an `Actor` Waypoint's bare
+    // Claim reaches into managed staging, a `Deterministic` Waypoint's
+    // reaches into its own execution directory, the same root
+    // `handle_claim`'s artifact-path join uses. Before this correction
+    // `dir`/`list` always answered with managed staging regardless of
+    // kind, so a Deterministic actor was told to write where its own
+    // automatic Claim would never look.
+    let (destination, unavailable_reason) = match def.kind {
+        wirk_core::WaypointKind::Actor => {
+            match wirk_core::outputs::ensure_staging_dir(&state.estate_root, &work_id, &run_id) {
+                Ok(dir) => (Some(dir), None),
+                Err(err) => {
+                    return err_reply(
+                        "OutputsUnavailable",
+                        &format!("this Run's managed output area could not be prepared: {err}"),
+                    );
+                }
             }
-        };
+        }
+        wirk_core::WaypointKind::Deterministic => {
+            // The execution directory of the World bound to *this* Run,
+            // read through `resolve_run_binding` — the same helper
+            // `handle_world_show` answers this very triple through, and
+            // the same one `handle_submit` checks a materialization
+            // against. It resolves the reservation this Run's own
+            // `RunOpened` consumed, matched on that Run's own
+            // `world_hash` and full structured equality.
+            // `worktree_path_for_run`, which this arm reached for
+            // first, resolves `world_for_waypoint` — the Waypoint's
+            // *most recent* World — so a Run a retry has since
+            // superseded would be answered with the newer attempt's
+            // World rather than its own.
+            let binding = match resolve_run_binding(&events, &state.estate_root, &work_id, &run_id)
+            {
+                Ok(binding) => binding,
+                Err(reason) => return err_reply("ValidationUnavailable", &reason),
+            };
+            let World::Deterministic(det) = &binding.world else {
+                return err_reply(
+                    "TripleMismatch",
+                    "this Run's Waypoint is Deterministic but the World bound to it is not",
+                );
+            };
+            // A current submission reserves a `cwd` for a Deterministic
+            // World on either source basis: the Git arm materializes
+            // this Work's own worktree, and the output-only arm reserves
+            // `owned_execution_address` for the executor's own
+            // `materialize_owned_directory` to create before it spawns
+            // the child. So "no Git checkout" does not mean "no output
+            // destination". What is left genuinely unavailable is a
+            // bound World carrying no execution directory at all —
+            // reported as that, never as a fabricated path, and nothing
+            // is created here to make the label true.
+            if det.cwd.as_os_str().is_empty() {
+                (
+                    None,
+                    Some(
+                        "the World bound to this Run reserves no execution directory for its \
+                         declared outputs"
+                            .to_string(),
+                    ),
+                )
+            } else {
+                (Some(det.cwd.clone()), None)
+            }
+        }
+        // A `Container` never opens a Run of its own (`find_definition`
+        // above always resolves a leaf), so this arm is unreached in
+        // practice; refused rather than guessed at.
+        wirk_core::WaypointKind::Container => {
+            return err_reply(
+                "TripleMismatch",
+                "this Run's Waypoint is a Container, which opens no Run and declares no outputs",
+            );
+        }
+    };
     let current = latest_run_for_waypoint(&events, &run.waypoint).map(|entry| entry.0)
         == Some(run_id.clone());
     let outputs: Vec<Value> = def
         .declared_outputs
         .iter()
-        .map(
-            |spec| match wirk_core::outputs::check_output_name(&spec.name) {
-                Ok(()) => {
-                    let path = staging.join(&spec.name);
-                    // `staged` is the plain question "is there a regular
-                    // file there now" — a symlink or a directory answers
-                    // `false` here and refuses at Claim, rather than reading
-                    // as ready and refusing later.
-                    let staged = std::fs::symlink_metadata(&path)
-                        .map(|meta| meta.file_type().is_file())
-                        .unwrap_or(false);
-                    json!({
-                        "name": spec.name,
-                        "required": spec.required,
-                        "addressable": true,
-                        "path": path.display().to_string(),
-                        "staged": staged,
-                    })
-                }
-                Err(err) => json!({
+        .map(|spec| {
+            if let Err(err) = wirk_core::outputs::check_output_name(&spec.name) {
+                return json!({
                     "name": spec.name,
                     "required": spec.required,
                     "addressable": false,
                     "detail": err.detail(),
-                }),
-            },
-        )
+                });
+            }
+            let Some(destination) = &destination else {
+                return json!({
+                    "name": spec.name,
+                    "required": spec.required,
+                    "addressable": false,
+                    "detail": unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "this Run has no output destination".to_string()),
+                });
+            };
+            let path = destination.join(&spec.name);
+            // `staged` is the plain question "is there a regular file
+            // there now" — a symlink or a directory answers `false` here
+            // and refuses at Claim, rather than reading as ready and
+            // refusing later.
+            let staged = std::fs::symlink_metadata(&path)
+                .map(|meta| meta.file_type().is_file())
+                .unwrap_or(false);
+            json!({
+                "name": spec.name,
+                "required": spec.required,
+                "addressable": true,
+                "path": path.display().to_string(),
+                "staged": staged,
+            })
+        })
         .collect();
     // Ruling 0235: which addressing this Run's declared outputs resolve
     // through (`ContractNames::Managed` for `Actor`, `::Checkout` for
@@ -25293,7 +25639,8 @@ fn handle_run_outputs(state: &Arc<WirkdState>, payload: super::RunOutputsPayload
         "waypoint": run.waypoint.0,
         "kind": kind,
         "current": current,
-        "staging": staging.display().to_string(),
+        "staging": destination.as_ref().map(|d| d.display().to_string()),
+        "unavailable_reason": unavailable_reason,
         "outputs": outputs,
     }))
 }

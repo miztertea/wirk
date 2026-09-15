@@ -58,6 +58,92 @@ pub(crate) fn commit_and_tree(
     )?;
     Ok((commit, format!("sha1:{tree}")))
 }
+/// One row of a `git ls-tree -r -z -l <commit>` listing, parsed exactly
+/// once and reused by both `resources` (which classifies each entry all
+/// the way to a `ResourceRecord`, reading a blob where admitted) and
+/// `preview` (which classifies the same entry into a coverage bucket
+/// without ever reading one) — one interpretation of the NUL/tab-framed
+/// wire format, not two that could drift apart.
+struct LsTreeEntry {
+    path: Vec<u8>,
+    mode: String,
+    oid: String,
+    size: Option<u64>,
+}
+
+fn parse_ls_tree(raw: &[u8]) -> Result<Vec<LsTreeEntry>, AtlasError> {
+    let mut entries = Vec::new();
+    for entry in raw.split(|b| *b == 0).filter(|x| !x.is_empty()) {
+        let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+            return Err(AtlasError::SourceBytesUnavailable(
+                "invalid NUL-framed ls-tree record".into(),
+            ));
+        };
+        let meta = std::str::from_utf8(&entry[..tab])
+            .map_err(|_| AtlasError::SourceBytesUnavailable("invalid Git metadata".into()))?;
+        let fields: Vec<_> = meta.split_whitespace().collect();
+        if fields.len() != 4 {
+            return Err(AtlasError::SourceBytesUnavailable(
+                "invalid Git tree fields".into(),
+            ));
+        }
+        entries.push(LsTreeEntry {
+            path: entry[tab + 1..].to_vec(),
+            mode: fields[0].to_owned(),
+            oid: fields[2].to_owned(),
+            size: fields[3].parse::<u64>().ok(),
+        });
+    }
+    Ok(entries)
+}
+
+/// What a path/mode/size alone — no blob read — settles about one Git
+/// entry, shared by `resources`' full classification and `preview`'s
+/// coverage bucket. The one place either function decides
+/// gitlink/symlink/excluded/no-extractor/oversize/family/candidate, so a
+/// preview and a real acquisition can never quietly disagree about where
+/// that boundary falls.
+enum PathVerdict {
+    Unsupported(&'static str),
+    Excluded,
+    /// Admitted by name; a real acquisition reads and extracts it.
+    Family,
+    /// The name settles nothing; a real acquisition screens a bounded
+    /// prefix of the blob before deciding.
+    Candidate,
+}
+
+fn classify_path(
+    mode: &str,
+    path: &[u8],
+    size: Option<u64>,
+    policy: &ExtractorPolicy,
+    limits: &crate::doctree::CaptureLimits,
+) -> PathVerdict {
+    if mode == "160000" {
+        return PathVerdict::Unsupported("gitlink");
+    }
+    if mode == "120000" {
+        return PathVerdict::Unsupported("symlink");
+    }
+    if ExtractorPolicy::excluded(path) {
+        return PathVerdict::Excluded;
+    }
+    match policy.admission(path) {
+        crate::extract::PathAdmission::No => {
+            PathVerdict::Unsupported("no extractor for path family")
+        }
+        // Checked from the size Git already reported, before the object
+        // is read: the bound refuses the read rather than complaining
+        // about one that already happened.
+        _ if size.is_some_and(|size| size > limits.max_file_bytes) => {
+            PathVerdict::Unsupported("blob exceeds the bounded source read size")
+        }
+        crate::extract::PathAdmission::Family(_) => PathVerdict::Family,
+        crate::extract::PathAdmission::Candidate => PathVerdict::Candidate,
+    }
+}
+
 /// Every committed path of `commit`, classified and — where admitted —
 /// extracted, under this estate's own source input bounds.
 ///
@@ -113,55 +199,23 @@ pub(crate) fn resources(
     }
 
     let mut entries: Vec<Entry> = Vec::new();
-    for entry in raw.split(|b| *b == 0).filter(|x| !x.is_empty()) {
-        let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
-            return Err(AtlasError::SourceBytesUnavailable(
-                "invalid NUL-framed ls-tree record".into(),
-            ));
-        };
-        let meta = std::str::from_utf8(&entry[..tab])
-            .map_err(|_| AtlasError::SourceBytesUnavailable("invalid Git metadata".into()))?;
-        let fields: Vec<_> = meta.split_whitespace().collect();
-        if fields.len() != 4 {
-            return Err(AtlasError::SourceBytesUnavailable(
-                "invalid Git tree fields".into(),
-            ));
-        }
-        let path = entry[tab + 1..].to_vec();
-        let mode = fields[0].to_owned();
-        let oid = fields[2].to_owned();
-        let size = fields[3].parse::<u64>().ok();
-        let classified = if mode == "160000" {
-            Classified::Decided(CoverageDisposition::Unsupported, Some("gitlink".into()))
-        } else if mode == "120000" {
-            Classified::Decided(CoverageDisposition::Unsupported, Some("symlink".into()))
-        } else if ExtractorPolicy::excluded(&path) {
-            Classified::Decided(
+    for row in parse_ls_tree(&raw)? {
+        let classified = match classify_path(&row.mode, &row.path, row.size, policy, limits) {
+            PathVerdict::Unsupported(detail) => {
+                Classified::Decided(CoverageDisposition::Unsupported, Some(detail.into()))
+            }
+            PathVerdict::Excluded => Classified::Decided(
                 CoverageDisposition::Excluded,
                 Some("fixed secret-like policy".into()),
-            )
-        } else {
-            match policy.admission(&path) {
-                crate::extract::PathAdmission::No => Classified::Decided(
-                    CoverageDisposition::Unsupported,
-                    Some("no extractor for path family".into()),
-                ),
-                // Checked from the size Git already reported, before the
-                // object is read: the bound refuses the read rather than
-                // complaining about one that already happened.
-                _ if size.is_some_and(|size| size > limits.max_file_bytes) => Classified::Decided(
-                    CoverageDisposition::Unsupported,
-                    Some("blob exceeds the bounded source read size".into()),
-                ),
-                crate::extract::PathAdmission::Family(_) => Classified::Read,
-                crate::extract::PathAdmission::Candidate => Classified::Screen,
-            }
+            ),
+            PathVerdict::Family => Classified::Read,
+            PathVerdict::Candidate => Classified::Screen,
         };
         entries.push(Entry {
-            path,
-            mode,
-            oid,
-            size,
+            path: row.path,
+            mode: row.mode,
+            oid: row.oid,
+            size: row.size,
             classified,
         });
     }
@@ -273,6 +327,54 @@ pub(crate) fn resources(
     records.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(records)
 }
+/// `atlas acquire --dry-run`'s Git half: the same `git ls-tree -l`
+/// listing `resources` reads, classified by path/mode/size alone — no
+/// blob is ever read here, so this is strictly cheaper than
+/// `resources`, which this never calls and which alone actually
+/// extracts anything.
+///
+/// A path `resources` would itself read without sniffing first
+/// (`PathAdmission::Family`) is reported `candidate`: whether it
+/// extracts is not knowable without that read, which this deliberately
+/// skips. A path `resources` would itself sniff before deciding
+/// (`PathAdmission::Candidate`) is reported `unclassified` rather than
+/// guessed at — Git's preview trades that one honest gap for reading
+/// zero bytes of tracked content, which is the entire reason a
+/// pre-acquisition preview over a large Git tree stays cheap.
+pub(crate) fn preview(
+    repo: &Path,
+    commit: &str,
+    policy: &ExtractorPolicy,
+    limits: &crate::doctree::CaptureLimits,
+) -> Result<crate::preview::PreviewReport, AtlasError> {
+    let raw = git(
+        repo,
+        &[
+            "ls-tree".into(),
+            "-r".into(),
+            "-z".into(),
+            "-l".into(),
+            commit.into(),
+        ],
+    )?;
+    let mut report = crate::preview::PreviewReport::new(
+        "git",
+        repo.display().to_string(),
+        commit.to_string(),
+        false,
+    );
+    for row in parse_ls_tree(&raw)? {
+        let size = row.size.unwrap_or(0);
+        match classify_path(&row.mode, &row.path, row.size, policy, limits) {
+            PathVerdict::Unsupported(_) => report.unsupported.add(size),
+            PathVerdict::Excluded => report.excluded.add(size),
+            PathVerdict::Family => report.candidate.add(size),
+            PathVerdict::Candidate => report.unclassified.add(size),
+        }
+    }
+    Ok(report)
+}
+
 pub(crate) fn blob(repo: &Path, oid: &str) -> Result<Vec<u8>, AtlasError> {
     git(repo, &["cat-file".into(), "blob".into(), oid.into()])
 }

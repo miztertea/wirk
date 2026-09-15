@@ -741,6 +741,66 @@ fn recurse(
     Ok(())
 }
 
+/// `atlas acquire --dry-run`'s document-tree half: reuses `capture`
+/// unchanged — the identical walk and bounded read a real acquisition
+/// runs — and classifies what it returns without ever calling `finish`,
+/// so no extraction (`ExtractorPolicy::units`/`document_units`) runs
+/// and no generation is written.
+///
+/// Unlike `git::preview`, this **does** read file content: `capture`'s
+/// own walk already performs the bounded sniff/read that decides
+/// `Excluded`/`Unsupported`/`Unavailable` before this function ever
+/// sees the result (see `recurse`'s own doc), so there is no cheaper
+/// document-tree walk to fall back to without re-implementing it — the
+/// one thing P6.3-B's brief rules out. `content_sniffed: true` names
+/// this honestly rather than leaving a caller to assume both source
+/// kinds cost the same to preview.
+///
+/// A `Content` entry — read in full by `capture`, same as a real
+/// acquisition would read it — is classified `candidate` unless the
+/// same cheap binary-blob heuristic `finish` applies before ever
+/// calling `policy.units` would already reject it (`unsupported`).
+/// Whether a `candidate` entry's real extraction then succeeds
+/// (`Indexed`) or fails (`Error`) is decided only by `finish`, which
+/// this never calls — a malformed document (the corpus's malformed
+/// `.docx`/`.xlsx` fixtures) previews as `candidate` and may still
+/// surface as `Error` only at real acquisition; naming that gap is the
+/// preview's job, not eliminating it.
+pub(crate) fn preview(
+    root: &Path,
+    policy: &ExtractorPolicy,
+    limits: &CaptureLimits,
+    stop: &wirk_core::jobs::JobStop,
+) -> Result<crate::preview::PreviewReport, AtlasError> {
+    let (_digest, _content, captured) = capture(root, policy, limits, stop)?;
+    let mut report = crate::preview::PreviewReport::new(
+        "document-tree",
+        root.display().to_string(),
+        CURRENT_OBSERVATION.to_string(),
+        true,
+    );
+    for entry in captured {
+        let size = entry.byte_len.unwrap_or(0);
+        match entry.kind {
+            CapturedKind::Symlink | CapturedKind::Special(_) | CapturedKind::Unsupported(_) => {
+                report.unsupported.add(size);
+            }
+            CapturedKind::Excluded => report.excluded.add(size),
+            CapturedKind::Unavailable(_) => report.unavailable.add(size),
+            CapturedKind::Content { bytes, .. } => {
+                if policy.family(&entry.relative, &bytes) != Some(ContentFamily::Document)
+                    && bytes.contains(&0)
+                {
+                    report.unsupported.add(size);
+                } else {
+                    report.candidate.add(size);
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// Attaches generation-dependent identity — retrieval unit ids, which
 /// fold in the `GenerationId` this policy cannot know until the whole
 /// tree has been walked and its manifest identity finalized — to what

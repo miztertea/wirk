@@ -820,6 +820,7 @@ pub(crate) fn rank(
             }
         }
         let cache: BTreeMap<Vec<u8>, std::sync::Arc<Vec<u8>>> = match crate::hydrate::blobs(
+            crate::extract::ExtractorEdition::recorded(&admitted.edition.chunker.extractor_set)?,
             &admitted.edition.acquisition_policy,
             Path::new(&admitted.locator),
             &crate::atlas_layout(&jobs.estate_root).root,

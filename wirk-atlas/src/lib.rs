@@ -11,6 +11,7 @@ mod findings;
 mod git;
 mod http_source;
 mod hydrate;
+mod preview;
 mod query;
 mod relationship;
 mod retrieval;
@@ -56,6 +57,9 @@ pub use http_source::ACQUISITION_POLICY as HTTP_SOURCE_POLICY;
 /// The only `--revision`/`requested_ref` spelling an HTTP source
 /// honours, parallel to `DOCUMENT_TREE_CURRENT_OBSERVATION`.
 pub use http_source::CURRENT_OBSERVATION as HTTP_SOURCE_CURRENT_OBSERVATION;
+/// `atlas acquire --dry-run`'s own answer shape — see the module doc
+/// for what each field means and does not promise.
+pub use preview::{PreviewBucket, PreviewReport};
 pub use query::{
     AnswerBudget, AnswerCoverage, EvidenceHit, HitGenerationIdentity, PathLookupOutcome,
     PathLookupRequest, PinnedProducer, SearchAnswer, SearchRequest, SemanticRequest,

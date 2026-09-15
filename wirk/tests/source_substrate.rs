@@ -1193,8 +1193,140 @@ fn status_work_scope_hides_a_denied_sources_locator() {
     stop_wirkd(&estate, wirkd_child);
 }
 
-// ---- 9. denial and a fresh estate are distinct from a genuine no_match ----
+/// Ruling 0357: `atlas status` was the one reading verb that never
+/// resolved scope through the actor's own inherited context — it scoped
+/// only when an explicit `--work` flag was given, so a real actor
+/// running inside its own Work (the injected triple, no `--work`, no
+/// `--admin` — exactly how `search`/`remove` already infer scope) still
+/// got the unscoped administrative disclosure: `work_scoped:false` and
+/// both sources' real locators, including the one it was never granted.
+#[test]
+fn status_inherits_actor_scope_with_no_explicit_flag_the_same_as_search_and_remove() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let estate = dir.path().join("estate");
+    fs::create_dir_all(&estate).unwrap();
+    install_smoke_route(&estate);
 
+    let wirk_repo = dir.path().join("wirk-repo");
+    seed_repo(&wirk_repo, "lib.rs", "fn validate_claim() {}\n");
+    let workspace_repo = dir.path().join("workspace-repo");
+    seed_repo(&workspace_repo, "claim-contract.md", "# claim contract\n");
+
+    let wirkd_child = start_wirkd(&estate);
+    for (source, repo) in [("wirk", &wirk_repo), ("workspace", &workspace_repo)] {
+        let (ok, acquired, err) = atlas(
+            &estate,
+            &[
+                "acquire",
+                "--source",
+                source,
+                "--repository",
+                repo.to_str().unwrap(),
+                "--revision",
+                "HEAD",
+            ],
+        );
+        assert!(ok, "acquire {source} failed: {err}");
+        let generation = acquired["generation"]["generation"].as_str().unwrap();
+        let (ok, _, err) = atlas(
+            &estate,
+            &["publish", "--source", source, "--generation", generation],
+        );
+        assert!(ok, "publish {source} failed: {err}");
+    }
+
+    let work_id = submit_work(&estate, &["wirk:read"], "wirk", &wirk_repo);
+
+    // The actor's own inherited context — the same triple `run-deterministic`
+    // injects into a real child — with no `--work` and no `--admin` named.
+    let mut full = vec!["atlas", "status", "--estate"];
+    let estate_str = estate.to_str().expect("estate path is utf-8");
+    full.push(estate_str);
+    full.push("--json");
+    let output = wirk_cli()
+        .env("WIRK_ESTATE_ROOT", &estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", "run-fixture")
+        .args(&full)
+        .output()
+        .expect("wirk atlas status runs");
+    assert!(
+        output.status.success(),
+        "inherited-context status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let scoped: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("status prints JSON");
+
+    assert!(
+        scoped["work_scoped"].as_bool().unwrap(),
+        "CONTRACT FAILURE (ruling 0357): an actor's own inherited context, \
+         with no --work and no --admin, must scope the same way search/remove \
+         already do — got {scoped}"
+    );
+    assert_eq!(
+        scoped["sources_total"].as_u64(),
+        Some(1),
+        "only the admitted source may be counted: {scoped}"
+    );
+    let shown = scoped["sources"].as_array().unwrap();
+    assert_eq!(shown.len(), 1, "only the admitted source may be disclosed");
+    assert_eq!(shown[0]["membership"]["alias"].as_str(), Some("wirk"));
+    let scoped_text = scoped.to_string();
+    assert!(
+        !scoped_text.contains(workspace_repo.to_str().unwrap()),
+        "CONTRACT FAILURE (ruling 0357): the withheld source's real locator \
+         must never reach an actor's own inherited-context status read: {scoped}"
+    );
+
+    // `--admin` from inside the same context is still the explicit,
+    // disclosed operator read of everything (unchanged).
+    let mut admin_args = vec!["atlas", "status", "--estate"];
+    admin_args.push(estate_str);
+    admin_args.push("--admin");
+    admin_args.push("--json");
+    let admin_output = wirk_cli()
+        .env("WIRK_ESTATE_ROOT", &estate)
+        .env("WIRK_WORK_ID", &work_id)
+        .env("WIRK_RUN_ID", "run-fixture")
+        .args(&admin_args)
+        .output()
+        .expect("wirk atlas status --admin runs");
+    assert!(admin_output.status.success());
+    let admin: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&admin_output.stdout).trim())
+            .expect("status prints JSON");
+    assert_eq!(admin["sources_total"].as_u64(), Some(2));
+    assert!(!admin["work_scoped"].as_bool().unwrap());
+
+    stop_wirkd(&estate, wirkd_child);
+}
+
+// ---- 9. denial, an unreachable scope and a fresh estate are each
+// distinct from a genuine no_match ----
+
+/// Four answers that a caller must be able to tell apart, and that a
+/// single `no_match` would flatten into one lie.
+///
+/// The middle two are the ones ruling 0357 moved. A scoped search now
+/// resolves the aliases this Work could possibly reach *from its own
+/// grants*, before the registry is consulted, and counts registration
+/// only over those. So:
+///
+/// * A Work granted a name this estate has never registered is **not**
+///   denied. Nothing withheld it; there is simply no source in its
+///   reach, and `no_sources` says exactly that. Answering `denied` here
+///   would disclose that some other membership exists — precisely what
+///   0357 removed — because `denied` and `no_sources` would then
+///   distinguish "registered but withheld" from "never registered". The
+///   two must read identically to a scoped caller, and they do: this
+///   estate has `wirk` registered and hidden, and the answer below is
+///   byte-identical to the one a genuinely empty estate gives.
+/// * A caller that names a `--source` outside its own grants **is**
+///   denied, and that denial is still worth keeping: it is about the
+///   request the caller actually made, not about what the estate holds,
+///   so it leaks nothing while telling the caller the useful thing.
 #[test]
 fn denied_and_fresh_estate_are_distinct_from_no_match() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1231,25 +1363,59 @@ fn denied_and_fresh_estate_are_distinct_from_no_match() {
     );
     assert!(ok, "publish failed: {err}");
 
-    // A registered-but-ungranted source: the Work's scope denies it.
+    // A Work whose only grant names nothing this estate registered.
+    // `wirk` IS registered and published here, and is withheld from this
+    // scope - so this is the case that must not be distinguishable from
+    // the fresh estate above.
     let work_id = submit_work(&estate, &["some-other-name:read"], "some-other-name", &repo);
-    let (ok, denied, err) = atlas(
+    let (ok, unreachable, err) = atlas(
         &estate,
         &["search", "--work", &work_id, "--query", "validate_claim"],
+    );
+    assert!(ok, "scope-limited search failed: {err}");
+    assert!(
+        unreachable["coverage"]["no_sources"].as_bool().unwrap(),
+        "a scope that reaches no registered source has nothing to search"
+    );
+    assert!(!unreachable["coverage"]["denied"].as_bool().unwrap());
+    assert!(!unreachable["coverage"]["no_match"].as_bool().unwrap());
+    assert_eq!(unreachable["admission"]["admitted"].as_u64(), Some(0));
+    // The withheld membership is disclosed by neither the coverage
+    // metadata nor the counts: this answer says the same thing the fresh
+    // estate's did.
+    assert_eq!(
+        unreachable["coverage"], fresh["coverage"],
+        "a withheld registration must not be readable from the coverage"
+    );
+
+    // Naming a source outside your own grants is still a denial, and
+    // still distinct: it reports on the request, not on the catalog.
+    let granted_work_id = submit_work(&estate, &["wirk:read"], "wirk", &repo);
+    let (ok, denied, err) = atlas(
+        &estate,
+        &[
+            "search",
+            "--work",
+            &granted_work_id,
+            "--source",
+            "some-other-name",
+            "--query",
+            "validate_claim",
+        ],
     );
     assert!(ok, "denied search failed: {err}");
     assert!(denied["coverage"]["denied"].as_bool().unwrap());
     assert!(!denied["coverage"]["no_match"].as_bool().unwrap());
+    assert!(!denied["coverage"]["no_sources"].as_bool().unwrap());
     assert_eq!(denied["admission"]["admitted"].as_u64(), Some(0));
 
     // A genuinely admitted, fully searched, zero-hit query.
-    let admitted_work_id = submit_work(&estate, &["wirk:read"], "wirk", &repo);
     let (ok, no_match, err) = atlas(
         &estate,
         &[
             "search",
             "--work",
-            &admitted_work_id,
+            &granted_work_id,
             "--query",
             "no_such_identifier_anywhere",
         ],
@@ -1683,7 +1849,7 @@ fn the_admitted_corpus_covers_code_docs_and_config_without_widening_exclusions()
     assert_eq!(
         acquired["generation"]["extractor_set"].as_str(),
         Some(
-            "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families+anydoc-0.2.4-detected-documents/v6"
+            "text-multiline-chunks/utf8-multiline-chunks-65536+semble-0.5.2-content-families+txt+anydoc-0.2.4-detected-documents/v7"
         ),
         "the identity must name the edition and say plainly that it is text chunks, not syntax"
     );

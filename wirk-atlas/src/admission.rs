@@ -30,12 +30,22 @@ pub struct AdmittedSource {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AdmissionSummary {
     pub admitted: usize,
+    /// How many sources the caller *named* were refused to it — never a
+    /// census of the catalog. Under a `Work` scope that named no source,
+    /// this is 0 however many memberships the estate holds: the caller
+    /// asked for nothing in particular, so nothing in particular was
+    /// refused, and counting the rest would publish the number of
+    /// sources it was never admitted to. `atlas status` holds the same
+    /// line by counting only what its scope admits.
     pub denied: usize,
 }
 
 /// Filters catalog memberships to those the caller's scope actually
 /// grants, before any ranking or blob read happens. A requested source
 /// narrows this set; it never adds a membership the scope did not grant.
+///
+/// The returned `denied` count is bounded to what `requested_source`
+/// named, for the reason on `AdmissionSummary::denied`.
 pub(crate) fn admit<'a>(
     memberships: impl Iterator<Item = &'a Membership>,
     scope: &QueryScope,
@@ -56,7 +66,7 @@ pub(crate) fn admit<'a>(
                         membership: membership.clone(),
                         access: Some(grant.access),
                     });
-                } else {
+                } else if requested_source.is_some() {
                     denied += 1;
                 }
             }

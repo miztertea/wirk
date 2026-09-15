@@ -132,7 +132,12 @@ fn work_filters_sources_before_ranking() {
     .unwrap();
 
     assert_eq!(answer.admission.admitted, 1);
-    assert_eq!(answer.admission.denied, 1);
+    // Zero, not one: this request named no source, so the distractor is
+    // filtered out of the searched vector (which is what this test is
+    // about) without being counted in a number the caller reads. See
+    // `a_wholly_withheld_source_changes_nothing_a_scoped_search_can_see`
+    // for why that count must not move with the catalog.
+    assert_eq!(answer.admission.denied, 0);
     assert!(!answer.hits.is_empty());
     assert!(answer.hits.iter().all(|hit| {
         hit.coordinate.source.0 != "distractor"
@@ -917,4 +922,234 @@ fn an_offset_past_the_last_candidate_is_spent_not_no_match() {
     let empty = at(0, "zzzznothing");
     assert!(empty.coverage.no_match);
     assert!(!empty.coverage.spent);
+}
+
+/// An explicitly named source this Work scope was never granted answers
+/// identically whether that alias is registered (and withheld) or does
+/// not exist in the estate's catalog at all — the same non-disclosing
+/// class `atlas remove`'s `UnknownSource` collapses these two cases
+/// into. Telling them apart would make a scoped search a
+/// catalog-existence oracle.
+#[test]
+fn an_ungranted_explicit_source_answers_the_same_whether_registered_or_not() {
+    let (repo, rev) = repo_with(&[("secret.rs", "fn withheld_marker() {}\n")]);
+    let estate = TempDir::new().unwrap();
+    let mut atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
+    // "withheld" really is registered and published in this estate;
+    // the requester's own scope below grants it nothing.
+    acquire_and_publish(&mut atlas, "withheld", repo.path(), &rev);
+
+    let ask = |source: &str| {
+        search(
+            &atlas,
+            &SearchRequest {
+                scope: work(&[], Access::Read),
+                requested_source: Some(source.into()),
+                query: "withheld_marker".into(),
+                families: vec![],
+                semantic: SemanticRequest::Disabled,
+                limit: 10,
+                capacity: None,
+                pinned: None,
+                offset: 0,
+                semantic_query: None,
+                pinned_editions: None,
+                pinned_mode: None,
+                pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+            },
+        )
+        .unwrap()
+    };
+
+    let registered_but_withheld = ask("withheld");
+    let never_registered = ask("totally-unregistered-xyz");
+
+    assert!(
+        registered_but_withheld.hits.is_empty() && never_registered.hits.is_empty(),
+        "positive control: neither answer leaks any hit"
+    );
+    assert_eq!(
+        registered_but_withheld.coverage, never_registered.coverage,
+        "CONTRACT FAILURE: a caller can tell a withheld, \
+         registered alias from a genuinely unregistered one by comparing \
+         `coverage` alone — {registered_but_withheld:?} vs {never_registered:?}"
+    );
+    assert_eq!(
+        registered_but_withheld.admission, never_registered.admission,
+        "CONTRACT FAILURE: admission summary also leaks the \
+         distinction — {registered_but_withheld:?} vs {never_registered:?}"
+    );
+    assert!(
+        registered_but_withheld.coverage.denied,
+        "an ungranted explicit source must read as denied, the same answer \
+         `atlas remove` already gives both cases"
+    );
+    assert!(!registered_but_withheld.coverage.no_sources);
+}
+
+/// A fresh estate with no explicit `--source` named at all must still
+/// work: this is not about collapsing `no_sources` everywhere, only
+/// about an explicitly named source an ungranted scope asked for by
+/// name.
+#[test]
+fn an_unnamed_search_over_a_fresh_estate_still_reports_no_sources_not_denied() {
+    let estate = TempDir::new().unwrap();
+    let atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
+
+    let answer = search(
+        &atlas,
+        &SearchRequest {
+            scope: work(&["whatever"], Access::Read),
+            requested_source: None,
+            query: "anything".into(),
+            families: vec![],
+            semantic: SemanticRequest::Disabled,
+            limit: 10,
+            capacity: None,
+            pinned: None,
+            offset: 0,
+            semantic_query: None,
+            pinned_editions: None,
+            pinned_mode: None,
+            pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+        },
+    )
+    .unwrap();
+
+    assert!(answer.coverage.no_sources);
+    assert!(!answer.coverage.denied);
+}
+
+/// The same disclosure class one level up from an explicitly named
+/// alias: the *aggregate* metadata a scoped answer carries. A Work scope
+/// that named no `--source` at all still gets an `AdmissionSummary`, and
+/// `denied` there used to be a census of every catalog membership this
+/// scope does not grant. That number is a count of sources the caller
+/// was never admitted to, so adding one wholly withheld source to the
+/// estate moved it — an existence-and-count oracle reached without
+/// naming anything, which `atlas status` already refuses to be by
+/// counting only what the scope admits.
+///
+/// The caller's own admitted vector must be unchanged by the addition,
+/// and so must every number describing it.
+#[test]
+fn a_wholly_withheld_source_changes_nothing_a_scoped_search_can_see() {
+    let (granted_repo, granted_rev) = repo_with(&[("guide.rs", "fn shared_marker() {}\n")]);
+    let (withheld_repo, withheld_rev) = repo_with(&[("secret.rs", "fn shared_marker() {}\n")]);
+    let estate = TempDir::new().unwrap();
+    let mut atlas = AtlasStore::open(estate.path(), "estate-a").unwrap();
+    acquire_and_publish(&mut atlas, "guide", granted_repo.path(), &granted_rev);
+
+    let ask = |atlas: &AtlasStore| {
+        search(
+            atlas,
+            &SearchRequest {
+                // Granted "guide" and nothing else; no `--source` named,
+                // which is the ordinary actor search.
+                scope: work(&["guide"], Access::Read),
+                requested_source: None,
+                query: "shared_marker".into(),
+                families: vec![],
+                semantic: SemanticRequest::Disabled,
+                limit: 10,
+                capacity: None,
+                pinned: None,
+                offset: 0,
+                semantic_query: None,
+                pinned_editions: None,
+                pinned_mode: None,
+                pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+            },
+        )
+        .unwrap()
+    };
+
+    let before = ask(&atlas);
+    assert_eq!(
+        before.admission.admitted, 1,
+        "positive control: the granted source really is admitted and searched"
+    );
+    assert!(
+        !before.hits.is_empty(),
+        "positive control: the granted source really does hold the marker"
+    );
+
+    // The only change to the estate: one more source, granted to nobody.
+    acquire_and_publish(&mut atlas, "withheld", withheld_repo.path(), &withheld_rev);
+    let after = ask(&atlas);
+
+    assert_eq!(
+        before.hits.len(),
+        after.hits.len(),
+        "the withheld source's own matching content must not be searched"
+    );
+    assert_eq!(
+        before.admission, after.admission,
+        "CONTRACT FAILURE: adding a source this scope was never granted moved \
+         the admission summary it can read — {:?} before, {:?} after. That is a \
+         count of sources the caller has no business knowing exist.",
+        before.admission, after.admission
+    );
+    assert_eq!(
+        before.coverage, after.coverage,
+        "CONTRACT FAILURE: adding a withheld source moved this scope's coverage \
+         — {:?} before, {:?} after",
+        before.coverage, after.coverage
+    );
+}
+
+/// The zero-grant case of the same class, and the boundary the fix must
+/// not cross. A scope granted nothing has nothing to search whatever the
+/// catalog holds, so a fresh estate and an estate full of sources it was
+/// never granted must read identically — while a genuine zero-hit search
+/// of admitted content stays `no_match`, not `denied`.
+#[test]
+fn a_scope_granted_nothing_cannot_tell_a_fresh_estate_from_a_withheld_one() {
+    let (repo, rev) = repo_with(&[("secret.rs", "fn withheld_marker() {}\n")]);
+
+    let fresh_dir = TempDir::new().unwrap();
+    let fresh = AtlasStore::open(fresh_dir.path(), "estate-a").unwrap();
+
+    let stocked_dir = TempDir::new().unwrap();
+    let mut stocked = AtlasStore::open(stocked_dir.path(), "estate-a").unwrap();
+    acquire_and_publish(&mut stocked, "withheld", repo.path(), &rev);
+
+    let ask = |atlas: &AtlasStore| {
+        search(
+            atlas,
+            &SearchRequest {
+                scope: work(&[], Access::Read),
+                requested_source: None,
+                query: "withheld_marker".into(),
+                families: vec![],
+                semantic: SemanticRequest::Disabled,
+                limit: 10,
+                capacity: None,
+                pinned: None,
+                offset: 0,
+                semantic_query: None,
+                pinned_editions: None,
+                pinned_mode: None,
+                pinned_producer: wirk_atlas::PinnedProducer::Unrecorded,
+            },
+        )
+        .unwrap()
+    };
+
+    let on_fresh = ask(&fresh);
+    let on_stocked = ask(&stocked);
+
+    assert!(on_fresh.hits.is_empty() && on_stocked.hits.is_empty());
+    assert_eq!(
+        on_fresh.coverage, on_stocked.coverage,
+        "CONTRACT FAILURE: a scope granted nothing can tell an empty estate from \
+         one holding sources it was never granted — {:?} vs {:?}",
+        on_fresh.coverage, on_stocked.coverage
+    );
+    assert_eq!(on_fresh.admission, on_stocked.admission);
+    assert!(
+        on_stocked.coverage.denied,
+        "a scope that admits nothing is denied, not searched-and-empty"
+    );
+    assert!(!on_stocked.coverage.no_match);
 }

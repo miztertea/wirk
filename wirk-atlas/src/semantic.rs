@@ -3434,12 +3434,15 @@ impl crate::AtlasStore {
             let bytes = match blob_cache.get(&cache_key) {
                 Some(bytes) => bytes.clone(),
                 None => match crate::hydrate::blob(
+                    crate::extract::ExtractorEdition::recorded(&generation.extractor_set)?,
                     &generation.acquisition_policy,
                     Path::new(&membership.locator),
                     self.root(),
                     &generation.id,
-                    &resource.path,
-                    &object_id,
+                    crate::hydrate::RecordedResource {
+                        path: &resource.path,
+                        object_id: &object_id,
+                    },
                     &self.capture_limits(),
                 ) {
                     Ok(bytes) => {
@@ -3644,12 +3647,15 @@ impl crate::AtlasStore {
                 // from the source that actually holds them rather than
                 // assuming the generation was a Git one.
                 None => match crate::hydrate::blob(
+                    crate::extract::ExtractorEdition::recorded(&edition.chunker.extractor_set)?,
                     &edition.acquisition_policy,
                     Path::new(&membership.locator),
                     self.root(),
                     &edition.generation,
-                    &row.path,
-                    &row.object_id,
+                    crate::hydrate::RecordedResource {
+                        path: &row.path,
+                        object_id: &row.object_id,
+                    },
                     &self.capture_limits(),
                 ) {
                     Ok(bytes) => {

@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Work lifecycle",
+    "subtitle": "States and transitions as wirk_core::fold writes them"
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "Under way"
+    },
+    {
+      "id": "held",
+      "label": "Waiting on someone"
+    },
+    {
+      "id": "terminal",
+      "label": "Ended"
+    }
+  ],
+  "states": [
+    {
+      "id": "pending",
+      "type": "start",
+      "label": "Pending",
+      "sublabel": "submitted",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "entry"
+    },
+    {
+      "id": "active",
+      "type": "active",
+      "label": "Active",
+      "sublabel": "a Waypoint is reserved",
+      "lane": "main",
+      "col": 2,
+      "step": "02",
+      "tag": "run"
+    },
+    {
+      "id": "completed",
+      "type": "success",
+      "label": "Completed",
+      "sublabel": "Done validated, nothing left",
+      "lane": "main",
+      "col": 4,
+      "step": "03",
+      "tag": "done"
+    },
+    {
+      "id": "needsinput",
+      "type": "waiting",
+      "label": "NeedsInput",
+      "sublabel": "a person has to answer",
+      "lane": "held",
+      "col": 0,
+      "tag": "ask"
+    },
+    {
+      "id": "waiting",
+      "type": "waiting",
+      "label": "Waiting",
+      "sublabel": "held on a stage below",
+      "lane": "held",
+      "col": 2,
+      "tag": "hold"
+    },
+    {
+      "id": "failed",
+      "type": "failure",
+      "label": "Failed",
+      "sublabel": "WorkFailed",
+      "lane": "terminal",
+      "col": 0,
+      "tag": "end"
+    },
+    {
+      "id": "canceled",
+      "type": "neutral",
+      "label": "Canceled",
+      "sublabel": "WorkCanceled",
+      "lane": "terminal",
+      "col": 2,
+      "tag": "end"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "reserved",
+      "from": "pending",
+      "to": "active",
+      "variant": "default",
+      "route": "straight",
+      "label": "WaypointReserved"
+    },
+    {
+      "id": "done",
+      "from": "active",
+      "to": "completed",
+      "variant": "default",
+      "route": "straight",
+      "label": "Done validated"
+    },
+    {
+      "id": "needs-a-person",
+      "from": "active",
+      "to": "needsinput",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "drop",
+      "label": "Question / RunFailed / RunVanished"
+    },
+    {
+      "id": "retried",
+      "from": "needsinput",
+      "to": "active",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "route": "straight",
+      "label": "RunOpened"
+    },
+    {
+      "id": "held",
+      "from": "active",
+      "to": "waiting",
+      "variant": "default",
+      "fromSide": "right",
+      "toSide": "top",
+      "route": "straight",
+      "via": [
+        [
+          560,
+          157
+        ],
+        [
+          560,
+          250
+        ],
+        [
+          710,
+          250
+        ]
+      ],
+      "label": "StageHeld"
+    },
+    {
+      "id": "failed-out",
+      "from": "active",
+      "to": "failed",
+      "variant": "security",
+      "fromSide": "left",
+      "toSide": "left",
+      "route": "drop",
+      "via": [
+        [
+          300,
+          157
+        ],
+        [
+          300,
+          479
+        ]
+      ],
+      "label": "WorkFailed"
+    },
+    {
+      "id": "canceled-out",
+      "from": "active",
+      "to": "canceled",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "right",
+      "route": "drop",
+      "via": [
+        [
+          402,
+          230
+        ],
+        [
+          980,
+          230
+        ],
+        [
+          980,
+          479
+        ]
+      ],
+      "label": "WorkCanceled"
+    }
+  ]
+}
